@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
   "name": "FPXpress Tracking Refresh",
-  "version": "1.1",
-  "description": "Automates tracking refresh on the FPXpress dashboard by clicking each tracking number.",
-  "permissions": ["activeTab", "scripting"],
-  "host_permissions": ["*://app.freightpop.com/*"],
+  "version": "2.0",
+  "description": "Automates tracking refresh on the FPXpress dashboard with AI-powered issue analysis via Claude Haiku.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "*://app.freightpop.com/*",
+    "https://api.anthropic.com/*"
+  ],
   "action": {
     "default_popup": "popup.html"
   },

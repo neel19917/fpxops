@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <style>
     body {
-      width: 340px;
+      width: 380px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 13px;
       padding: 16px;
@@ -14,7 +14,19 @@
     h3 {
       margin: 0 0 12px;
       font-size: 15px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
+    .api-badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 3px;
+      text-transform: uppercase;
+    }
+    .api-badge.ok { background: #dcfce7; color: #166534; }
+    .api-badge.missing { background: #fee2e2; color: #991b1b; }
     .field {
       margin-bottom: 10px;
     }
@@ -72,10 +84,168 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+
+    /* AI toggle */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .toggle-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-bottom: 0;
+    }
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+    }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      position: absolute;
+      inset: 0;
+      background: #d1d5db;
+      border-radius: 20px;
+      transition: background 0.2s;
+      cursor: pointer;
+    }
+    .toggle-slider::before {
+      content: "";
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      left: 2px;
+      bottom: 2px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .toggle-switch input:checked + .toggle-slider {
+      background: #2563eb;
+    }
+    .toggle-switch input:checked + .toggle-slider::before {
+      transform: translateX(16px);
+    }
+
+    /* Prompt editor section */
+    .section-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+      padding: 8px 0 4px;
+      margin-top: 12px;
+      border-top: 1px solid #e5e7eb;
+    }
+    .section-toggle h4 {
+      margin: 0;
+      font-size: 13px;
+      color: #374151;
+    }
+    .section-toggle .arrow {
+      font-size: 11px;
+      color: #9ca3af;
+      transition: transform 0.2s;
+    }
+    .section-toggle .arrow.open {
+      transform: rotate(90deg);
+    }
+    .prompt-editor {
+      display: none;
+      margin-top: 8px;
+    }
+    .prompt-editor.visible {
+      display: block;
+    }
+    .prompt-editor .field {
+      margin-bottom: 8px;
+    }
+    .prompt-editor label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #374151;
+    }
+    .prompt-editor textarea {
+      width: 100%;
+      min-height: 70px;
+      padding: 6px 8px;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 11px;
+      resize: vertical;
+      box-sizing: border-box;
+      line-height: 1.4;
+    }
+    #savePromptsBtn {
+      background: #059669;
+      color: #fff;
+      flex: none;
+      padding: 6px 16px;
+      font-size: 12px;
+    }
+    #resetPromptsBtn {
+      background: #6b7280;
+      color: #fff;
+      flex: none;
+      padding: 6px 16px;
+      font-size: 12px;
+    }
+    .prompt-btn-row {
+      display: flex;
+      gap: 6px;
+      justify-content: flex-end;
+      margin-top: 4px;
+    }
+    .save-status {
+      font-size: 11px;
+      color: #059669;
+      margin-right: auto;
+      align-self: center;
+    }
+
+    /* AI Summary section */
+    .ai-summary {
+      margin-top: 12px;
+      border-top: 1px solid #e5e7eb;
+      padding-top: 8px;
+      display: none;
+    }
+    .ai-summary.visible {
+      display: block;
+    }
+    .ai-summary h4 {
+      margin: 0 0 6px;
+      font-size: 13px;
+      color: #374151;
+    }
+    #aiSummaryText {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 4px;
+      padding: 10px;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 200px;
+      overflow-y: auto;
+    }
   </style>
 </head>
 <body>
-  <h3>FPXpress Tracking Refresh</h3>
+  <h3>
+    FPXpress Tracking Refresh
+    <span id="apiBadge" class="api-badge missing">No API Key</span>
+  </h3>
 
   <div class="field">
     <label for="filterCol">Filter Column</label>
@@ -96,11 +266,65 @@
     <div class="hint">Pick a column first, then choose a value.</div>
   </div>
 
+  <div class="toggle-row">
+    <label class="toggle-label" for="aiToggle">
+      <span class="toggle-switch">
+        <input type="checkbox" id="aiToggle" checked>
+        <span class="toggle-slider"></span>
+      </span>
+      AI Analysis
+    </label>
+    <span class="hint" style="margin:0">When off, scrapes data only — no API calls.</span>
+  </div>
+
+  <div class="toggle-row">
+    <label class="toggle-label" for="smartGateToggle">
+      <span class="toggle-switch">
+        <input type="checkbox" id="smartGateToggle">
+        <span class="toggle-slider"></span>
+      </span>
+      Smart Gate
+    </label>
+    <span class="hint" style="margin:0">Skip AI for clearly routine shipments to save API calls.</span>
+  </div>
+
   <div class="btn-row">
     <button id="startBtn">Start</button>
     <button id="stopBtn" disabled>Stop</button>
   </div>
   <div id="status">Ready. Set your filter, then click Start.</div>
+
+  <!-- AI Summary -->
+  <div id="aiSummarySection" class="ai-summary">
+    <h4>AI Summary</h4>
+    <div id="aiSummaryText"></div>
+  </div>
+
+  <!-- Prompt Editor -->
+  <div class="section-toggle" id="promptToggle">
+    <h4>Prompt Settings</h4>
+    <span class="arrow" id="promptArrow">&#9654;</span>
+  </div>
+  <div class="prompt-editor" id="promptEditor">
+    <div class="field">
+      <label for="systemPrompt">System Prompt</label>
+      <textarea id="systemPrompt" rows="3"></textarea>
+    </div>
+    <div class="field">
+      <label for="perShipmentPrompt">Per-Shipment Prompt <span class="hint">(use {{data}} for shipment JSON)</span></label>
+      <textarea id="perShipmentPrompt" rows="4"></textarea>
+    </div>
+    <div class="field">
+      <label for="summaryPrompt">Summary Prompt <span class="hint">(use {{allShipments}} for all data)</span></label>
+      <textarea id="summaryPrompt" rows="3"></textarea>
+    </div>
+    <div class="prompt-btn-row">
+      <span class="save-status" id="saveStatus"></span>
+      <button id="resetPromptsBtn">Reset</button>
+      <button id="savePromptsBtn">Save</button>
+    </div>
+  </div>
+
   <script src="popup.js"></script>
 </body>
 </html>

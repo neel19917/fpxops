@@ -1,5 +1,7 @@
 let stopRequested = false;
 let logRows = [];
+let aiEnabled = true;
+let smartGateEnabled = false;
 
 function sendStatus(text) {
   console.log("[FPX]", text);
@@ -288,38 +290,495 @@ function scrapeModal() {
   return data;
 }
 
-function downloadCSV(rows) {
-  if (!rows.length) return;
+const DISPLAY_COLUMNS = [
+  { key: "_trackingNumber", header: "Tracking Number" },
+  { key: "SHIPMENT STATUS", header: "Shipment Status" },
+  { key: "CARRIER", header: "Carrier" },
+  { key: "CARRIER NAME", header: "Carrier Name" },
+  { key: "MODE", header: "Mode" },
+  { key: "COMMENTS", header: "Comments" },
+  { key: "PICKUP DATE", header: "Pickup Date" },
+  { key: "UPDATED ETA", header: "Updated ETA" },
+  { key: "ESTIMATED DEPARTURE DATE", header: "Est. Departure" },
+  { key: "ACTUAL DEPARTURE DATE", header: "Act. Departure" },
+  { key: "ESTIMATED ARRIVAL DATE", header: "Est. Arrival" },
+  { key: "ACTUAL ARRIVAL DATE", header: "Act. Arrival" },
+  { key: "DELIVERY DATE", header: "Delivery Date" },
+  { key: "SIGNED BY", header: "Signed By" },
+  { key: "BOOKING DATE", header: "Booking Date" },
+  { key: "INBOUND CUSTOMS DATE", header: "Inbound Customs" },
+  { key: "PORT DEPARTURE DATE", header: "Port Departure" },
+  { key: "OUTBOUND CUSTOMS DATE", header: "Outbound Customs" },
+  { key: "ON-BOARD DATE", header: "On-Board Date" },
+  { key: "LONGITUDE", header: "Longitude" },
+  { key: "LATITUDE", header: "Latitude" },
+  { key: "_inputSummary", header: "Input (Extracted)" },
+  { key: "_outputSummary", header: "Output (AI Analysis)" },
+  { key: "_actionRequired", header: "Action Required" },
+  { key: "_aiIssue", header: "AI Issue" },
+  { key: "_aiRecommendation", header: "AI Recommendation" },
+  { key: "_timestamp", header: "Scraped At" },
+  { key: "_error", header: "Error" },
+];
 
-  const allKeys = [];
-  const keySet = new Set();
-  for (const row of rows) {
-    for (const key of Object.keys(row)) {
-      if (!keySet.has(key)) {
-        keySet.add(key);
-        allKeys.push(key);
-      }
+function repairModelJson(s) {
+  let t = s;
+  t = t.replace(
+    /"actionRequired"\s*:\s*true\s+or\s+false/gi,
+    '"actionRequired": false'
+  );
+  t = t.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
+  return t;
+}
+
+function findAnalysisObject(obj, depth) {
+  const d = depth ?? 0;
+  if (d > 10 || obj == null || typeof obj !== "object") return null;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const f = findAnalysisObject(item, d + 1);
+      if (f) return f;
+    }
+    return null;
+  }
+  const keys = Object.keys(obj);
+  const hasSignal = keys.some((k) =>
+    /actionrequired|issue|recommendation|action_required|requiresaction/i.test(
+      k.replace(/_/g, "")
+    )
+  );
+  if (hasSignal) return obj;
+  for (const k of keys) {
+    const v = obj[k];
+    if (v != null && typeof v === "object") {
+      const f = findAnalysisObject(v, d + 1);
+      if (f) return f;
     }
   }
+  return null;
+}
 
-  const escape = (v) => {
-    const s = String(v ?? "");
-    return s.includes(",") || s.includes('"') || s.includes("\n")
-      ? '"' + s.replace(/"/g, '""') + '"'
-      : s;
+function extractJsonObject(text) {
+  if (!text || typeof text !== "string") return null;
+  let t = text.trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/im);
+  if (fence) t = fence[1].trim();
+  t = repairModelJson(t);
+  try {
+    const p = JSON.parse(t);
+    return findAnalysisObject(p, 0) || p;
+  } catch {}
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      const slice = repairModelJson(t.slice(start, end + 1));
+      const p = JSON.parse(slice);
+      return findAnalysisObject(p, 0) || p;
+    } catch {}
+  }
+  return null;
+}
+
+function coerceActionRequired(val) {
+  if (val === undefined || val === null) return "";
+  if (val === true || val === 1) return "YES";
+  if (val === false || val === 0) return "NO";
+  if (typeof val === "string") {
+    const s = val.trim().toLowerCase();
+    if (["true", "yes", "y", "1"].includes(s)) return "YES";
+    if (["false", "no", "n", "0"].includes(s)) return "NO";
+  }
+  return "";
+}
+
+function stringifyField(v) {
+  if (v == null) return "";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v).trim();
+}
+
+function normalizeAiFields(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const actionRaw =
+    obj.actionRequired ??
+    obj.ActionRequired ??
+    obj.action_required ??
+    obj.requiresAction ??
+    obj.requires_action;
+  const issue = stringifyField(obj.issue ?? obj.Issue);
+  const recommendation = stringifyField(
+    obj.recommendation ?? obj.Recommendation
+  );
+  return { actionRaw, issue, recommendation };
+}
+
+function isClearlyOnTrackIssue(issue) {
+  if (!issue || typeof issue !== "string") return true;
+  const s = issue.trim().toLowerCase();
+  return (
+    /^(none|n\/a)\b/.test(s) ||
+    /\bon track\b/.test(s) ||
+    /\bno issue\b/.test(s) ||
+    /\bno action needed\b/.test(s) ||
+    /\bno immediate action\b/.test(s) ||
+    /\bshipment is on track\b/.test(s) ||
+    /\bproceeding normally\b/.test(s) ||
+    /\bas expected\b/.test(s)
+  );
+}
+
+function deriveActionRequired(actionCoerced, issue) {
+  if (actionCoerced === "YES") return "YES";
+  const actionable =
+    issue.length > 0 && !isClearlyOnTrackIssue(issue);
+  if (actionCoerced === "NO" && actionable) return "YES";
+  if (actionCoerced === "" && actionable) return "YES";
+  return actionCoerced;
+}
+
+function scrapeFieldsFromLooseJson(text) {
+  let issueM = text.match(/"issue"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (!issueM) {
+    const m2 = text.match(
+      /"issue"\s*:\s*"([\s\S]*?)"\s*,\s*"recommendation"/i
+    );
+    if (m2) issueM = m2;
+  }
+  const recM = text.match(/"recommendation"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  const arTrue =
+    /"actionRequired"\s*:\s*true\b/.test(text) ||
+    /'actionRequired'\s*:\s*true\b/.test(text);
+  const arFalse =
+    /"actionRequired"\s*:\s*false\b/.test(text) ||
+    /'actionRequired'\s*:\s*false\b/.test(text);
+  return {
+    issue: issueM ? issueM[1].replace(/\\"/g, '"').replace(/\\n/g, "\n") : "",
+    recommendation: recM
+      ? recM[1].replace(/\\"/g, '"').replace(/\\n/g, "\n")
+      : "",
+    arTrue,
+    arFalse,
   };
+}
 
-  const lines = [allKeys.map(escape).join(",")];
+function applyAiResponseToRow(modalData, aiText) {
+  const parsed = extractJsonObject(aiText);
+  if (!parsed) {
+    const loose = scrapeFieldsFromLooseJson(aiText);
+    let coerced = "";
+    if (loose.arTrue) coerced = "YES";
+    else if (loose.arFalse) coerced = "NO";
+    modalData._aiRawAnalysis = aiText;
+    modalData._aiIssue = loose.issue || aiText;
+    modalData._aiRecommendation = loose.recommendation;
+    if (loose.issue || loose.arTrue || loose.arFalse) {
+      modalData._actionRequired = deriveActionRequired(
+        coerced,
+        modalData._aiIssue
+      );
+    } else {
+      modalData._actionRequired = "";
+    }
+    return;
+  }
+  const norm = normalizeAiFields(parsed);
+  if (!norm) {
+    modalData._aiRawAnalysis = aiText;
+    modalData._actionRequired = "";
+    modalData._aiIssue = aiText;
+    modalData._aiRecommendation = "";
+    return;
+  }
+  modalData._aiRawAnalysis = aiText;
+  const coerced = coerceActionRequired(norm.actionRaw);
+  modalData._actionRequired = deriveActionRequired(coerced, norm.issue);
+  modalData._aiIssue = norm.issue;
+  modalData._aiRecommendation = norm.recommendation;
+}
+
+function computeNeedsActionForSheet(r) {
+  const ar = String(r._actionRequired ?? "").trim().toUpperCase();
+  const issue = String(r._aiIssue ?? "").trim();
+  const onTrack = isClearlyOnTrackIssue(issue);
+  if (ar === "ERROR") return true;
+  if (ar === "YES" || ar === "TRUE" || ar === "Y" || ar === "1") return true;
+  if (ar === "NO") return issue.length > 0 && !onTrack;
+  if (!issue) return false;
+  if (onTrack) return false;
+  if (issue.length > 4000) {
+    return /\b(error|failed|contact|reschedule|delay|wrong|incorrect|attention|call|customer|data|delivery|attempt|problem|urgent|immediately)\b/i.test(
+      issue
+    );
+  }
+  return true;
+}
+
+function finalizeActionSheetFlag(r) {
+  r._needsActionSheet = computeNeedsActionForSheet(r);
+  if (r._needsActionSheet && r._actionRequired !== "ERROR") {
+    r._actionRequired = "YES";
+  }
+}
+
+function buildInputSummary(data) {
+  const parts = [];
+  const v = (k) => (data[k] || "").trim();
+
+  if (v("_trackingNumber")) parts.push(`Tracking: ${v("_trackingNumber")}`);
+  if (v("SHIPMENT STATUS")) parts.push(`Status: ${v("SHIPMENT STATUS")}`);
+  if (v("CARRIER NAME") || v("CARRIER")) parts.push(`Carrier: ${v("CARRIER NAME") || v("CARRIER")}`);
+  if (v("MODE")) parts.push(`Mode: ${v("MODE")}`);
+  if (v("PICKUP DATE")) parts.push(`Pickup: ${v("PICKUP DATE")}`);
+  if (v("UPDATED ETA")) parts.push(`ETA: ${v("UPDATED ETA")}`);
+  if (v("ESTIMATED ARRIVAL DATE")) parts.push(`Est. Arrival: ${v("ESTIMATED ARRIVAL DATE")}`);
+  if (v("ACTUAL ARRIVAL DATE")) parts.push(`Act. Arrival: ${v("ACTUAL ARRIVAL DATE")}`);
+  if (v("DELIVERY DATE")) parts.push(`Delivered: ${v("DELIVERY DATE")}`);
+  if (v("SIGNED BY")) parts.push(`Signed: ${v("SIGNED BY")}`);
+  if (v("COMMENTS")) parts.push(`Comments: ${v("COMMENTS")}`);
+
+  return parts.join(" | ");
+}
+
+function buildOutputSummary(data) {
+  const action = data._actionRequired || "";
+  const issue = data._aiIssue || "";
+  const rec = data._aiRecommendation || "";
+
+  if (action === "ERROR") return `Error: ${issue}`;
+  if (!action && !issue) return "";
+
+  const parts = [];
+  if (action === "YES") parts.push("ACTION NEEDED.");
+  else if (action === "NO") parts.push("No action needed.");
+
+  if (issue) parts.push(`Issue: ${issue}.`);
+  if (rec) parts.push(`Next step: ${rec}.`);
+
+  return parts.join(" ");
+}
+
+function buildSummaryPayload(rows) {
+  const actionRows = rows.filter((r) => r._needsActionSheet === true);
+  const errorCount = rows.filter((r) => r._actionRequired === "ERROR").length;
+  const noActionCount = rows.filter((r) => r._actionRequired === "NO").length;
+  const SUMMARY_KEYS = [
+    "_trackingNumber", "SHIPMENT STATUS", "CARRIER NAME", "MODE",
+    "UPDATED ETA", "DELIVERY DATE", "_actionRequired", "_aiIssue",
+    "_aiRecommendation",
+  ];
+  const compact = (r) => {
+    const o = {};
+    for (const k of SUMMARY_KEYS) {
+      const v = r[k];
+      if (v !== undefined && v !== "") o[k] = v;
+    }
+    return o;
+  };
+  return {
+    total: rows.length,
+    actionNeeded: actionRows.length,
+    noAction: noActionCount,
+    errors: errorCount,
+    actionItems: actionRows.map(compact),
+    sample: rows.filter((r) => !r._needsActionSheet).slice(0, 30).map(compact),
+  };
+}
+
+function rowsToSheetData(rows) {
+  const present = DISPLAY_COLUMNS.filter((col) =>
+    rows.some((r) => r[col.key] !== undefined && r[col.key] !== "")
+  );
+  const headers = present.map((c) => c.header);
+  const data = [headers];
   for (const row of rows) {
-    lines.push(allKeys.map((k) => escape(row[k] || "")).join(","));
+    data.push(present.map((c) => row[c.key] ?? ""));
+  }
+  return data;
+}
+
+function autoFitCols(sheetData) {
+  return sheetData[0].map((_, ci) => {
+    let max = 10;
+    for (const row of sheetData) {
+      const len = String(row[ci] ?? "").length;
+      if (len > max) max = len;
+    }
+    return { wch: Math.min(max + 2, 60) };
+  });
+}
+
+const XL_BORDER = {
+  top:    { style: "thin", color: { rgb: "CCCCCC" } },
+  bottom: { style: "thin", color: { rgb: "CCCCCC" } },
+  left:   { style: "thin", color: { rgb: "CCCCCC" } },
+  right:  { style: "thin", color: { rgb: "CCCCCC" } },
+};
+const XL_HDR_STYLE = {
+  font: { name: "Arial", sz: 10, bold: true, color: { rgb: "FFFFFF" } },
+  fill: { patternType: "solid", fgColor: { rgb: "1F4E79" } },
+  alignment: { horizontal: "center", vertical: "center", wrapText: true },
+  border: XL_BORDER,
+};
+const XL_DATA_STYLE = {
+  font: { name: "Arial", sz: 9 },
+  alignment: { vertical: "center" },
+  border: XL_BORDER,
+};
+const XL_ALT_FILL = { patternType: "solid", fgColor: { rgb: "EBF3FB" } };
+const XL_YES_FONT = { name: "Arial", sz: 9, bold: true, color: { rgb: "C00000" } };
+const XL_NO_FONT  = { name: "Arial", sz: 9, bold: true, color: { rgb: "1E6B31" } };
+const XL_ERR_FONT = { name: "Arial", sz: 9, bold: true, color: { rgb: "C00000" } };
+const XL_TITLE_STYLE = {
+  font: { name: "Arial", sz: 13, bold: true, color: { rgb: "1F4E79" } },
+};
+const XL_LABEL_STYLE = {
+  font: { name: "Arial", sz: 10, bold: true },
+  border: XL_BORDER,
+};
+const XL_VALUE_STYLE = {
+  font: { name: "Arial", sz: 10 },
+  border: XL_BORDER,
+};
+
+function styleDataSheet(ws, sheetData, actionColIdx) {
+  const numCols = sheetData[0].length;
+  const numRows = sheetData.length;
+  for (let c = 0; c < numCols; c++) {
+    const addr = XLSX.utils.encode_cell({ r: 0, c });
+    if (ws[addr]) ws[addr].s = XL_HDR_STYLE;
+  }
+  for (let r = 1; r < numRows; r++) {
+    const isAlt = r % 2 === 0;
+    for (let c = 0; c < numCols; c++) {
+      const addr = XLSX.utils.encode_cell({ r, c });
+      if (!ws[addr]) {
+        ws[addr] = { t: "s", v: "" };
+      }
+      const s = { ...XL_DATA_STYLE, font: { ...XL_DATA_STYLE.font } };
+      if (isAlt) s.fill = XL_ALT_FILL;
+      if (actionColIdx >= 0 && c === actionColIdx) {
+        const val = String(ws[addr].v || "").trim().toUpperCase();
+        if (val === "YES") s.font = XL_YES_FONT;
+        else if (val === "NO") s.font = XL_NO_FONT;
+        else if (val === "ERROR") s.font = XL_ERR_FONT;
+      }
+      ws[addr].s = s;
+    }
+  }
+  ws["!rows"] = [{ hpt: 28 }];
+}
+
+function findHeaderIndex(headers, name) {
+  return headers.findIndex((h) =>
+    typeof h === "string" && h.toLowerCase() === name.toLowerCase()
+  );
+}
+
+function downloadXLSX(rows, summaryText) {
+  if (!rows.length) return;
+  if (typeof XLSX === "undefined") {
+    console.error("[FPX] XLSX library not loaded, falling back to alert.");
+    return;
   }
 
-  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  const wb = XLSX.utils.book_new();
+
+  // --- Sheet 1: Actions (items needing action) ---
+  const actionRows = rows.filter((r) => r._needsActionSheet === true);
+  const actionData = actionRows.length > 0
+    ? rowsToSheetData(actionRows)
+    : [["No action items found."]];
+  const wsActions = XLSX.utils.aoa_to_sheet(actionData);
+  wsActions["!cols"] = autoFitCols(actionData);
+  if (actionRows.length > 0) {
+    const actIdx = findHeaderIndex(actionData[0], "Action Required");
+    styleDataSheet(wsActions, actionData, actIdx);
+  }
+  XLSX.utils.book_append_sheet(wb, wsActions, "Actions");
+
+  // --- Sheet 2: Inputs (all scraped fields, dynamic columns) ---
+  const INPUT_EXCLUDE = new Set([
+    "_aiRawAnalysis", "_aiIssue", "_aiRecommendation",
+    "_actionRequired", "_needsActionSheet",
+    "_inputSummary", "_outputSummary",
+  ]);
+  const inputKeysSet = new Set();
+  for (const row of rows) {
+    for (const k of Object.keys(row)) {
+      if (!INPUT_EXCLUDE.has(k)) inputKeysSet.add(k);
+    }
+  }
+  const inputKeys = Array.from(inputKeysSet);
+  const inputData = [inputKeys];
+  for (const row of rows) {
+    inputData.push(inputKeys.map((k) => {
+      const v = row[k];
+      if (v === undefined || v === null) return "";
+      if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
+      return String(v);
+    }));
+  }
+  const wsInputs = XLSX.utils.aoa_to_sheet(inputData);
+  wsInputs["!cols"] = autoFitCols(inputData);
+  styleDataSheet(wsInputs, inputData, -1);
+  XLSX.utils.book_append_sheet(wb, wsInputs, "Inputs");
+
+  // --- Sheet 3: All Shipments ---
+  const allData = rowsToSheetData(rows);
+  const wsAll = XLSX.utils.aoa_to_sheet(allData);
+  wsAll["!cols"] = autoFitCols(allData);
+  const allActIdx = findHeaderIndex(allData[0], "Action Required");
+  styleDataSheet(wsAll, allData, allActIdx);
+  XLSX.utils.book_append_sheet(wb, wsAll, "All Shipments");
+
+  // --- Sheet 4: Summary ---
+  const totalCount = rows.length;
+  const actionCount = actionRows.length;
+  const noActionCount = rows.filter((r) => r._actionRequired === "NO").length;
+  const errorCount = rows.filter((r) => r._actionRequired === "ERROR").length;
+
+  const summaryRows = [
+    ["FPXpress Shipment Analysis Report"],
+    ["Generated", new Date().toLocaleString()],
+    [],
+    ["Total Shipments", totalCount],
+    ["Action Required", actionCount],
+    ["No Action Needed", noActionCount],
+    ["Errors", errorCount],
+    [],
+    ["AI Executive Summary"],
+    [summaryText || "(No summary available)"],
+  ];
+  const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
+  wsSummary["!cols"] = [{ wch: 25 }, { wch: 80 }];
+
+  const sc = (r, c) => XLSX.utils.encode_cell({ r, c });
+  if (wsSummary[sc(0, 0)]) wsSummary[sc(0, 0)].s = XL_TITLE_STYLE;
+  if (wsSummary[sc(1, 0)]) wsSummary[sc(1, 0)].s = XL_LABEL_STYLE;
+  if (wsSummary[sc(1, 1)]) wsSummary[sc(1, 1)].s = XL_VALUE_STYLE;
+  for (let r = 3; r <= 6; r++) {
+    if (wsSummary[sc(r, 0)]) wsSummary[sc(r, 0)].s = XL_LABEL_STYLE;
+    if (wsSummary[sc(r, 1)]) wsSummary[sc(r, 1)].s = XL_VALUE_STYLE;
+  }
+  if (wsSummary[sc(8, 0)]) wsSummary[sc(8, 0)].s = {
+    font: { name: "Arial", sz: 11, bold: true, color: { rgb: "1F4E79" } },
+  };
+  if (wsSummary[sc(9, 0)]) wsSummary[sc(9, 0)].s = {
+    font: { name: "Arial", sz: 9 },
+    alignment: { wrapText: true, vertical: "top" },
+  };
+  XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
+
+  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([buf], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  a.download = `tracking-refresh-${ts}.csv`;
+  a.download = `fpx-shipment-analysis-${ts}.xlsx`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -435,6 +894,44 @@ function goToNextPage() {
   return false;
 }
 
+function waitForGridReady(timeout = 3000) {
+  return new Promise((resolve) => {
+    const interval = 300;
+    let elapsed = 0;
+    const timer = setInterval(() => {
+      const rows = document.querySelectorAll(
+        ".k-grid-content tbody tr, .k-grid tbody tr"
+      );
+      const loading = document.querySelector(".k-loading-mask, .k-loading-image");
+      if (rows.length > 0 && !loading) {
+        clearInterval(timer);
+        resolve();
+        return;
+      }
+      elapsed += interval;
+      if (elapsed >= timeout) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, interval);
+  });
+}
+
+const ROUTINE_STATUSES = new Set([
+  "delivered", "in transit", "booked", "scheduled/tendered",
+]);
+const EXCEPTION_KEYWORDS = /\b(delay|exception|missed|failed|refused|damaged|lost|hold|return|cancel|wrong|incorrect|urgent|rescheduled|appointment missed)\b/i;
+
+function shipmentNeedsAi(modalData) {
+  if (!smartGateEnabled) return true;
+  const status = (modalData["SHIPMENT STATUS"] || "").trim().toLowerCase();
+  const comments = (modalData["COMMENTS"] || "").trim();
+  if (status === "issue") return true;
+  if (EXCEPTION_KEYWORDS.test(comments)) return true;
+  if (ROUTINE_STATUSES.has(status) && !EXCEPTION_KEYWORDS.test(comments)) return false;
+  return true;
+}
+
 async function processPage() {
   const links = collectTrackingLinks();
   const total = links.length;
@@ -446,7 +943,7 @@ async function processPage() {
 
   for (let i = 0; i < total; i++) {
     if (stopRequested) {
-      if (logRows.length > 0) downloadCSV(logRows);
+      if (logRows.length > 0) downloadXLSX(logRows, "");
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
@@ -456,37 +953,81 @@ async function processPage() {
     sendStatus(`Processing ${i + 1} of ${total} — ${trackingNum}`);
 
     simulateClick(link);
-    await sleep(500);
+    await sleep(300);
 
     sendStatus(`Clicked ${trackingNum} — waiting for modal...`);
     const closeBtn = await waitForCloseButton(15000);
     if (closeBtn) {
-      await sleep(1000);
+      await sleep(600);
       sendStatus(`Scraping modal data for ${trackingNum}...`);
       const modalData = scrapeModal();
       modalData._trackingNumber = trackingNum;
       modalData._timestamp = new Date().toISOString();
+
+      if (aiEnabled) {
+        if (shipmentNeedsAi(modalData)) {
+          sendStatus(`Analyzing ${trackingNum} with AI...`);
+          try {
+            const aiResult = await chrome.runtime.sendMessage({
+              type: "analyzeShipment",
+              data: modalData,
+            });
+            if (aiResult && aiResult.text) {
+              applyAiResponseToRow(modalData, aiResult.text);
+            } else if (aiResult && aiResult.error) {
+              modalData._aiRawAnalysis = aiResult.error;
+              modalData._actionRequired = "ERROR";
+              modalData._aiIssue = aiResult.error;
+              modalData._aiRecommendation = "";
+            }
+          } catch (e) {
+            modalData._aiRawAnalysis = e.message;
+            modalData._actionRequired = "ERROR";
+            modalData._aiIssue = e.message;
+            modalData._aiRecommendation = "";
+          }
+        } else {
+          modalData._actionRequired = "NO";
+          modalData._aiIssue = "None - shipment is on track";
+          modalData._aiRecommendation = "No action needed (auto-classified by smart gate).";
+        }
+        finalizeActionSheetFlag(modalData);
+      } else {
+        modalData._needsActionSheet = false;
+      }
+
+      modalData._inputSummary = buildInputSummary(modalData);
+      modalData._outputSummary = buildOutputSummary(modalData);
       logRows.push(modalData);
 
-      sendStatus(`Closing modal for ${trackingNum}...`);
+      const actionTag = modalData._needsActionSheet ? " [ACTION NEEDED]" : "";
+      sendStatus(`Done ${trackingNum}${actionTag} — closing modal...`);
       simulateClick(closeBtn);
-      await sleep(500);
+      await sleep(300);
     } else {
       logRows.push({
         _trackingNumber: trackingNum,
         _timestamp: new Date().toISOString(),
         _error: "Modal did not appear (timeout)",
+        _actionRequired: "",
+        _aiIssue: "",
+        _aiRecommendation: "",
+        _inputSummary: `Tracking: ${trackingNum}`,
+        _outputSummary: "Error: Modal did not appear (timeout)",
+        _needsActionSheet: false,
       });
       sendStatus(`Timeout on ${trackingNum} — no modal appeared, skipping.`);
     }
 
-    await sleep(1000);
+    await sleep(500);
   }
 }
 
-async function run(filterCol, filterVal) {
+async function run(filterCol, filterVal, useAi, useSmartGate) {
   stopRequested = false;
   logRows = [];
+  aiEnabled = useAi !== false;
+  smartGateEnabled = useSmartGate === true;
 
   if (filterCol && filterVal) {
     sendStatus(`Filtering ${filterCol} to "${filterVal}"...`);
@@ -500,7 +1041,7 @@ async function run(filterCol, filterVal) {
 
   while (true) {
     if (stopRequested) {
-      if (logRows.length > 0) downloadCSV(logRows);
+      if (logRows.length > 0) downloadXLSX(logRows, "");
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
@@ -509,7 +1050,7 @@ async function run(filterCol, filterVal) {
     await processPage();
 
     if (stopRequested) {
-      if (logRows.length > 0) downloadCSV(logRows);
+      if (logRows.length > 0) downloadXLSX(logRows, "");
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
@@ -519,15 +1060,39 @@ async function run(filterCol, filterVal) {
     if (!advanced) break;
 
     pageNum++;
-    await sleep(2000); // wait for grid to reload
+    await waitForGridReady(3000);
   }
 
+  let summaryText = "";
   if (logRows.length > 0) {
-    sendStatus(`Downloading CSV with ${logRows.length} row(s)...`);
-    downloadCSV(logRows);
+    if (aiEnabled) {
+      sendStatus(`Requesting AI summary for ${logRows.length} shipment(s)...`);
+      try {
+        const summaryResult = await chrome.runtime.sendMessage({
+          type: "summarizeAll",
+          payload: buildSummaryPayload(logRows),
+        });
+        if (summaryResult && summaryResult.text) {
+          summaryText = summaryResult.text;
+        } else if (summaryResult && summaryResult.error) {
+          summaryText = "Summary error: " + summaryResult.error;
+        }
+      } catch (e) {
+        summaryText = "Summary error: " + e.message;
+      }
+    }
+
+    sendStatus(`Downloading XLSX with ${logRows.length} row(s)...`);
+    downloadXLSX(logRows, summaryText);
   }
 
-  sendComplete(`Done — processed ${pageNum} page(s), ${logRows.length} tracking number(s) logged.`);
+  const actionCount = logRows.filter((r) => r._needsActionSheet === true).length;
+  try {
+    chrome.runtime.sendMessage({ type: "aiSummary", text: summaryText });
+  } catch {}
+  sendComplete(
+    `Done — ${pageNum} page(s), ${logRows.length} shipment(s). ${actionCount} need action.\n\n${summaryText}`
+  );
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -535,7 +1100,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "ping") {
     sendResponse({ ok: true });
   } else if (msg.action === "start") {
-    run(msg.filterCol, msg.filterVal);
+    run(msg.filterCol, msg.filterVal, msg.aiEnabled, msg.smartGate);
     sendResponse({ ok: true });
   } else if (msg.action === "stop") {
     stopRequested = true;
