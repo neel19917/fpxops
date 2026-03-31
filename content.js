@@ -1714,39 +1714,94 @@ function gpFlagOutliers(rows, stats) {
 }
 
 function scrapeTransactionGrid() {
-  const headers = [];
-  const thEls = document.querySelectorAll(".k-grid th, .k-grid-header th");
-  for (const th of thEls) {
-    const link = th.querySelector("a.k-link");
-    const text = (link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim();
-    headers.push(text);
+  const grid = document.querySelector(".k-grid, [kendo-grid], [data-role='grid']");
+  if (!grid) return [];
+
+  const lockedHeaderContainer = grid.querySelector(".k-grid-header-locked");
+  const scrollHeaderContainer = grid.querySelector(".k-grid-header-wrap") ||
+    grid.querySelector(".k-grid-header");
+
+  const lockedHeaders = [];
+  const scrollHeaders = [];
+
+  if (lockedHeaderContainer) {
+    for (const th of lockedHeaderContainer.querySelectorAll("th")) {
+      const link = th.querySelector("a.k-link");
+      lockedHeaders.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
+    }
   }
 
-  const bodyRows = document.querySelectorAll(
-    ".k-grid-content tbody tr, .k-grid tbody tr"
-  );
+  if (scrollHeaderContainer) {
+    for (const th of scrollHeaderContainer.querySelectorAll("th")) {
+      const link = th.querySelector("a.k-link");
+      scrollHeaders.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
+    }
+  }
+
+  const allHeaders = lockedHeaders.length > 0
+    ? [...lockedHeaders, ...scrollHeaders]
+    : [...scrollHeaders];
+
+  if (allHeaders.length === 0) {
+    for (const th of grid.querySelectorAll("th")) {
+      const link = th.querySelector("a.k-link");
+      allHeaders.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
+    }
+  }
+
+  const lockedBody = grid.querySelector(".k-grid-content-locked tbody");
+  const scrollBody = grid.querySelector(".k-grid-content tbody") ||
+    grid.querySelector("tbody");
+
+  const lockedRows = lockedBody ? [...lockedBody.querySelectorAll("tr")] : [];
+  const scrollRows = scrollBody ? [...scrollBody.querySelectorAll("tr")] : [];
+  const rowCount = Math.max(lockedRows.length, scrollRows.length);
 
   const rows = [];
-  for (const tr of bodyRows) {
-    if (tr.classList.contains("k-grouping-row") || tr.classList.contains("k-no-data")) continue;
-    const cells = tr.querySelectorAll("td");
+  for (let i = 0; i < rowCount; i++) {
+    const lockedTr = lockedRows[i];
+    const scrollTr = scrollRows[i];
+
+    if (lockedTr?.classList.contains("k-grouping-row") || lockedTr?.classList.contains("k-no-data")) continue;
+    if (scrollTr?.classList.contains("k-grouping-row") || scrollTr?.classList.contains("k-no-data")) continue;
+
+    const lockedCells = lockedTr ? [...lockedTr.querySelectorAll("td")] : [];
+    const scrollCells = scrollTr ? [...scrollTr.querySelectorAll("td")] : [];
+    const allCells = [...lockedCells, ...scrollCells];
+
     const row = {};
-    for (let i = 0; i < cells.length && i < headers.length; i++) {
-      const key = headers[i];
-      if (!key || key === "") continue;
-      const val = (cells[i].textContent || "").replace(/\s+/g, " ").trim();
+    for (let c = 0; c < allCells.length && c < allHeaders.length; c++) {
+      const key = allHeaders[c];
+      if (!key) continue;
+      const val = (allCells[c].textContent || "").replace(/\s+/g, " ").trim();
       if (val) row[key] = val;
     }
     if (Object.keys(row).length > 0) rows.push(row);
   }
+
+  console.log("[FPX-GP] Scraped", rows.length, "rows, headers:", allHeaders.join(", "));
   return rows;
 }
 
 function setDateInput(input, dateStr) {
+  const kendoWidget = window.jQuery && window.jQuery(input).data("kendoDatePicker");
+  if (kendoWidget) {
+    const parts = dateStr.split("/");
+    const dateObj = new Date(+parts[2], +parts[0] - 1, +parts[1]);
+    kendoWidget.value(dateObj);
+    kendoWidget.trigger("change");
+    console.log("[FPX-GP] Set Kendo datepicker to", dateStr);
+    return;
+  }
+
   input.focus();
-  input.value = dateStr;
+  const nativeSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLInputElement.prototype, "value"
+  ).set;
+  nativeSetter.call(input, dateStr);
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
+  input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
   input.blur();
 }
 
@@ -1815,6 +1870,48 @@ function gpDownloadXLSX(rows, stats, bizDate) {
   URL.revokeObjectURL(url);
 }
 
+function findDateInputs() {
+  const result = { from: null, to: null };
+
+  const allInputs = document.querySelectorAll("input");
+  for (const input of allInputs) {
+    if (input.type === "hidden" || input.type === "checkbox" || input.type === "submit") continue;
+    const ph = (input.placeholder || "").toLowerCase();
+    const name = (input.name || "").toLowerCase();
+    const id = (input.id || "").toLowerCase();
+    const ariaLabel = (input.getAttribute("aria-label") || "").toLowerCase();
+
+    const labelEl = input.closest("td, div, .form-group, tr");
+    const parentText = labelEl ? labelEl.textContent.toUpperCase().replace(/\s+/g, " ") : "";
+
+    const isDateField = ph.includes("mm/dd") || ph.includes("mm-dd") ||
+      ph.includes("date") || input.type === "date" ||
+      name.includes("date") || id.includes("date") ||
+      ariaLabel.includes("date") ||
+      input.closest("[data-role='datepicker']") ||
+      input.closest(".k-datepicker");
+
+    if (!isDateField) continue;
+
+    if (!result.from && (parentText.includes("FROM") || name.includes("from") || id.includes("from"))) {
+      result.from = input;
+    } else if (!result.to && (parentText.includes("TO") || name.includes("to") || id.includes("to"))) {
+      result.to = input;
+    }
+  }
+
+  if (!result.from || !result.to) {
+    const datePickers = document.querySelectorAll(
+      "input[data-role='datepicker'], .k-datepicker input, input[placeholder*='mm/dd'], input[placeholder*='mm-dd']"
+    );
+    const arr = [...datePickers];
+    if (!result.from && arr.length >= 1) result.from = arr[0];
+    if (!result.to && arr.length >= 2) result.to = arr[1];
+  }
+
+  return result;
+}
+
 async function gpAuditRun(bizDate) {
   stopRequested = false;
   sendGpStatus("Starting GP Audit for " + bizDate + "...");
@@ -1827,65 +1924,106 @@ async function gpAuditRun(bizDate) {
   }
 
   sendGpStatus("Waiting for Generate History Report dialog...");
-  for (let wait = 0; wait < 15000; wait += 500) {
-    const heading = document.querySelector("h4, h3, .modal-title, .k-window-title");
-    if (heading && /generate history report/i.test(heading.textContent)) break;
+  let dialogFound = false;
+  for (let wait = 0; wait < 20000; wait += 500) {
+    const allText = document.body.innerText.toUpperCase();
+    if (allText.includes("GENERATE HISTORY REPORT") || allText.includes("GENERATE REPORT")) {
+      dialogFound = true;
+      break;
+    }
+    const btn = document.querySelector("button.generate-report, [ng-click*='generate'], a.btn");
+    if (btn && /generate report/i.test(btn.textContent)) {
+      simulateClick(btn);
+      await sleep(1500);
+    }
     await sleep(500);
   }
 
-  sendGpStatus("Filling date fields...");
-  const dateInputs = document.querySelectorAll('input[type="date"], input[type="text"]');
-  let fromFilled = false;
-  let toFilled = false;
-  for (const input of dateInputs) {
-    const label = input.closest(".form-group, div, tr");
-    const labelText = label ? label.textContent.toUpperCase() : "";
-    if (!fromFilled && labelText.includes("FROM DATE")) {
-      setDateInput(input, bizDate);
-      fromFilled = true;
-      sendGpStatus("Set FROM DATE to " + bizDate);
-    } else if (!toFilled && labelText.includes("TO DATE")) {
-      setDateInput(input, bizDate);
-      toFilled = true;
-      sendGpStatus("Set TO DATE to " + bizDate);
+  if (!dialogFound) {
+    sendGpStatus("Looking for Generate Report button...");
+    const allBtns = document.querySelectorAll("button, a.btn, input[type='button']");
+    for (const b of allBtns) {
+      if (/generate\s*report/i.test(b.textContent || b.value || "")) {
+        simulateClick(b);
+        await sleep(2000);
+        break;
+      }
     }
   }
 
-  if (!fromFilled || !toFilled) {
-    const allInputs = document.querySelectorAll("input");
-    const datePattern = allInputs.length;
-    let idx = 0;
-    for (const input of allInputs) {
-      if (input.type === "hidden" || input.type === "checkbox") continue;
-      const ph = (input.placeholder || "").toLowerCase();
-      if (ph.includes("mm") || ph.includes("date") || input.type === "date") {
-        if (!fromFilled && idx === 0) {
-          setDateInput(input, bizDate);
-          fromFilled = true;
-          idx++;
-        } else if (!toFilled) {
-          setDateInput(input, bizDate);
-          toFilled = true;
-          break;
-        }
-      }
-    }
+  await sleep(1000);
+  sendGpStatus("Filling date fields with " + bizDate + "...");
+
+  const dateFields = findDateInputs();
+  if (dateFields.from) {
+    setDateInput(dateFields.from, bizDate);
+    sendGpStatus("Set FROM DATE to " + bizDate);
+  } else {
+    sendGpStatus("WARNING: Could not find FROM DATE input");
+  }
+  await sleep(300);
+
+  if (dateFields.to) {
+    setDateInput(dateFields.to, bizDate);
+    sendGpStatus("Set TO DATE to " + bizDate);
+  } else {
+    sendGpStatus("WARNING: Could not find TO DATE input");
+  }
+  await sleep(500);
+
+  if (dateFields.from && !dateFields.from.value) {
+    sendGpStatus("Retrying FROM DATE with direct value...");
+    dateFields.from.setAttribute("value", bizDate);
+    dateFields.from.value = bizDate;
+    dateFields.from.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  if (dateFields.to && !dateFields.to.value) {
+    sendGpStatus("Retrying TO DATE with direct value...");
+    dateFields.to.setAttribute("value", bizDate);
+    dateFields.to.value = bizDate;
+    dateFields.to.dispatchEvent(new Event("change", { bubbles: true }));
   }
   await sleep(500);
 
   sendGpStatus("Clicking CONTINUE...");
-  const buttons = document.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn");
+  let continueClicked = false;
+  const buttons = document.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn, .btn");
   for (const btn of buttons) {
-    const txt = (btn.textContent || btn.value || "").trim().toUpperCase();
-    if (txt === "CONTINUE") {
+    const txt = (btn.textContent || btn.value || "").replace(/\s+/g, " ").trim().toUpperCase();
+    if (txt === "CONTINUE" || txt === "GENERATE" || txt === "SUBMIT") {
       simulateClick(btn);
+      continueClicked = true;
       break;
     }
   }
 
+  if (!continueClicked) {
+    sendGpComplete("ERROR: Could not find CONTINUE button.");
+    return;
+  }
+
   sendGpStatus("Waiting for results grid to load...");
   await sleep(3000);
-  await waitForGridReady(10000);
+
+  let gridReady = false;
+  for (let wait = 0; wait < 15000; wait += 1000) {
+    const gridRows = document.querySelectorAll(
+      ".k-grid-content tbody tr, .k-grid tbody tr"
+    );
+    const visibleRows = [...gridRows].filter(
+      (r) => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row")
+    );
+    if (visibleRows.length > 0) {
+      gridReady = true;
+      break;
+    }
+    await sleep(1000);
+  }
+
+  if (!gridReady) {
+    sendGpComplete("No grid data loaded. The form may not have submitted — check dates.");
+    return;
+  }
 
   let allRows = [];
   let pageNum = 1;
