@@ -300,6 +300,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       ANTHROPIC_API_KEY.length > 0;
     sendResponse({ configured });
     return;
+  } else if (msg.type === "fetchNtpDate") {
+    (async () => {
+      try {
+        const resp = await fetch(
+          "https://worldtimeapi.org/api/timezone/America/New_York",
+          { signal: AbortSignal.timeout(5000) }
+        );
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        const today = new Date(data.datetime);
+        const day = today.getDay();
+        const offset = day === 0 ? 2 : day === 1 ? 3 : day === 6 ? 1 : 1;
+        const bizDate = new Date(today);
+        bizDate.setDate(bizDate.getDate() - offset);
+        const mm = String(bizDate.getMonth() + 1).padStart(2, "0");
+        const dd = String(bizDate.getDate()).padStart(2, "0");
+        const yyyy = bizDate.getFullYear();
+        sendResponse({ date: `${mm}/${dd}/${yyyy}`, iso: bizDate.toISOString().slice(0, 10) });
+      } catch (e) {
+        sendResponse({ error: e.message });
+      }
+    })();
+    return true;
   } else if (msg.type === "startServer") {
     sendNativeMessage("start").then(sendResponse);
     return true;

@@ -7,7 +7,8 @@
   "host_permissions": [
     "*://app.freightpop.com/*",
     "https://api.anthropic.com/*",
-    "http://localhost:3210/*"
+    "http://localhost:3210/*",
+    "https://worldtimeapi.org/*"
   ],
   "action": {
     "default_popup": "popup.html"

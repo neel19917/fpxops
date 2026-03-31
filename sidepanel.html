@@ -269,6 +269,79 @@
       max-height: 300px;
       overflow-y: auto;
     }
+
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      margin-bottom: 14px;
+      border-bottom: 2px solid #e5e7eb;
+    }
+    .tab-bar button {
+      flex: 1;
+      padding: 8px 0;
+      border: none;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
+      background: none;
+      font-size: 13px;
+      font-weight: 600;
+      color: #6b7280;
+      cursor: pointer;
+      border-radius: 0;
+    }
+    .tab-bar button.active {
+      color: #2563eb;
+      border-bottom-color: #2563eb;
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    .gp-date-info {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-size: 12px;
+      margin-bottom: 10px;
+      color: #1e40af;
+      font-weight: 600;
+    }
+    .outlier-alert {
+      display: none;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 4px;
+      padding: 10px;
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.5;
+      max-height: 250px;
+      overflow-y: auto;
+    }
+    .outlier-alert.visible { display: block; }
+    .outlier-alert h4 {
+      margin: 0 0 6px;
+      color: #991b1b;
+      font-size: 13px;
+    }
+    .outlier-alert .outlier-row {
+      padding: 3px 0;
+      border-bottom: 1px solid #fee2e2;
+      font-size: 11px;
+    }
+    .outlier-alert .outlier-row:last-child { border-bottom: none; }
+    .no-outliers {
+      display: none;
+      background: #dcfce7;
+      border: 1px solid #bbf7d0;
+      border-radius: 4px;
+      padding: 10px;
+      margin-top: 10px;
+      font-size: 12px;
+      color: #166534;
+      font-weight: 600;
+    }
+    .no-outliers.visible { display: block; }
   </style>
 </head>
 <body>
@@ -277,6 +350,13 @@
     <span id="apiBadge" class="api-badge missing">No API Key</span>
     <span id="serverBadge" class="server-badge offline"><span class="dot"></span> Server Offline</span>
   </h3>
+
+  <div class="tab-bar">
+    <button id="tabTracking" class="active">Tracking Refresh</button>
+    <button id="tabGpAudit">GP Audit</button>
+  </div>
+
+  <div id="trackingTab" class="tab-content active">
 
   <div class="server-ctrl">
     <div>
@@ -369,6 +449,33 @@
       <button id="savePromptsBtn">Save</button>
     </div>
   </div>
+
+  </div><!-- end trackingTab -->
+
+  <div id="gpAuditTab" class="tab-content">
+    <div id="gpDateInfo" class="gp-date-info">Fetching last business day...</div>
+
+    <div class="btn-row">
+      <button id="gpStartBtn">Start GP Audit</button>
+      <button id="gpStopBtn" disabled>Stop</button>
+    </div>
+
+    <div id="gpProgressText" class="progress-text"></div>
+    <div id="gpProgressBar" class="progress-bar-container">
+      <div id="gpProgressFill" class="progress-bar-fill"></div>
+    </div>
+
+    <div id="gpStatus" class="field" style="background:#f3f4f6;border-radius:4px;padding:10px;min-height:20px;line-height:1.4;white-space:pre-wrap;word-break:break-word;">
+      Ready. Click Start GP Audit to begin.
+    </div>
+
+    <div id="gpNoOutliers" class="no-outliers">No GP outliers detected. All shipments are within normal range.</div>
+
+    <div id="gpOutlierAlert" class="outlier-alert">
+      <h4>GP Outliers Detected</h4>
+      <div id="gpOutlierList"></div>
+    </div>
+  </div><!-- end gpAuditTab -->
 
   <script src="sidepanel.js"></script>
 </body>

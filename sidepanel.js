@@ -300,6 +300,97 @@ function parseProgress(text) {
   return null;
 }
 
+// --- Tab switching ---
+
+const tabTracking = document.getElementById("tabTracking");
+const tabGpAudit = document.getElementById("tabGpAudit");
+const trackingTabContent = document.getElementById("trackingTab");
+const gpAuditTabContent = document.getElementById("gpAuditTab");
+
+function switchTab(tab) {
+  tabTracking.classList.toggle("active", tab === "tracking");
+  tabGpAudit.classList.toggle("active", tab === "gp");
+  trackingTabContent.classList.toggle("active", tab === "tracking");
+  gpAuditTabContent.classList.toggle("active", tab === "gp");
+  if (tab === "gp") fetchGpDate();
+}
+
+tabTracking.addEventListener("click", () => switchTab("tracking"));
+tabGpAudit.addEventListener("click", () => switchTab("gp"));
+
+// --- GP Audit logic ---
+
+const gpDateInfo = document.getElementById("gpDateInfo");
+const gpStartBtn = document.getElementById("gpStartBtn");
+const gpStopBtn = document.getElementById("gpStopBtn");
+const gpStatus = document.getElementById("gpStatus");
+const gpProgressBar = document.getElementById("gpProgressBar");
+const gpProgressFill = document.getElementById("gpProgressFill");
+const gpProgressText = document.getElementById("gpProgressText");
+const gpOutlierAlert = document.getElementById("gpOutlierAlert");
+const gpOutlierList = document.getElementById("gpOutlierList");
+const gpNoOutliers = document.getElementById("gpNoOutliers");
+
+let gpBizDate = null;
+
+function fetchGpDate() {
+  gpDateInfo.textContent = "Fetching last business day...";
+  chrome.runtime.sendMessage({ type: "fetchNtpDate" }, (res) => {
+    if (chrome.runtime.lastError || !res || res.error) {
+      gpDateInfo.textContent = "Could not fetch date: " + (res?.error || "unknown error");
+      return;
+    }
+    gpBizDate = res.date;
+    gpDateInfo.textContent = `Auditing: ${res.date} (last business day)`;
+  });
+}
+
+function setGpRunning(running) {
+  gpStartBtn.disabled = running;
+  gpStopBtn.disabled = !running;
+  if (!running) {
+    gpProgressBar.classList.remove("visible");
+    gpProgressText.classList.remove("visible");
+  }
+}
+
+gpStartBtn.addEventListener("click", async () => {
+  if (!gpBizDate) {
+    gpStatus.textContent = "Date not loaded yet. Please wait...";
+    fetchGpDate();
+    return;
+  }
+  setGpRunning(true);
+  gpProgressBar.classList.add("visible");
+  gpProgressText.classList.add("visible");
+  gpProgressFill.style.width = "0%";
+  gpProgressText.textContent = "";
+  gpStatus.textContent = "Starting GP Audit...";
+  gpOutlierAlert.classList.remove("visible");
+  gpNoOutliers.classList.remove("visible");
+  chrome.runtime.sendMessage({ type: "setRunning", running: true });
+
+  try {
+    await sendToTab("gpAudit", { bizDate: gpBizDate });
+  } catch (e) {
+    gpStatus.textContent = "Error: " + e.message;
+    setGpRunning(false);
+  }
+});
+
+gpStopBtn.addEventListener("click", async () => {
+  setGpRunning(false);
+  gpStatus.textContent = "Stopping...";
+  chrome.runtime.sendMessage({ type: "setRunning", running: false });
+  try {
+    await sendToTab("stop");
+  } catch (e) {
+    gpStatus.textContent = "Error: " + e.message;
+  }
+});
+
+// --- Listen for messages ---
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "status") {
     statusDiv.textContent = msg.text;
@@ -322,5 +413,45 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (msg.type === "aiSummary" && msg.text) {
     aiSummaryText.textContent = msg.text;
     aiSummarySection.classList.add("visible");
+  } else if (msg.type === "gpAuditStatus") {
+    gpStatus.textContent = msg.text;
+    const p = parseProgress(msg.text);
+    if (p && p.total > 0) {
+      const pct = Math.round((p.current / p.total) * 100);
+      gpProgressFill.style.width = pct + "%";
+      gpProgressText.textContent = `${p.current} / ${p.total}`;
+      gpProgressBar.classList.add("visible");
+      gpProgressText.classList.add("visible");
+    }
+  } else if (msg.type === "gpAuditComplete") {
+    gpStatus.textContent = msg.text || "Done.";
+    setGpRunning(false);
+    gpProgressFill.style.width = "100%";
+    setTimeout(() => {
+      gpProgressBar.classList.remove("visible");
+      gpProgressText.classList.remove("visible");
+    }, 3000);
+  } else if (msg.type === "gpAuditOutliers") {
+    const outliers = msg.outliers || [];
+    if (outliers.length === 0) {
+      gpNoOutliers.classList.add("visible");
+      gpOutlierAlert.classList.remove("visible");
+    } else {
+      gpNoOutliers.classList.remove("visible");
+      gpOutlierList.innerHTML = "";
+      for (const o of outliers.slice(0, 20)) {
+        const div = document.createElement("div");
+        div.className = "outlier-row";
+        div.textContent = `${o.customerId} / ${o.customerName} — ShipID ${o.shipmentId}: GP ${o.gpPct}% (avg ${o.mean}%, dev ${o.deviation}%)`;
+        gpOutlierList.appendChild(div);
+      }
+      if (outliers.length > 20) {
+        const more = document.createElement("div");
+        more.className = "outlier-row";
+        more.textContent = `...and ${outliers.length - 20} more. See Excel for full list.`;
+        gpOutlierList.appendChild(more);
+      }
+      gpOutlierAlert.classList.add("visible");
+    }
   }
 });

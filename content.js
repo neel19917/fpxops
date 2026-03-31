@@ -1648,6 +1648,297 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
   );
 }
 
+// =====================================================================
+// GP AUDIT MODE
+// =====================================================================
+
+function sendGpStatus(text) {
+  console.log("[FPX-GP]", text);
+  try { chrome.runtime.sendMessage({ type: "gpAuditStatus", text }); } catch {}
+}
+
+function sendGpComplete(text) {
+  console.log("[FPX-GP] COMPLETE:", text);
+  try { chrome.runtime.sendMessage({ type: "gpAuditComplete", text }); } catch {}
+}
+
+function gpComputeGpPct(grossProfit, markupRate) {
+  const gp = parseFloat(grossProfit);
+  const mr = parseFloat(markupRate);
+  if (!Number.isFinite(gp) || !Number.isFinite(mr) || mr === 0) return null;
+  return (gp / mr) * 100;
+}
+
+function gpComputeStats(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const cid = row["Customer Id"] || "";
+    if (!cid) continue;
+    const pct = gpComputeGpPct(row["Shipment Gross Profit"], row["Shipment Marked-Up Rate"]);
+    if (pct === null) continue;
+    if (!groups.has(cid)) {
+      groups.set(cid, { customerId: cid, customerName: row["Customer Name"] || "", values: [] });
+    }
+    groups.get(cid).values.push(pct);
+  }
+  const stats = new Map();
+  for (const [cid, g] of groups) {
+    const n = g.values.length;
+    const mean = g.values.reduce((a, b) => a + b, 0) / n;
+    const variance = g.values.reduce((a, v) => a + (v - mean) ** 2, 0) / n;
+    const stdev = Math.sqrt(variance);
+    stats.set(cid, { customerId: cid, customerName: g.customerName, count: n, mean, stdev, outlierCount: 0 });
+  }
+  return stats;
+}
+
+function gpFlagOutliers(rows, stats) {
+  for (const row of rows) {
+    const cid = row["Customer Id"] || "";
+    const pct = gpComputeGpPct(row["Shipment Gross Profit"], row["Shipment Marked-Up Rate"]);
+    row._gpPct = pct;
+    row._isOutlier = false;
+    const st = stats.get(cid);
+    if (!st || pct === null) continue;
+    row._customerMean = st.mean;
+    row._customerStdev = st.stdev;
+    if (st.count < 3) continue;
+    const deviation = Math.abs(pct - st.mean);
+    row._deviation = deviation;
+    if (deviation > 2 * st.stdev) {
+      row._isOutlier = true;
+      st.outlierCount++;
+    }
+  }
+  return rows;
+}
+
+function scrapeTransactionGrid() {
+  const headers = [];
+  const thEls = document.querySelectorAll(".k-grid th, .k-grid-header th");
+  for (const th of thEls) {
+    const link = th.querySelector("a.k-link");
+    const text = (link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim();
+    headers.push(text);
+  }
+
+  const bodyRows = document.querySelectorAll(
+    ".k-grid-content tbody tr, .k-grid tbody tr"
+  );
+
+  const rows = [];
+  for (const tr of bodyRows) {
+    if (tr.classList.contains("k-grouping-row") || tr.classList.contains("k-no-data")) continue;
+    const cells = tr.querySelectorAll("td");
+    const row = {};
+    for (let i = 0; i < cells.length && i < headers.length; i++) {
+      const key = headers[i];
+      if (!key || key === "") continue;
+      const val = (cells[i].textContent || "").replace(/\s+/g, " ").trim();
+      if (val) row[key] = val;
+    }
+    if (Object.keys(row).length > 0) rows.push(row);
+  }
+  return rows;
+}
+
+function setDateInput(input, dateStr) {
+  input.focus();
+  input.value = dateStr;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  input.blur();
+}
+
+function gpDownloadXLSX(rows, stats, bizDate) {
+  if (!rows.length || typeof XLSX === "undefined") return;
+  const wb = XLSX.utils.book_new();
+
+  const outlierRows = rows.filter((r) => r._isOutlier);
+  const outlierData = [["Customer Id", "Customer Name", "ShipmentID", "Shipped Date", "Shipment Marked-Up Rate", "Shipment Gross Profit", "GP%", "Avg GP%", "StdDev", "Deviation"]];
+  for (const r of outlierRows.sort((a, b) => (b._deviation || 0) - (a._deviation || 0))) {
+    outlierData.push([
+      r["Customer Id"] || "", r["Customer Name"] || "", r["ShipmentID"] || "", r["Shipped Date"] || "",
+      r["Shipment Marked-Up Rate"] || "", r["Shipment Gross Profit"] || "",
+      r._gpPct != null ? r._gpPct.toFixed(2) + "%" : "",
+      r._customerMean != null ? r._customerMean.toFixed(2) + "%" : "",
+      r._customerStdev != null ? r._customerStdev.toFixed(2) : "",
+      r._deviation != null ? r._deviation.toFixed(2) : "",
+    ]);
+  }
+  if (outlierData.length === 1) outlierData.push(["No outliers detected."]);
+  const wsOutliers = XLSX.utils.aoa_to_sheet(outlierData);
+  wsOutliers["!cols"] = outlierData[0].map(() => ({ wch: 18 }));
+  styleDataSheet(wsOutliers, outlierData, -1);
+  XLSX.utils.book_append_sheet(wb, wsOutliers, "Outliers");
+
+  const custData = [["Customer Id", "Customer Name", "Shipment Count", "Avg GP%", "StdDev", "Outlier Count"]];
+  for (const [, st] of stats) {
+    custData.push([st.customerId, st.customerName, st.count, st.mean.toFixed(2) + "%", st.stdev.toFixed(2), st.outlierCount]);
+  }
+  const wsCust = XLSX.utils.aoa_to_sheet(custData);
+  wsCust["!cols"] = custData[0].map(() => ({ wch: 18 }));
+  styleDataSheet(wsCust, custData, -1);
+  XLSX.utils.book_append_sheet(wb, wsCust, "By Customer");
+
+  const allHeaders = new Set();
+  for (const r of rows) {
+    for (const k of Object.keys(r)) {
+      if (!k.startsWith("_")) allHeaders.add(k);
+    }
+  }
+  const allKeys = [...allHeaders];
+  allKeys.push("GP%");
+  const allData = [allKeys];
+  for (const r of rows) {
+    const vals = allKeys.map((k) => {
+      if (k === "GP%") return r._gpPct != null ? r._gpPct.toFixed(2) + "%" : "";
+      return r[k] || "";
+    });
+    allData.push(vals);
+  }
+  const wsAll = XLSX.utils.aoa_to_sheet(allData);
+  wsAll["!cols"] = allData[0].map(() => ({ wch: 18 }));
+  styleDataSheet(wsAll, allData, -1);
+  XLSX.utils.book_append_sheet(wb, wsAll, "All Transactions");
+
+  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  a.download = `fpx-gp-audit-${bizDate.replace(/\//g, "-")}-${ts}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function gpAuditRun(bizDate) {
+  stopRequested = false;
+  sendGpStatus("Starting GP Audit for " + bizDate + "...");
+
+  const currentUrl = window.location.href;
+  if (!currentUrl.includes("Transactions")) {
+    sendGpStatus("Navigating to Transactions page...");
+    window.location.hash = "#!/Transactions";
+    await sleep(3000);
+  }
+
+  sendGpStatus("Waiting for Generate History Report dialog...");
+  for (let wait = 0; wait < 15000; wait += 500) {
+    const heading = document.querySelector("h4, h3, .modal-title, .k-window-title");
+    if (heading && /generate history report/i.test(heading.textContent)) break;
+    await sleep(500);
+  }
+
+  sendGpStatus("Filling date fields...");
+  const dateInputs = document.querySelectorAll('input[type="date"], input[type="text"]');
+  let fromFilled = false;
+  let toFilled = false;
+  for (const input of dateInputs) {
+    const label = input.closest(".form-group, div, tr");
+    const labelText = label ? label.textContent.toUpperCase() : "";
+    if (!fromFilled && labelText.includes("FROM DATE")) {
+      setDateInput(input, bizDate);
+      fromFilled = true;
+      sendGpStatus("Set FROM DATE to " + bizDate);
+    } else if (!toFilled && labelText.includes("TO DATE")) {
+      setDateInput(input, bizDate);
+      toFilled = true;
+      sendGpStatus("Set TO DATE to " + bizDate);
+    }
+  }
+
+  if (!fromFilled || !toFilled) {
+    const allInputs = document.querySelectorAll("input");
+    const datePattern = allInputs.length;
+    let idx = 0;
+    for (const input of allInputs) {
+      if (input.type === "hidden" || input.type === "checkbox") continue;
+      const ph = (input.placeholder || "").toLowerCase();
+      if (ph.includes("mm") || ph.includes("date") || input.type === "date") {
+        if (!fromFilled && idx === 0) {
+          setDateInput(input, bizDate);
+          fromFilled = true;
+          idx++;
+        } else if (!toFilled) {
+          setDateInput(input, bizDate);
+          toFilled = true;
+          break;
+        }
+      }
+    }
+  }
+  await sleep(500);
+
+  sendGpStatus("Clicking CONTINUE...");
+  const buttons = document.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn");
+  for (const btn of buttons) {
+    const txt = (btn.textContent || btn.value || "").trim().toUpperCase();
+    if (txt === "CONTINUE") {
+      simulateClick(btn);
+      break;
+    }
+  }
+
+  sendGpStatus("Waiting for results grid to load...");
+  await sleep(3000);
+  await waitForGridReady(10000);
+
+  let allRows = [];
+  let pageNum = 1;
+  while (true) {
+    if (stopRequested) {
+      sendGpComplete("Stopped by user.");
+      return;
+    }
+    sendGpStatus(`Scraping transaction grid page ${pageNum}...`);
+    const pageRows = scrapeTransactionGrid();
+    sendGpStatus(`Page ${pageNum}: found ${pageRows.length} row(s).`);
+    allRows = allRows.concat(pageRows);
+
+    const advanced = goToNextPage();
+    if (!advanced) break;
+    pageNum++;
+    await waitForGridReady(5000);
+  }
+
+  sendGpStatus(`Scraped ${allRows.length} total transaction(s). Computing GP stats...`);
+
+  if (allRows.length === 0) {
+    sendGpComplete("No transactions found for " + bizDate + ".");
+    return;
+  }
+
+  const stats = gpComputeStats(allRows);
+  gpFlagOutliers(allRows, stats);
+
+  const outliers = allRows.filter((r) => r._isOutlier);
+  sendGpStatus(`Found ${outliers.length} outlier(s) across ${stats.size} customer(s).`);
+
+  const outlierSummary = outliers.map((r) => ({
+    customerId: r["Customer Id"] || "",
+    customerName: r["Customer Name"] || "",
+    shipmentId: r["ShipmentID"] || "",
+    gpPct: r._gpPct != null ? r._gpPct.toFixed(2) : "?",
+    mean: r._customerMean != null ? r._customerMean.toFixed(2) : "?",
+    deviation: r._deviation != null ? r._deviation.toFixed(2) : "?",
+  }));
+
+  try {
+    chrome.runtime.sendMessage({ type: "gpAuditOutliers", outliers: outlierSummary });
+  } catch {}
+
+  sendGpStatus("Downloading GP Audit XLSX...");
+  gpDownloadXLSX(allRows, stats, bizDate);
+
+  sendGpComplete(
+    `GP Audit done — ${allRows.length} transaction(s), ${stats.size} customer(s), ${outliers.length} outlier(s).`
+  );
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   console.log("[FPX] Message received:", msg);
   if (msg.action === "ping") {
@@ -1657,6 +1948,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
   } else if (msg.action === "stop") {
     stopRequested = true;
+    sendResponse({ ok: true });
+  } else if (msg.action === "gpAudit") {
+    gpAuditRun(msg.bizDate);
     sendResponse({ ok: true });
   }
 });
