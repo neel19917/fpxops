@@ -1,0 +1,10 @@
+{
+  "name": "fpxpress-tracking-refresh",
+  "version": "3.0.0",
+  "private": true,
+  "scripts": {
+    "setup": "cd server && npm install",
+    "server": "cd server && node index.js",
+    "test": "cd server && npm test"
+  }
+}

@@ -1,15 +1,19 @@
 {
   "manifest_version": 3,
   "name": "FPXpress Tracking Refresh",
-  "version": "2.0",
+  "version": "3.0",
   "description": "Automates tracking refresh on the FPXpress dashboard with AI-powered issue analysis via Claude Haiku.",
-  "permissions": ["activeTab", "scripting", "storage"],
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel", "nativeMessaging"],
   "host_permissions": [
     "*://app.freightpop.com/*",
-    "https://api.anthropic.com/*"
+    "https://api.anthropic.com/*",
+    "http://localhost:3210/*"
   ],
   "action": {
     "default_popup": "popup.html"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "background": {
     "service_worker": "background.js"

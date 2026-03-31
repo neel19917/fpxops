@@ -2,6 +2,7 @@ let stopRequested = false;
 let logRows = [];
 let aiEnabled = true;
 let smartGateEnabled = false;
+let useBatchMode = false;
 
 function sendStatus(text) {
   console.log("[FPX]", text);
@@ -17,23 +18,51 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Poll for a visible CLOSE button up to `timeout` ms.
-function waitForCloseButton(timeout = 15000) {
+function isVisibleForClick(el) {
+  if (!el) return false;
+  const r = el.getClientRects();
+  if (!r || r.length === 0) return false;
+  const st = window.getComputedStyle(el);
+  if (st.display === "none" || st.visibility === "hidden") return false;
+  return true;
+}
+
+// First visible control that can dismiss the shipment modal / Kendo window.
+function findModalDismissControl() {
+  const candidates = document.querySelectorAll(
+    "button, a[role='button'], [role='button'], a.k-window-action"
+  );
+  for (const el of candidates) {
+    if (!isVisibleForClick(el)) continue;
+    const txt = el.innerText.replace(/\s+/g, " ").trim();
+    if (/^close$/i.test(txt) || /^done$/i.test(txt)) return el;
+    const al = (el.getAttribute("aria-label") || "").trim();
+    if (/^(close|dismiss)$/i.test(al)) return el;
+  }
+  for (const sel of [
+    ".k-window-action[aria-label='Close']",
+    "a.k-window-action.k-window-action-close",
+    ".k-window [class*='k-window-action'] .k-i-close",
+  ]) {
+    const inner = document.querySelector(sel);
+    if (!inner || !isVisibleForClick(inner)) continue;
+    return inner.closest("a, button") || inner;
+  }
+  return null;
+}
+
+// Poll for a dismiss control (CLOSE button, Kendo X, aria-label Close) up to `timeout` ms.
+function waitForCloseButton(timeout = 25000) {
   return new Promise((resolve) => {
-    const interval = 500;
+    const interval = 400;
     let elapsed = 0;
 
     const timer = setInterval(() => {
-      const buttons = document.querySelectorAll("button");
-      for (const btn of buttons) {
-        if (
-          btn.innerText.trim().toUpperCase() === "CLOSE" &&
-          btn.offsetParent !== null
-        ) {
-          clearInterval(timer);
-          resolve(btn);
-          return;
-        }
+      const btn = findModalDismissControl();
+      if (btn) {
+        clearInterval(timer);
+        resolve(btn);
+        return;
       }
       elapsed += interval;
       if (elapsed >= timeout) {
@@ -253,7 +282,7 @@ function scrapeModal() {
   const labels = modal.querySelectorAll("label, strong, b, .field-label, .control-label, dt");
   for (const lbl of labels) {
     const key = lbl.textContent.trim().replace(/:$/, "");
-    if (!key || key.length > 60) continue;
+    if (!key || key.length > 200) continue;
 
     let val = "";
     const next = lbl.nextElementSibling;
@@ -286,7 +315,21 @@ function scrapeModal() {
     }
   }
 
-  console.log("[FPX] Scraped modal data:", data);
+  const dialogRoot = document.querySelector(
+    ".modal.in, .modal.show, .k-window, [role='dialog']"
+  );
+  if (dialogRoot) {
+    const raw = String(dialogRoot.innerText || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/[ \t\f\v]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    if (raw) {
+      data["FULL MODAL TEXT"] = raw;
+    }
+  }
+
+  console.log("[FPX] Scraped modal data keys:", Object.keys(data).length);
   return data;
 }
 
@@ -297,6 +340,9 @@ const DISPLAY_COLUMNS = [
   { key: "CARRIER NAME", header: "Carrier Name" },
   { key: "MODE", header: "Mode" },
   { key: "COMMENTS", header: "Comments" },
+  { key: "PICKUP RESPONSE", header: "Pickup Response" },
+  { key: "PICKUP REQUEST NUMBER", header: "Pickup Request # (Grid)" },
+  { key: "CONFIRMATION NUMBER", header: "Confirmation # (Grid)" },
   { key: "PICKUP DATE", header: "Pickup Date" },
   { key: "UPDATED ETA", header: "Updated ETA" },
   { key: "ESTIMATED DEPARTURE DATE", header: "Est. Departure" },
@@ -317,6 +363,9 @@ const DISPLAY_COLUMNS = [
   { key: "_actionRequired", header: "Action Required" },
   { key: "_aiIssue", header: "AI Issue" },
   { key: "_aiRecommendation", header: "AI Recommendation" },
+  { key: "_actionQuickRef", header: "Action — Key Data" },
+  { key: "_carrierEmailDraft", header: "Carrier Email Draft" },
+  { key: "_inputsSheetLink", header: "Find on Inputs Sheet" },
   { key: "_timestamp", header: "Scraped At" },
   { key: "_error", header: "Error" },
 ];
@@ -500,14 +549,13 @@ function applyAiResponseToRow(modalData, aiText) {
 function computeNeedsActionForSheet(r) {
   const ar = String(r._actionRequired ?? "").trim().toUpperCase();
   const issue = String(r._aiIssue ?? "").trim();
-  const onTrack = isClearlyOnTrackIssue(issue);
   if (ar === "ERROR") return true;
   if (ar === "YES" || ar === "TRUE" || ar === "Y" || ar === "1") return true;
-  if (ar === "NO") return issue.length > 0 && !onTrack;
+  if (ar === "NO") return false;
   if (!issue) return false;
-  if (onTrack) return false;
+  if (isClearlyOnTrackIssue(issue)) return false;
   if (issue.length > 4000) {
-    return /\b(error|failed|contact|reschedule|delay|wrong|incorrect|attention|call|customer|data|delivery|attempt|problem|urgent|immediately)\b/i.test(
+    return /\b(error|failed|delay|contact|missing|stuck|exception|damaged|refused|undeliverable)\b/i.test(
       issue
     );
   }
@@ -516,9 +564,6 @@ function computeNeedsActionForSheet(r) {
 
 function finalizeActionSheetFlag(r) {
   r._needsActionSheet = computeNeedsActionForSheet(r);
-  if (r._needsActionSheet && r._actionRequired !== "ERROR") {
-    r._actionRequired = "YES";
-  }
 }
 
 function buildInputSummary(data) {
@@ -536,6 +581,7 @@ function buildInputSummary(data) {
   if (v("DELIVERY DATE")) parts.push(`Delivered: ${v("DELIVERY DATE")}`);
   if (v("SIGNED BY")) parts.push(`Signed: ${v("SIGNED BY")}`);
   if (v("COMMENTS")) parts.push(`Comments: ${v("COMMENTS")}`);
+  if (v("PICKUP RESPONSE")) parts.push(`Pickup Response: ${v("PICKUP RESPONSE")}`);
 
   return parts.join(" | ");
 }
@@ -556,6 +602,260 @@ function buildOutputSummary(data) {
   if (rec) parts.push(`Next step: ${rec}.`);
 
   return parts.join(" ");
+}
+
+// Modal keys vary by tenant; try exact labels then loose key matches.
+const PRO_FIELD_KEYS = [
+  "PRO", "PRO NUMBER", "PRO #", "PRO NO", "CARRIER PRO", "CARRIER PRO NUMBER",
+  "PRO NUM", "PRO NUMBERS",
+];
+const PICKUP_FIELD_KEYS = [
+  "PICKUP REQUEST NUMBER",
+  "PICKUP RESPONSE",
+  "PICKUP NUMBER", "PICKUP #", "PICKUP NO", "PU NUMBER", "PU #",
+  "PICKUP CONFIRMATION", "PICKUP CONF #", "PICKUP REF", "PICKUP REFERENCE",
+];
+const ORIGIN_ZIP_KEYS = [
+  "ORIGIN ZIP", "SHIPPER ZIP", "PICKUP ZIP", "ORIGIN POSTAL CODE",
+  "FROM ZIP", "SHIP FROM ZIP", "ORIGIN POSTAL", "SHIPPER POSTAL CODE",
+];
+const DEST_ZIP_KEYS = [
+  "DESTINATION ZIP", "CONSIGNEE ZIP", "DELIVERY ZIP", "DEST ZIP", "TO ZIP",
+  "DELIVERY POSTAL CODE", "DESTINATION POSTAL CODE", "CONSIGNEE POSTAL CODE",
+];
+const SHIP_FROM_KEYS = [
+  "SHIP FROM", "SHIP FROM ADDRESS", "ORIGIN", "SHIPPER ADDRESS", "PICKUP ADDRESS",
+];
+const SHIP_TO_KEYS = [
+  "SHIP TO", "SHIP TO ADDRESS", "DESTINATION", "CONSIGNEE ADDRESS", "DELIVERY ADDRESS",
+];
+const REF_NUMBER_KEYS = [
+  "REF1 / REF2", "REF1", "REF2", "REFERENCE", "REFERENCE NUMBER", "REF #", "REF NO",
+];
+
+function getScrapedField(row, exactKeys, opts) {
+  const rowKeyMustMatch = opts && opts.rowKeyMustMatch;
+  if (!row || typeof row !== "object") return "";
+  for (const k of exactKeys) {
+    if (row[k] === undefined || row[k] === null) continue;
+    const v = String(row[k]).trim();
+    if (v) return v;
+  }
+  const rowKeys = Object.keys(row);
+  for (const want of exactKeys) {
+    const w = want.toUpperCase().replace(/\s+/g, " ");
+    for (const k of rowKeys) {
+      if (k.startsWith("_")) continue;
+      if (rowKeyMustMatch && !rowKeyMustMatch.test(k)) continue;
+      const ku = k.toUpperCase().replace(/\s+/g, " ");
+      if (ku === w || ku.includes(w) || w.includes(ku)) {
+        const v = String(row[k] ?? "").trim();
+        if (v) return v;
+      }
+    }
+  }
+  return "";
+}
+
+function suggestsNoProTracking(row) {
+  const blob = [
+    row.COMMENTS,
+    row._aiIssue,
+    row._aiRecommendation,
+    row["SHIPMENT STATUS"],
+  ]
+    .map((x) => String(x || ""))
+    .join(" ");
+  if (
+    /\b(no tracking|not tracking|invalid pro|bad pro|pro not|unable to track|no visibility|not visible|carrier (portal|site)|trace|tracking (issue|problem|unavailable))\b/i.test(
+      blob
+    )
+  ) {
+    return true;
+  }
+  if (String(row["SHIPMENT STATUS"] || "").trim().toLowerCase() === "issue") {
+    return true;
+  }
+  if (/\bcontact\s+(the\s+)?carrier\b/i.test(blob)) return true;
+  return false;
+}
+
+/** Turn comma-separated modal address blobs into readable line breaks. */
+function formatShipAddressBlob(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  return s
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function buildActionQuickRef(row) {
+  const parts = [];
+  const trk = String(row._trackingNumber || "").trim();
+  parts.push(`Tracking: ${trk || "—"}`);
+  const pro = getScrapedField(row, PRO_FIELD_KEYS);
+  if (pro) parts.push(`PRO: ${pro}`);
+  const pickup = getScrapedField(row, PICKUP_FIELD_KEYS);
+  if (row["PICKUP RESPONSE"]) parts.push(`Pickup Response: ${row["PICKUP RESPONSE"]}`);
+  if (pickup) parts.push(`Pickup #: ${pickup}`);
+  const oz = getScrapedField(row, ORIGIN_ZIP_KEYS, {
+    rowKeyMustMatch: /\b(ZIP|POSTAL)\b/i,
+  });
+  const dz = getScrapedField(row, DEST_ZIP_KEYS, {
+    rowKeyMustMatch: /\b(ZIP|POSTAL)\b/i,
+  });
+  if (oz || dz) parts.push(`ZIPs: ${oz || "?"} → ${dz || "?"}`);
+  const carrier = String(row["CARRIER NAME"] || row.CARRIER || "").trim();
+  if (carrier) parts.push(`Carrier: ${carrier}`);
+  if (row["SHIPMENT STATUS"]) parts.push(`Status: ${row["SHIPMENT STATUS"]}`);
+  if (row["PICKUP DATE"]) parts.push(`Pickup date: ${row["PICKUP DATE"]}`);
+  if (row["UPDATED ETA"]) parts.push(`ETA: ${row["UPDATED ETA"]}`);
+  if (row["DELIVERY DATE"]) parts.push(`Delivery: ${row["DELIVERY DATE"]}`);
+  return parts.join(" | ");
+}
+
+function buildCarrierEmailDraft(row) {
+  const carrier = String(row["CARRIER NAME"] || row.CARRIER || "").trim();
+  const trk = String(row._trackingNumber || "").trim();
+  const pro = getScrapedField(row, PRO_FIELD_KEYS);
+  const pickup = getScrapedField(row, PICKUP_FIELD_KEYS);
+  const oz = getScrapedField(row, ORIGIN_ZIP_KEYS, {
+    rowKeyMustMatch: /\b(ZIP|POSTAL)\b/i,
+  });
+  const dz = getScrapedField(row, DEST_ZIP_KEYS, {
+    rowKeyMustMatch: /\b(ZIP|POSTAL)\b/i,
+  });
+  const mode = String(row.MODE || "").trim();
+  const shipFromRaw = getScrapedField(row, SHIP_FROM_KEYS);
+  const shipToRaw = getScrapedField(row, SHIP_TO_KEYS);
+  const shipFromFmt = formatShipAddressBlob(shipFromRaw);
+  const shipToFmt = formatShipAddressBlob(shipToRaw);
+
+  const noProTracking = suggestsNoProTracking(row);
+  // PRO is the carrier tracking number; grid/modal "tracking number" is the same PRO when data returns.
+  const proNumber = trk || pro;
+  const trackingReturning = Boolean(proNumber) && !noProTracking;
+
+  const lines = [];
+  if (trackingReturning) {
+    lines.push(`Subject: Status update — PRO ${proNumber}`);
+  } else {
+    lines.push(
+      `Subject: Tracking visibility — Ref ${pickup || proNumber || "shipment"}`
+    );
+  }
+  lines.push("");
+  lines.push(carrier ? `Hello ${carrier},` : "Hello,");
+  lines.push("");
+
+  if (trackingReturning) {
+    lines.push(
+      "We are following up on the shipment below. Please send a brief status update at your convenience."
+    );
+    lines.push("");
+    lines.push(`PRO: ${proNumber}`);
+    lines.push("");
+    if (shipFromFmt) {
+      lines.push("Ship from:");
+      lines.push(shipFromFmt);
+      lines.push("");
+    }
+    if (shipToFmt) {
+      lines.push("Ship to:");
+      lines.push(shipToFmt);
+      lines.push("");
+    }
+    if (oz || dz) {
+      lines.push(`Lane (ZIP): ${oz || "?"} → ${dz || "?"}.`);
+      lines.push("");
+    }
+  } else {
+    lines.push(
+      "We are following up on a shipment and need your help with tracking visibility."
+    );
+    lines.push("");
+
+    if (noProTracking && pickup) {
+      lines.push(
+        "We are not receiving usable tracking updates with the PRO number we have on file" +
+          (pro ? ` (${pro})` : trk ? ` (${trk})` : "") +
+          ". Please provide the correct or updated PRO number."
+      );
+      lines.push(`Please reference our pickup number: ${pickup}.`);
+      lines.push("");
+    } else if (!pickup && (oz || dz)) {
+      lines.push(
+        "We do not have a pickup number on file for this shipment. Please locate the load and confirm the active PRO using the origin and destination ZIP codes below."
+      );
+      lines.push(
+        `Ship-from / origin ZIP: ${oz || "(not captured)"} — Ship-to / destination ZIP: ${dz || "(not captured)"}.`
+      );
+      if (pro || trk) {
+        lines.push(
+          `The PRO we have on file (if it helps): ${pro || trk}.`
+        );
+      }
+      lines.push("");
+    } else {
+      lines.push(
+        "Please confirm the active PRO and current status for this shipment."
+      );
+      if (pickup) lines.push(`Pickup reference: ${pickup}.`);
+      if (oz || dz) {
+        lines.push(`Lane: ZIP ${oz || "?"} → ${dz || "?"}.`);
+      }
+      lines.push("");
+    }
+
+    if (shipFromFmt) {
+      lines.push("Ship from:");
+      lines.push(shipFromFmt);
+      lines.push("");
+    }
+    if (shipToFmt) {
+      lines.push("Ship to:");
+      lines.push(shipToFmt);
+      lines.push("");
+    }
+
+    lines.push("Reference details:");
+    const refVal = getScrapedField(row, REF_NUMBER_KEYS);
+    if (trk) lines.push(`• FreightPOP / portal tracking: ${trk}`);
+    if (pro && pro !== trk) lines.push(`• PRO on file: ${pro}`);
+    if (pickup) lines.push(`• Pickup number: ${pickup}`);
+    if (refVal) lines.push(`• Reference: ${refVal}`);
+    if (oz || dz) lines.push(`• ZIPs: ${oz || "?"} → ${dz || "?"}`);
+    if (mode) lines.push(`• Mode: ${mode}`);
+    lines.push("");
+  }
+
+  lines.push("Thank you,");
+  lines.push("[Your name / brokerage]");
+
+  return lines.join("\n");
+}
+
+function buildActionRowForSheet(r, allRows) {
+  const idx = allRows.indexOf(r);
+  const excelRow = idx >= 0 ? idx + 2 : "";
+  const trk = String(r._trackingNumber || "").trim();
+  const linkHint =
+    excelRow && trk
+      ? `Inputs row ${excelRow} — search Inputs for "${trk}"`
+      : excelRow
+        ? `Inputs row ${excelRow} — use Find in Inputs sheet`
+        : trk
+          ? `Search Inputs sheet for "${trk}"`
+          : "";
+  return {
+    ...r,
+    _actionQuickRef: buildActionQuickRef(r),
+    _carrierEmailDraft: buildCarrierEmailDraft(r),
+    _inputsSheetLink: linkHint,
+    _inputExcelRow: excelRow,
+  };
 }
 
 function buildSummaryPayload(rows) {
@@ -686,14 +986,29 @@ function downloadXLSX(rows, summaryText) {
 
   // --- Sheet 1: Actions (items needing action) ---
   const actionRows = rows.filter((r) => r._needsActionSheet === true);
-  const actionData = actionRows.length > 0
-    ? rowsToSheetData(actionRows)
-    : [["No action items found."]];
+  const actionSheetRows =
+    actionRows.length > 0
+      ? actionRows.map((r) => buildActionRowForSheet(r, rows))
+      : [];
+  const actionData =
+    actionSheetRows.length > 0
+      ? rowsToSheetData(actionSheetRows)
+      : [["No action items found."]];
   const wsActions = XLSX.utils.aoa_to_sheet(actionData);
   wsActions["!cols"] = autoFitCols(actionData);
-  if (actionRows.length > 0) {
+  if (actionSheetRows.length > 0) {
     const actIdx = findHeaderIndex(actionData[0], "Action Required");
     styleDataSheet(wsActions, actionData, actIdx);
+    const linkColIdx = findHeaderIndex(actionData[0], "Find on Inputs Sheet");
+    if (linkColIdx >= 0) {
+      for (let r = 1; r < actionData.length; r++) {
+        const er = actionSheetRows[r - 1]._inputExcelRow;
+        if (!er) continue;
+        const addr = XLSX.utils.encode_cell({ r, c: linkColIdx });
+        const label = `Inputs row ${er}`.replace(/"/g, '""');
+        wsActions[addr] = { f: `HYPERLINK("#Inputs!A${er}","${label}")` };
+      }
+    }
   }
   XLSX.utils.book_append_sheet(wb, wsActions, "Actions");
 
@@ -702,6 +1017,8 @@ function downloadXLSX(rows, summaryText) {
     "_aiRawAnalysis", "_aiIssue", "_aiRecommendation",
     "_actionRequired", "_needsActionSheet",
     "_inputSummary", "_outputSummary",
+    "_actionQuickRef", "_carrierEmailDraft", "_inputsSheetLink", "_inputExcelRow",
+    "FULL MODAL TEXT",
   ]);
   const inputKeysSet = new Set();
   for (const row of rows) {
@@ -785,62 +1102,141 @@ function downloadXLSX(rows, summaryText) {
   URL.revokeObjectURL(url);
 }
 
-// Find the Tracking Number column index from the grid header using the
-// data-field attribute, then collect clickable elements from that column
-// in every body row.
-function collectTrackingLinks() {
-  // Step 1: find the Tracking Number column via data-field attribute.
-  const trackingHeader = document.querySelector(
-    'th[data-field="TrackingNumber"], th[data-field="trackingNumber"]'
-  );
-  const dataIndex = trackingHeader
-    ? parseInt(trackingHeader.getAttribute("data-index"), 10)
-    : -1;
-
-  console.log("[FPX] TrackingNumber header found:", !!trackingHeader, "data-index:", dataIndex);
-
-  // Step 2: count locked (frozen) columns so we can compute the offset
-  // inside the scrollable body table.
+function getLockedColumnCount() {
   const lockedHeaders = document.querySelectorAll(
     ".k-grid-header-locked th, .k-grid-header-locked td"
   );
-  const lockedCount = lockedHeaders.length;
-  const scrollIndex = dataIndex >= 0 ? dataIndex - lockedCount : -1;
+  return lockedHeaders.length;
+}
 
-  console.log("[FPX] Locked columns:", lockedCount, "Scroll-body column index:", scrollIndex);
+function readGridCellText(row, dataIndex, lockedCount) {
+  if (dataIndex < 0) return "";
+  const cells = row.querySelectorAll("td");
+  const scrollIndex = dataIndex - lockedCount;
+  let cell = null;
+  if (scrollIndex >= 0 && scrollIndex < cells.length) {
+    cell = cells[scrollIndex];
+  }
+  if (
+    (!cell || !String(cell.textContent || "").trim()) &&
+    dataIndex >= 0 &&
+    dataIndex < cells.length
+  ) {
+    cell = cells[dataIndex];
+  }
+  if (!cell) return "";
+  return String(cell.textContent || "").replace(/\s+/g, " ").trim();
+}
 
-  // Step 3: get body rows from the scrollable section of the grid.
+function findColumnDataIndexByField(candidates) {
+  for (const f of candidates) {
+    const th = document.querySelector(`th[data-field="${f}"]`);
+    if (th) {
+      const idx = parseInt(th.getAttribute("data-index"), 10);
+      if (!Number.isNaN(idx)) return idx;
+    }
+  }
+  return -1;
+}
+
+function findPickupResponseDataIndex() {
+  const byField = findColumnDataIndexByField([
+    "PickupResponse",
+    "pickupResponse",
+    "PickupRequestResponse",
+    "PickupReqResponse",
+    "ShipperPickupResponse",
+    "ShipPickupResponse",
+    "PickupResponseText",
+  ]);
+  if (byField >= 0) return byField;
+
+  const allTh = document.querySelectorAll(
+    ".k-grid-header-wrap th[data-index], .k-grid-header th[data-index], .k-grid th[data-index]"
+  );
+  for (const th of allTh) {
+    const link = th.querySelector("a.k-link");
+    const text = (link ? link.textContent : th.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) continue;
+    if (/pickup\s*response/i.test(text)) {
+      const idx = parseInt(th.getAttribute("data-index"), 10);
+      if (!Number.isNaN(idx)) return idx;
+    }
+  }
+  return -1;
+}
+
+// Grid "Pickup Response" cell (e.g. "Pickup Request number is …") merged into row export.
+function applyGridPickupResponse(modalData, raw) {
+  const full = String(raw || "").replace(/\s+/g, " ").trim();
+  modalData["PICKUP RESPONSE"] = full;
+  const pr = full.match(/Pickup Request number is\s*(\S+)/i);
+  if (pr) modalData["PICKUP REQUEST NUMBER"] = pr[1].trim();
+  const cn = full.match(/Confirmation Number\s*=\s*(\S+)/i);
+  if (cn) modalData["CONFIRMATION NUMBER"] = cn[1].trim();
+}
+
+// Find the Tracking Number column and Pickup Response column, then collect
+// { link, pickupResponse } for each body row that has a tracking control.
+function collectShipmentJobs() {
+  const trackingHeader = document.querySelector(
+    'th[data-field="TrackingNumber"], th[data-field="trackingNumber"]'
+  );
+  const trackingDataIndex = trackingHeader
+    ? parseInt(trackingHeader.getAttribute("data-index"), 10)
+    : -1;
+
+  const pickupDataIndex = findPickupResponseDataIndex();
+  const lockedCount = getLockedColumnCount();
+  const trackingScrollIndex =
+    trackingDataIndex >= 0 ? trackingDataIndex - lockedCount : -1;
+
+  console.log(
+    "[FPX] TrackingNumber data-index:",
+    trackingDataIndex,
+    "Pickup Response data-index:",
+    pickupDataIndex,
+    "locked columns:",
+    lockedCount,
+    "tracking scroll col:",
+    trackingScrollIndex
+  );
+
   const bodyRows = document.querySelectorAll(
     ".k-grid-content tbody tr, .k-grid-content-locked tbody tr"
   );
-  // Also try all tbody rows if the above finds nothing.
-  const allRows = bodyRows.length > 0
-    ? bodyRows
-    : document.querySelectorAll(".k-grid tbody tr");
+  const allRows =
+    bodyRows.length > 0
+      ? bodyRows
+      : document.querySelectorAll(".k-grid tbody tr");
 
   console.log("[FPX] Body rows found:", allRows.length);
 
-  const links = [];
+  const jobs = [];
 
   for (const row of allRows) {
     if (row.classList.contains("k-grouping-row")) continue;
     if (row.classList.contains("k-no-data")) continue;
     const cells = row.querySelectorAll("td");
 
-    // Try the computed column index first.
     let cell = null;
-    if (scrollIndex >= 0 && scrollIndex < cells.length) {
-      cell = cells[scrollIndex];
+    if (trackingScrollIndex >= 0 && trackingScrollIndex < cells.length) {
+      cell = cells[trackingScrollIndex];
     }
-    // Fallback: try with the raw data-index.
-    if ((!cell || !cell.textContent.trim()) && dataIndex >= 0 && dataIndex < cells.length) {
-      cell = cells[dataIndex];
+    if (
+      (!cell || !cell.textContent.trim()) &&
+      trackingDataIndex >= 0 &&
+      trackingDataIndex < cells.length
+    ) {
+      cell = cells[trackingDataIndex];
     }
 
     if (!cell) continue;
 
-    // Find any clickable element inside the cell: <a>, or element with
-    // ng-click, or the cell itself if it has text content.
+    const pickupText = readGridCellText(row, pickupDataIndex, lockedCount);
+
     const clickable =
       cell.querySelector("a") ||
       cell.querySelector("[ng-click]") ||
@@ -849,25 +1245,27 @@ function collectTrackingLinks() {
       cell.querySelector("span.k-link");
 
     if (clickable && clickable.textContent.trim()) {
-      links.push(clickable);
-      console.log("[FPX]   Found:", clickable.textContent.trim(), "tag:", clickable.tagName);
+      jobs.push({ link: clickable, pickupResponse: pickupText });
     } else if (cell.textContent.trim() && cell.querySelector("*")) {
-      // If no obvious clickable child, look for any child with text.
       const children = cell.querySelectorAll("*");
       for (const child of children) {
         const t = child.textContent.trim();
         if (t && child.childElementCount === 0 && /\d/.test(t)) {
-          links.push(child);
-          console.log("[FPX]   Found (fallback):", t, "tag:", child.tagName);
+          jobs.push({ link: child, pickupResponse: pickupText });
           break;
         }
       }
     }
   }
 
-  console.log("[FPX] Matched tracking links:", links.map((el) => el.textContent.trim()));
-  sendStatus(`Found ${links.length} tracking link(s) on this page.`);
-  return links;
+  console.log("[FPX] Shipment jobs:", jobs.length);
+  sendStatus(
+    `Found ${jobs.length} tracking link(s) on this page` +
+      (pickupDataIndex >= 0
+        ? " (Pickup Response column mapped)."
+        : " (Pickup Response header not found — column left blank).")
+  );
+  return jobs;
 }
 
 // Check for an enabled next-page button and click it.
@@ -933,8 +1331,8 @@ function shipmentNeedsAi(modalData) {
 }
 
 async function processPage() {
-  const links = collectTrackingLinks();
-  const total = links.length;
+  const jobs = collectShipmentJobs();
+  const total = jobs.length;
 
   if (total === 0) {
     sendStatus("No tracking links found on this page.");
@@ -948,23 +1346,24 @@ async function processPage() {
       return;
     }
 
-    const link = links[i];
+    const { link, pickupResponse } = jobs[i];
     const trackingNum = link.textContent.trim();
     sendStatus(`Processing ${i + 1} of ${total} — ${trackingNum}`);
 
     simulateClick(link);
-    await sleep(300);
+    await sleep(350);
 
     sendStatus(`Clicked ${trackingNum} — waiting for modal...`);
-    const closeBtn = await waitForCloseButton(15000);
+    const closeBtn = await waitForCloseButton(25000);
     if (closeBtn) {
-      await sleep(600);
+      await sleep(400);
       sendStatus(`Scraping modal data for ${trackingNum}...`);
       const modalData = scrapeModal();
       modalData._trackingNumber = trackingNum;
       modalData._timestamp = new Date().toISOString();
+      applyGridPickupResponse(modalData, pickupResponse);
 
-      if (aiEnabled) {
+      if (aiEnabled && !useBatchMode) {
         if (shipmentNeedsAi(modalData)) {
           sendStatus(`Analyzing ${trackingNum} with AI...`);
           try {
@@ -992,34 +1391,133 @@ async function processPage() {
           modalData._aiRecommendation = "No action needed (auto-classified by smart gate).";
         }
         finalizeActionSheetFlag(modalData);
-      } else {
-        modalData._needsActionSheet = false;
+      } else if (!useBatchMode) {
+        modalData._needsActionSheet = modalData._actionRequired === "ERROR";
       }
 
       modalData._inputSummary = buildInputSummary(modalData);
       modalData._outputSummary = buildOutputSummary(modalData);
+      delete modalData["FULL MODAL TEXT"];
+      delete modalData["_aiRawAnalysis"];
       logRows.push(modalData);
+
+      if (logRows.length % 25 === 0) {
+        try { chrome.storage.local.set({ _fpxCheckpoint: logRows }); } catch {}
+      }
 
       const actionTag = modalData._needsActionSheet ? " [ACTION NEEDED]" : "";
       sendStatus(`Done ${trackingNum}${actionTag} — closing modal...`);
       simulateClick(closeBtn);
-      await sleep(300);
+      await sleep(250);
     } else {
-      logRows.push({
+      const timeoutRow = {
         _trackingNumber: trackingNum,
         _timestamp: new Date().toISOString(),
         _error: "Modal did not appear (timeout)",
         _actionRequired: "",
         _aiIssue: "",
         _aiRecommendation: "",
-        _inputSummary: `Tracking: ${trackingNum}`,
+        _inputSummary: "",
         _outputSummary: "Error: Modal did not appear (timeout)",
         _needsActionSheet: false,
-      });
+      };
+      applyGridPickupResponse(timeoutRow, pickupResponse);
+      timeoutRow._inputSummary = buildInputSummary(timeoutRow);
+      logRows.push(timeoutRow);
       sendStatus(`Timeout on ${trackingNum} — no modal appeared, skipping.`);
     }
 
-    await sleep(500);
+    await sleep(300);
+  }
+}
+
+const BATCH_CHUNK_SIZE = 25;
+
+async function tryBatchAnalyze(rows) {
+  const total = rows.length;
+  const allAnalyzed = [];
+  const summaries = [];
+  let totalErrors = 0;
+
+  sendStatus(`Batch analysis: ${total} shipment(s) in chunks of ${BATCH_CHUNK_SIZE}...`);
+
+  for (let offset = 0; offset < total; offset += BATCH_CHUNK_SIZE) {
+    if (stopRequested) return null;
+
+    const chunk = rows.slice(offset, offset + BATCH_CHUNK_SIZE);
+    const chunkEnd = Math.min(offset + BATCH_CHUNK_SIZE, total);
+    sendStatus(`Analyzing batch ${offset + 1}–${chunkEnd} of ${total}...`);
+
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "analyzeBatch",
+        rows: chunk,
+      });
+
+      if (result && result.error) {
+        sendStatus(`Batch ${offset + 1}–${chunkEnd} failed: ${result.error}. Continuing...`);
+        for (const row of chunk) {
+          allAnalyzed.push({ ...row, _actionRequired: "ERROR", _aiIssue: result.error, _aiRecommendation: "" });
+        }
+        totalErrors += chunk.length;
+        continue;
+      }
+
+      if (result && Array.isArray(result.analyzed)) {
+        allAnalyzed.push(...result.analyzed);
+        if (result.summary) summaries.push(result.summary);
+        totalErrors += result.errors || 0;
+      } else {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  return {
+    analyzed: allAnalyzed,
+    summary: summaries.join("\n\n"),
+    errors: totalErrors,
+  };
+}
+
+async function fallbackPerRowAnalysis() {
+  sendStatus("LangGraph server unavailable — falling back to per-row AI analysis...");
+  for (let i = 0; i < logRows.length; i++) {
+    if (stopRequested) return;
+    const row = logRows[i];
+    if (row._actionRequired) continue;
+
+    sendStatus(`Fallback AI: ${i + 1}/${logRows.length} — ${row._trackingNumber || "?"}`);
+    if (shipmentNeedsAi(row)) {
+      try {
+        const aiResult = await chrome.runtime.sendMessage({
+          type: "analyzeShipment",
+          data: row,
+        });
+        if (aiResult && aiResult.text) {
+          applyAiResponseToRow(row, aiResult.text);
+        } else if (aiResult && aiResult.error) {
+          row._aiRawAnalysis = aiResult.error;
+          row._actionRequired = "ERROR";
+          row._aiIssue = aiResult.error;
+          row._aiRecommendation = "";
+        }
+      } catch (e) {
+        row._aiRawAnalysis = e.message;
+        row._actionRequired = "ERROR";
+        row._aiIssue = e.message;
+        row._aiRecommendation = "";
+      }
+    } else {
+      row._actionRequired = "NO";
+      row._aiIssue = "None - shipment is on track";
+      row._aiRecommendation = "No action needed (auto-classified by smart gate).";
+    }
+    finalizeActionSheetFlag(row);
+    row._inputSummary = buildInputSummary(row);
+    row._outputSummary = buildOutputSummary(row);
   }
 }
 
@@ -1028,6 +1526,22 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
   logRows = [];
   aiEnabled = useAi !== false;
   smartGateEnabled = useSmartGate === true;
+  useBatchMode = false;
+
+  if (aiEnabled) {
+    sendStatus("Checking LangGraph server...");
+    try {
+      const serverCheck = await chrome.runtime.sendMessage({ type: "checkServer" });
+      if (serverCheck && serverCheck.online) {
+        useBatchMode = true;
+        sendStatus("LangGraph server online — using batch mode.");
+      } else {
+        sendStatus("LangGraph server offline — using per-row mode.");
+      }
+    } catch {
+      sendStatus("LangGraph server unreachable — using per-row mode.");
+    }
+  }
 
   if (filterCol && filterVal) {
     sendStatus(`Filtering ${filterCol} to "${filterVal}"...`);
@@ -1064,27 +1578,66 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
   }
 
   let summaryText = "";
-  if (logRows.length > 0) {
-    if (aiEnabled) {
+  if (logRows.length > 0 && aiEnabled) {
+    if (useBatchMode) {
+      const batchResult = await tryBatchAnalyze(logRows);
+      if (batchResult) {
+        const analyzedMap = new Map();
+        for (const a of batchResult.analyzed) {
+          analyzedMap.set(a._trackingNumber || "", a);
+        }
+        for (const row of logRows) {
+          const match = analyzedMap.get(row._trackingNumber || "");
+          if (match) {
+            row._actionRequired = match._actionRequired || "";
+            row._aiIssue = match._aiIssue || "";
+            row._aiRecommendation = match._aiRecommendation || "";
+            row._needsActionSheet = match._needsActionSheet;
+          }
+          finalizeActionSheetFlag(row);
+          row._inputSummary = buildInputSummary(row);
+          row._outputSummary = buildOutputSummary(row);
+          delete row._aiRawAnalysis;
+        }
+        summaryText = batchResult.summary || "";
+        sendStatus(`Batch analysis complete — ${logRows.length} shipments processed.`);
+      } else {
+        await fallbackPerRowAnalysis();
+        sendStatus(`Requesting AI summary for ${logRows.length} shipment(s)...`);
+        try {
+          const summaryResult = await chrome.runtime.sendMessage({
+            type: "summarizeAll",
+            payload: buildSummaryPayload(logRows),
+          });
+          if (summaryResult && summaryResult.text) summaryText = summaryResult.text;
+          else if (summaryResult && summaryResult.error)
+            summaryText = "Summary error: " + summaryResult.error;
+        } catch (e) {
+          summaryText = "Summary error: " + e.message;
+        }
+      }
+    } else {
       sendStatus(`Requesting AI summary for ${logRows.length} shipment(s)...`);
       try {
         const summaryResult = await chrome.runtime.sendMessage({
           type: "summarizeAll",
           payload: buildSummaryPayload(logRows),
         });
-        if (summaryResult && summaryResult.text) {
-          summaryText = summaryResult.text;
-        } else if (summaryResult && summaryResult.error) {
+        if (summaryResult && summaryResult.text) summaryText = summaryResult.text;
+        else if (summaryResult && summaryResult.error)
           summaryText = "Summary error: " + summaryResult.error;
-        }
       } catch (e) {
         summaryText = "Summary error: " + e.message;
       }
     }
+  }
 
+  if (logRows.length > 0) {
     sendStatus(`Downloading XLSX with ${logRows.length} row(s)...`);
     downloadXLSX(logRows, summaryText);
   }
+
+  try { chrome.storage.local.remove("_fpxCheckpoint"); } catch {}
 
   const actionCount = logRows.filter((r) => r._needsActionSheet === true).length;
   try {
