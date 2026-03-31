@@ -336,12 +336,13 @@ let gpBizDate = null;
 function fetchGpDate() {
   gpDateInfo.textContent = "Fetching last business day...";
   chrome.runtime.sendMessage({ type: "fetchNtpDate" }, (res) => {
-    if (chrome.runtime.lastError || !res || res.error) {
-      gpDateInfo.textContent = "Could not fetch date: " + (res?.error || "unknown error");
+    if (chrome.runtime.lastError || !res) {
+      gpDateInfo.textContent = "Could not fetch date. Please retry.";
       return;
     }
     gpBizDate = res.date;
-    gpDateInfo.textContent = `Auditing: ${res.date} (last business day)`;
+    const src = res.source === "local" ? " (local clock)" : "";
+    gpDateInfo.textContent = `Auditing: ${res.date} (last business day)${src}`;
   });
 }
 

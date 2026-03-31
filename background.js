@@ -302,14 +302,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   } else if (msg.type === "fetchNtpDate") {
     (async () => {
-      try {
-        const resp = await fetch(
-          "https://worldtimeapi.org/api/timezone/America/New_York",
-          { signal: AbortSignal.timeout(5000) }
-        );
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
-        const today = new Date(data.datetime);
+      function calcLastBizDay(today) {
         const day = today.getDay();
         const offset = day === 0 ? 2 : day === 1 ? 3 : day === 6 ? 1 : 1;
         const bizDate = new Date(today);
@@ -317,10 +310,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const mm = String(bizDate.getMonth() + 1).padStart(2, "0");
         const dd = String(bizDate.getDate()).padStart(2, "0");
         const yyyy = bizDate.getFullYear();
-        sendResponse({ date: `${mm}/${dd}/${yyyy}`, iso: bizDate.toISOString().slice(0, 10) });
-      } catch (e) {
-        sendResponse({ error: e.message });
+        return { date: `${mm}/${dd}/${yyyy}`, iso: bizDate.toISOString().slice(0, 10) };
       }
+
+      let today;
+      let source = "ntp";
+      try {
+        const resp = await fetch(
+          "https://worldtimeapi.org/api/timezone/America/New_York",
+          { signal: AbortSignal.timeout(5000) }
+        );
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        today = new Date(data.datetime);
+      } catch {
+        today = new Date();
+        source = "local";
+        console.log("[FPX] NTP fetch failed, falling back to local time");
+      }
+
+      const result = calcLastBizDay(today);
+      result.source = source;
+      sendResponse(result);
     })();
     return true;
   } else if (msg.type === "startServer") {
