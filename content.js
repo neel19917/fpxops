@@ -2027,40 +2027,35 @@ async function gpAuditRun(bizDate) {
   }
   await sleep(500);
 
-  if (dateFields.from && !dateFields.from.value) {
-    sendGpStatus("Retrying FROM DATE with angular model...");
-    const scope = window.angular && window.angular.element(dateFields.from).scope();
-    if (scope) {
-      const modelAttr = dateFields.from.getAttribute("ng-model") || dateFields.from.getAttribute("data-ng-model");
-      if (modelAttr) {
-        const keys = modelAttr.split(".");
-        let target = scope;
-        for (let i = 0; i < keys.length - 1; i++) target = target[keys[i]];
-        target[keys[keys.length - 1]] = bizDate;
-        scope.$apply();
-        sendGpStatus("Set FROM via Angular model: " + modelAttr);
+  function retryDateFill(input, label) {
+    if (!input || input.value) return;
+    const parts = bizDate.split("/");
+    const isoVal = `${parts[2]}-${parts[0]}-${parts[1]}`;
+    const valForType = input.type === "date" ? isoVal : bizDate;
+
+    sendGpStatus(`Retrying ${label} with angular model...`);
+    try {
+      const scope = window.angular && window.angular.element(input).scope();
+      if (scope) {
+        const modelAttr = input.getAttribute("ng-model") || input.getAttribute("data-ng-model");
+        if (modelAttr) {
+          const keys = modelAttr.split(".");
+          let target = scope;
+          for (let i = 0; i < keys.length - 1; i++) target = target[keys[i]];
+          target[keys[keys.length - 1]] = valForType;
+          scope.$apply();
+          sendGpStatus(`Set ${label} via Angular model: ${modelAttr}`);
+        }
       }
+    } catch (e) {
+      console.log("[FPX-GP] Angular retry failed:", e.message);
     }
-    dateFields.from.value = bizDate;
-    dateFields.from.dispatchEvent(new Event("change", { bubbles: true }));
+    input.value = valForType;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
   }
-  if (dateFields.to && !dateFields.to.value) {
-    sendGpStatus("Retrying TO DATE with angular model...");
-    const scope = window.angular && window.angular.element(dateFields.to).scope();
-    if (scope) {
-      const modelAttr = dateFields.to.getAttribute("ng-model") || dateFields.to.getAttribute("data-ng-model");
-      if (modelAttr) {
-        const keys = modelAttr.split(".");
-        let target = scope;
-        for (let i = 0; i < keys.length - 1; i++) target = target[keys[i]];
-        target[keys[keys.length - 1]] = bizDate;
-        scope.$apply();
-        sendGpStatus("Set TO via Angular model: " + modelAttr);
-      }
-    }
-    dateFields.to.value = bizDate;
-    dateFields.to.dispatchEvent(new Event("change", { bubbles: true }));
-  }
+
+  retryDateFill(dateFields.from, "FROM DATE");
+  retryDateFill(dateFields.to, "TO DATE");
   await sleep(500);
 
   sendGpStatus("Clicking CONTINUE...");
