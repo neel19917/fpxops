@@ -1784,25 +1784,46 @@ function scrapeTransactionGrid() {
 }
 
 function setDateInput(input, dateStr) {
-  const kendoWidget = window.jQuery && window.jQuery(input).data("kendoDatePicker");
-  if (kendoWidget) {
-    const parts = dateStr.split("/");
-    const dateObj = new Date(+parts[2], +parts[0] - 1, +parts[1]);
-    kendoWidget.value(dateObj);
-    kendoWidget.trigger("change");
-    console.log("[FPX-GP] Set Kendo datepicker to", dateStr);
-    return;
+  const parts = dateStr.split("/");
+  const mm = parts[0], dd = parts[1], yyyy = parts[2];
+  const isoDate = `${yyyy}-${mm}-${dd}`;
+  const dateObj = new Date(+yyyy, +mm - 1, +dd);
+
+  try {
+    const kendoWidget = window.jQuery && window.jQuery(input).data("kendoDatePicker");
+    if (kendoWidget) {
+      kendoWidget.value(dateObj);
+      kendoWidget.trigger("change");
+      console.log("[FPX-GP] Set via Kendo API:", dateStr);
+      return;
+    }
+  } catch (e) {
+    console.log("[FPX-GP] Kendo API failed, trying direct:", e.message);
   }
 
+  const valueToSet = input.type === "date" ? isoDate : dateStr;
+
   input.focus();
-  const nativeSetter = Object.getOwnPropertyDescriptor(
-    window.HTMLInputElement.prototype, "value"
-  ).set;
-  nativeSetter.call(input, dateStr);
+  try {
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, "value"
+    ).set;
+    nativeSetter.call(input, valueToSet);
+  } catch {
+    input.value = valueToSet;
+  }
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+  input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "0" }));
   input.blur();
+
+  if (!input.value) {
+    input.setAttribute("value", valueToSet);
+    input.value = valueToSet;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  console.log("[FPX-GP] setDateInput:", input.type, "value after:", input.value, "target:", valueToSet);
 }
 
 function gpDownloadXLSX(rows, stats, bizDate) {
@@ -1870,45 +1891,78 @@ function gpDownloadXLSX(rows, stats, bizDate) {
   URL.revokeObjectURL(url);
 }
 
+function getNearbyLabelText(input) {
+  const row = input.closest("tr");
+  if (row) return row.textContent.toUpperCase().replace(/\s+/g, " ");
+
+  const formGroup = input.closest(".form-group, .control-group");
+  if (formGroup) return formGroup.textContent.toUpperCase().replace(/\s+/g, " ");
+
+  const parent = input.parentElement;
+  if (parent) {
+    const prev = parent.previousElementSibling;
+    if (prev) return prev.textContent.toUpperCase().replace(/\s+/g, " ");
+  }
+
+  const td = input.closest("td");
+  if (td) {
+    const prevTd = td.previousElementSibling;
+    if (prevTd) return prevTd.textContent.toUpperCase().replace(/\s+/g, " ");
+  }
+
+  return "";
+}
+
 function findDateInputs() {
   const result = { from: null, to: null };
+  const candidates = [];
 
-  const allInputs = document.querySelectorAll("input");
+  const allInputs = document.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='submit']):not([type='button'])");
+
   for (const input of allInputs) {
-    if (input.type === "hidden" || input.type === "checkbox" || input.type === "submit") continue;
+    if (!isVisibleForClick(input)) continue;
+
     const ph = (input.placeholder || "").toLowerCase();
     const name = (input.name || "").toLowerCase();
     const id = (input.id || "").toLowerCase();
-    const ariaLabel = (input.getAttribute("aria-label") || "").toLowerCase();
 
-    const labelEl = input.closest("td, div, .form-group, tr");
-    const parentText = labelEl ? labelEl.textContent.toUpperCase().replace(/\s+/g, " ") : "";
-
-    const isDateField = ph.includes("mm/dd") || ph.includes("mm-dd") ||
-      ph.includes("date") || input.type === "date" ||
+    const isDateField =
+      input.type === "date" ||
+      ph.includes("mm/dd") || ph.includes("mm-dd") || ph.includes("date") ||
       name.includes("date") || id.includes("date") ||
-      ariaLabel.includes("date") ||
       input.closest("[data-role='datepicker']") ||
-      input.closest(".k-datepicker");
+      input.closest(".k-datepicker") ||
+      input.closest(".k-widget.k-datepicker");
 
     if (!isDateField) continue;
+    candidates.push(input);
+  }
 
-    if (!result.from && (parentText.includes("FROM") || name.includes("from") || id.includes("from"))) {
+  console.log("[FPX-GP] findDateInputs: found", candidates.length, "date-like inputs");
+
+  for (const input of candidates) {
+    const label = getNearbyLabelText(input);
+    const name = (input.name || "").toLowerCase();
+    const id = (input.id || "").toLowerCase();
+    console.log("[FPX-GP]   candidate:", input.type, "id='" + input.id + "' name='" + input.name + "' nearby='" + label.slice(0, 60) + "'");
+
+    if (!result.from && (label.includes("FROM") || name.includes("from") || id.includes("from") || name.includes("start"))) {
       result.from = input;
-    } else if (!result.to && (parentText.includes("TO") || name.includes("to") || id.includes("to"))) {
+    } else if (!result.to && (label.includes("TO DATE") || label.includes("TO:") || name.includes("to") || id.includes("to") || name.includes("end"))) {
       result.to = input;
     }
   }
 
-  if (!result.from || !result.to) {
-    const datePickers = document.querySelectorAll(
-      "input[data-role='datepicker'], .k-datepicker input, input[placeholder*='mm/dd'], input[placeholder*='mm-dd']"
-    );
-    const arr = [...datePickers];
-    if (!result.from && arr.length >= 1) result.from = arr[0];
-    if (!result.to && arr.length >= 2) result.to = arr[1];
+  if ((!result.from || !result.to) && candidates.length >= 2) {
+    console.log("[FPX-GP] Using positional fallback for date inputs");
+    if (!result.from) result.from = candidates[0];
+    if (!result.to) result.to = candidates[1];
+  } else if ((!result.from || !result.to) && candidates.length === 1) {
+    if (!result.from) result.from = candidates[0];
+    if (!result.to) result.to = candidates[0];
   }
 
+  console.log("[FPX-GP] Final: from=", result.from?.id || result.from?.name || "?", "to=", result.to?.id || result.to?.name || "?");
   return result;
 }
 
@@ -1955,31 +2009,55 @@ async function gpAuditRun(bizDate) {
   sendGpStatus("Filling date fields with " + bizDate + "...");
 
   const dateFields = findDateInputs();
+  if (!dateFields.from && !dateFields.to) {
+    sendGpStatus("ERROR: Could not find any date inputs on this page. Check that the Generate History Report dialog is open.");
+    sendGpComplete("Failed — no date inputs found.");
+    return;
+  }
+
   if (dateFields.from) {
     setDateInput(dateFields.from, bizDate);
-    sendGpStatus("Set FROM DATE to " + bizDate);
-  } else {
-    sendGpStatus("WARNING: Could not find FROM DATE input");
+    sendGpStatus("Set FROM DATE to " + bizDate + " (value: " + dateFields.from.value + ")");
   }
-  await sleep(300);
+  await sleep(500);
 
   if (dateFields.to) {
     setDateInput(dateFields.to, bizDate);
-    sendGpStatus("Set TO DATE to " + bizDate);
-  } else {
-    sendGpStatus("WARNING: Could not find TO DATE input");
+    sendGpStatus("Set TO DATE to " + bizDate + " (value: " + dateFields.to.value + ")");
   }
   await sleep(500);
 
   if (dateFields.from && !dateFields.from.value) {
-    sendGpStatus("Retrying FROM DATE with direct value...");
-    dateFields.from.setAttribute("value", bizDate);
+    sendGpStatus("Retrying FROM DATE with angular model...");
+    const scope = window.angular && window.angular.element(dateFields.from).scope();
+    if (scope) {
+      const modelAttr = dateFields.from.getAttribute("ng-model") || dateFields.from.getAttribute("data-ng-model");
+      if (modelAttr) {
+        const keys = modelAttr.split(".");
+        let target = scope;
+        for (let i = 0; i < keys.length - 1; i++) target = target[keys[i]];
+        target[keys[keys.length - 1]] = bizDate;
+        scope.$apply();
+        sendGpStatus("Set FROM via Angular model: " + modelAttr);
+      }
+    }
     dateFields.from.value = bizDate;
     dateFields.from.dispatchEvent(new Event("change", { bubbles: true }));
   }
   if (dateFields.to && !dateFields.to.value) {
-    sendGpStatus("Retrying TO DATE with direct value...");
-    dateFields.to.setAttribute("value", bizDate);
+    sendGpStatus("Retrying TO DATE with angular model...");
+    const scope = window.angular && window.angular.element(dateFields.to).scope();
+    if (scope) {
+      const modelAttr = dateFields.to.getAttribute("ng-model") || dateFields.to.getAttribute("data-ng-model");
+      if (modelAttr) {
+        const keys = modelAttr.split(".");
+        let target = scope;
+        for (let i = 0; i < keys.length - 1; i++) target = target[keys[i]];
+        target[keys[keys.length - 1]] = bizDate;
+        scope.$apply();
+        sendGpStatus("Set TO via Angular model: " + modelAttr);
+      }
+    }
     dateFields.to.value = bizDate;
     dateFields.to.dispatchEvent(new Event("change", { bubbles: true }));
   }
