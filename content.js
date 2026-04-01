@@ -2050,10 +2050,6 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
     await sleep(3000);
   }
 
-  sendGpStatus("Selecting " + typeLabel + " tab...");
-  clickShipmentTypeTab(shipmentType);
-  await sleep(1500);
-
   sendGpStatus("Waiting for Generate History Report dialog...");
   let dialogFound = false;
   for (let wait = 0; wait < 20000; wait += 500) {
@@ -2083,6 +2079,11 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
   }
 
   await sleep(1000);
+
+  sendGpStatus("Selecting " + typeLabel + " tab...");
+  clickShipmentTypeTab(shipmentType);
+  await sleep(1500);
+
   sendGpStatus("Filling date fields with " + bizDate + "...");
 
   const dateFields = findDateInputs();
