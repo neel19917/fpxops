@@ -2080,10 +2080,6 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
 
   await sleep(1000);
 
-  sendGpStatus("Selecting " + typeLabel + " tab...");
-  clickShipmentTypeTab(shipmentType);
-  await sleep(1500);
-
   sendGpStatus("Filling date fields with " + bizDate + "...");
 
   const dateFields = findDateInputs();
@@ -2214,6 +2210,11 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
     sendGpStatus("No grid data loaded for " + typeLabel + ". The form may not have submitted.");
     return [];
   }
+
+  sendGpStatus("Selecting " + typeLabel + " tab...");
+  clickShipmentTypeTab(shipmentType);
+  await sleep(2000);
+  await waitForGridReady(5000);
 
   let allRows = [];
   let pageNum = 1;
