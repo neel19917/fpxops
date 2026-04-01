@@ -2058,6 +2058,45 @@ async function gpAuditRun(bizDate) {
   retryDateFill(dateFields.to, "TO DATE");
   await sleep(500);
 
+  sendGpStatus("Setting SELECT CUSTOMER to All Customers...");
+  const selects = document.querySelectorAll("select");
+  for (const sel of selects) {
+    const row = sel.closest("tr, div, .form-group");
+    const rowText = row ? row.textContent.toUpperCase() : "";
+    const name = (sel.name || "").toLowerCase();
+    const id = (sel.id || "").toLowerCase();
+
+    if (rowText.includes("CUSTOMER") || name.includes("customer") || id.includes("customer")) {
+      for (const opt of sel.options) {
+        if (/all\s*customers/i.test(opt.text)) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+          sendGpStatus("Set customer dropdown to: " + opt.text);
+          break;
+        }
+      }
+
+      try {
+        const kendoWidget = window.jQuery && window.jQuery(sel).data("kendoDropDownList");
+        if (kendoWidget) {
+          const ds = kendoWidget.dataSource.data();
+          for (let i = 0; i < ds.length; i++) {
+            if (/all\s*customers/i.test(ds[i].text || ds[i].Text || ds[i].Name || "")) {
+              kendoWidget.select(i);
+              kendoWidget.trigger("change");
+              sendGpStatus("Set customer via Kendo dropdown");
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        console.log("[FPX-GP] Kendo dropdown failed:", e.message);
+      }
+      break;
+    }
+  }
+  await sleep(500);
+
   sendGpStatus("Clicking CONTINUE...");
   let continueClicked = false;
   const buttons = document.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn, .btn");
