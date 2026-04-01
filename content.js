@@ -1662,6 +1662,44 @@ function sendGpComplete(text) {
   try { chrome.runtime.sendMessage({ type: "gpAuditComplete", text }); } catch {}
 }
 
+function normalizeRowKeys(row) {
+  const keyMap = {
+    "customerid": "Customer Id",
+    "customer_id": "Customer Id",
+    "CustomerId": "Customer Id",
+    "customername": "Customer Name",
+    "customer_name": "Customer Name",
+    "CustomerName": "Customer Name",
+    "shipmentid": "ShipmentID",
+    "shipment_id": "ShipmentID",
+    "ShipmentId": "ShipmentID",
+    "shipmentmarkeduprate": "Shipment Marked-Up Rate",
+    "ShipmentMarkedUpRate": "Shipment Marked-Up Rate",
+    "Shipment_Marked_Up_Rate": "Shipment Marked-Up Rate",
+    "shipmentratewithoutmarkup": "Shipment Rate without mark up",
+    "ShipmentRateWithoutMarkUp": "Shipment Rate without mark up",
+    "shipmentgrossprofit": "Shipment Gross Profit",
+    "ShipmentGrossProfit": "Shipment Gross Profit",
+    "Shipment_Gross_Profit": "Shipment Gross Profit",
+    "shippeddate": "Shipped Date",
+    "ShippedDate": "Shipped Date",
+    "Shipped_Date": "Shipped Date",
+    "originalmarkedupamount": "Original Marked-Up Amount",
+    "OriginalMarkedUpAmount": "Original Marked-Up Amount",
+    "ratechangeamount": "Rate Change Amount",
+    "RateChangeAmount": "Rate Change Amount",
+    "accountmanager": "Account Manager",
+    "AccountManager": "Account Manager",
+  };
+
+  const normalized = {};
+  for (const [key, val] of Object.entries(row)) {
+    const mapped = keyMap[key] || keyMap[key.replace(/[\s\-_]/g, "")] || key;
+    normalized[mapped] = val;
+  }
+  return normalized;
+}
+
 function gpComputeGpPct(grossProfit, markupRate) {
   const gp = parseFloat(grossProfit);
   const mr = parseFloat(markupRate);
@@ -1714,73 +1752,98 @@ function gpFlagOutliers(rows, stats) {
 }
 
 function scrapeTransactionGrid() {
-  const grid = document.querySelector(".k-grid, [kendo-grid], [data-role='grid']");
+  const $ = window.jQuery;
+
+  if ($) {
+    const gridEl = $(".k-grid").first();
+    const kendoGrid = gridEl.data("kendoGrid");
+    if (kendoGrid) {
+      const ds = kendoGrid.dataSource;
+      const total = ds.total();
+      const pageData = ds.data();
+      const rows = [];
+      const skipKeys = new Set(["_events", "uid", "dirty", "_handlers"]);
+
+      for (let i = 0; i < pageData.length; i++) {
+        const item = pageData[i];
+        const row = {};
+        for (const key of Object.keys(item)) {
+          if (skipKeys.has(key) || key.startsWith("_")) continue;
+          const val = item[key];
+          if (val === null || val === undefined || val === "") continue;
+          row[key] = typeof val === "object" ? JSON.stringify(val) : String(val);
+        }
+        if (Object.keys(row).length > 0) rows.push(row);
+      }
+      console.log("[FPX-GP] Kendo API: got", rows.length, "of", total, "total rows. Keys:", Object.keys(rows[0] || {}).join(", "));
+      return rows;
+    }
+  }
+
+  console.log("[FPX-GP] Kendo grid not found, falling back to DOM scrape");
+  const grid = document.querySelector(".k-grid");
   if (!grid) return [];
 
-  const lockedHeaderContainer = grid.querySelector(".k-grid-header-locked");
-  const scrollHeaderContainer = grid.querySelector(".k-grid-header-wrap") ||
-    grid.querySelector(".k-grid-header");
-
-  const lockedHeaders = [];
-  const scrollHeaders = [];
-
-  if (lockedHeaderContainer) {
-    for (const th of lockedHeaderContainer.querySelectorAll("th")) {
-      const link = th.querySelector("a.k-link");
-      lockedHeaders.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
-    }
+  const headers = [];
+  for (const th of grid.querySelectorAll("th")) {
+    const link = th.querySelector("a.k-link");
+    headers.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
   }
-
-  if (scrollHeaderContainer) {
-    for (const th of scrollHeaderContainer.querySelectorAll("th")) {
-      const link = th.querySelector("a.k-link");
-      scrollHeaders.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
-    }
-  }
-
-  const allHeaders = lockedHeaders.length > 0
-    ? [...lockedHeaders, ...scrollHeaders]
-    : [...scrollHeaders];
-
-  if (allHeaders.length === 0) {
-    for (const th of grid.querySelectorAll("th")) {
-      const link = th.querySelector("a.k-link");
-      allHeaders.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
-    }
-  }
-
-  const lockedBody = grid.querySelector(".k-grid-content-locked tbody");
-  const scrollBody = grid.querySelector(".k-grid-content tbody") ||
-    grid.querySelector("tbody");
-
-  const lockedRows = lockedBody ? [...lockedBody.querySelectorAll("tr")] : [];
-  const scrollRows = scrollBody ? [...scrollBody.querySelectorAll("tr")] : [];
-  const rowCount = Math.max(lockedRows.length, scrollRows.length);
 
   const rows = [];
-  for (let i = 0; i < rowCount; i++) {
-    const lockedTr = lockedRows[i];
-    const scrollTr = scrollRows[i];
-
-    if (lockedTr?.classList.contains("k-grouping-row") || lockedTr?.classList.contains("k-no-data")) continue;
-    if (scrollTr?.classList.contains("k-grouping-row") || scrollTr?.classList.contains("k-no-data")) continue;
-
-    const lockedCells = lockedTr ? [...lockedTr.querySelectorAll("td")] : [];
-    const scrollCells = scrollTr ? [...scrollTr.querySelectorAll("td")] : [];
-    const allCells = [...lockedCells, ...scrollCells];
-
+  for (const tr of grid.querySelectorAll("tbody tr")) {
+    if (tr.classList.contains("k-grouping-row") || tr.classList.contains("k-no-data")) continue;
+    const cells = tr.querySelectorAll("td");
     const row = {};
-    for (let c = 0; c < allCells.length && c < allHeaders.length; c++) {
-      const key = allHeaders[c];
-      if (!key) continue;
-      const val = (allCells[c].textContent || "").replace(/\s+/g, " ").trim();
-      if (val) row[key] = val;
+    for (let i = 0; i < cells.length && i < headers.length; i++) {
+      if (!headers[i]) continue;
+      const val = (cells[i].textContent || "").replace(/\s+/g, " ").trim();
+      if (val) row[headers[i]] = val;
     }
     if (Object.keys(row).length > 0) rows.push(row);
   }
-
-  console.log("[FPX-GP] Scraped", rows.length, "rows, headers:", allHeaders.join(", "));
+  console.log("[FPX-GP] DOM scrape:", rows.length, "rows");
   return rows;
+}
+
+function getKendoGridAllRows() {
+  const $ = window.jQuery;
+  if (!$) return null;
+
+  const gridEl = $(".k-grid").first();
+  const kendoGrid = gridEl.data("kendoGrid");
+  if (!kendoGrid) return null;
+
+  const ds = kendoGrid.dataSource;
+  const total = ds.total();
+  const pageSize = ds.pageSize();
+  const totalPages = ds.totalPages();
+
+  console.log("[FPX-GP] Kendo grid: total=" + total + " pageSize=" + pageSize + " pages=" + totalPages);
+
+  if (total <= 0) return [];
+
+  const allRows = [];
+  const skipKeys = new Set(["_events", "uid", "dirty", "_handlers"]);
+
+  for (let page = 1; page <= totalPages; page++) {
+    ds.page(page);
+    const pageData = ds.data();
+    for (let i = 0; i < pageData.length; i++) {
+      const item = pageData[i];
+      const row = {};
+      for (const key of Object.keys(item)) {
+        if (skipKeys.has(key) || key.startsWith("_")) continue;
+        const val = item[key];
+        if (val === null || val === undefined || val === "") continue;
+        row[key] = typeof val === "object" ? JSON.stringify(val) : String(val);
+      }
+      if (Object.keys(row).length > 0) allRows.push(row);
+    }
+  }
+
+  console.log("[FPX-GP] Kendo all-pages: got", allRows.length, "rows across", totalPages, "pages");
+  return allRows;
 }
 
 function setDateInput(input, dateStr) {
@@ -2012,6 +2075,11 @@ async function gpAuditRun(bizDate, shipmentType) {
 }
 
 function gpFinalize(allRows, bizDate) {
+  for (let i = 0; i < allRows.length; i++) {
+    allRows[i] = normalizeRowKeys(allRows[i]);
+  }
+  console.log("[FPX-GP] Normalized", allRows.length, "rows. Sample keys:", Object.keys(allRows[0] || {}).join(", "));
+
   const stats = gpComputeStats(allRows);
   gpFlagOutliers(allRows, stats);
 
@@ -2216,25 +2284,34 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
   await sleep(2000);
   await waitForGridReady(5000);
 
-  let allRows = [];
-  let pageNum = 1;
-  while (true) {
-    if (stopRequested) {
-      sendGpStatus("Stopped by user.");
-      return allRows;
-    }
-    sendGpStatus(`Scraping ${typeLabel} grid page ${pageNum}...`);
-    const pageRows = scrapeTransactionGrid();
-    sendGpStatus(`Page ${pageNum}: found ${pageRows.length} row(s).`);
-    allRows = allRows.concat(pageRows);
+  sendGpStatus("Reading " + typeLabel + " transaction data...");
 
-    const advanced = goToNextPage();
-    if (!advanced) break;
-    pageNum++;
-    await waitForGridReady(5000);
+  let allRows = getKendoGridAllRows();
+
+  if (allRows !== null) {
+    sendGpStatus(`Kendo API: got ${allRows.length} ${typeLabel} transaction(s).`);
+  } else {
+    sendGpStatus("Kendo API unavailable, scraping pages...");
+    allRows = [];
+    let pageNum = 1;
+    while (true) {
+      if (stopRequested) {
+        sendGpStatus("Stopped by user.");
+        return allRows;
+      }
+      sendGpStatus(`Scraping ${typeLabel} grid page ${pageNum}...`);
+      const pageRows = scrapeTransactionGrid();
+      sendGpStatus(`Page ${pageNum}: found ${pageRows.length} row(s).`);
+      allRows = allRows.concat(pageRows);
+
+      const advanced = goToNextPage();
+      if (!advanced) break;
+      pageNum++;
+      await waitForGridReady(5000);
+    }
   }
 
-  sendGpStatus(`Scraped ${allRows.length} ${typeLabel} transaction(s).`);
+  sendGpStatus(`Read ${allRows.length} ${typeLabel} transaction(s).`);
   return allRows;
 }
 
