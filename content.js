@@ -1966,9 +1966,82 @@ function findDateInputs() {
   return result;
 }
 
-async function gpAuditRun(bizDate) {
+function clickShipmentTypeTab(type) {
+  const navLinks = document.querySelectorAll("a, button, li, span, div[role='tab']");
+  for (const el of navLinks) {
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (type === "parcel" && /^parcel$/i.test(txt)) {
+      simulateClick(el);
+      return true;
+    }
+    if (type === "non-parcel" && /^non[\s-]?parcel$/i.test(txt)) {
+      simulateClick(el);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function gpAuditRun(bizDate, shipmentType) {
   stopRequested = false;
-  sendGpStatus("Starting GP Audit for " + bizDate + "...");
+
+  if (shipmentType === "all") {
+    sendGpStatus("Running GP Audit for ALL types (Non-Parcel + Parcel)...");
+    const nonParcelRows = await gpAuditSingleRun(bizDate, "non-parcel");
+    if (stopRequested) return;
+    const parcelRows = await gpAuditSingleRun(bizDate, "parcel");
+    if (stopRequested) return;
+
+    const allRows = [...(nonParcelRows || []), ...(parcelRows || [])];
+    if (allRows.length === 0) {
+      sendGpComplete("No transactions found for " + bizDate + ".");
+      return;
+    }
+    sendGpStatus(`Combined ${allRows.length} total transaction(s). Computing GP stats...`);
+    gpFinalize(allRows, bizDate);
+    return;
+  }
+
+  const rows = await gpAuditSingleRun(bizDate, shipmentType);
+  if (stopRequested) return;
+  if (!rows || rows.length === 0) {
+    sendGpComplete("No transactions found for " + bizDate + ".");
+    return;
+  }
+  gpFinalize(rows, bizDate);
+}
+
+function gpFinalize(allRows, bizDate) {
+  const stats = gpComputeStats(allRows);
+  gpFlagOutliers(allRows, stats);
+
+  const outliers = allRows.filter((r) => r._isOutlier);
+  sendGpStatus(`Found ${outliers.length} outlier(s) across ${stats.size} customer(s).`);
+
+  const outlierSummary = outliers.map((r) => ({
+    customerId: r["Customer Id"] || "",
+    customerName: r["Customer Name"] || "",
+    shipmentId: r["ShipmentID"] || "",
+    gpPct: r._gpPct != null ? r._gpPct.toFixed(2) : "?",
+    mean: r._customerMean != null ? r._customerMean.toFixed(2) : "?",
+    deviation: r._deviation != null ? r._deviation.toFixed(2) : "?",
+  }));
+
+  try {
+    chrome.runtime.sendMessage({ type: "gpAuditOutliers", outliers: outlierSummary });
+  } catch {}
+
+  sendGpStatus("Downloading GP Audit XLSX...");
+  gpDownloadXLSX(allRows, stats, bizDate);
+
+  sendGpComplete(
+    `GP Audit done — ${allRows.length} transaction(s), ${stats.size} customer(s), ${outliers.length} outlier(s).`
+  );
+}
+
+async function gpAuditSingleRun(bizDate, shipmentType) {
+  const typeLabel = shipmentType === "parcel" ? "Parcel" : "Non-Parcel";
+  sendGpStatus("Starting GP Audit (" + typeLabel + ") for " + bizDate + "...");
 
   const currentUrl = window.location.href;
   if (!currentUrl.includes("Transactions")) {
@@ -1976,6 +2049,10 @@ async function gpAuditRun(bizDate) {
     window.location.hash = "#!/Transactions";
     await sleep(3000);
   }
+
+  sendGpStatus("Selecting " + typeLabel + " tab...");
+  clickShipmentTypeTab(shipmentType);
+  await sleep(1500);
 
   sendGpStatus("Waiting for Generate History Report dialog...");
   let dialogFound = false;
@@ -2133,18 +2210,18 @@ async function gpAuditRun(bizDate) {
   }
 
   if (!gridReady) {
-    sendGpComplete("No grid data loaded. The form may not have submitted — check dates.");
-    return;
+    sendGpStatus("No grid data loaded for " + typeLabel + ". The form may not have submitted.");
+    return [];
   }
 
   let allRows = [];
   let pageNum = 1;
   while (true) {
     if (stopRequested) {
-      sendGpComplete("Stopped by user.");
-      return;
+      sendGpStatus("Stopped by user.");
+      return allRows;
     }
-    sendGpStatus(`Scraping transaction grid page ${pageNum}...`);
+    sendGpStatus(`Scraping ${typeLabel} grid page ${pageNum}...`);
     const pageRows = scrapeTransactionGrid();
     sendGpStatus(`Page ${pageNum}: found ${pageRows.length} row(s).`);
     allRows = allRows.concat(pageRows);
@@ -2155,38 +2232,8 @@ async function gpAuditRun(bizDate) {
     await waitForGridReady(5000);
   }
 
-  sendGpStatus(`Scraped ${allRows.length} total transaction(s). Computing GP stats...`);
-
-  if (allRows.length === 0) {
-    sendGpComplete("No transactions found for " + bizDate + ".");
-    return;
-  }
-
-  const stats = gpComputeStats(allRows);
-  gpFlagOutliers(allRows, stats);
-
-  const outliers = allRows.filter((r) => r._isOutlier);
-  sendGpStatus(`Found ${outliers.length} outlier(s) across ${stats.size} customer(s).`);
-
-  const outlierSummary = outliers.map((r) => ({
-    customerId: r["Customer Id"] || "",
-    customerName: r["Customer Name"] || "",
-    shipmentId: r["ShipmentID"] || "",
-    gpPct: r._gpPct != null ? r._gpPct.toFixed(2) : "?",
-    mean: r._customerMean != null ? r._customerMean.toFixed(2) : "?",
-    deviation: r._deviation != null ? r._deviation.toFixed(2) : "?",
-  }));
-
-  try {
-    chrome.runtime.sendMessage({ type: "gpAuditOutliers", outliers: outlierSummary });
-  } catch {}
-
-  sendGpStatus("Downloading GP Audit XLSX...");
-  gpDownloadXLSX(allRows, stats, bizDate);
-
-  sendGpComplete(
-    `GP Audit done — ${allRows.length} transaction(s), ${stats.size} customer(s), ${outliers.length} outlier(s).`
-  );
+  sendGpStatus(`Scraped ${allRows.length} ${typeLabel} transaction(s).`);
+  return allRows;
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -2200,7 +2247,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     stopRequested = true;
     sendResponse({ ok: true });
   } else if (msg.action === "gpAudit") {
-    gpAuditRun(msg.bizDate);
+    gpAuditRun(msg.bizDate, msg.shipmentType);
     sendResponse({ ok: true });
   }
 });

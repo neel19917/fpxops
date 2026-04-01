@@ -455,6 +455,15 @@
   <div id="gpAuditTab" class="tab-content">
     <div id="gpDateInfo" class="gp-date-info">Fetching last business day...</div>
 
+    <div class="field">
+      <label for="gpShipmentType">Shipment Type</label>
+      <select id="gpShipmentType">
+        <option value="all">All (Parcel + Non-Parcel)</option>
+        <option value="non-parcel" selected>Non-Parcel</option>
+        <option value="parcel">Parcel</option>
+      </select>
+    </div>
+
     <div class="btn-row">
       <button id="gpStartBtn">Start GP Audit</button>
       <button id="gpStopBtn" disabled>Stop</button>

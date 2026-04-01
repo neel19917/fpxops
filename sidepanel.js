@@ -371,8 +371,10 @@ gpStartBtn.addEventListener("click", async () => {
   gpNoOutliers.classList.remove("visible");
   chrome.runtime.sendMessage({ type: "setRunning", running: true });
 
+  const shipmentType = document.getElementById("gpShipmentType").value;
+
   try {
-    await sendToTab("gpAudit", { bizDate: gpBizDate });
+    await sendToTab("gpAudit", { bizDate: gpBizDate, shipmentType });
   } catch (e) {
     gpStatus.textContent = "Error: " + e.message;
     setGpRunning(false);
