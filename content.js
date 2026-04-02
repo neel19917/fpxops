@@ -1778,82 +1778,13 @@ function kendoItemToRow(item, fieldMap) {
 
 function getKendoGridAllRows() {
   return new Promise((resolve) => {
-    const resultId = "_fpxKendoResult_" + Date.now();
+    let settled = false;
 
-    const script = document.createElement("script");
-    script.textContent = `
-      (function() {
-        var result = { rows: null, error: null };
-        try {
-          var $ = window.jQuery || window.$;
-          if (!$) throw new Error("jQuery not found");
-
-          var gridEl = $(".k-grid").first();
-          var kendoGrid = gridEl.data("kendoGrid");
-          if (!kendoGrid) throw new Error("kendoGrid widget not found");
-
-          var fieldMap = {};
-          var columns = kendoGrid.columns || [];
-          for (var c = 0; c < columns.length; c++) {
-            if (columns[c].field && columns[c].title) {
-              fieldMap[columns[c].field] = columns[c].title;
-            }
-          }
-
-          var ds = kendoGrid.dataSource;
-          var total = ds.total();
-          var totalPages = ds.totalPages();
-          var origPage = ds.page();
-          var allRows = [];
-          var skipKeys = { _events:1, uid:1, dirty:1, _handlers:1, __metadata:1 };
-
-          for (var page = 1; page <= totalPages; page++) {
-            if (ds.page() !== page) ds.page(page);
-            var pageData = ds.data();
-            for (var i = 0; i < pageData.length; i++) {
-              var item = pageData[i];
-              var row = {};
-              for (var key in item) {
-                if (!item.hasOwnProperty(key)) continue;
-                if (skipKeys[key] || key.charAt(0) === '_') continue;
-                var val = item[key];
-                if (val === null || val === undefined || val === '') continue;
-                var displayName = fieldMap[key] || key;
-                row[displayName] = (typeof val === 'object') ? JSON.stringify(val) : String(val);
-              }
-              if (Object.keys(row).length > 0) allRows.push(row);
-            }
-          }
-
-          if (origPage && origPage !== ds.page()) ds.page(origPage);
-
-          result.rows = allRows;
-          result.total = total;
-          result.fieldMap = fieldMap;
-        } catch(e) {
-          result.error = e.message;
-        }
-
-        var el = document.createElement('div');
-        el.id = '${resultId}';
-        el.style.display = 'none';
-        el.textContent = JSON.stringify(result);
-        document.body.appendChild(el);
-      })();
-    `;
-    document.head.appendChild(script);
-    script.remove();
-
-    setTimeout(() => {
-      const el = document.getElementById(resultId);
-      if (!el) {
-        console.log("[FPX-GP] Kendo inject: no result element found");
-        resolve(null);
-        return;
-      }
-      try {
-        const result = JSON.parse(el.textContent);
-        el.remove();
+    function onMessage(event) {
+      if (event.data && event.data.type === "_fpxKendoResult") {
+        window.removeEventListener("message", onMessage);
+        settled = true;
+        const result = event.data.payload;
 
         if (result.error) {
           console.log("[FPX-GP] Kendo inject error:", result.error);
@@ -1865,14 +1796,36 @@ function getKendoGridAllRows() {
         console.log("[FPX-GP] Field map:", JSON.stringify(result.fieldMap));
         if (result.rows.length > 0) {
           console.log("[FPX-GP] Sample keys:", Object.keys(result.rows[0]).join(", "));
+          console.log("[FPX-GP] Sample row:", JSON.stringify(result.rows[0]));
         }
         resolve(result.rows);
-      } catch (e) {
-        console.log("[FPX-GP] Kendo inject parse error:", e.message);
-        el.remove();
+      }
+    }
+
+    window.addEventListener("message", onMessage);
+
+    const script = document.createElement("script");
+    script.src = chrome.runtime.getURL("inject-kendo.js");
+    script.onload = () => script.remove();
+    script.onerror = () => {
+      console.log("[FPX-GP] Failed to load inject-kendo.js");
+      script.remove();
+      if (!settled) {
+        window.removeEventListener("message", onMessage);
+        settled = true;
         resolve(null);
       }
-    }, 500);
+    };
+    (document.head || document.documentElement).appendChild(script);
+
+    setTimeout(() => {
+      if (!settled) {
+        window.removeEventListener("message", onMessage);
+        settled = true;
+        console.log("[FPX-GP] Kendo inject timed out after 3s");
+        resolve(null);
+      }
+    }, 3000);
   });
 }
 

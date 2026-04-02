@@ -18,5 +18,9 @@
   },
   "background": {
     "service_worker": "background.js"
-  }
+  },
+  "web_accessible_resources": [{
+    "resources": ["inject-kendo.js"],
+    "matches": ["*://app.freightpop.com/*"]
+  }]
 }
