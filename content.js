@@ -1777,43 +1777,103 @@ function kendoItemToRow(item, fieldMap) {
 }
 
 function getKendoGridAllRows() {
-  const $ = window.jQuery;
-  if (!$) return null;
+  return new Promise((resolve) => {
+    const resultId = "_fpxKendoResult_" + Date.now();
 
-  const gridEl = $(".k-grid").first();
-  const kendoGrid = gridEl.data("kendoGrid");
-  if (!kendoGrid) return null;
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        var result = { rows: null, error: null };
+        try {
+          var $ = window.jQuery || window.$;
+          if (!$) throw new Error("jQuery not found");
 
-  const fieldMap = buildKendoFieldMap(kendoGrid);
-  const ds = kendoGrid.dataSource;
-  const total = ds.total();
-  const pageSize = ds.pageSize();
-  const totalPages = ds.totalPages();
-  const origPage = ds.page();
+          var gridEl = $(".k-grid").first();
+          var kendoGrid = gridEl.data("kendoGrid");
+          if (!kendoGrid) throw new Error("kendoGrid widget not found");
 
-  console.log("[FPX-GP] Kendo grid: total=" + total + " pageSize=" + pageSize + " pages=" + totalPages);
+          var fieldMap = {};
+          var columns = kendoGrid.columns || [];
+          for (var c = 0; c < columns.length; c++) {
+            if (columns[c].field && columns[c].title) {
+              fieldMap[columns[c].field] = columns[c].title;
+            }
+          }
 
-  if (total <= 0) return [];
+          var ds = kendoGrid.dataSource;
+          var total = ds.total();
+          var totalPages = ds.totalPages();
+          var origPage = ds.page();
+          var allRows = [];
+          var skipKeys = { _events:1, uid:1, dirty:1, _handlers:1, __metadata:1 };
 
-  const allRows = [];
+          for (var page = 1; page <= totalPages; page++) {
+            if (ds.page() !== page) ds.page(page);
+            var pageData = ds.data();
+            for (var i = 0; i < pageData.length; i++) {
+              var item = pageData[i];
+              var row = {};
+              for (var key in item) {
+                if (!item.hasOwnProperty(key)) continue;
+                if (skipKeys[key] || key.charAt(0) === '_') continue;
+                var val = item[key];
+                if (val === null || val === undefined || val === '') continue;
+                var displayName = fieldMap[key] || key;
+                row[displayName] = (typeof val === 'object') ? JSON.stringify(val) : String(val);
+              }
+              if (Object.keys(row).length > 0) allRows.push(row);
+            }
+          }
 
-  for (let page = 1; page <= totalPages; page++) {
-    if (ds.page() !== page) ds.page(page);
-    const pageData = ds.data();
-    for (let i = 0; i < pageData.length; i++) {
-      const row = kendoItemToRow(pageData[i], fieldMap);
-      if (Object.keys(row).length > 0) allRows.push(row);
-    }
-  }
+          if (origPage && origPage !== ds.page()) ds.page(origPage);
 
-  if (origPage && origPage !== ds.page()) ds.page(origPage);
+          result.rows = allRows;
+          result.total = total;
+          result.fieldMap = fieldMap;
+        } catch(e) {
+          result.error = e.message;
+        }
 
-  console.log("[FPX-GP] Kendo all-pages: got", allRows.length, "rows across", totalPages, "pages");
-  if (allRows.length > 0) {
-    console.log("[FPX-GP] Sample row keys:", Object.keys(allRows[0]).join(", "));
-    console.log("[FPX-GP] Sample row:", JSON.stringify(allRows[0]));
-  }
-  return allRows;
+        var el = document.createElement('div');
+        el.id = '${resultId}';
+        el.style.display = 'none';
+        el.textContent = JSON.stringify(result);
+        document.body.appendChild(el);
+      })();
+    `;
+    document.head.appendChild(script);
+    script.remove();
+
+    setTimeout(() => {
+      const el = document.getElementById(resultId);
+      if (!el) {
+        console.log("[FPX-GP] Kendo inject: no result element found");
+        resolve(null);
+        return;
+      }
+      try {
+        const result = JSON.parse(el.textContent);
+        el.remove();
+
+        if (result.error) {
+          console.log("[FPX-GP] Kendo inject error:", result.error);
+          resolve(null);
+          return;
+        }
+
+        console.log("[FPX-GP] Kendo inject: got", result.rows.length, "of", result.total, "total rows");
+        console.log("[FPX-GP] Field map:", JSON.stringify(result.fieldMap));
+        if (result.rows.length > 0) {
+          console.log("[FPX-GP] Sample keys:", Object.keys(result.rows[0]).join(", "));
+        }
+        resolve(result.rows);
+      } catch (e) {
+        console.log("[FPX-GP] Kendo inject parse error:", e.message);
+        el.remove();
+        resolve(null);
+      }
+    }, 500);
+  });
 }
 
 function setDateInput(input, dateStr) {
@@ -2256,7 +2316,7 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
 
   sendGpStatus("Reading " + typeLabel + " transaction data...");
 
-  let allRows = getKendoGridAllRows();
+  let allRows = await getKendoGridAllRows();
 
   if (allRows !== null) {
     sendGpStatus(`Kendo API: got ${allRows.length} ${typeLabel} transaction(s).`);
