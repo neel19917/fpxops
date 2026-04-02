@@ -1751,59 +1751,29 @@ function gpFlagOutliers(rows, stats) {
   return rows;
 }
 
-function scrapeTransactionGrid() {
-  const $ = window.jQuery;
-
-  if ($) {
-    const gridEl = $(".k-grid").first();
-    const kendoGrid = gridEl.data("kendoGrid");
-    if (kendoGrid) {
-      const ds = kendoGrid.dataSource;
-      const total = ds.total();
-      const pageData = ds.data();
-      const rows = [];
-      const skipKeys = new Set(["_events", "uid", "dirty", "_handlers"]);
-
-      for (let i = 0; i < pageData.length; i++) {
-        const item = pageData[i];
-        const row = {};
-        for (const key of Object.keys(item)) {
-          if (skipKeys.has(key) || key.startsWith("_")) continue;
-          const val = item[key];
-          if (val === null || val === undefined || val === "") continue;
-          row[key] = typeof val === "object" ? JSON.stringify(val) : String(val);
-        }
-        if (Object.keys(row).length > 0) rows.push(row);
-      }
-      console.log("[FPX-GP] Kendo API: got", rows.length, "of", total, "total rows. Keys:", Object.keys(rows[0] || {}).join(", "));
-      return rows;
+function buildKendoFieldMap(kendoGrid) {
+  const fieldToTitle = {};
+  const columns = kendoGrid.columns || [];
+  for (const col of columns) {
+    if (col.field && col.title) {
+      fieldToTitle[col.field] = col.title;
     }
   }
+  console.log("[FPX-GP] Kendo column map:", JSON.stringify(fieldToTitle));
+  return fieldToTitle;
+}
 
-  console.log("[FPX-GP] Kendo grid not found, falling back to DOM scrape");
-  const grid = document.querySelector(".k-grid");
-  if (!grid) return [];
-
-  const headers = [];
-  for (const th of grid.querySelectorAll("th")) {
-    const link = th.querySelector("a.k-link");
-    headers.push((link ? link.textContent : th.textContent || "").replace(/\s+/g, " ").trim());
+function kendoItemToRow(item, fieldMap) {
+  const skipKeys = new Set(["_events", "uid", "dirty", "_handlers", "__metadata"]);
+  const row = {};
+  for (const key of Object.keys(item)) {
+    if (skipKeys.has(key) || key.startsWith("_")) continue;
+    const val = item[key];
+    if (val === null || val === undefined || val === "") continue;
+    const displayName = fieldMap[key] || key;
+    row[displayName] = typeof val === "object" ? JSON.stringify(val) : String(val);
   }
-
-  const rows = [];
-  for (const tr of grid.querySelectorAll("tbody tr")) {
-    if (tr.classList.contains("k-grouping-row") || tr.classList.contains("k-no-data")) continue;
-    const cells = tr.querySelectorAll("td");
-    const row = {};
-    for (let i = 0; i < cells.length && i < headers.length; i++) {
-      if (!headers[i]) continue;
-      const val = (cells[i].textContent || "").replace(/\s+/g, " ").trim();
-      if (val) row[headers[i]] = val;
-    }
-    if (Object.keys(row).length > 0) rows.push(row);
-  }
-  console.log("[FPX-GP] DOM scrape:", rows.length, "rows");
-  return rows;
+  return row;
 }
 
 function getKendoGridAllRows() {
@@ -1814,35 +1784,35 @@ function getKendoGridAllRows() {
   const kendoGrid = gridEl.data("kendoGrid");
   if (!kendoGrid) return null;
 
+  const fieldMap = buildKendoFieldMap(kendoGrid);
   const ds = kendoGrid.dataSource;
   const total = ds.total();
   const pageSize = ds.pageSize();
   const totalPages = ds.totalPages();
+  const origPage = ds.page();
 
   console.log("[FPX-GP] Kendo grid: total=" + total + " pageSize=" + pageSize + " pages=" + totalPages);
 
   if (total <= 0) return [];
 
   const allRows = [];
-  const skipKeys = new Set(["_events", "uid", "dirty", "_handlers"]);
 
   for (let page = 1; page <= totalPages; page++) {
-    ds.page(page);
+    if (ds.page() !== page) ds.page(page);
     const pageData = ds.data();
     for (let i = 0; i < pageData.length; i++) {
-      const item = pageData[i];
-      const row = {};
-      for (const key of Object.keys(item)) {
-        if (skipKeys.has(key) || key.startsWith("_")) continue;
-        const val = item[key];
-        if (val === null || val === undefined || val === "") continue;
-        row[key] = typeof val === "object" ? JSON.stringify(val) : String(val);
-      }
+      const row = kendoItemToRow(pageData[i], fieldMap);
       if (Object.keys(row).length > 0) allRows.push(row);
     }
   }
 
+  if (origPage && origPage !== ds.page()) ds.page(origPage);
+
   console.log("[FPX-GP] Kendo all-pages: got", allRows.length, "rows across", totalPages, "pages");
+  if (allRows.length > 0) {
+    console.log("[FPX-GP] Sample row keys:", Object.keys(allRows[0]).join(", "));
+    console.log("[FPX-GP] Sample row:", JSON.stringify(allRows[0]));
+  }
   return allRows;
 }
 
