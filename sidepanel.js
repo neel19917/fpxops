@@ -17,6 +17,11 @@ const saveStatusEl = document.getElementById("saveStatus");
 const apiBadge = document.getElementById("apiBadge");
 const costBadge = document.getElementById("costBadge");
 const serverBadge = document.getElementById("serverBadge");
+const serverCtrl = document.getElementById("serverCtrl");
+const serverToggleBtn = document.getElementById("serverToggleBtn");
+const serverInfo = document.getElementById("serverInfo");
+const serverSub = document.getElementById("serverSub");
+const serverHint = document.getElementById("serverHint");
 const aiSummarySection = document.getElementById("aiSummarySection");
 const aiSummaryText = document.getElementById("aiSummaryText");
 const progressBar = document.getElementById("progressBar");
@@ -113,23 +118,46 @@ costBadge.addEventListener("click", () => {
   }
 });
 
-// --- API server health check (Railway) ---
+// --- API server health + (for localhost) Start/Stop control -----------------
 
-function updateServerStatus(online, version, uptime) {
-  if (online) {
-    const uptimeStr = uptime != null ? ` (up ${formatUptime(uptime)})` : "";
-    serverBadge.className = "server-badge online";
-    serverBadge.innerHTML = `<span class="dot"></span> API v${version || "?"}${uptimeStr}`;
-  } else {
-    serverBadge.className = "server-badge offline";
-    serverBadge.innerHTML = '<span class="dot"></span> API offline';
-  }
-}
+let serverOnline = false;
+let isLocalApi = false;
+let busy = false;
 
 function formatUptime(seconds) {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
   return `${(seconds / 3600).toFixed(1)}h`;
+}
+
+function setBtn(label, cls, disabled) {
+  if (!serverToggleBtn) return;
+  serverToggleBtn.textContent = label;
+  serverToggleBtn.className = cls;
+  serverToggleBtn.disabled = !!disabled;
+}
+
+function updateServerStatus(online, version, uptime) {
+  serverOnline = online;
+  if (online) {
+    const uptimeStr = uptime != null ? ` (up ${formatUptime(uptime)})` : "";
+    serverBadge.className = "server-badge online";
+    serverBadge.innerHTML = `<span class="dot"></span> API v${version || "?"}${uptimeStr}`;
+    if (isLocalApi) {
+      serverInfo.textContent = uptimeStr;
+      serverSub.textContent = "Server is running. Click Stop to shut it down when you're done.";
+      setBtn("Stop", "stop", busy);
+      serverHint.classList.remove("visible");
+    }
+  } else {
+    serverBadge.className = "server-badge offline";
+    serverBadge.innerHTML = '<span class="dot"></span> API offline';
+    if (isLocalApi) {
+      serverInfo.textContent = "";
+      serverSub.textContent = "Click Start to launch the Node server on your machine.";
+      setBtn("Start", "start", busy);
+    }
+  }
 }
 
 function checkServer() {
@@ -139,8 +167,61 @@ function checkServer() {
   });
 }
 
-checkServer();
-setInterval(checkServer, 30000);
+function refreshServerCard() {
+  chrome.runtime.sendMessage({ type: "getApiKey" }, (res) => {
+    if (chrome.runtime.lastError) return;
+    const url = (res && res.url) || "";
+    // Only show Start/Stop when the API URL is localhost — cloud deploys don't need it.
+    isLocalApi = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:|\/|$)/i.test(url);
+    if (serverCtrl) serverCtrl.hidden = !isLocalApi;
+  });
+  checkServer();
+}
+
+if (serverToggleBtn) {
+  serverToggleBtn.addEventListener("click", () => {
+    if (busy) return;
+    busy = true;
+    if (serverOnline) {
+      setBtn("Stopping…", "stop", true);
+      chrome.runtime.sendMessage({ type: "stopServer" }, (res) => {
+        busy = false;
+        if (!res || res.ok === false) {
+          serverHint.textContent = (res && res.error) || "Couldn't stop the server. See install-native-host setup.";
+          serverHint.classList.add("visible");
+        }
+        setTimeout(checkServer, 600);
+      });
+    } else {
+      setBtn("Starting…", "start", true);
+      chrome.runtime.sendMessage({ type: "startServer" }, (res) => {
+        busy = false;
+        if (!res || res.ok === false) {
+          const err = (res && res.error) || "";
+          if (/native host|not installed|not found|disconnect/i.test(err)) {
+            serverHint.textContent = "The native host isn't installed yet. Double-click install-native-host.command (Mac) or install-native-host.bat (Windows) in the FPXpress folder, paste this extension's ID when asked, then reload the extension.";
+          } else {
+            serverHint.textContent = err || "Couldn't start the server.";
+          }
+          serverHint.classList.add("visible");
+          setBtn("Start", "start", false);
+          return;
+        }
+        // Give Node a moment to bind the port, then poll health.
+        setTimeout(checkServer, 1200);
+        setTimeout(checkServer, 2800);
+      });
+    }
+  });
+}
+
+refreshServerCard();
+setInterval(checkServer, 15000);
+
+// Re-evaluate when the popup saves a new URL/key.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "apiKeyUpdated") refreshServerCard();
+});
 
 // --- AI toggle persistence ---
 

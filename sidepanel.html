@@ -494,6 +494,19 @@
 
   <div id="trackingTab" class="tab-content active">
 
+  <div id="serverCtrl" class="server-ctrl" hidden>
+    <div style="flex:1;min-width:0;">
+      <div class="label">Local API server <span class="sub" id="serverInfo"></span></div>
+      <div class="sub" id="serverSub">Click Start to launch the Node server on your machine.</div>
+    </div>
+    <button id="serverToggleBtn" class="start" type="button">Start</button>
+  </div>
+  <div id="serverHint" class="server-hint">
+    First time? Double-click <b>install-native-host.command</b> (Mac) or
+    <b>install-native-host.bat</b> (Windows) in the FPXpress folder and paste
+    your extension ID when it asks. Then reload the extension.
+  </div>
+
   <div class="field">
     <label for="filterCol">Filter Column</label>
     <select id="filterCol">

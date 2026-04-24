@@ -66,6 +66,30 @@ function stopKeepalive() {
   if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
 }
 
+// ---------- Native host (local server control) ----------
+// Only used when the API URL is localhost — the extension can launch/stop the
+// node server via a native messaging host installed by install-native-host.command.
+const NATIVE_HOST = "com.fpxpress.server";
+
+function sendNativeMessage(action) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
+    try {
+      chrome.runtime.sendNativeMessage(NATIVE_HOST, { action }, (response) => {
+        if (chrome.runtime.lastError) {
+          done({ ok: false, error: chrome.runtime.lastError.message || "Native host unavailable" });
+          return;
+        }
+        done(response || { ok: false, error: "Empty native response" });
+      });
+    } catch (e) {
+      done({ ok: false, error: e && e.message || String(e) });
+    }
+    setTimeout(() => done({ ok: false, error: "Native host timeout" }), 8000);
+  });
+}
+
 // ---------- Prompts (still stored locally so users can tweak) ----------
 const DEFAULT_PROMPTS = {
   system:
@@ -338,5 +362,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   } else if (msg.type === "resetApiCost") {
     sessionCost = { inputTokens: 0, outputTokens: 0, totalUsd: 0, calls: 0 };
     sendResponse({ ok: true }); return;
+  } else if (msg.type === "startServer") {
+    sendNativeMessage("start").then(sendResponse); return true;
+  } else if (msg.type === "stopServer") {
+    sendNativeMessage("stop").then(sendResponse); return true;
+  } else if (msg.type === "serverStatus") {
+    sendNativeMessage("status").then(sendResponse); return true;
+  } else if (msg.type === "serverTailLog") {
+    sendNativeMessage("tail-log").then(sendResponse); return true;
   }
 });
