@@ -20,6 +20,33 @@ All AI calls are authenticated with `x-api-key`, logged to `fpx_ai_analyses`, an
 
 ## Setup
 
+The server can run anywhere — **localhost for team testing**, then **Railway
+(or any host)** when you go live. The extension and dashboard both just point
+at whatever URL you're using via a single env var.
+
+> **Teammates just testing?** Hand them [SETUP-TEAMMATE.md](./SETUP-TEAMMATE.md)
+> — a zipped copy of this folder with `server/.env` and `config.js` pre-filled.
+> They double-click `start-server.command` (Mac) or `start-server.bat` (Windows)
+> and they're running.
+
+### Local / self-hosted quick path
+
+```bash
+git clone https://github.com/neel19917/fpxops.git
+cd fpxops/server
+cp .env.example .env   # edit with your keys
+npm install
+npm start              # listens on http://localhost:3210 by default
+```
+
+Mint your first key (admin scope):
+```bash
+npm run create-key -- "bootstrap" read,write,admin
+```
+
+Point the extension's `config.js` and the dashboard's setup dialog at
+`http://localhost:3210`. Done.
+
 ### 1 · Deploy the server to Railway
 
 ```bash
