@@ -1,80 +1,44 @@
-# FPXpress — Teammate Setup (localhost testing)
+# FPXpress — Teammate Setup
 
-Run the API server on your own machine. The Chrome extension talks to it over
-`http://localhost:3210`. All shipment + AI data is written to the shared
-Supabase — so what you scrape is visible in the team dashboard.
+The FPX API runs in the cloud on Railway. You just need to install the Chrome
+extension and paste a key — no server to run, no terminal to keep open.
 
-## One-time setup (5 min)
+## One-time setup (2 min)
 
-1. **Install Node.js 20+** from https://nodejs.org (pick the LTS installer).
-2. **Unzip FPXpress** to a permanent folder, e.g. `~/FPXpress` or `C:\FPXpress`.
-3. **Check the `server/.env` file** — your admin will have pre-filled it with the
-   shared Anthropic + Supabase keys. If it's missing:
-   - Copy `server/.env.example` to `server/.env`
-   - Ask your admin for the values.
-4. **Check `config.js`** — it should have your personal FPX API key pre-set:
+1. **Unzip FPXpress** to a permanent folder (e.g. `~/FPXpress` or `C:\FPXpress`).
+
+2. **Open `config.js`** in any text editor. It should already have:
    ```js
-   const FPX_API_URL = "http://localhost:3210";
+   const FPX_API_URL = "https://YOUR-APP.up.railway.app";
    const FPX_API_KEY = "fpx_live_...";
    ```
-   If it's missing or shows `YOUR_FPX_API_KEY_HERE`, ask your admin for a key.
+   If the key is still `YOUR_FPX_API_KEY_HERE`, ask your admin for a key.
 
-### Load the Chrome extension
-1. Open `chrome://extensions`
-2. Toggle **Developer mode** (top-right)
-3. Click **Load unpacked** → pick the FPXpress folder
-4. Pin the extension to your toolbar
-5. **Copy your extension ID** — the long string under "FPXpress" (looks like
-   `abcdefghijklmnopqrstuvwxyzabcdef`). You'll paste it in the next step.
+3. **Load the extension**
+   - Open `chrome://extensions`
+   - Toggle **Developer mode** (top-right)
+   - Click **Load unpacked** → pick the FPXpress folder
+   - Pin the extension to your toolbar
 
-### Register the "Start Server" button (one-time)
-- **Mac**: double-click `install-native-host.command`. If macOS blocks it,
-  right-click → Open → Open. Paste the extension ID when it asks.
-- **Windows**: double-click `install-native-host.bat`. Paste the extension ID.
+4. **Verify** — click the FPXpress icon. You should see:
+   - 🟢 **API Key OK**
+   - 🟢 **API v2.0.0 (up Xs)**
 
-This installs a tiny helper so the extension's **Start Server** button can
-launch the Node server on your machine. You only do this once.
-
-### Fallback: start the server from the terminal
-If you skip the native-host install, you can still run the server manually:
-- **Mac**: double-click `start-server.command`
-- **Windows**: double-click `start-server.bat`
-
-Keep that terminal window open. With the native host installed, you don't
-need to.
+If the badge is red: click it → paste the URL and key → Save.
 
 ## Daily use
 
-1. Open the FreightPOP app and click the FPXpress extension icon.
-2. In the side panel, click **Start Server** (green button). Wait ~2s — badge
-   flips to 🟢 API v2.0.0.
-3. Run a refresh / GP audit / invoice audit. Results appear in the shared
-   dashboard within seconds.
-4. When you're done for the day, click **Stop** (or leave it running — it
-   uses negligible resources).
-
-### Verify it works
-Click the FPXpress icon. You should see:
-- 🟢 **API Key OK**
-- 🟢 **API v2.0.0 (up Xs)**
-
-If either shows red, either the server isn't running or your API key is wrong.
-
-### Use it
-Navigate to https://app.freightpop.com, click the extension icon, open the
-side panel, and run a refresh / GP audit / invoice audit like usual. Results
-will appear in the shared dashboard within seconds.
+Navigate to https://app.freightpop.com, open the FPXpress side panel, run a
+refresh / GP audit / invoice audit as usual. Data and AI analyses are written
+to the shared Supabase and show up in the team dashboard within seconds.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| "node is not installed" on start | Install from https://nodejs.org, then try again |
-| "API offline" in the extension | Terminal window closed — run `start-server.command` again |
-| "401 Invalid or revoked API key" | Your key was revoked. Ask admin for a new one and update `config.js` |
-| Port 3210 already in use | Edit `server/.env` → set `PORT=3211` (or another) and update `config.js` `FPX_API_URL` to match |
-| macOS: "can't be opened because it's from an unidentified developer" | Right-click `start-server.command` → Open → Open |
-| Start Server button shows "native host isn't installed" | Run `install-native-host.command` / `.bat` once, paste the extension ID, then reload the extension |
+| 🔴 No API Key | Click the badge, paste the URL + key your admin gave you |
+| "401 Invalid or revoked API key" | Your key was revoked. Ask admin for a new one |
+| API badge shows Offline | Railway is down or the URL is wrong — ask your admin |
 
 ## Where your data goes
 
@@ -84,3 +48,18 @@ will appear in the shared dashboard within seconds.
 - **GP / Invoice audits** → shared Supabase tables `fpx_gp_audits`, `fpx_invoice_audits`
 
 Everyone on the team sees the same dashboard.
+
+---
+
+## Optional: running the server locally (advanced)
+
+You don't need this for normal use — the cloud API handles everything. But if
+you need to debug or develop against the server, you can run it on your own
+machine:
+
+1. Install Node.js 20+ from https://nodejs.org
+2. Register the native host (one-time): double-click
+   `install-native-host.command` (Mac) or `install-native-host.bat` (Windows)
+   and paste your extension ID when asked.
+3. Update `config.js` to point at `http://localhost:3210`.
+4. Open the side panel → click **Start Server**.

@@ -20,32 +20,12 @@ All AI calls are authenticated with `x-api-key`, logged to `fpx_ai_analyses`, an
 
 ## Setup
 
-The server can run anywhere — **localhost for team testing**, then **Railway
-(or any host)** when you go live. The extension and dashboard both just point
-at whatever URL you're using via a single env var.
+The API server is deployed to **Railway**. The extension and dashboard both
+point at a single URL (`FPX_API_URL`). For teammates, this is the only path —
+no local server to run.
 
-> **Teammates just testing?** Hand them [SETUP-TEAMMATE.md](./SETUP-TEAMMATE.md)
-> — a zipped copy of this folder with `server/.env` and `config.js` pre-filled.
-> They double-click `start-server.command` (Mac) or `start-server.bat` (Windows)
-> and they're running.
-
-### Local / self-hosted quick path
-
-```bash
-git clone https://github.com/neel19917/fpxops.git
-cd fpxops/server
-cp .env.example .env   # edit with your keys
-npm install
-npm start              # listens on http://localhost:3210 by default
-```
-
-Mint your first key (admin scope):
-```bash
-npm run create-key -- "bootstrap" read,write,admin
-```
-
-Point the extension's `config.js` and the dashboard's setup dialog at
-`http://localhost:3210`. Done.
+> **Handing this to a teammate?** Send them the folder + [SETUP-TEAMMATE.md](./SETUP-TEAMMATE.md).
+> They load the extension, paste the API key, done.
 
 ### 1 · Deploy the server to Railway
 
@@ -155,6 +135,29 @@ DELETE /api-keys/:id   (soft-revoke)
 | **Refresh All Shipments** | Opens each shipment modal, scrapes fields, optionally runs AI per-shipment. Bulk-pushes all rows + logs every AI call to Supabase through the API |
 | **GP Audit** | Scrapes transaction history, computes GP% + outliers, optional AI exec summary |
 | **Invoice Audit** | Matches a carrier-bill XLSX against shipment costs; optional AI summary |
+
+---
+
+## Running the server locally (advanced / debugging)
+
+Not required for normal use — Railway handles everything. Only useful for
+developing the server itself:
+
+```bash
+cd server
+cp .env.example .env          # fill in keys
+npm install
+npm start                     # listens on http://localhost:3210 by default
+```
+
+Mint an admin key: `npm run create-key -- "admin" read,write,admin`.
+Point `config.js` at `http://localhost:3210` and reload the extension.
+
+The extension also supports a one-click Start/Stop button for the local
+server — register Chrome's native messaging host once with
+`install-native-host.command` (Mac) or `install-native-host.bat` (Windows).
+The side panel's "Local API server" card will appear whenever `FPX_API_URL`
+points at localhost.
 
 ---
 
