@@ -1,6 +1,14 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+
+// Surface crashes in Railway's deploy logs instead of silently exiting.
+process.on("uncaughtException", (e) => {
+  console.error("[FPX] uncaughtException:", e?.stack || e);
+});
+process.on("unhandledRejection", (e) => {
+  console.error("[FPX] unhandledRejection:", e?.stack || e);
+});
 import { ChatAnthropic } from "@langchain/anthropic";
 import { buildGraph } from "./graph.js";
 import { requireAuth, bootstrapAdminKey, bootstrapAdminEmail } from "./lib/auth.js";
@@ -119,10 +127,20 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: err.message || "Server error" });
 });
 
-app.listen(PORT, async () => {
-  console.log(`[FPX] API server running on :${PORT}`);
+const HOST = process.env.HOST || "0.0.0.0";
+const server = app.listen(PORT, HOST, () => {
+  console.log(`[FPX] API server listening on ${HOST}:${PORT}`);
   console.log(`[FPX] CORS origins: ${rawOrigins.join(", ") || "(none)"}`);
   if (!isDbReady()) console.warn("[FPX] ⚠️  Supabase env vars missing — reads/writes will fail");
+});
+server.on("error", (e) => {
+  console.error("[FPX] server.listen error:", e.stack || e);
+  process.exit(1);
+});
+
+// Bootstrap after listener is up. Failures here must NOT crash the server —
+// health check needs to respond regardless.
+(async () => {
   try { await bootstrapAdminKey(); } catch (e) { console.warn("[FPX] bootstrapAdminKey failed:", e.message); }
   try { await bootstrapAdminEmail(); } catch (e) { console.warn("[FPX] bootstrapAdminEmail failed:", e.message); }
-});
+})();
