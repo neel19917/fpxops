@@ -1,6 +1,4 @@
-const ANTHROPIC_API_KEY = "YOUR_API_KEY_HERE";
-
-const FPX_LARGE_PROMPT_CHARS = 12000;
-const FPX_MODEL_DEFAULT = "claude-haiku-4-5-20251001";
-const FPX_MODEL_LARGE_PROMPT = "claude-sonnet-4-5-20250929";
-const FPX_MAX_TOKENS_LARGE = 4096;
+// FPX API server (Railway). The extension no longer talks to Anthropic directly —
+// all AI calls go through this server, which also writes to Supabase.
+const FPX_API_URL = "https://YOUR-APP.up.railway.app";
+const FPX_API_KEY = "YOUR_FPX_API_KEY_HERE"; // fpx_live_...

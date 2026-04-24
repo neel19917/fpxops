@@ -1,0 +1,55 @@
+import { Router } from "express";
+import { supabase } from "../lib/supabase.js";
+import { mapShipment, mapShipmentsBulk } from "../lib/shipments.js";
+
+export const shipmentsRouter = Router();
+
+// GET /shipments?limit=500&customer=Acme&action=YES&status=Issue&q=track123
+shipmentsRouter.get("/", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 500, 5000);
+  let q = supabase.from("fpx_shipments").select("*").order("scraped_at", { ascending: false }).limit(limit);
+  if (req.query.customer) q = q.eq("customer_name", String(req.query.customer));
+  if (req.query.action) q = q.eq("action_required", String(req.query.action));
+  if (req.query.status) q = q.eq("shipment_status", String(req.query.status));
+  if (req.query.q) {
+    const s = String(req.query.q);
+    q = q.or(`tracking_number.ilike.%${s}%,customer_name.ilike.%${s}%,carrier_name.ilike.%${s}%,ai_issue.ilike.%${s}%`);
+  }
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: data || [] });
+});
+
+shipmentsRouter.get("/:id", async (req, res) => {
+  const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!ship) return res.status(404).json({ error: "Shipment not found" });
+  const { data: analyses } = await supabase
+    .from("fpx_ai_analyses")
+    .select("*")
+    .or(`shipment_uuid.eq.${ship.id},tracking_number.eq.${ship.tracking_number || "__none__"}`)
+    .order("created_at", { ascending: false })
+    .limit(50);
+  res.json({ shipment: ship, analyses: analyses || [] });
+});
+
+// POST /shipments — single or bulk upsert. Body: { shipment: {...} } or { shipments: [...] }
+shipmentsRouter.post("/", async (req, res) => {
+  const single = req.body.shipment;
+  const bulk = req.body.shipments;
+  if (single) {
+    const mapped = mapShipment(single);
+    if (!mapped || !mapped.tracking_number) return res.status(400).json({ error: "tracking_number required" });
+    const { data, error } = await supabase.from("fpx_shipments").insert(mapped).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ shipment: data });
+  }
+  if (Array.isArray(bulk)) {
+    const mapped = mapShipmentsBulk(bulk);
+    if (!mapped.length) return res.json({ count: 0, ids: [] });
+    const { data, error } = await supabase.from("fpx_shipments").insert(mapped).select("id,tracking_number");
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ count: data.length, ids: data.map((r) => r.id) });
+  }
+  res.status(400).json({ error: "Provide { shipment } or { shipments: [] }" });
+});

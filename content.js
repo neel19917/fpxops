@@ -4,6 +4,10 @@ let aiEnabled = true;
 let smartGateEnabled = false;
 let useBatchMode = false;
 
+// Tracks the active MutationObserver so it can be disconnected before re-registering
+// on the next "View Shipment" click (one observer per shipment interaction).
+let activeDetailObserver = null;
+
 function sendStatus(text) {
   console.log("[FPX]", text);
   try { chrome.runtime.sendMessage({ type: "status", text }); } catch {}
@@ -16,6 +20,22 @@ function sendComplete(text) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Random delay between min and max ms — prevents robotic timing patterns
+function humanDelay(minMs, maxMs) {
+  const jitter = minMs + Math.random() * (maxMs - minMs);
+  return sleep(Math.round(jitter));
+}
+
+// Yield to the browser so it can paint/reflow — prevents "page unresponsive"
+function yieldToBrowser() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+// Micro-pause: short randomized breath (50–200ms) to keep the main thread alive
+function microPause() {
+  return humanDelay(50, 200);
 }
 
 function isVisibleForClick(el) {
@@ -94,6 +114,133 @@ function waitForElement(selector, timeout = 5000) {
   });
 }
 
+// MutationObserver-based wait for the shipment detail view (#ShipmentSale) to
+// populate. Replaces the old sleep(2000) + 1s-polling loop, cutting detail-load
+// wait from ~5-36s to <3s by reacting to actual DOM mutations instead of sleeping.
+function waitForDetailWithObserver(timeout = 15000) {
+  return new Promise((resolve) => {
+    // Disconnect any leftover observer from a previous shipment interaction.
+    if (activeDetailObserver) {
+      activeDetailObserver.disconnect();
+      activeDetailObserver = null;
+    }
+
+    // Fast path: element already exists and has content (0ms).
+    const existing = document.getElementById("ShipmentSale");
+    if (existing && existing.textContent.trim()) {
+      resolve(existing);
+      return;
+    }
+
+    let tabClicked = false;
+    let settled = false;
+
+    function tryResolve() {
+      if (settled) return;
+      const el = document.getElementById("ShipmentSale");
+      if (el && el.textContent.trim()) {
+        settled = true;
+        if (activeDetailObserver) { activeDetailObserver.disconnect(); activeDetailObserver = null; }
+        clearTimeout(timer);
+        resolve(el);
+        return;
+      }
+
+      // If #bdetails exists but is hidden, click its tab once to reveal it.
+      if (!tabClicked) {
+        const bd = document.getElementById("bdetails");
+        if (bd && (bd.style.display === "none" || !bd.offsetParent)) {
+          const tabs = document.querySelectorAll(
+            "a[data-toggle='tab'], a[href='#bdetails'], li a, .nav-tabs a, .k-tabstrip-items a"
+          );
+          for (const tab of tabs) {
+            const txt = (tab.textContent || "").trim();
+            const href = tab.getAttribute("href") || "";
+            if (href === "#bdetails" || /broker\s*details/i.test(txt) || /detail/i.test(txt)) {
+              tabClicked = true;
+              tab.click();
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Narrow the observer scope: prefer the detail container's parent over body.
+    const scope =
+      document.getElementById("bdetails")?.parentElement ||
+      document.getElementById("details")?.parentElement ||
+      document.querySelector(".tab-content, .k-tabstrip-wrapper, [ui-view], [ng-view]") ||
+      document.body;
+
+    const observer = new MutationObserver(() => tryResolve());
+    activeDetailObserver = observer;
+    observer.observe(scope, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["style", "class"],
+    });
+
+    // Timeout fallback so we never hang indefinitely.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      observer.disconnect();
+      activeDetailObserver = null;
+      resolve(null);
+    }, timeout);
+
+    // Run one immediate check in case the mutation already happened before observe().
+    tryResolve();
+  });
+}
+
+// MutationObserver-based wait for the Kendo grid to reappear after navigating
+// back from the detail view. Replaces hardcoded sleep(2000-3000) calls.
+function waitForGridWithObserver(timeout = 8000) {
+  return new Promise((resolve) => {
+    function checkGrid() {
+      const row = document.querySelector(".k-grid-content tbody tr, .k-grid tbody tr");
+      if (row && !row.classList.contains("k-no-data")) return row;
+      return null;
+    }
+
+    // Fast path.
+    const existing = checkGrid();
+    if (existing) { resolve(existing); return; }
+
+    let settled = false;
+
+    const scope =
+      document.querySelector(".k-grid-content, .k-grid") ||
+      document.body;
+
+    const observer = new MutationObserver(() => {
+      if (settled) return;
+      const row = checkGrid();
+      if (row) {
+        settled = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(row);
+      }
+    });
+
+    observer.observe(scope, {
+      childList: true,
+      subtree: true,
+    });
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      observer.disconnect();
+      resolve(null);
+    }, timeout);
+  });
+}
+
 // Apply a column filter via the Kendo header filter popup.
 // `colName` is the header text (e.g. "Mode"), `value` is the filter
 // value (e.g. "LTL"). If either is empty, filtering is skipped.
@@ -131,9 +278,8 @@ async function applyFilter(colName, value) {
   }
 
   filterIcon.click();
-  await sleep(800);
+  await humanDelay(600, 1000);
 
-  // Find the visible filter popup containing a "Filter" button.
   let filterPopup = null;
   const containers = document.querySelectorAll(
     ".k-animation-container, .k-filter-menu, .k-column-menu"
@@ -160,19 +306,18 @@ async function applyFilter(colName, value) {
     "span.k-dropdown, span.k-widget.k-dropdown, [data-role='dropdownlist']"
   );
 
-  // Ensure operator is "Is equal to".
   if (selects.length >= 1) {
     const opSelect = selects[0];
     if (opSelect.value !== "eq") {
       opSelect.value = "eq";
       opSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      await sleep(300);
+      await humanDelay(200, 500);
     }
   } else if (kendoDropdowns.length >= 1) {
     const opDd = kendoDropdowns[0];
     if (!opDd.textContent.includes("Is equal to")) {
       (opDd.querySelector(".k-dropdown-wrap, .k-input") || opDd).click();
-      await sleep(500);
+      await humanDelay(400, 700);
       for (const item of document.querySelectorAll(
         ".k-animation-container .k-list .k-item, .k-popup .k-item"
       )) {
@@ -181,11 +326,10 @@ async function applyFilter(colName, value) {
           break;
         }
       }
-      await sleep(400);
+      await humanDelay(300, 600);
     }
   }
 
-  // Set the value — try native <select>, then Kendo dropdown, then text input.
   let valueSet = false;
 
   if (selects.length >= 2) {
@@ -193,13 +337,13 @@ async function applyFilter(colName, value) {
     valSelect.value = value;
     valSelect.dispatchEvent(new Event("change", { bubbles: true }));
     valueSet = true;
-    await sleep(300);
+    await humanDelay(200, 500);
   }
 
   if (!valueSet && kendoDropdowns.length >= 2) {
     const valDd = kendoDropdowns[1];
     (valDd.querySelector(".k-dropdown-wrap, .k-input") || valDd).click();
-    await sleep(600);
+    await humanDelay(400, 800);
     for (const item of document.querySelectorAll(
       ".k-animation-container .k-list .k-item, " +
       ".k-list-container .k-item, " +
@@ -211,7 +355,7 @@ async function applyFilter(colName, value) {
         break;
       }
     }
-    await sleep(400);
+    await humanDelay(300, 600);
   }
 
   if (!valueSet) {
@@ -224,7 +368,7 @@ async function applyFilter(colName, value) {
       textInput.dispatchEvent(new Event("input", { bubbles: true }));
       textInput.dispatchEvent(new Event("change", { bubbles: true }));
       valueSet = true;
-      await sleep(300);
+      await humanDelay(200, 500);
     }
   }
 
@@ -233,7 +377,7 @@ async function applyFilter(colName, value) {
     return;
   }
 
-  await sleep(300);
+  await microPause();
   for (const btn of filterPopup.querySelectorAll("button")) {
     if (btn.textContent.trim() === "Filter") {
       btn.click();
@@ -242,7 +386,7 @@ async function applyFilter(colName, value) {
   }
 
   sendStatus(`Filtered ${colName} to "${value}".`);
-  await sleep(2000);
+  await humanDelay(1500, 2500);
 }
 
 // READ-ONLY CLICK: dispatch a mouse-click sequence on the element without
@@ -253,13 +397,15 @@ async function applyFilter(colName, value) {
 // CLOSE button. All three are safe read-only operations.
 function simulateClick(el) {
   const rect = el.getBoundingClientRect();
+  const jitterX = (Math.random() - 0.5) * Math.min(rect.width * 0.3, 6);
+  const jitterY = (Math.random() - 0.5) * Math.min(rect.height * 0.3, 4);
   const opts = {
     bubbles: true,
     cancelable: true,
     view: window,
     detail: 1,
-    clientX: rect.left + rect.width / 2,
-    clientY: rect.top + rect.height / 2,
+    clientX: rect.left + rect.width / 2 + jitterX,
+    clientY: rect.top + rect.height / 2 + jitterY,
   };
   el.dispatchEvent(new MouseEvent("mousedown", opts));
   el.dispatchEvent(new MouseEvent("mouseup", opts));
@@ -1102,6 +1248,214 @@ function downloadXLSX(rows, summaryText) {
   URL.revokeObjectURL(url);
 }
 
+function escHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildDashboardHtml(rows, summaryText) {
+  const total = rows.length;
+  const actionRows = rows.filter((r) => r._needsActionSheet === true);
+  const noActionCount = rows.filter((r) => r._actionRequired === "NO").length;
+  const errorCount = rows.filter((r) => r._actionRequired === "ERROR").length;
+  const generatedAt = new Date().toLocaleString();
+  const generatedIso = new Date().toISOString();
+
+  const carrierCounts = {};
+  const statusCounts = {};
+  for (const r of rows) {
+    const c = String(r["CARRIER NAME"] || "Unknown").trim() || "Unknown";
+    carrierCounts[c] = (carrierCounts[c] || 0) + 1;
+    const s = String(r["SHIPMENT STATUS"] || "Unknown").trim() || "Unknown";
+    statusCounts[s] = (statusCounts[s] || 0) + 1;
+  }
+  const topCarriers = Object.entries(carrierCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8);
+  const topStatuses = Object.entries(statusCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8);
+
+  function bar(label, count, maxCount) {
+    const pct = maxCount > 0 ? Math.round((count / maxCount) * 100) : 0;
+    return `
+      <div class="bar-row">
+        <div class="bar-label" title="${escHtml(label)}">${escHtml(label)}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+        <div class="bar-count">${count}</div>
+      </div>`;
+  }
+  const maxCarrier = topCarriers.length ? topCarriers[0][1] : 0;
+  const maxStatus = topStatuses.length ? topStatuses[0][1] : 0;
+
+  function actionRow(r) {
+    return `
+      <tr>
+        <td>${escHtml(r._trackingNumber || "")}</td>
+        <td>${escHtml(r["CARRIER NAME"] || "")}</td>
+        <td>${escHtml(r["MODE"] || "")}</td>
+        <td>${escHtml(r["SHIPMENT STATUS"] || "")}</td>
+        <td>${escHtml(r["UPDATED ETA"] || r["DELIVERY DATE"] || "")}</td>
+        <td>${escHtml(r._aiIssue || "")}</td>
+        <td>${escHtml(r._aiRecommendation || "")}</td>
+      </tr>`;
+  }
+
+  const actionTableBody = actionRows.length
+    ? actionRows.map(actionRow).join("")
+    : `<tr><td colspan="7" class="empty">No action items.</td></tr>`;
+
+  const summaryBlock = summaryText
+    ? `<div class="summary-card"><h2>AI Executive Summary</h2><pre>${escHtml(summaryText)}</pre></div>`
+    : "";
+
+  // Refresh meta tag triggers a re-load every 60 seconds — useful when the
+  // file is overwritten by a subsequent Refresh All Shipments run.
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="60">
+<title>FPXpress Dashboard — ${escHtml(generatedAt)}</title>
+<style>
+  :root {
+    --bg: #f3f4f6; --card: #ffffff; --text: #111827; --muted: #6b7280;
+    --accent: #2563eb; --ok: #16a34a; --warn: #f59e0b; --err: #dc2626;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 20px; flex-wrap: wrap; gap: 8px; }
+  h1 { margin: 0; font-size: 22px; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .kpi { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .kpi .label { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; }
+  .kpi .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .kpi.action .value { color: var(--err); }
+  .kpi.ok .value { color: var(--ok); }
+  .kpi.err .value { color: var(--warn); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; }
+  .summary-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .summary-card h2 { margin: 0 0 8px; font-size: 14px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; }
+  .summary-card pre { white-space: pre-wrap; word-wrap: break-word; font-family: inherit; font-size: 13px; line-height: 1.5; margin: 0; color: var(--text); }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 12px; }
+  .bar-label { width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-track { flex: 1; background: #f3f4f6; border-radius: 3px; height: 14px; overflow: hidden; }
+  .bar-fill { background: var(--accent); height: 100%; }
+  .bar-count { width: 32px; text-align: right; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; background: var(--card); }
+  thead th { background: #f9fafb; text-align: left; padding: 8px; border-bottom: 2px solid var(--border); font-weight: 600; color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: 0.3px; }
+  tbody td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:hover { background: #f9fafb; }
+  .empty { text-align: center; color: var(--muted); padding: 20px; }
+  .table-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .table-wrap h2 { margin: 0; padding: 16px; font-size: 14px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+  .filter { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .filter input { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; }
+  .footer { color: var(--muted); font-size: 11px; text-align: center; margin-top: 20px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>FPXpress Shipment Dashboard</h1>
+    <div class="meta">Generated <span id="genAt">${escHtml(generatedAt)}</span> · auto-refresh every 60s</div>
+  </div>
+  <div class="meta" id="ageMeta"></div>
+</header>
+
+<section class="kpis">
+  <div class="kpi"><div class="label">Total Shipments</div><div class="value">${total}</div></div>
+  <div class="kpi action"><div class="label">Action Required</div><div class="value">${actionRows.length}</div></div>
+  <div class="kpi ok"><div class="label">No Action Needed</div><div class="value">${noActionCount}</div></div>
+  <div class="kpi err"><div class="label">Errors</div><div class="value">${errorCount}</div></div>
+</section>
+
+${summaryBlock}
+
+<section class="grid">
+  <div class="card">
+    <h2>Top Carriers</h2>
+    ${topCarriers.length ? topCarriers.map(([k, v]) => bar(k, v, maxCarrier)).join("") : '<div class="empty">No data.</div>'}
+  </div>
+  <div class="card">
+    <h2>Status Breakdown</h2>
+    ${topStatuses.length ? topStatuses.map(([k, v]) => bar(k, v, maxStatus)).join("") : '<div class="empty">No data.</div>'}
+  </div>
+</section>
+
+<section class="table-wrap">
+  <h2>Action Items (${actionRows.length})</h2>
+  <div class="filter"><input id="filterInput" type="text" placeholder="Filter rows..."></div>
+  <table id="actionTable">
+    <thead>
+      <tr>
+        <th>Tracking #</th><th>Carrier</th><th>Mode</th><th>Status</th><th>ETA / Delivery</th><th>Issue</th><th>Recommendation</th>
+      </tr>
+    </thead>
+    <tbody>${actionTableBody}</tbody>
+  </table>
+</section>
+
+<div class="footer">FPXpress Tracking Refresh · data snapshot at ${escHtml(generatedAt)}</div>
+
+<script>
+  const generatedIso = ${JSON.stringify(generatedIso)};
+  function tickAge() {
+    const ageEl = document.getElementById("ageMeta");
+    if (!ageEl) return;
+    const ms = Date.now() - new Date(generatedIso).getTime();
+    const sec = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(sec / 60), s = sec % 60;
+    ageEl.textContent = "Snapshot age: " + (m ? m + "m " : "") + s + "s";
+  }
+  setInterval(tickAge, 1000); tickAge();
+  const filterInput = document.getElementById("filterInput");
+  if (filterInput) {
+    filterInput.addEventListener("input", () => {
+      const q = filterInput.value.trim().toLowerCase();
+      const rows = document.querySelectorAll("#actionTable tbody tr");
+      rows.forEach((r) => {
+        r.style.display = !q || r.textContent.toLowerCase().includes(q) ? "" : "none";
+      });
+    });
+  }
+</script>
+</body>
+</html>`;
+}
+
+async function downloadDashboard(rows, summaryText) {
+  if (!rows || !rows.length) return;
+  try {
+    const html = buildDashboardHtml(rows, summaryText);
+    const res = await chrome.runtime.sendMessage({
+      type: "saveDashboard",
+      html,
+      filename: "fpx-dashboard-latest.html",
+    });
+    if (!res || !res.ok) {
+      console.warn("[FPX] Dashboard save failed:", res && res.error);
+    } else {
+      console.log("[FPX] Dashboard saved (download id:", res.downloadId, ")");
+    }
+  } catch (e) {
+    console.warn("[FPX] Dashboard generation error:", e);
+  }
+}
+
 function getLockedColumnCount() {
   const lockedHeaders = document.querySelectorAll(
     ".k-grid-header-locked th, .k-grid-header-locked td"
@@ -1341,7 +1695,10 @@ async function processPage() {
 
   for (let i = 0; i < total; i++) {
     if (stopRequested) {
-      if (logRows.length > 0) downloadXLSX(logRows, "");
+      if (logRows.length > 0) {
+        downloadXLSX(logRows, "");
+        downloadDashboard(logRows, "");
+      }
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
@@ -1351,12 +1708,12 @@ async function processPage() {
     sendStatus(`Processing ${i + 1} of ${total} — ${trackingNum}`);
 
     simulateClick(link);
-    await sleep(350);
+    await humanDelay(300, 600);
 
     sendStatus(`Clicked ${trackingNum} — waiting for modal...`);
     const closeBtn = await waitForCloseButton(25000);
     if (closeBtn) {
-      await sleep(400);
+      await humanDelay(350, 700);
       sendStatus(`Scraping modal data for ${trackingNum}...`);
       const modalData = scrapeModal();
       modalData._trackingNumber = trackingNum;
@@ -1408,7 +1765,7 @@ async function processPage() {
       const actionTag = modalData._needsActionSheet ? " [ACTION NEEDED]" : "";
       sendStatus(`Done ${trackingNum}${actionTag} — closing modal...`);
       simulateClick(closeBtn);
-      await sleep(250);
+      await humanDelay(200, 500);
     } else {
       const timeoutRow = {
         _trackingNumber: trackingNum,
@@ -1427,7 +1784,8 @@ async function processPage() {
       sendStatus(`Timeout on ${trackingNum} — no modal appeared, skipping.`);
     }
 
-    await sleep(300);
+    await humanDelay(250, 600);
+    if (i % 5 === 4) await yieldToBrowser();
   }
 }
 
@@ -1546,7 +1904,7 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
   if (filterCol && filterVal) {
     sendStatus(`Filtering ${filterCol} to "${filterVal}"...`);
     await applyFilter(filterCol, filterVal);
-    await sleep(1000);
+    await humanDelay(800, 1300);
   } else {
     sendStatus("No filter set — proceeding with current grid view.");
   }
@@ -1555,7 +1913,10 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
 
   while (true) {
     if (stopRequested) {
-      if (logRows.length > 0) downloadXLSX(logRows, "");
+      if (logRows.length > 0) {
+        downloadXLSX(logRows, "");
+        downloadDashboard(logRows, "");
+      }
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
@@ -1564,7 +1925,10 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
     await processPage();
 
     if (stopRequested) {
-      if (logRows.length > 0) downloadXLSX(logRows, "");
+      if (logRows.length > 0) {
+        downloadXLSX(logRows, "");
+        downloadDashboard(logRows, "");
+      }
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
@@ -1633,8 +1997,15 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
   }
 
   if (logRows.length > 0) {
-    sendStatus(`Downloading XLSX with ${logRows.length} row(s)...`);
+    sendStatus(`Downloading XLSX + dashboard with ${logRows.length} row(s)...`);
+    try {
+      chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: logRows }, (r) => {
+        if (r && r.ok) console.log(`[FPX] Pushed ${r.count} shipments to Supabase`);
+        else if (r && r.error) console.warn("[FPX] Supabase upsert error:", r.error);
+      });
+    } catch (e) { console.warn("[FPX] Supabase push failed:", e.message); }
     downloadXLSX(logRows, summaryText);
+    downloadDashboard(logRows, summaryText);
   }
 
   try { chrome.storage.local.remove("_fpxCheckpoint"); } catch {}
@@ -1872,10 +2243,96 @@ function setDateInput(input, dateStr) {
   console.log("[FPX-GP] setDateInput:", input.type, "value after:", input.value, "target:", valueToSet);
 }
 
-function gpDownloadXLSX(rows, stats, bizDate) {
+function gpDownloadXLSX(rows, stats, bizDate, reviewRows, execSummaryText, perRowNotes, apiCost) {
   if (!rows.length || typeof XLSX === "undefined") return;
   const wb = XLSX.utils.book_new();
 
+  // --- Sheet 1: Executive Summary ---
+  const totalOutliers = rows.filter((r) => r._isOutlier).length;
+  const totalReview = (reviewRows || []).length;
+  const summaryData = [
+    ["FPXpress GP Audit Report"],
+    ["Date Audited", bizDate],
+    ["Generated", new Date().toLocaleString()],
+    [],
+    ["Total Transactions", rows.length],
+    ["Total Customers", stats.size],
+    ["Outliers (>2 STDEV)", totalOutliers],
+    ["Needs Review", totalReview],
+    ["Claude API Cost", apiCost ? `$${apiCost.totalUsd.toFixed(4)} (${apiCost.calls} calls, ${apiCost.inputTokens.toLocaleString()} in / ${apiCost.outputTokens.toLocaleString()} out tokens)` : "N/A"],
+    [],
+    ["AI Executive Summary"],
+    [execSummaryText || "(AI analysis not enabled)"],
+  ];
+  const wsSummary = XLSX.utils.aoa_to_sheet(summaryData);
+  wsSummary["!cols"] = [{ wch: 25 }, { wch: 90 }];
+  const sc = (r, c) => XLSX.utils.encode_cell({ r, c });
+  if (wsSummary[sc(0, 0)]) wsSummary[sc(0, 0)].s = XL_TITLE_STYLE;
+  for (let r = 1; r <= 2; r++) {
+    if (wsSummary[sc(r, 0)]) wsSummary[sc(r, 0)].s = XL_LABEL_STYLE;
+    if (wsSummary[sc(r, 1)]) wsSummary[sc(r, 1)].s = XL_VALUE_STYLE;
+  }
+  for (let r = 4; r <= 8; r++) {
+    if (wsSummary[sc(r, 0)]) wsSummary[sc(r, 0)].s = XL_LABEL_STYLE;
+    if (wsSummary[sc(r, 1)]) wsSummary[sc(r, 1)].s = XL_VALUE_STYLE;
+  }
+  if (wsSummary[sc(10, 0)]) wsSummary[sc(10, 0)].s = {
+    font: { name: "Arial", sz: 11, bold: true, color: { rgb: "1F4E79" } },
+  };
+  if (wsSummary[sc(10, 0)]) wsSummary[sc(10, 0)].s = {
+    font: { name: "Arial", sz: 9 },
+    alignment: { wrapText: true, vertical: "top" },
+  };
+  XLSX.utils.book_append_sheet(wb, wsSummary, "Executive Summary");
+
+  // --- Sheet 2: Needs Review (outliers + borderline + negative GP + low GP%) ---
+  const reviewHeaders = [
+    "Review Reason", "Customer Id", "Customer Name", "ShipmentID", "Shipped Date",
+    "Carrier", "Service", "Account Manager",
+    "Shipment Marked-Up Rate", "Shipment Rate without mark up", "Shipment Gross Profit",
+    "GP%", "Avg GP%", "StdDev", "Deviation",
+  ];
+  if (perRowNotes) reviewHeaders.push("AI Notes");
+  const reviewData = [reviewHeaders];
+  const sortedReview = [...(reviewRows || [])].sort((a, b) => (b._deviation || 0) - (a._deviation || 0));
+  for (const r of sortedReview) {
+    const sid = r["ShipmentID"] || "";
+    const rowData = [
+      r._reviewReason || "",
+      r["Customer Id"] || "", r["Customer Name"] || "", sid, r["Shipped Date"] || "",
+      r["Carrier"] || "", r["Service"] || "", r["Account Manager"] || "",
+      r["Shipment Marked-Up Rate"] || "", r["Shipment Rate without mark up"] || "", r["Shipment Gross Profit"] || "",
+      r._gpPct != null ? r._gpPct.toFixed(2) + "%" : "",
+      r._customerMean != null ? r._customerMean.toFixed(2) + "%" : "",
+      r._customerStdev != null ? r._customerStdev.toFixed(2) : "",
+      r._deviation != null ? r._deviation.toFixed(2) : "",
+    ];
+    if (perRowNotes) rowData.push(perRowNotes.get(sid) || "");
+    reviewData.push(rowData);
+  }
+  if (reviewData.length === 1) reviewData.push(["No rows flagged for review."]);
+  const wsReview = XLSX.utils.aoa_to_sheet(reviewData);
+  wsReview["!cols"] = reviewHeaders.map((h) => ({
+    wch: h === "AI Notes" ? 50 : h === "Review Reason" ? 30 : 18,
+  }));
+  const reasonColIdx = 0;
+  styleDataSheet(wsReview, reviewData, -1);
+  for (let r = 1; r < reviewData.length; r++) {
+    const addr = XLSX.utils.encode_cell({ r, c: reasonColIdx });
+    if (wsReview[addr]) {
+      const reason = String(wsReview[addr].v || "");
+      if (reason.includes("Outlier")) {
+        wsReview[addr].s = { ...wsReview[addr].s, font: { ...XL_YES_FONT } };
+      } else if (reason.includes("Borderline")) {
+        wsReview[addr].s = { ...wsReview[addr].s, font: { name: "Arial", sz: 9, bold: true, color: { rgb: "D4A017" } } };
+      } else {
+        wsReview[addr].s = { ...wsReview[addr].s, font: { name: "Arial", sz: 9, bold: true, color: { rgb: "9C4500" } } };
+      }
+    }
+  }
+  XLSX.utils.book_append_sheet(wb, wsReview, "Needs Review");
+
+  // --- Sheet 3: Outliers ---
   const outlierRows = rows.filter((r) => r._isOutlier);
   const outlierData = [["Customer Id", "Customer Name", "ShipmentID", "Shipped Date", "Shipment Marked-Up Rate", "Shipment Gross Profit", "GP%", "Avg GP%", "StdDev", "Deviation"]];
   for (const r of outlierRows.sort((a, b) => (b._deviation || 0) - (a._deviation || 0))) {
@@ -1894,6 +2351,7 @@ function gpDownloadXLSX(rows, stats, bizDate) {
   styleDataSheet(wsOutliers, outlierData, -1);
   XLSX.utils.book_append_sheet(wb, wsOutliers, "Outliers");
 
+  // --- Sheet 4: By Customer ---
   const custData = [["Customer Id", "Customer Name", "Shipment Count", "Avg GP%", "StdDev", "Outlier Count"]];
   for (const [, st] of stats) {
     custData.push([st.customerId, st.customerName, st.count, st.mean.toFixed(2) + "%", st.stdev.toFixed(2), st.outlierCount]);
@@ -1903,6 +2361,7 @@ function gpDownloadXLSX(rows, stats, bizDate) {
   styleDataSheet(wsCust, custData, -1);
   XLSX.utils.book_append_sheet(wb, wsCust, "By Customer");
 
+  // --- Sheet 5: All Transactions ---
   const allHeaders = new Set();
   for (const r of rows) {
     for (const k of Object.keys(r)) {
@@ -1930,7 +2389,8 @@ function gpDownloadXLSX(rows, stats, bizDate) {
   const a = document.createElement("a");
   a.href = url;
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  a.download = `fpx-gp-audit-${bizDate.replace(/\//g, "-")}-${ts}.xlsx`;
+  const safeDateLabel = bizDate.replace(/[\/\s—]+/g, "-").replace(/-{2,}/g, "-");
+  a.download = `fpx-gp-audit-${safeDateLabel}-${ts}.xlsx`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -2028,36 +2488,119 @@ function clickShipmentTypeTab(type) {
   return false;
 }
 
-async function gpAuditRun(bizDate, shipmentType) {
+async function gpAuditRun(fromDate, toDate, shipmentType, aiAnalysis, customerFilter) {
   stopRequested = false;
+  const aiLevel = aiAnalysis || "off";
+  const dateLabel = fromDate === toDate ? fromDate : `${fromDate} — ${toDate}`;
 
   if (shipmentType === "all") {
     sendGpStatus("Running GP Audit for ALL types (Non-Parcel + Parcel)...");
-    const nonParcelRows = await gpAuditSingleRun(bizDate, "non-parcel");
-    if (stopRequested) return;
-    const parcelRows = await gpAuditSingleRun(bizDate, "parcel");
-    if (stopRequested) return;
+    const nonParcelRows = await gpAuditSingleRun(fromDate, toDate, "non-parcel", customerFilter);
+    if (stopRequested) { sendGpComplete("Stopped by user."); return; }
+    const parcelRows = await gpAuditSingleRun(fromDate, toDate, "parcel", customerFilter);
+    if (stopRequested) { sendGpComplete("Stopped by user."); return; }
 
     const allRows = [...(nonParcelRows || []), ...(parcelRows || [])];
     if (allRows.length === 0) {
-      sendGpComplete("No transactions found for " + bizDate + ".");
+      sendGpComplete("No transactions found for " + dateLabel + ".");
       return;
     }
     sendGpStatus(`Combined ${allRows.length} total transaction(s). Computing GP stats...`);
-    gpFinalize(allRows, bizDate);
+    await gpFinalize(allRows, dateLabel, aiLevel);
     return;
   }
 
-  const rows = await gpAuditSingleRun(bizDate, shipmentType);
-  if (stopRequested) return;
+  const rows = await gpAuditSingleRun(fromDate, toDate, shipmentType, customerFilter);
+  if (stopRequested) { sendGpComplete("Stopped by user."); return; }
   if (!rows || rows.length === 0) {
-    sendGpComplete("No transactions found for " + bizDate + ".");
+    sendGpComplete("No transactions found for " + dateLabel + ".");
     return;
   }
-  gpFinalize(rows, bizDate);
+  await gpFinalize(rows, dateLabel, aiLevel);
 }
 
-function gpFinalize(allRows, bizDate) {
+function gpIdentifyNeedsReview(allRows, stats) {
+  const review = [];
+  for (const row of allRows) {
+    if (row._isOutlier) {
+      row._reviewReason = "Outlier (>2 STDEV from customer avg)";
+      review.push(row);
+      continue;
+    }
+    const cid = row["Customer Id"] || "";
+    const st = stats.get(cid);
+    if (!st || row._gpPct === null || row._gpPct === undefined) continue;
+
+    if (st.count >= 3 && st.stdev > 0) {
+      const dev = Math.abs(row._gpPct - st.mean);
+      if (dev > 1.5 * st.stdev) {
+        row._reviewReason = "Borderline (>1.5 STDEV from customer avg)";
+        review.push(row);
+        continue;
+      }
+    }
+
+    const gp = parseFloat(row["Shipment Gross Profit"]);
+    if (Number.isFinite(gp) && gp < 0) {
+      row._reviewReason = "Negative gross profit";
+      review.push(row);
+      continue;
+    }
+
+    if (row._gpPct !== null && row._gpPct !== undefined && row._gpPct < 2) {
+      row._reviewReason = "GP% below 2% threshold";
+      review.push(row);
+      continue;
+    }
+
+    const mr = parseFloat(row["Shipment Marked-Up Rate"]);
+    if (Number.isFinite(mr) && mr === 0) {
+      row._reviewReason = "Zero marked-up rate";
+      review.push(row);
+    }
+  }
+  return review;
+}
+
+function gpBuildAiPayload(allRows, stats, outliers, reviewRows) {
+  const custSummaries = [];
+  for (const [, st] of stats) {
+    custSummaries.push({
+      customerId: st.customerId,
+      customerName: st.customerName,
+      shipments: st.count,
+      avgGpPct: +st.mean.toFixed(2),
+      stdev: +st.stdev.toFixed(2),
+      outliers: st.outlierCount,
+    });
+  }
+
+  const flaggedRows = reviewRows.map((r) => ({
+    shipmentId: r["ShipmentID"] || "",
+    customerId: r["Customer Id"] || "",
+    customerName: r["Customer Name"] || "",
+    markedUpRate: r["Shipment Marked-Up Rate"] || "",
+    grossProfit: r["Shipment Gross Profit"] || "",
+    gpPct: r._gpPct != null ? +r._gpPct.toFixed(2) : null,
+    customerAvgGpPct: r._customerMean != null ? +r._customerMean.toFixed(2) : null,
+    deviation: r._deviation != null ? +r._deviation.toFixed(2) : null,
+    reason: r._reviewReason || "",
+    carrier: r["Carrier"] || "",
+    service: r["Service"] || "",
+  }));
+
+  return {
+    date: allRows[0]?.["Shipped Date"] || "",
+    totalShipments: allRows.length,
+    totalCustomers: stats.size,
+    outlierCount: outliers.length,
+    reviewCount: reviewRows.length,
+    customerSummaries: custSummaries.sort((a, b) => b.outliers - a.outliers),
+    flaggedShipments: flaggedRows,
+  };
+}
+
+async function gpFinalize(allRows, bizDate, aiLevel) {
   for (let i = 0; i < allRows.length; i++) {
     allRows[i] = normalizeRowKeys(allRows[i]);
   }
@@ -2067,7 +2610,9 @@ function gpFinalize(allRows, bizDate) {
   gpFlagOutliers(allRows, stats);
 
   const outliers = allRows.filter((r) => r._isOutlier);
-  sendGpStatus(`Found ${outliers.length} outlier(s) across ${stats.size} customer(s).`);
+  const reviewRows = gpIdentifyNeedsReview(allRows, stats);
+
+  sendGpStatus(`Found ${outliers.length} outlier(s), ${reviewRows.length} row(s) needing review across ${stats.size} customer(s).`);
 
   const outlierSummary = outliers.map((r) => ({
     customerId: r["Customer Id"] || "",
@@ -2082,23 +2627,92 @@ function gpFinalize(allRows, bizDate) {
     chrome.runtime.sendMessage({ type: "gpAuditOutliers", outliers: outlierSummary });
   } catch {}
 
+  let execSummaryText = "";
+  let perRowNotes = null;
+
+  if (aiLevel !== "off") {
+    const payload = gpBuildAiPayload(allRows, stats, outliers, reviewRows);
+
+    sendGpStatus("Requesting AI executive summary...");
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "gpAuditAiSummary",
+        payload,
+      });
+      if (result && result.text) {
+        execSummaryText = result.text;
+        try {
+          chrome.runtime.sendMessage({ type: "gpAiSummary", text: execSummaryText });
+        } catch {}
+      } else if (result && result.error) {
+        execSummaryText = "AI Summary error: " + result.error;
+      }
+    } catch (e) {
+      execSummaryText = "AI Summary error: " + e.message;
+    }
+
+    if (aiLevel === "full" && reviewRows.length > 0) {
+      sendGpStatus(`Running per-row AI review on ${reviewRows.length} flagged row(s)...`);
+      perRowNotes = new Map();
+      for (let i = 0; i < reviewRows.length; i++) {
+        if (stopRequested) break;
+        const r = reviewRows[i];
+        const sid = r["ShipmentID"] || `row-${i}`;
+        sendGpStatus(`AI review ${i + 1}/${reviewRows.length} — ShipID ${sid}...`);
+        try {
+          const result = await chrome.runtime.sendMessage({
+            type: "gpAuditRowReview",
+            row: {
+              shipmentId: sid,
+              customerId: r["Customer Id"] || "",
+              customerName: r["Customer Name"] || "",
+              markedUpRate: r["Shipment Marked-Up Rate"] || "",
+              rateWithoutMarkup: r["Shipment Rate without mark up"] || "",
+              grossProfit: r["Shipment Gross Profit"] || "",
+              gpPct: r._gpPct != null ? +r._gpPct.toFixed(2) : null,
+              customerAvgGpPct: r._customerMean != null ? +r._customerMean.toFixed(2) : null,
+              stdev: r._customerStdev != null ? +r._customerStdev.toFixed(2) : null,
+              deviation: r._deviation != null ? +r._deviation.toFixed(2) : null,
+              reason: r._reviewReason || "",
+              carrier: r["Carrier"] || "",
+              service: r["Service"] || "",
+              accountManager: r["Account Manager"] || "",
+            },
+          });
+          if (result && result.text) perRowNotes.set(sid, result.text);
+          else if (result && result.error) perRowNotes.set(sid, "Error: " + result.error);
+        } catch (e) {
+          perRowNotes.set(sid, "Error: " + e.message);
+        }
+      }
+    }
+  }
+
+  let apiCost = null;
+  try {
+    apiCost = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "getApiCost" }, resolve);
+    });
+  } catch {}
+
   sendGpStatus("Downloading GP Audit XLSX...");
-  gpDownloadXLSX(allRows, stats, bizDate);
+  gpDownloadXLSX(allRows, stats, bizDate, reviewRows, execSummaryText, perRowNotes, apiCost);
 
   sendGpComplete(
-    `GP Audit done — ${allRows.length} transaction(s), ${stats.size} customer(s), ${outliers.length} outlier(s).`
+    `GP Audit done — ${allRows.length} transaction(s), ${stats.size} customer(s), ${outliers.length} outlier(s), ${reviewRows.length} review row(s).`
   );
 }
 
-async function gpAuditSingleRun(bizDate, shipmentType) {
+async function gpAuditSingleRun(fromDate, toDate, shipmentType, customerFilter) {
   const typeLabel = shipmentType === "parcel" ? "Parcel" : "Non-Parcel";
-  sendGpStatus("Starting GP Audit (" + typeLabel + ") for " + bizDate + "...");
+  const dateLabel = fromDate === toDate ? fromDate : `${fromDate} — ${toDate}`;
+  sendGpStatus("Starting GP Audit (" + typeLabel + ") for " + dateLabel + "...");
 
   const currentUrl = window.location.href;
   if (!currentUrl.includes("Transactions")) {
     sendGpStatus("Navigating to Transactions page...");
     window.location.hash = "#!/Transactions";
-    await sleep(3000);
+    await humanDelay(2500, 4000);
   }
 
   sendGpStatus("Waiting for Generate History Report dialog...");
@@ -2112,9 +2726,9 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
     const btn = document.querySelector("button.generate-report, [ng-click*='generate'], a.btn");
     if (btn && /generate report/i.test(btn.textContent)) {
       simulateClick(btn);
-      await sleep(1500);
+      await humanDelay(1200, 2000);
     }
-    await sleep(500);
+    await humanDelay(400, 700);
   }
 
   if (!dialogFound) {
@@ -2123,15 +2737,15 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
     for (const b of allBtns) {
       if (/generate\s*report/i.test(b.textContent || b.value || "")) {
         simulateClick(b);
-        await sleep(2000);
+        await humanDelay(1500, 2500);
         break;
       }
     }
   }
 
-  await sleep(1000);
+  await humanDelay(800, 1500);
 
-  sendGpStatus("Filling date fields with " + bizDate + "...");
+  sendGpStatus("Filling date fields: " + dateLabel + "...");
 
   const dateFields = findDateInputs();
   if (!dateFields.from && !dateFields.to) {
@@ -2141,22 +2755,22 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
   }
 
   if (dateFields.from) {
-    setDateInput(dateFields.from, bizDate);
-    sendGpStatus("Set FROM DATE to " + bizDate + " (value: " + dateFields.from.value + ")");
+    setDateInput(dateFields.from, fromDate);
+    sendGpStatus("Set FROM DATE to " + fromDate + " (value: " + dateFields.from.value + ")");
   }
-  await sleep(500);
+  await humanDelay(400, 800);
 
   if (dateFields.to) {
-    setDateInput(dateFields.to, bizDate);
-    sendGpStatus("Set TO DATE to " + bizDate + " (value: " + dateFields.to.value + ")");
+    setDateInput(dateFields.to, toDate);
+    sendGpStatus("Set TO DATE to " + toDate + " (value: " + dateFields.to.value + ")");
   }
-  await sleep(500);
+  await humanDelay(400, 800);
 
-  function retryDateFill(input, label) {
+  function retryDateFill(input, label, dateStr) {
     if (!input || input.value) return;
-    const parts = bizDate.split("/");
+    const parts = dateStr.split("/");
     const isoVal = `${parts[2]}-${parts[0]}-${parts[1]}`;
-    const valForType = input.type === "date" ? isoVal : bizDate;
+    const valForType = input.type === "date" ? isoVal : dateStr;
 
     sendGpStatus(`Retrying ${label} with angular model...`);
     try {
@@ -2179,11 +2793,14 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
     input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  retryDateFill(dateFields.from, "FROM DATE");
-  retryDateFill(dateFields.to, "TO DATE");
-  await sleep(500);
+  retryDateFill(dateFields.from, "FROM DATE", fromDate);
+  retryDateFill(dateFields.to, "TO DATE", toDate);
+  await humanDelay(400, 800);
 
-  sendGpStatus("Setting SELECT CUSTOMER to All Customers...");
+  const custTarget = customerFilter || "";
+  const useAllCustomers = !custTarget || /^all(\s*customers)?$/i.test(custTarget);
+
+  sendGpStatus(useAllCustomers ? "Setting SELECT CUSTOMER to All Customers..." : `Setting customer filter to "${custTarget}"...`);
   const selects = document.querySelectorAll("select");
   for (const sel of selects) {
     const row = sel.closest("tr, div, .form-group");
@@ -2192,12 +2809,39 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
     const id = (sel.id || "").toLowerCase();
 
     if (rowText.includes("CUSTOMER") || name.includes("customer") || id.includes("customer")) {
-      for (const opt of sel.options) {
-        if (/all\s*customers/i.test(opt.text)) {
-          sel.value = opt.value;
-          sel.dispatchEvent(new Event("change", { bubbles: true }));
-          sendGpStatus("Set customer dropdown to: " + opt.text);
-          break;
+      let matched = false;
+
+      if (useAllCustomers) {
+        for (const opt of sel.options) {
+          if (/all\s*customers/i.test(opt.text)) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            sendGpStatus("Set customer dropdown to: " + opt.text);
+            matched = true;
+            break;
+          }
+        }
+      } else {
+        const needle = custTarget.toLowerCase();
+        for (const opt of sel.options) {
+          const optText = opt.text.toLowerCase();
+          if (optText.includes(needle) || opt.value === custTarget) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            sendGpStatus("Set customer dropdown to: " + opt.text);
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          sendGpStatus(`Customer "${custTarget}" not found in dropdown, using All Customers.`);
+          for (const opt of sel.options) {
+            if (/all\s*customers/i.test(opt.text)) {
+              sel.value = opt.value;
+              sel.dispatchEvent(new Event("change", { bubbles: true }));
+              break;
+            }
+          }
         }
       }
 
@@ -2205,11 +2849,13 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
         const kendoWidget = window.jQuery && window.jQuery(sel).data("kendoDropDownList");
         if (kendoWidget) {
           const ds = kendoWidget.dataSource.data();
+          const searchTarget = useAllCustomers ? /all\s*customers/i : new RegExp(custTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
           for (let i = 0; i < ds.length; i++) {
-            if (/all\s*customers/i.test(ds[i].text || ds[i].Text || ds[i].Name || "")) {
+            const itemText = ds[i].text || ds[i].Text || ds[i].Name || "";
+            if (searchTarget.test(itemText)) {
               kendoWidget.select(i);
               kendoWidget.trigger("change");
-              sendGpStatus("Set customer via Kendo dropdown");
+              sendGpStatus("Set customer via Kendo dropdown: " + itemText);
               break;
             }
           }
@@ -2220,7 +2866,7 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
       break;
     }
   }
-  await sleep(500);
+  await humanDelay(400, 800);
 
   sendGpStatus("Clicking CONTINUE...");
   let continueClicked = false;
@@ -2240,7 +2886,7 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
   }
 
   sendGpStatus("Waiting for results grid to load...");
-  await sleep(3000);
+  await humanDelay(2500, 4000);
 
   let gridReady = false;
   for (let wait = 0; wait < 15000; wait += 1000) {
@@ -2254,7 +2900,7 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
       gridReady = true;
       break;
     }
-    await sleep(1000);
+    await humanDelay(800, 1300);
   }
 
   if (!gridReady) {
@@ -2264,7 +2910,7 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
 
   sendGpStatus("Selecting " + typeLabel + " tab...");
   clickShipmentTypeTab(shipmentType);
-  await sleep(2000);
+  await humanDelay(1500, 2500);
   await waitForGridReady(5000);
 
   sendGpStatus("Reading " + typeLabel + " transaction data...");
@@ -2298,6 +2944,1526 @@ async function gpAuditSingleRun(bizDate, shipmentType) {
   return allRows;
 }
 
+// =====================================================================
+// INVOICE AUDIT
+// =====================================================================
+
+function sendInvStatus(text) {
+  console.log("[FPX-INV]", text);
+  try { chrome.runtime.sendMessage({ type: "invoiceAuditStatus", text }); } catch {}
+}
+
+function sendInvComplete(text) {
+  console.log("[FPX-INV] COMPLETE:", text);
+  try { chrome.runtime.sendMessage({ type: "invoiceAuditComplete", text }); } catch {}
+}
+
+async function invoiceAuditRun(shipments, skippedRows, fromDate, toDate, shipmentType, customerFilter, aiAnalysis, skipReport) {
+  stopRequested = false;
+  const aiLevel = aiAnalysis || "off";
+  const dateLabel = fromDate === toDate ? fromDate : `${fromDate} — ${toDate}`;
+  const total = shipments.length;
+
+  sendInvStatus(`Starting Invoice Audit: ${total} shipment(s), lookback ${dateLabel}`);
+
+  if (skipReport) {
+    sendInvStatus("Skipping report generation — using existing grid data.");
+  } else {
+    const reportGenerated = await invoiceGenerateReport(fromDate, toDate, shipmentType, customerFilter);
+    if (!reportGenerated || stopRequested) {
+      sendInvComplete(stopRequested ? "Stopped by user." : "Report generation failed.");
+      return;
+    }
+  }
+
+  // Build a lookup of shipments we need from the uploaded carrier invoice
+  const needMap = new Map();
+  for (const ship of shipments) {
+    needMap.set(String(ship.shipmentId), ship);
+  }
+
+  // Restore progress from session storage (survives page changes)
+  const prevSession = invLoadSession();
+  const results = [];
+  const found = new Set();
+  if (prevSession && prevSession.foundIds) {
+    for (const id of prevSession.foundIds) found.add(id);
+    if (prevSession.results) results.push(...prevSession.results);
+    sendInvStatus(`Resumed session: ${found.size} already processed.`);
+  }
+  let pageNum = 1;
+
+  // Save progress to sessionStorage after each shipment
+  function persistProgress() {
+    invSaveSession({
+      foundIds: [...found],
+      results,
+      needIds: [...needMap.keys()],
+      total,
+    });
+  }
+
+  // Wait for the grid to fully load after report generation
+  sendInvStatus("Waiting for grid to fully load…");
+  for (let wait = 0; wait < 30000; wait += 1000) {
+    const rows = document.querySelectorAll(".k-grid-content tbody tr");
+    const dataRows = [...rows].filter(r => !r.classList.contains("k-no-data"));
+    if (dataRows.length > 0) break;
+    await humanDelay(800, 1300);
+  }
+  await humanDelay(1500, 2500);
+
+  sendInvStatus(`Setting page size to ${INV_PAGE_SIZE}…`);
+  await invoiceSetPageSize(INV_PAGE_SIZE);
+  await humanDelay(1500, 2500);
+
+  // Kendo grids with locked (frozen) columns split rows into two <table> elements:
+  //   .k-grid-content-locked — locked cols (VIEW SHIPMENT, GET INVOICE buttons)
+  //   .k-grid-content        — scrollable cols (Customer ID, …, ShipmentID, …)
+  // The rows match by index: locked row[i] ↔ scrollable row[i].
+
+  function getRowPairs() {
+    const lockedRows = [...document.querySelectorAll(".k-grid-content-locked tbody tr")].filter(
+      r => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row")
+    );
+    const scrollRows = [...document.querySelectorAll(".k-grid-content tbody tr")].filter(
+      r => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row")
+    );
+
+    if (lockedRows.length === 0) {
+      return scrollRows.map(r => ({ buttonRow: r, dataRow: r }));
+    }
+
+    const pairs = [];
+    const len = Math.min(lockedRows.length, scrollRows.length);
+    for (let i = 0; i < len; i++) {
+      pairs.push({ buttonRow: lockedRows[i], dataRow: scrollRows[i] });
+    }
+    return pairs;
+  }
+
+  function findShipmentIdInRow(dataRow) {
+    const cells = dataRow.querySelectorAll("td");
+    for (const cell of cells) {
+      const text = cell.textContent.replace(/\s+/g, "").trim();
+      if (text && needMap.has(text)) return text;
+    }
+    for (const cell of cells) {
+      const text = cell.textContent.replace(/\s+/g, "").trim();
+      const m = text.match(/^\d{7,}$/);
+      if (m && needMap.has(m[0])) return m[0];
+    }
+    return null;
+  }
+
+  function clickViewShipmentOnRow(buttonRow) {
+    const btns = buttonRow.querySelectorAll("a, button, input[type='button']");
+    for (const btn of btns) {
+      const txt = (btn.textContent || btn.value || "").replace(/\s+/g, " ").trim();
+      if (/view\s*shipment/i.test(txt)) {
+        btn.click();
+        return true;
+      }
+    }
+    const firstLink = buttonRow.querySelector("a");
+    if (firstLink) { firstLink.click(); return true; }
+    return false;
+  }
+
+  async function processPage() {
+    const pairs = getRowPairs();
+    sendInvStatus(`Page ${pageNum}: ${pairs.length} row(s). Scanning for matches… (${found.size}/${total} done)`);
+
+    for (let ri = 0; ri < pairs.length; ri++) {
+      if (stopRequested) return;
+      const { buttonRow, dataRow } = pairs[ri];
+      const sid = findShipmentIdInRow(dataRow);
+      if (!sid || found.has(sid)) {
+        if (ri % 20 === 19) await yieldToBrowser();
+        continue;
+      }
+
+      const ship = needMap.get(sid);
+      found.add(sid);
+      sendInvStatus(`[${found.size}/${total}] ShipID ${sid}: clicking View Shipment…`);
+
+      await microPause();
+      if (!clickViewShipmentOnRow(buttonRow)) {
+        results.push(makeErrorResult(ship, "View Shipment button not found on row"));
+        persistProgress();
+        continue;
+      }
+
+      sendInvStatus(`[${found.size}/${total}] ShipID ${sid}: waiting for detail view…`);
+      await humanDelay(2500, 4000);
+
+      const result = await invoiceScreenshotShipment(ship);
+      results.push(result);
+      persistProgress();
+
+      await invoiceCloseModal(sid);
+      await humanDelay(800, 1800);
+      await yieldToBrowser();
+    }
+  }
+
+  // Paginate through grid — 50 rows per page
+  while (true) {
+    if (stopRequested) break;
+    await processPage();
+    if (found.size >= total) {
+      sendInvStatus(`All ${total} shipment(s) found.`);
+      break;
+    }
+    const advanced = goToNextPage();
+    if (!advanced) {
+      sendInvStatus(`Reached last page (page ${pageNum}). ${total - found.size} shipment(s) not in grid.`);
+      break;
+    }
+    pageNum++;
+    sendInvStatus(`Page ${pageNum}: loading… (${found.size}/${total} found so far)`);
+    await humanDelay(800, 1500);
+    await waitForGridReady(8000);
+  }
+
+  // Report shipments not found in the grid
+  for (const ship of shipments) {
+    if (!found.has(String(ship.shipmentId))) {
+      results.push(makeErrorResult(ship, "Shipment not found in grid"));
+    }
+  }
+
+  if (stopRequested) {
+    persistProgress();
+    sendInvComplete(`Stopped by user. Processed ${found.size} of ${total}. Progress saved — resume to continue.`);
+    return;
+  }
+
+  invClearSession();
+  sendInvStatus(`Processed ${found.size} of ${total}. ${results.filter(r => r.error).length} not found.`);
+  await invoiceFinalize(results, skippedRows, dateLabel, aiLevel);
+}
+
+const INV_PAGE_SIZE = 50;
+const INV_SESSION_KEY = "_fpxInvAuditState";
+
+function invSaveSession(state) {
+  try { sessionStorage.setItem(INV_SESSION_KEY, JSON.stringify(state)); } catch {}
+}
+
+function invLoadSession() {
+  try {
+    const raw = sessionStorage.getItem(INV_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function invClearSession() {
+  try { sessionStorage.removeItem(INV_SESSION_KEY); } catch {}
+}
+
+async function invoiceSetPageSize(target) {
+  // Strategy 1: Kendo API
+  try {
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        var $ = window.jQuery || window.$;
+        if (!$) return;
+        var grid = $(".k-grid").data("kendoGrid");
+        if (!grid) return;
+        grid.dataSource.pageSize(${target});
+        window.postMessage({ type: "_fpxPageSizeSet", size: ${target} }, "*");
+      })();
+    `;
+    document.head.appendChild(script);
+    script.remove();
+
+    const ok = await new Promise((resolve) => {
+      function onMsg(e) {
+        if (e.data && e.data.type === "_fpxPageSizeSet") {
+          window.removeEventListener("message", onMsg);
+          resolve(true);
+        }
+      }
+      window.addEventListener("message", onMsg);
+      setTimeout(() => { window.removeEventListener("message", onMsg); resolve(false); }, 3000);
+    });
+    if (ok) {
+      sendInvStatus(`Page size set to ${target} via Kendo API.`);
+      await waitForGridReady(10000);
+      return;
+    }
+  } catch (e) {
+    console.log("[FPX-INV] Kendo pageSize error:", e.message);
+  }
+
+  // Strategy 2: Native <select> dropdown — pick closest value >= target
+  const pageSizeSelects = document.querySelectorAll(
+    ".k-pager-sizes select, .k-pager-wrap select, select[data-role='dropdownlist']"
+  );
+  for (const sel of pageSizeSelects) {
+    let bestOpt = null, bestVal = Infinity;
+    for (const opt of sel.options) {
+      const n = parseInt(opt.value, 10);
+      if (Number.isFinite(n) && n >= target && n < bestVal) { bestVal = n; bestOpt = opt; }
+    }
+    if (!bestOpt) {
+      let maxVal = 0;
+      for (const opt of sel.options) {
+        const n = parseInt(opt.value, 10);
+        if (Number.isFinite(n) && n > maxVal) { maxVal = n; bestOpt = opt; bestVal = n; }
+      }
+    }
+    if (bestOpt) {
+      sel.value = bestOpt.value;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      sendInvStatus(`Set page size to ${bestVal} from dropdown.`);
+      await waitForGridReady(10000);
+      return;
+    }
+  }
+
+  // Strategy 3: Kendo-rendered dropdown
+  const kendoDropdowns = document.querySelectorAll(".k-pager-sizes .k-dropdown, .k-pager-sizes .k-dropdownlist");
+  for (const dd of kendoDropdowns) {
+    dd.click();
+    await humanDelay(400, 700);
+    const listItems = document.querySelectorAll(".k-animation-container .k-list .k-item, .k-animation-container .k-list-item");
+    let bestLi = null, bestN = Infinity;
+    for (const li of listItems) {
+      const n = parseInt(li.textContent.trim(), 10);
+      if (Number.isFinite(n) && n >= target && n < bestN) { bestN = n; bestLi = li; }
+    }
+    if (!bestLi) {
+      let maxN = 0;
+      for (const li of listItems) {
+        const n = parseInt(li.textContent.trim(), 10);
+        if (Number.isFinite(n) && n > maxN) { maxN = n; bestLi = li; bestN = n; }
+      }
+    }
+    if (bestLi) {
+      bestLi.click();
+      sendInvStatus(`Set page size to ${bestN} from Kendo dropdown.`);
+      await waitForGridReady(10000);
+      return;
+    }
+  }
+
+  sendInvStatus("Could not change page size — will use default page size.");
+}
+
+function makeErrorResult(ship, errorMsg) {
+  return {
+    shipmentId: ship.shipmentId,
+    billAmount: ship.billAmount,
+    vendor: ship.vendor,
+    invoiceNumber: ship.invoiceNumber,
+    memo: ship.memo,
+    shipmentSale: null, shipmentCost: null, grossProfit: null,
+    difference: null, pctDifference: null, direction: "N/A",
+    matched: false, marginDollars: null, marginPct: null,
+    error: errorMsg, scrapedFields: {},
+  };
+}
+
+// Scroll the financial confirmation area into the viewport so captureVisibleTab
+// captures Shipment Sale / Cost / Gross Profit regardless of window size.
+function scrollFinancialFieldsIntoView() {
+  const selectors = [
+    "span:has(+ span)", // generic adjacent spans (confirmation area)
+  ];
+  const keywords = /shipment\s*(sale|cost)|gross\s*profit/i;
+
+  // Strategy 1: Find the actual text labels and scroll the last one into view
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) =>
+      keywords.test(node.textContent) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT,
+  });
+  let lastMatch = null;
+  while (walker.nextNode()) lastMatch = walker.currentNode;
+  if (lastMatch && lastMatch.parentElement) {
+    lastMatch.parentElement.scrollIntoView({ behavior: "instant", block: "center" });
+    return true;
+  }
+
+  // Strategy 2: Look for known container IDs / classes
+  for (const id of ["ShipmentCost", "ShipmentSale", "GrossProfit"]) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.scrollIntoView({ behavior: "instant", block: "center" });
+      return true;
+    }
+  }
+
+  // Strategy 3: Scroll the confirmation section if it exists
+  const confirmEl = document.querySelector("[id*='confirmation' i], [class*='confirmation' i], [id*='bdetails'], #bdetails");
+  if (confirmEl) {
+    confirmEl.scrollIntoView({ behavior: "instant", block: "center" });
+    return true;
+  }
+
+  return false;
+}
+
+// Quick DOM scrape for the three financial fields — free, instant, no API cost
+function domScrapeFinancials() {
+  const sale = scrapeShipmentSaleAmount();
+  const cost = scrapeShipmentCostAmount();
+
+  let gp = null;
+  const bodyText = document.body.innerText || "";
+  const gpMatch = bodyText.match(/Gross\s*Profit\s*[:\s]*\$?\s*([\d,]+\.?\d*)/i);
+  if (gpMatch) {
+    const val = parseFloat(gpMatch[1].replace(/,/g, ""));
+    if (Number.isFinite(val)) gp = val;
+  }
+
+  return { sale, cost, gp };
+}
+
+async function invoiceScreenshotShipment(ship) {
+  const result = {
+    shipmentId: ship.shipmentId,
+    billAmount: ship.billAmount,
+    vendor: ship.vendor,
+    invoiceNumber: ship.invoiceNumber,
+    memo: ship.memo,
+    shipmentSale: null, shipmentCost: null, grossProfit: null,
+    difference: null, pctDifference: null, direction: "N/A",
+    matched: false, marginDollars: null, marginPct: null,
+    error: null, scrapedFields: {},
+  };
+
+  let saleAmount = null;
+  let costAmount = null;
+  let gpAmount = null;
+
+  // Phase 1: Try instant DOM scrape first (free, no API cost)
+  const domData = domScrapeFinancials();
+  if (domData.sale !== null) saleAmount = domData.sale;
+  if (domData.cost !== null) costAmount = domData.cost;
+  if (domData.gp !== null) gpAmount = domData.gp;
+
+  if (saleAmount !== null && costAmount !== null && gpAmount !== null) {
+    sendInvStatus(`ShipID ${ship.shipmentId}: DOM scrape → Cost $${costAmount}, Sale $${saleAmount}, GP $${gpAmount}`);
+    result.scrapedFields._method = "dom";
+  } else {
+    // Phase 2: Scroll financial area into view, then screenshot + vision
+    sendInvStatus(`ShipID ${ship.shipmentId}: scrolling financial fields into view…`);
+    scrollFinancialFieldsIntoView();
+    await humanDelay(300, 600);
+
+    sendInvStatus(`ShipID ${ship.shipmentId}: capturing screenshot…`);
+    try {
+      const visionResp = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: "invoiceScreenshotParse" }, (resp) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(resp);
+        });
+      });
+      if (visionResp && visionResp.data) {
+        const d = visionResp.data;
+        if (d.shipmentSale != null && Number.isFinite(d.shipmentSale) && saleAmount === null) saleAmount = d.shipmentSale;
+        if (d.shipmentCost != null && Number.isFinite(d.shipmentCost) && costAmount === null) costAmount = d.shipmentCost;
+        if (d.grossProfit != null && Number.isFinite(d.grossProfit) && gpAmount === null) gpAmount = d.grossProfit;
+        sendInvStatus(
+          `ShipID ${ship.shipmentId}: vision → Cost $${costAmount ?? "N/A"}, Sale $${saleAmount ?? "N/A"}, GP $${gpAmount ?? "N/A"}`
+        );
+        result.scrapedFields._visionUsed = true;
+        result.scrapedFields._visionRaw = visionResp.raw;
+      } else {
+        sendInvStatus(`ShipID ${ship.shipmentId}: vision parse failed — ${visionResp?.error || "unknown"}`);
+      }
+    } catch (e) {
+      sendInvStatus(`ShipID ${ship.shipmentId}: screenshot error — ${e.message}`);
+    }
+    result.scrapedFields._method = saleAmount !== null || costAmount !== null ? "dom+vision" : "vision";
+  }
+
+  result.shipmentSale = saleAmount;
+  result.shipmentCost = costAmount;
+  result.grossProfit = gpAmount;
+
+  // PRIMARY COMPARISON: Bill Amount [CI] vs Shipment Cost [FPX]
+  if (costAmount !== null) {
+    result.difference = +(ship.billAmount - costAmount).toFixed(2);
+    result.pctDifference = costAmount !== 0 ? +((result.difference / costAmount) * 100).toFixed(2) : 0;
+    result.direction = result.difference > 0.01 ? "OVER" : result.difference < -0.01 ? "UNDER" : "MATCH";
+    result.matched = Math.abs(result.difference) <= 0.01;
+  } else {
+    result.error = "Shipment Cost not found on detail page";
+  }
+
+  // Margin: Sale minus Cost
+  if (saleAmount !== null && costAmount !== null) {
+    result.marginDollars = +(saleAmount - costAmount).toFixed(2);
+    result.marginPct = saleAmount !== 0 ? +((result.marginDollars / saleAmount) * 100).toFixed(2) : 0;
+  }
+
+  sendInvStatus(
+    `ShipID ${ship.shipmentId}: Bill $${ship.billAmount.toFixed(2)} vs FPX Cost $${costAmount != null ? costAmount.toFixed(2) : "N/A"} — ${result.direction}` +
+    (result.matched ? "" : result.difference != null ? ` ($${result.difference.toFixed(2)})` : "")
+  );
+
+  return result;
+}
+
+async function invoiceCloseModal(shipmentId) {
+  // Strategy 1: Click Back / Close / Return button visible on the detail view
+  const candidates = document.querySelectorAll("a, button, input[type='button'], .btn");
+  for (const el of candidates) {
+    const txt = (el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+    if (/^(back|close|return|cancel|go\s*back|back\s*to\s*list|×|✕)/i.test(txt) && isVisibleForClick(el)) {
+      el.click();
+      await waitForGridWithObserver(5000);
+      return;
+    }
+  }
+
+  // Strategy 2: Click the Transactions breadcrumb / link
+  const links = document.querySelectorAll("a[href*='Transactions'], .breadcrumb a, .nav a");
+  for (const a of links) {
+    if (/transaction/i.test(a.textContent || "")) {
+      a.click();
+      await waitForGridWithObserver(5000);
+      return;
+    }
+  }
+
+  // Strategy 3: Browser back
+  sendInvStatus(`ShipID ${shipmentId}: using browser back to close detail…`);
+  history.back();
+  await waitForGridWithObserver(5000);
+}
+
+function invoiceMatchFromGrid(ship, gridMap) {
+  const result = {
+    shipmentId: ship.shipmentId,
+    billAmount: ship.billAmount,
+    vendor: ship.vendor,
+    invoiceNumber: ship.invoiceNumber,
+    memo: ship.memo,
+    shipmentSale: null,
+    shipmentCost: null,
+    grossProfit: null,
+    difference: null,
+    pctDifference: null,
+    direction: "N/A",
+    matched: false,
+    marginDollars: null,
+    marginPct: null,
+    error: null,
+    scrapedFields: {},
+  };
+
+  const gridRow = gridMap.get(String(ship.shipmentId));
+  if (!gridRow) {
+    result.error = "Shipment not found in grid data";
+    return result;
+  }
+
+  // FPX Grid fields:
+  //   "Shipment Marked-Up Rate"       = Sale (what customer was charged)
+  //   "Shipment Rate without mark up"  = Cost (what FreightPOP pays carrier)
+  //   "Shipment Gross Profit"          = Sale - Cost
+  const saleRaw = gridRow["Shipment Marked-Up Rate"];
+  const costRaw = gridRow["Shipment Rate without mark up"];
+  const gpRaw = gridRow["Shipment Gross Profit"];
+
+  const saleAmount = saleRaw != null ? parseFloat(String(saleRaw).replace(/[$,]/g, "")) : null;
+  const costAmount = costRaw != null ? parseFloat(String(costRaw).replace(/[$,]/g, "")) : null;
+  const gpAmount = gpRaw != null ? parseFloat(String(gpRaw).replace(/[$,]/g, "")) : null;
+
+  result.shipmentSale = Number.isFinite(saleAmount) ? saleAmount : null;
+  result.shipmentCost = Number.isFinite(costAmount) ? costAmount : null;
+  result.grossProfit = Number.isFinite(gpAmount) ? gpAmount : null;
+
+  // Copy all grid fields for reference
+  for (const [k, v] of Object.entries(gridRow)) {
+    if (!k.startsWith("_")) result.scrapedFields[k] = v;
+  }
+
+  // PRIMARY COMPARISON: Bill Amount (carrier invoice) vs Shipment Cost (FPX recorded cost)
+  if (result.shipmentCost !== null) {
+    result.difference = +(ship.billAmount - result.shipmentCost).toFixed(2);
+    result.pctDifference = result.shipmentCost !== 0 ? +((result.difference / result.shipmentCost) * 100).toFixed(2) : 0;
+    result.direction = result.difference > 0.01 ? "OVER" : result.difference < -0.01 ? "UNDER" : "MATCH";
+    result.matched = Math.abs(result.difference) <= 0.01;
+  } else {
+    result.error = "Shipment Cost not available in grid data";
+  }
+
+  // Margin: Sale minus Cost (FreightPOP's profit on this shipment)
+  if (result.shipmentSale !== null && result.shipmentCost !== null) {
+    result.marginDollars = +(result.shipmentSale - result.shipmentCost).toFixed(2);
+    result.marginPct = result.shipmentSale !== 0
+      ? +((result.marginDollars / result.shipmentSale) * 100).toFixed(2) : 0;
+  }
+
+  return result;
+}
+
+async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFilter) {
+  const currentUrl = window.location.href;
+  const onTransactions = currentUrl.includes("Transactions");
+  if (!onTransactions) {
+    sendInvStatus("Navigating to Transactions page...");
+    window.location.hash = "#!/Transactions";
+    await humanDelay(2500, 4000);
+  } else {
+    sendInvStatus("Already on Transactions page.");
+  }
+
+  sendInvStatus("Waiting for Generate History Report dialog...");
+  let dialogFound = false;
+  for (let wait = 0; wait < 20000; wait += 500) {
+    const allText = document.body.innerText.toUpperCase();
+    if (allText.includes("GENERATE HISTORY REPORT") || allText.includes("GENERATE REPORT")) {
+      dialogFound = true;
+      break;
+    }
+    const btn = document.querySelector("button.generate-report, [ng-click*='generate'], a.btn");
+    if (btn && /generate report/i.test(btn.textContent)) {
+      simulateClick(btn);
+      await humanDelay(1200, 2000);
+    }
+    await humanDelay(400, 700);
+  }
+
+  if (!dialogFound) {
+    sendInvStatus("Looking for Generate Report button...");
+    const allBtns = document.querySelectorAll("button, a.btn, input[type='button']");
+    for (const b of allBtns) {
+      if (/generate\s*report/i.test(b.textContent || b.value || "")) {
+        simulateClick(b);
+        await humanDelay(1500, 2500);
+        break;
+      }
+    }
+  }
+
+  await humanDelay(800, 1500);
+
+  const dateLabel = fromDate === toDate ? fromDate : `${fromDate} — ${toDate}`;
+  sendInvStatus("Filling date fields: " + dateLabel + "...");
+
+  const dateFields = findDateInputs();
+  if (!dateFields.from && !dateFields.to) {
+    sendInvComplete("Failed — no date inputs found.");
+    return false;
+  }
+
+  if (dateFields.from) {
+    setDateInput(dateFields.from, fromDate);
+    sendInvStatus("Set FROM DATE to " + fromDate);
+  }
+  await humanDelay(400, 800);
+
+  if (dateFields.to) {
+    setDateInput(dateFields.to, toDate);
+    sendInvStatus("Set TO DATE to " + toDate);
+  }
+  await humanDelay(400, 800);
+
+  function retryDateFill(input, label, dateStr) {
+    if (!input || input.value) return;
+    const parts = dateStr.split("/");
+    const isoVal = `${parts[2]}-${parts[0]}-${parts[1]}`;
+    const valForType = input.type === "date" ? isoVal : dateStr;
+    try {
+      const scope = window.angular && window.angular.element(input).scope();
+      if (scope) {
+        const modelAttr = input.getAttribute("ng-model") || input.getAttribute("data-ng-model");
+        if (modelAttr) {
+          const keys = modelAttr.split(".");
+          let target = scope;
+          for (let k = 0; k < keys.length - 1; k++) target = target[keys[k]];
+          target[keys[keys.length - 1]] = valForType;
+          scope.$apply();
+        }
+      }
+    } catch {}
+    input.value = valForType;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  retryDateFill(dateFields.from, "FROM DATE", fromDate);
+  retryDateFill(dateFields.to, "TO DATE", toDate);
+  await humanDelay(400, 800);
+
+  const custTarget = customerFilter || "";
+  const useAllCustomers = !custTarget || /^all(\s*customers)?$/i.test(custTarget);
+
+  sendInvStatus(useAllCustomers ? "Setting All Customers..." : `Setting customer to "${custTarget}"...`);
+  const selects = document.querySelectorAll("select");
+  for (const sel of selects) {
+    const row = sel.closest("tr, div, .form-group");
+    const rowText = row ? row.textContent.toUpperCase() : "";
+    const name = (sel.name || "").toLowerCase();
+    const id = (sel.id || "").toLowerCase();
+
+    if (rowText.includes("CUSTOMER") || name.includes("customer") || id.includes("customer")) {
+      if (useAllCustomers) {
+        for (const opt of sel.options) {
+          if (/all\s*customers/i.test(opt.text)) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            break;
+          }
+        }
+      } else {
+        const needle = custTarget.toLowerCase();
+        let matched = false;
+        for (const opt of sel.options) {
+          if (opt.text.toLowerCase().includes(needle) || opt.value === custTarget) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          for (const opt of sel.options) {
+            if (/all\s*customers/i.test(opt.text)) {
+              sel.value = opt.value;
+              sel.dispatchEvent(new Event("change", { bubbles: true }));
+              break;
+            }
+          }
+        }
+      }
+
+      try {
+        const kendoWidget = window.jQuery && window.jQuery(sel).data("kendoDropDownList");
+        if (kendoWidget) {
+          const ds = kendoWidget.dataSource.data();
+          const pat = useAllCustomers ? /all\s*customers/i : new RegExp(custTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+          for (let k = 0; k < ds.length; k++) {
+            const txt = ds[k].text || ds[k].Text || ds[k].Name || "";
+            if (pat.test(txt)) {
+              kendoWidget.select(k);
+              kendoWidget.trigger("change");
+              break;
+            }
+          }
+        }
+      } catch {}
+      break;
+    }
+  }
+  await humanDelay(400, 800);
+
+  sendInvStatus("Clicking CONTINUE...");
+  let continueClicked = false;
+  const buttons = document.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn, .btn");
+  for (const btn of buttons) {
+    const txt = (btn.textContent || btn.value || "").replace(/\s+/g, " ").trim().toUpperCase();
+    if (txt === "CONTINUE" || txt === "GENERATE" || txt === "SUBMIT") {
+      simulateClick(btn);
+      continueClicked = true;
+      break;
+    }
+  }
+
+  if (!continueClicked) {
+    sendInvComplete("ERROR: Could not find CONTINUE button.");
+    return false;
+  }
+
+  sendInvStatus("Waiting for results grid to load...");
+  await humanDelay(2500, 4000);
+
+  let gridReady = false;
+  for (let wait = 0; wait < 15000; wait += 1000) {
+    const gridRows = document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr");
+    const visibleRows = [...gridRows].filter(
+      (r) => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row")
+    );
+    if (visibleRows.length > 0) { gridReady = true; break; }
+    await humanDelay(800, 1300);
+  }
+
+  if (!gridReady) {
+    sendInvComplete("No grid data loaded. Report may not have generated.");
+    return false;
+  }
+
+  const typeToClick = shipmentType || "non-parcel";
+  if (typeToClick !== "all") {
+    sendInvStatus("Selecting " + (typeToClick === "parcel" ? "Parcel" : "Non-Parcel") + " tab...");
+    clickShipmentTypeTab(typeToClick);
+    await humanDelay(1500, 2500);
+    await waitForGridReady(5000);
+  }
+
+  sendInvStatus("Report generated. Ready to process shipments.");
+  return true;
+}
+
+async function filterGridByShipmentId(shipmentId) {
+  sendInvStatus(`Filtering grid for ShipmentID ${shipmentId}...`);
+
+  const headerCells = document.querySelectorAll(".k-grid th");
+  let targetHeader = null;
+  for (const cell of headerCells) {
+    const link = cell.querySelector("a.k-link");
+    const text = link ? link.textContent.trim() : cell.textContent.trim();
+    if (/shipment\s*id/i.test(text) || text === "ShipmentID") {
+      targetHeader = cell;
+      break;
+    }
+  }
+
+  if (!targetHeader) {
+    sendInvStatus("ShipmentID column header not found. Trying Kendo API...");
+    return await filterGridViaKendoApi(shipmentId);
+  }
+
+  const filterIcon =
+    targetHeader.querySelector("a.k-grid-filter") ||
+    targetHeader.querySelector("a.k-grid-filter-menu") ||
+    targetHeader.querySelector(".k-grid-filter") ||
+    targetHeader.querySelector("[data-role='columnmenu']");
+
+  if (!filterIcon) {
+    sendInvStatus("ShipmentID filter icon not found. Trying Kendo API...");
+    return await filterGridViaKendoApi(shipmentId);
+  }
+
+  filterIcon.click();
+  await humanDelay(600, 1000);
+
+  let filterPopup = null;
+  const containers = document.querySelectorAll(".k-animation-container, .k-filter-menu, .k-column-menu");
+  for (const c of containers) {
+    if (c.offsetParent !== null || c.style.display !== "none") {
+      const hasFilterBtn = Array.from(c.querySelectorAll("button")).some(
+        (b) => b.textContent.trim() === "Filter"
+      );
+      if (hasFilterBtn) { filterPopup = c; break; }
+    }
+  }
+
+  if (!filterPopup) {
+    sendInvStatus("Filter popup did not open. Trying Kendo API...");
+    return await filterGridViaKendoApi(shipmentId);
+  }
+
+  const selects = filterPopup.querySelectorAll("select");
+  const kendoDropdowns = filterPopup.querySelectorAll("span.k-dropdown, span.k-widget.k-dropdown, [data-role='dropdownlist']");
+
+  if (selects.length >= 1) {
+    const opSelect = selects[0];
+    if (opSelect.value !== "eq") {
+      opSelect.value = "eq";
+      opSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      await humanDelay(200, 500);
+    }
+  } else if (kendoDropdowns.length >= 1) {
+    const opDd = kendoDropdowns[0];
+    if (!opDd.textContent.includes("Is equal to")) {
+      (opDd.querySelector(".k-dropdown-wrap, .k-input") || opDd).click();
+      await humanDelay(400, 700);
+      for (const item of document.querySelectorAll(".k-animation-container .k-list .k-item, .k-popup .k-item")) {
+        if (item.textContent.trim() === "Is equal to") { item.click(); break; }
+      }
+      await humanDelay(300, 600);
+    }
+  }
+
+  const textInput = filterPopup.querySelector('input[type="text"], input.k-textbox, input:not([type="hidden"]):not([type="checkbox"])');
+  if (textInput) {
+    textInput.focus();
+    textInput.value = shipmentId;
+    textInput.dispatchEvent(new Event("input", { bubbles: true }));
+    textInput.dispatchEvent(new Event("change", { bubbles: true }));
+    await humanDelay(200, 500);
+  }
+
+  for (const btn of filterPopup.querySelectorAll("button")) {
+    if (btn.textContent.trim() === "Filter") { btn.click(); break; }
+  }
+
+  await humanDelay(1500, 2500);
+  await waitForGridReady(5000);
+  return true;
+}
+
+async function filterGridViaKendoApi(shipmentId) {
+  try {
+    const grids = document.querySelectorAll("[data-role='grid'], .k-grid");
+    for (const gridEl of grids) {
+      const kGrid = window.jQuery && window.jQuery(gridEl).data("kendoGrid");
+      if (!kGrid) continue;
+      kGrid.dataSource.filter({
+        field: "ShipmentID",
+        operator: "eq",
+        value: shipmentId,
+      });
+      await humanDelay(1500, 2500);
+      await waitForGridReady(5000);
+      return true;
+    }
+  } catch (e) {
+    sendInvStatus("Kendo API filter failed: " + e.message);
+  }
+  return false;
+}
+
+async function clearShipmentIdFilter() {
+  try {
+    const grids = document.querySelectorAll("[data-role='grid'], .k-grid");
+    for (const gridEl of grids) {
+      const kGrid = window.jQuery && window.jQuery(gridEl).data("kendoGrid");
+      if (!kGrid) continue;
+      kGrid.dataSource.filter({});
+      await humanDelay(1200, 2000);
+      await waitForGridReady(3000);
+      return true;
+    }
+  } catch (e) {
+    sendInvStatus("Clear filter failed: " + e.message);
+  }
+
+  const headerCells = document.querySelectorAll(".k-grid th");
+  for (const cell of headerCells) {
+    const link = cell.querySelector("a.k-link");
+    const text = link ? link.textContent.trim() : cell.textContent.trim();
+    if (/shipment\s*id/i.test(text) || text === "ShipmentID") {
+      const filterIcon = cell.querySelector("a.k-grid-filter") || cell.querySelector(".k-grid-filter");
+      if (filterIcon) {
+        filterIcon.click();
+        await humanDelay(600, 1000);
+        const containers = document.querySelectorAll(".k-animation-container, .k-filter-menu");
+        for (const c of containers) {
+          if (c.offsetParent === null && c.style.display === "none") continue;
+          for (const btn of c.querySelectorAll("button")) {
+            if (btn.textContent.trim() === "Clear") { btn.click(); break; }
+          }
+        }
+        await humanDelay(1200, 2000);
+      }
+      break;
+    }
+  }
+
+  return true;
+}
+
+function parseMoneyText(el) {
+  if (!el) return null;
+  const raw = (el.textContent || el.value || "").replace(/[$,\s]/g, "");
+  const val = parseFloat(raw);
+  return Number.isFinite(val) ? val : null;
+}
+
+function scrapeShipmentSaleAmount() {
+  const byId = document.getElementById("ShipmentSale");
+  if (byId) {
+    const val = parseMoneyText(byId);
+    if (val !== null) { console.log("[FPX-INV] #ShipmentSale by ID:", val); return val; }
+  }
+
+  const allWindows = document.querySelectorAll(".k-window, .modal, [role='dialog']");
+  for (const modal of allWindows) {
+    const text = modal.innerText || "";
+    const m = text.match(/Shipment\s*Sale[s]?\s*[:\s]*\$?\s*([\d,]+\.?\d*)/i);
+    if (m) {
+      const val = parseFloat(m[1].replace(/,/g, ""));
+      if (Number.isFinite(val)) { console.log("[FPX-INV] ShipmentSale from modal text:", val); return val; }
+    }
+  }
+
+  const bodyText = document.body.innerText || "";
+  const m2 = bodyText.match(/Shipment\s*Sale[s]?\s*[:\s]*\$?\s*([\d,]+\.?\d*)/i);
+  if (m2) {
+    const val = parseFloat(m2[1].replace(/,/g, ""));
+    if (Number.isFinite(val)) { console.log("[FPX-INV] ShipmentSale from body text:", val); return val; }
+  }
+
+  console.log("[FPX-INV] ShipmentSale NOT found. #ShipmentSale el:", byId, "modals found:", allWindows.length);
+  return null;
+}
+
+function scrapeShipmentCostAmount() {
+  const byId = document.getElementById("ShipmentCost");
+  if (byId) {
+    const val = parseMoneyText(byId);
+    if (val !== null) { console.log("[FPX-INV] #ShipmentCost by ID:", val); return val; }
+  }
+
+  const allWindows = document.querySelectorAll(".k-window, .modal, [role='dialog']");
+  for (const modal of allWindows) {
+    const text = modal.innerText || "";
+    const m = text.match(/Shipment\s*Cost\s*[:\s]*\$?\s*([\d,]+\.?\d*)/i);
+    if (m) {
+      const val = parseFloat(m[1].replace(/,/g, ""));
+      if (Number.isFinite(val)) { console.log("[FPX-INV] ShipmentCost from modal text:", val); return val; }
+    }
+  }
+
+  return null;
+}
+
+async function invoiceProcessShipment(ship, idx, total) {
+  const result = {
+    shipmentId: ship.shipmentId,
+    billAmount: ship.billAmount,
+    vendor: ship.vendor,
+    invoiceNumber: ship.invoiceNumber,
+    memo: ship.memo,
+    shipmentSale: null,
+    shipmentCost: null,
+    grossProfit: null,
+    difference: null,
+    pctDifference: null,
+    direction: "N/A",
+    matched: false,
+    marginDollars: null,
+    marginPct: null,
+    error: null,
+    scrapedFields: {},
+  };
+
+  try {
+    const filtered = await filterGridByShipmentId(ship.shipmentId);
+    if (!filtered) {
+      result.error = "Could not filter grid";
+      await clearShipmentIdFilter();
+      return result;
+    }
+
+    const gridRows = document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr");
+    const dataRows = [...gridRows].filter(
+      (r) => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row")
+    );
+
+    if (dataRows.length === 0) {
+      result.error = "No grid rows after filter — shipment not found in report";
+      sendInvStatus(`ShipID ${ship.shipmentId}: not found in report.`);
+      await clearShipmentIdFilter();
+      return result;
+    }
+
+    sendInvStatus(`ShipID ${ship.shipmentId}: found ${dataRows.length} row(s). Opening View Shipment...`);
+
+    // --- Click "View Shipment" ---
+    let viewClicked = false;
+
+    const allClickables = document.querySelectorAll(
+      ".k-grid-content a, .k-grid-content button, .k-grid-content input[type='button'], " +
+      ".k-grid a, .k-grid button, .k-grid input[type='button']"
+    );
+    for (const el of allClickables) {
+      const txt = (el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+      if (/view\s*shipment/i.test(txt) && isVisibleForClick(el)) {
+        sendInvStatus(`ShipID ${ship.shipmentId}: clicking "${txt}"...`);
+        el.click();
+        viewClicked = true;
+        break;
+      }
+    }
+
+    if (!viewClicked) {
+      for (const row of dataRows) {
+        const btns = row.querySelectorAll("a, button, input[type='button']");
+        for (const btn of btns) {
+          const txt = (btn.textContent || btn.value || "").replace(/\s+/g, " ").trim();
+          if (/view\s*shipment/i.test(txt)) {
+            btn.click();
+            viewClicked = true;
+            break;
+          }
+        }
+        if (viewClicked) break;
+      }
+    }
+
+    if (!viewClicked) {
+      for (const row of dataRows) {
+        const firstLink = row.querySelector("a");
+        if (firstLink) {
+          sendInvStatus(`ShipID ${ship.shipmentId}: fallback — clicking first link in row.`);
+          firstLink.click();
+          viewClicked = true;
+          break;
+        }
+      }
+    }
+
+    if (!viewClicked) {
+      result.error = "Could not find View Shipment link";
+      await clearShipmentIdFilter();
+      return result;
+    }
+
+    sendInvStatus(`ShipID ${ship.shipmentId}: waiting for detail view to render…`);
+    await humanDelay(2000, 3500);
+
+    // --- Extract financials (DOM first, then vision fallback) ---
+    let saleAmount = null;
+    let costAmount = null;
+    let gpAmount = null;
+
+    const domData = domScrapeFinancials();
+    if (domData.sale !== null) saleAmount = domData.sale;
+    if (domData.cost !== null) costAmount = domData.cost;
+    if (domData.gp !== null) gpAmount = domData.gp;
+
+    if (saleAmount !== null && costAmount !== null && gpAmount !== null) {
+      sendInvStatus(`ShipID ${ship.shipmentId}: DOM scrape → Cost $${costAmount}, Sale $${saleAmount}, GP $${gpAmount}`);
+      result.scrapedFields._method = "dom";
+    } else {
+      scrollFinancialFieldsIntoView();
+      await humanDelay(300, 600);
+      sendInvStatus(`ShipID ${ship.shipmentId}: capturing screenshot…`);
+      try {
+        const visionResp = await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "invoiceScreenshotParse" }, (resp) => {
+            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+            else resolve(resp);
+          });
+        });
+        if (visionResp && visionResp.data) {
+          const d = visionResp.data;
+          if (d.shipmentSale != null && Number.isFinite(d.shipmentSale) && saleAmount === null) saleAmount = d.shipmentSale;
+          if (d.shipmentCost != null && Number.isFinite(d.shipmentCost) && costAmount === null) costAmount = d.shipmentCost;
+          if (d.grossProfit != null && Number.isFinite(d.grossProfit) && gpAmount === null) gpAmount = d.grossProfit;
+          sendInvStatus(
+            `ShipID ${ship.shipmentId}: vision → Sale $${saleAmount ?? "N/A"}, Cost $${costAmount ?? "N/A"}, GP $${gpAmount ?? "N/A"}`
+          );
+          result.scrapedFields._visionUsed = true;
+          result.scrapedFields._visionRaw = visionResp.raw;
+        } else {
+          sendInvStatus(`ShipID ${ship.shipmentId}: vision parse failed — ${visionResp?.error || "unknown"}`);
+        }
+      } catch (e) {
+        sendInvStatus(`ShipID ${ship.shipmentId}: screenshot error — ${e.message}`);
+      }
+      result.scrapedFields._method = saleAmount !== null || costAmount !== null ? "dom+vision" : "vision";
+    }
+
+    result.shipmentSale = saleAmount;
+    result.shipmentCost = costAmount;
+    result.grossProfit = gpAmount;
+
+    // Scrape additional fields from the detail section
+    for (const containerId of ["bdetails", "details", "shipmentDetails"]) {
+      const container = document.getElementById(containerId);
+      if (!container) continue;
+      const labels = container.querySelectorAll("label span, label, .control-label");
+      for (const lbl of labels) {
+        const key = lbl.textContent.trim().replace(/:$/, "");
+        if (!key) continue;
+        const parent = lbl.closest(".row, .form-group, .col-md-12, .col-sm-12");
+        if (!parent) continue;
+        const valEl = parent.querySelector("span[id], input[readonly], .form-control-static, p");
+        if (valEl && valEl !== lbl) {
+          const val = (valEl.value || valEl.textContent || "").trim();
+          if (val) result.scrapedFields[key] = val;
+        }
+      }
+    }
+
+    // --- PRIMARY COMPARISON: Bill Amount [CI] vs Shipment Cost [FPX] ---
+    if (costAmount !== null) {
+      result.difference = +(ship.billAmount - costAmount).toFixed(2);
+      result.pctDifference = costAmount !== 0 ? +((result.difference / costAmount) * 100).toFixed(2) : 0;
+      result.direction = result.difference > 0.01 ? "OVER" : result.difference < -0.01 ? "UNDER" : "MATCH";
+      result.matched = Math.abs(result.difference) <= 0.01;
+    } else {
+      result.error = "Shipment Cost not found on detail page";
+    }
+
+    // Margin: Sale minus Cost
+    if (saleAmount !== null && costAmount !== null) {
+      result.marginDollars = +(saleAmount - costAmount).toFixed(2);
+      result.marginPct = saleAmount !== 0 ? +((result.marginDollars / saleAmount) * 100).toFixed(2) : 0;
+    }
+
+    setTimeout(() => {
+      const s = ship.shipmentId;
+      if (costAmount !== null) {
+        sendInvStatus(
+          `ShipID ${s}: Bill $${ship.billAmount.toFixed(2)} vs FPX Cost $${costAmount.toFixed(2)} — ${result.direction}` +
+          (result.matched ? "" : ` ($${result.difference.toFixed(2)})`) +
+          (saleAmount !== null ? ` | Sale $${saleAmount.toFixed(2)}` : "") +
+          (result.grossProfit !== null ? ` | GP $${result.grossProfit.toFixed(2)}` : "")
+        );
+      } else {
+        sendInvStatus(`ShipID ${s}: could not read Shipment Cost from detail page.`);
+      }
+    }, 0);
+
+    // --- Navigate back to the grid ---
+    await invoiceReturnToGrid(ship.shipmentId);
+
+    await clearShipmentIdFilter();
+
+  } catch (e) {
+    result.error = e.message;
+    sendInvStatus(`ShipID ${ship.shipmentId}: error — ${e.message}`);
+    try { await invoiceReturnToGrid(ship.shipmentId); } catch {}
+    try { await clearShipmentIdFilter(); } catch {}
+  }
+
+  return result;
+}
+
+async function invoiceReturnToGrid(shipmentId) {
+  // Strategy 1: Look for a Back / Close / Return button
+  const candidates = document.querySelectorAll(
+    "a, button, input[type='button'], .btn"
+  );
+  for (const el of candidates) {
+    const txt = (el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+    if (/^(back|close|return|cancel|go\s*back|back\s*to\s*list)/i.test(txt) && isVisibleForClick(el)) {
+      sendInvStatus(`ShipID ${shipmentId}: clicking "${txt}" to return to grid...`);
+      el.click();
+      // Was: sleep(2000). Now: observer fires as soon as grid rows appear in the DOM.
+      const gridBack = await waitForGridWithObserver(8000);
+      if (gridBack) return;
+    }
+  }
+
+  // Strategy 2: Click the Transactions hash link / breadcrumb
+  const links = document.querySelectorAll("a[href*='Transactions'], .breadcrumb a, .nav a");
+  for (const a of links) {
+    if (/transaction/i.test(a.textContent || "")) {
+      sendInvStatus(`ShipID ${shipmentId}: clicking Transactions link...`);
+      a.click();
+      // Was: sleep(2500). Now: observer-based wait.
+      const gridBack = await waitForGridWithObserver(8000);
+      if (gridBack) return;
+    }
+  }
+
+  // Strategy 3: Hash navigation
+  sendInvStatus(`ShipID ${shipmentId}: hash-navigating back to Transactions...`);
+  window.location.hash = "#!/Transactions";
+  // Was: sleep(3000) + 1s-polling loop up to 15s. Now: single observer wait.
+  const gridBack = await waitForGridWithObserver(10000);
+  if (gridBack) return;
+
+  sendInvStatus(`ShipID ${shipmentId}: grid may not have reloaded — proceeding.`);
+}
+
+async function invoiceFinalize(results, skippedRows, dateLabel, aiLevel) {
+  const discrepancies = results.filter((r) => !r.matched && r.shipmentCost !== null);
+  const matches = results.filter((r) => r.matched);
+  const errors = results.filter((r) => r.error);
+  const totalVariance = discrepancies.reduce((sum, r) => sum + (r.difference || 0), 0);
+
+  sendInvStatus(`${discrepancies.length} discrepancy(ies), ${matches.length} match(es), ${errors.length} error(s).`);
+
+  try {
+    chrome.runtime.sendMessage({
+      type: "invoiceAuditDiscrepancies",
+      discrepancies: discrepancies.map((d) => ({
+        shipmentId: d.shipmentId,
+        vendor: d.vendor,
+        billAmount: d.billAmount,
+        shipmentSale: d.shipmentSale,
+        shipmentCost: d.shipmentCost,
+        difference: d.difference,
+        direction: d.direction,
+      })),
+    });
+  } catch {}
+
+  let execSummaryText = "";
+  let perRowNotes = null;
+
+  if (aiLevel !== "off") {
+    const payload = {
+      totalAudited: results.length,
+      totalMatched: matches.length,
+      totalDiscrepancies: discrepancies.length,
+      totalSkipped: (skippedRows || []).length,
+      totalVariance: +totalVariance.toFixed(2),
+      totalErrors: errors.length,
+      discrepancies: discrepancies.map((d) => ({
+        shipmentId: d.shipmentId,
+        vendor: d.vendor,
+        invoiceNumber: d.invoiceNumber,
+        billAmount: d.billAmount,
+        shipmentSale: d.shipmentSale,
+        shipmentCost: d.shipmentCost,
+        grossProfit: d.grossProfit,
+        difference: d.difference,
+        pctDifference: d.pctDifference,
+        direction: d.direction,
+      })),
+      matches: matches.slice(0, 20).map((m) => ({
+        shipmentId: m.shipmentId,
+        vendor: m.vendor,
+        billAmount: m.billAmount,
+        shipmentSale: m.shipmentSale,
+        shipmentCost: m.shipmentCost,
+      })),
+    };
+
+    sendInvStatus("Requesting AI executive summary...");
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: "invoiceAuditAiSummary", payload });
+      if (resp && resp.text) {
+        execSummaryText = resp.text;
+        try { chrome.runtime.sendMessage({ type: "invoiceAiSummary", text: execSummaryText }); } catch {}
+      } else if (resp && resp.error) {
+        execSummaryText = "AI error: " + resp.error;
+      }
+    } catch (e) {
+      execSummaryText = "AI error: " + e.message;
+    }
+
+    if (aiLevel === "full" && discrepancies.length > 0) {
+      sendInvStatus(`Running per-row AI review on ${discrepancies.length} discrepancy(ies)...`);
+      perRowNotes = new Map();
+      for (let i = 0; i < discrepancies.length; i++) {
+        if (stopRequested) break;
+        const d = discrepancies[i];
+        sendInvStatus(`AI row ${i + 1}/${discrepancies.length} — ShipID ${d.shipmentId}...`);
+        try {
+          const resp = await chrome.runtime.sendMessage({
+            type: "invoiceAuditRowReview",
+            row: {
+              shipmentId: d.shipmentId,
+              vendor: d.vendor,
+              invoiceNumber: d.invoiceNumber,
+              billAmount: d.billAmount,
+              shipmentSale: d.shipmentSale,
+              shipmentCost: d.shipmentCost,
+              grossProfit: d.grossProfit,
+              difference: d.difference,
+              pctDifference: d.pctDifference,
+              direction: d.direction,
+            },
+          });
+          if (resp && resp.text) perRowNotes.set(d.shipmentId, resp.text);
+          else if (resp && resp.error) perRowNotes.set(d.shipmentId, "Error: " + resp.error);
+        } catch (e) {
+          perRowNotes.set(d.shipmentId, "Error: " + e.message);
+        }
+      }
+    }
+  }
+
+  // Grab API cost snapshot before downloading
+  let apiCost = null;
+  try {
+    apiCost = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "getApiCost" }, resolve);
+    });
+  } catch {}
+
+  sendInvStatus("Downloading Invoice Audit XLSX...");
+  invoiceDownloadXLSX(results, skippedRows, dateLabel, execSummaryText, perRowNotes, apiCost);
+
+  sendInvComplete(
+    `Invoice Audit done — ${results.length} shipment(s), ${discrepancies.length} discrepancy(ies), ${matches.length} match(es), ${errors.length} error(s).`
+  );
+}
+
+function invoiceDownloadXLSX(results, skippedRows, dateLabel, execSummaryText, perRowNotes, apiCost) {
+  if (typeof XLSX === "undefined") return;
+  const wb = XLSX.utils.book_new();
+  const sc = (r, c) => XLSX.utils.encode_cell({ r, c });
+
+  const discrepancies = results.filter((r) => !r.matched && r.shipmentCost !== null);
+  const matches = results.filter((r) => r.matched);
+  const errors = results.filter((r) => r.error);
+  const totalVariance = discrepancies.reduce((sum, r) => sum + (r.difference || 0), 0);
+
+  const marginRows = results.filter((r) => r.marginDollars != null);
+  const totalMargin = marginRows.reduce((s, r) => s + r.marginDollars, 0);
+  const avgMarginPct = marginRows.length > 0
+    ? +(marginRows.reduce((s, r) => s + (r.marginPct || 0), 0) / marginRows.length).toFixed(2)
+    : 0;
+
+  // --- Sheet 1: Executive Summary ---
+  const summaryData = [
+    ["FPXpress Invoice Audit Report"],
+    ["Date Range", dateLabel],
+    ["Generated", new Date().toLocaleString()],
+    [],
+    ["Data Sources"],
+    ["  Carrier Invoice File", "Columns: Amount (→ Bill Amount), Memo (→ Shipment ID), Vendor, Invoice Number"],
+    ["  FPX Transaction Grid", "Columns: Shipment Rate without mark up (→ Cost), Shipment Marked-Up Rate (→ Sale), Shipment Gross Profit"],
+    [],
+    ["Comparison", "Bill Amount (Carrier Invoice)  vs  Shipment Cost (FPX Grid)"],
+    [],
+    ["Total Audited", results.length],
+    ["Matched (Bill = Cost)", matches.length],
+    ["Discrepancies (Bill ≠ Cost)", discrepancies.length],
+    ["Errors / Not Found", errors.length],
+    ["Skipped (No ID)", (skippedRows || []).length],
+    ["Total $ Variance", "$" + totalVariance.toFixed(2)],
+    [],
+    ["Total Est. Margin ($)", "$" + totalMargin.toFixed(2)],
+    ["Avg Est. Margin (%)", avgMarginPct + "%"],
+    [],
+    ["Claude API Cost", apiCost ? `$${apiCost.totalUsd.toFixed(4)} (${apiCost.calls} calls, ${apiCost.inputTokens.toLocaleString()} in / ${apiCost.outputTokens.toLocaleString()} out tokens)` : "N/A"],
+    [],
+    ["AI Executive Summary"],
+    [execSummaryText || "(AI analysis not enabled)"],
+  ];
+  const wsSummary = XLSX.utils.aoa_to_sheet(summaryData);
+  wsSummary["!cols"] = [{ wch: 30 }, { wch: 100 }];
+  if (wsSummary[sc(0, 0)]) wsSummary[sc(0, 0)].s = XL_TITLE_STYLE;
+  for (let r = 1; r <= 2; r++) {
+    if (wsSummary[sc(r, 0)]) wsSummary[sc(r, 0)].s = XL_LABEL_STYLE;
+    if (wsSummary[sc(r, 1)]) wsSummary[sc(r, 1)].s = XL_VALUE_STYLE;
+  }
+  if (wsSummary[sc(4, 0)]) wsSummary[sc(4, 0)].s = { font: { name: "Arial", sz: 11, bold: true, color: { rgb: "1F4E79" } } };
+  for (let r = 5; r <= 6; r++) {
+    if (wsSummary[sc(r, 0)]) wsSummary[sc(r, 0)].s = XL_LABEL_STYLE;
+    if (wsSummary[sc(r, 1)]) wsSummary[sc(r, 1)].s = { font: { name: "Arial", sz: 10, italic: true, color: { rgb: "555555" } } };
+  }
+  if (wsSummary[sc(8, 0)]) wsSummary[sc(8, 0)].s = XL_LABEL_STYLE;
+  if (wsSummary[sc(8, 1)]) wsSummary[sc(8, 1)].s = { font: { name: "Arial", sz: 11, bold: true } };
+  for (let r = 10; r <= 20; r++) {
+    if (wsSummary[sc(r, 0)]) wsSummary[sc(r, 0)].s = XL_LABEL_STYLE;
+    if (wsSummary[sc(r, 1)]) wsSummary[sc(r, 1)].s = XL_VALUE_STYLE;
+  }
+  if (wsSummary[sc(22, 0)]) wsSummary[sc(22, 0)].s = {
+    font: { name: "Arial", sz: 11, bold: true, color: { rgb: "1F4E79" } },
+  };
+  XLSX.utils.book_append_sheet(wb, wsSummary, "Executive Summary");
+
+  // --- Sheet 2: Discrepancies ---
+  // Source labels: [CI] = Carrier Invoice file, [FPX] = FreightPOP Grid
+  const discHeaders = [
+    "Shipment ID", "[CI] Vendor", "[CI] Invoice #", "[CI] Bill Amount ($)",
+    "[FPX] Cost ($)", "[FPX] Sale ($)", "[FPX] Gross Profit ($)",
+    "Difference ($)", "% Difference", "Direction",
+    "Est. Margin ($)", "Est. Margin %",
+    "AI Notes",
+  ];
+  const discData = [discHeaders];
+  for (const d of discrepancies) {
+    discData.push([
+      d.shipmentId,
+      d.vendor,
+      d.invoiceNumber,
+      d.billAmount,
+      d.shipmentCost != null ? d.shipmentCost : "",
+      d.shipmentSale != null ? d.shipmentSale : "",
+      d.grossProfit != null ? d.grossProfit : "",
+      d.difference,
+      d.pctDifference != null ? d.pctDifference + "%" : "",
+      d.direction,
+      d.marginDollars != null ? d.marginDollars : "",
+      d.marginPct != null ? d.marginPct + "%" : "",
+      perRowNotes ? (perRowNotes.get(d.shipmentId) || "") : "",
+    ]);
+  }
+  const wsDisc = XLSX.utils.aoa_to_sheet(discData);
+  wsDisc["!cols"] = [
+    { wch: 14 }, { wch: 28 }, { wch: 18 }, { wch: 18 },
+    { wch: 16 }, { wch: 16 }, { wch: 18 },
+    { wch: 14 }, { wch: 12 }, { wch: 10 },
+    { wch: 14 }, { wch: 12 },
+    { wch: 50 },
+  ];
+  for (let c = 0; c < discHeaders.length; c++) {
+    if (wsDisc[sc(0, c)]) wsDisc[sc(0, c)].s = XL_HDR_STYLE;
+  }
+  for (let r = 1; r < discData.length; r++) {
+    const isAlt = r % 2 === 0;
+    for (let c = 0; c < discHeaders.length; c++) {
+      const cell = wsDisc[sc(r, c)];
+      if (!cell) continue;
+      cell.s = isAlt
+        ? { ...XL_DATA_STYLE, fill: XL_ALT_FILL }
+        : { ...XL_DATA_STYLE };
+    }
+  }
+  XLSX.utils.book_append_sheet(wb, wsDisc, "Discrepancies");
+
+  // --- Sheet 3: All Audited ---
+  const allHeaders = [
+    "Shipment ID", "[CI] Vendor", "[CI] Invoice #", "[CI] Bill Amount ($)",
+    "[FPX] Cost ($)", "[FPX] Sale ($)", "[FPX] Gross Profit ($)",
+    "Difference ($)", "% Difference", "Direction",
+    "Est. Margin ($)", "Est. Margin %",
+    "Status", "Error",
+  ];
+  const allData = [allHeaders];
+  for (const r of results) {
+    allData.push([
+      r.shipmentId,
+      r.vendor,
+      r.invoiceNumber,
+      r.billAmount,
+      r.shipmentCost != null ? r.shipmentCost : "",
+      r.shipmentSale != null ? r.shipmentSale : "",
+      r.grossProfit != null ? r.grossProfit : "",
+      r.difference != null ? r.difference : "",
+      r.pctDifference != null ? r.pctDifference + "%" : "",
+      r.direction,
+      r.marginDollars != null ? r.marginDollars : "",
+      r.marginPct != null ? r.marginPct + "%" : "",
+      r.matched ? "MATCH" : r.error ? "ERROR" : "MISMATCH",
+      r.error || "",
+    ]);
+  }
+  const wsAll = XLSX.utils.aoa_to_sheet(allData);
+  wsAll["!cols"] = [
+    { wch: 14 }, { wch: 28 }, { wch: 18 }, { wch: 18 },
+    { wch: 16 }, { wch: 16 }, { wch: 18 },
+    { wch: 14 }, { wch: 12 }, { wch: 10 },
+    { wch: 14 }, { wch: 12 },
+    { wch: 12 }, { wch: 35 },
+  ];
+  for (let c = 0; c < allHeaders.length; c++) {
+    if (wsAll[sc(0, c)]) wsAll[sc(0, c)].s = XL_HDR_STYLE;
+  }
+  for (let r = 1; r < allData.length; r++) {
+    const isAlt = r % 2 === 0;
+    for (let c = 0; c < allHeaders.length; c++) {
+      const cell = wsAll[sc(r, c)];
+      if (!cell) continue;
+      cell.s = isAlt
+        ? { ...XL_DATA_STYLE, fill: XL_ALT_FILL }
+        : { ...XL_DATA_STYLE };
+    }
+  }
+  XLSX.utils.book_append_sheet(wb, wsAll, "All Audited");
+
+  // --- Sheet 4: Skipped ---
+  const skipHeaders = ["Vendor", "Invoice Number", "Amount", "Memo"];
+  const skipData = [skipHeaders];
+  for (const s of (skippedRows || [])) {
+    skipData.push([s.vendor, s.invoiceNumber, s.amount, s.memo]);
+  }
+  const wsSkip = XLSX.utils.aoa_to_sheet(skipData);
+  wsSkip["!cols"] = [{ wch: 28 }, { wch: 18 }, { wch: 14 }, { wch: 50 }];
+  for (let c = 0; c < skipHeaders.length; c++) {
+    if (wsSkip[sc(0, c)]) wsSkip[sc(0, c)].s = XL_HDR_STYLE;
+  }
+  XLSX.utils.book_append_sheet(wb, wsSkip, "Skipped");
+
+  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", cellStyles: true });
+  const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const safeDateLabel = dateLabel.replace(/[/\s—]+/g, "-").replace(/-{2,}/g, "-");
+  const ts = new Date().toISOString().replace(/:/g, "-").split(".")[0];
+  a.download = `fpx-invoice-audit-${safeDateLabel}-${ts}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 2000);
+}
+
+// =====================================================================
+// MESSAGE LISTENER
+// =====================================================================
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   console.log("[FPX] Message received:", msg);
   if (msg.action === "ping") {
@@ -2309,7 +4475,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     stopRequested = true;
     sendResponse({ ok: true });
   } else if (msg.action === "gpAudit") {
-    gpAuditRun(msg.bizDate, msg.shipmentType);
+    gpAuditRun(msg.fromDate, msg.toDate, msg.shipmentType, msg.aiAnalysis, msg.customerFilter);
+    sendResponse({ ok: true });
+  } else if (msg.action === "invoiceAudit") {
+    invoiceAuditRun(msg.shipments, msg.skippedRows, msg.fromDate, msg.toDate, msg.shipmentType, msg.customerFilter, msg.aiAnalysis, msg.skipReport);
     sendResponse({ ok: true });
   }
 });

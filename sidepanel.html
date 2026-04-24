@@ -306,6 +306,45 @@
       color: #1e40af;
       font-weight: 600;
     }
+    .quick-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .quick-filters button {
+      flex: none;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 500;
+      border: 1px solid #d1d5db;
+      border-radius: 3px;
+      background: #fff;
+      color: #374151;
+      cursor: pointer;
+    }
+    .quick-filters button:hover { background: #f3f4f6; }
+    .quick-filters button.active {
+      background: #2563eb;
+      color: #fff;
+      border-color: #2563eb;
+    }
+    .custom-date-row {
+      display: none;
+      gap: 8px;
+      margin-top: 6px;
+      align-items: center;
+    }
+    .custom-date-row.visible { display: flex; }
+    .custom-date-row input[type="date"] {
+      flex: 1;
+      padding: 4px 6px;
+      font-size: 12px;
+    }
+    .custom-date-row span {
+      font-size: 11px;
+      color: #6b7280;
+    }
     .outlier-alert {
       display: none;
       background: #fef2f2;
@@ -342,31 +381,118 @@
       font-weight: 600;
     }
     .no-outliers.visible { display: block; }
+
+    .file-upload-zone {
+      border: 2px dashed #d1d5db;
+      border-radius: 6px;
+      padding: 14px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      margin-bottom: 10px;
+    }
+    .file-upload-zone:hover, .file-upload-zone.dragover {
+      border-color: #2563eb;
+      background: #eff6ff;
+    }
+    .file-upload-zone .upload-label {
+      font-size: 12px;
+      color: #6b7280;
+      font-weight: 500;
+    }
+    .file-upload-zone .file-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: #1e40af;
+      margin-top: 4px;
+    }
+    .file-upload-zone input[type="file"] { display: none; }
+    .parsed-info {
+      display: none;
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-size: 12px;
+      margin-bottom: 10px;
+      color: #166534;
+      font-weight: 500;
+    }
+    .parsed-info.visible { display: block; }
+    .mode-toggle {
+      display: flex;
+      gap: 0;
+      margin-bottom: 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .mode-toggle button {
+      flex: 1;
+      padding: 6px 0;
+      border: none;
+      background: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      color: #6b7280;
+      cursor: pointer;
+      border-radius: 0;
+    }
+    .mode-toggle button.active {
+      background: #2563eb;
+      color: #fff;
+    }
+    .single-shipment-fields { display: none; }
+    .single-shipment-fields.visible { display: block; }
+    .discrepancy-alert {
+      display: none;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 4px;
+      padding: 10px;
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.5;
+      max-height: 250px;
+      overflow-y: auto;
+    }
+    .discrepancy-alert.visible { display: block; }
+    .discrepancy-alert h4 { margin: 0 0 6px; color: #991b1b; font-size: 13px; }
+    .discrepancy-alert .disc-row {
+      padding: 3px 0;
+      border-bottom: 1px solid #fee2e2;
+      font-size: 11px;
+    }
+    .discrepancy-alert .disc-row:last-child { border-bottom: none; }
+    .no-discrepancies {
+      display: none;
+      background: #dcfce7;
+      border: 1px solid #bbf7d0;
+      border-radius: 4px;
+      padding: 10px;
+      margin-top: 10px;
+      font-size: 12px;
+      color: #166534;
+      font-weight: 600;
+    }
+    .no-discrepancies.visible { display: block; }
   </style>
 </head>
 <body>
   <h3>
     FPXpress Tracking Refresh
     <span id="apiBadge" class="api-badge missing">No API Key</span>
+    <span id="costBadge" class="api-badge ok" style="cursor:pointer;background:#eff6ff;color:#1e40af" title="Click to reset">$0.0000</span>
     <span id="serverBadge" class="server-badge offline"><span class="dot"></span> Server Offline</span>
   </h3>
 
   <div class="tab-bar">
-    <button id="tabTracking" class="active">Tracking Refresh</button>
+    <button id="tabTracking" class="active">Tracking</button>
     <button id="tabGpAudit">GP Audit</button>
+    <button id="tabInvoiceAudit">Invoice Audit</button>
   </div>
 
   <div id="trackingTab" class="tab-content active">
-
-  <div class="server-ctrl">
-    <div>
-      <div class="label">LangGraph Server <span class="sub" id="serverInfo"></span></div>
-    </div>
-    <button id="serverToggleBtn" class="start">Start</button>
-  </div>
-  <div id="serverHint" class="server-hint">
-    First time? Run <b>install-native-host.command</b> to enable auto-start.
-  </div>
 
   <div class="field">
     <label for="filterCol">Filter Column</label>
@@ -453,7 +579,32 @@
   </div><!-- end trackingTab -->
 
   <div id="gpAuditTab" class="tab-content">
-    <div id="gpDateInfo" class="gp-date-info">Fetching last business day...</div>
+    <div id="gpDateInfo" class="gp-date-info">Fetching date...</div>
+
+    <div class="field">
+      <label>Date Range</label>
+      <div class="quick-filters" id="gpQuickFilters">
+        <button data-mode="lastBizDay" class="active">Last Biz Day</button>
+        <button data-mode="last7">Last 7 Days</button>
+        <button data-mode="last30">Last 30 Days</button>
+        <button data-mode="thisWeek">This Week</button>
+        <button data-mode="thisMonth">This Month</button>
+        <button data-mode="lastMonth">Last Month</button>
+        <button data-mode="thisQuarter">This Quarter</button>
+        <button data-mode="custom">Custom</button>
+      </div>
+      <div class="custom-date-row" id="gpCustomDateRow">
+        <input type="date" id="gpCustomFrom">
+        <span>to</span>
+        <input type="date" id="gpCustomTo">
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="gpCustomerFilter">Customer Filter</label>
+      <input type="text" id="gpCustomerFilter" placeholder="All Customers (type to filter)">
+      <div class="hint">Leave blank for all. Type a name or ID to filter in the report form.</div>
+    </div>
 
     <div class="field">
       <label for="gpShipmentType">Shipment Type</label>
@@ -462,6 +613,16 @@
         <option value="non-parcel" selected>Non-Parcel</option>
         <option value="parcel">Parcel</option>
       </select>
+    </div>
+
+    <div class="field">
+      <label for="gpAiAnalysis">AI Analysis</label>
+      <select id="gpAiAnalysis">
+        <option value="off">Off — Stats Only</option>
+        <option value="summary" selected>Exec Summary</option>
+        <option value="full">Full (Summary + Per-Row Review)</option>
+      </select>
+      <div class="hint">Exec Summary uses one API call. Full analyzes every flagged row.</div>
     </div>
 
     <div class="btn-row">
@@ -484,8 +645,168 @@
       <h4>GP Outliers Detected</h4>
       <div id="gpOutlierList"></div>
     </div>
+
+    <div id="gpAiSummarySection" class="ai-summary">
+      <h4>AI Executive Summary</h4>
+      <div id="gpAiSummaryText"></div>
+    </div>
+
+    <div class="section-toggle" id="gpPromptToggle">
+      <h4>GP Audit Prompt Settings</h4>
+      <span class="arrow" id="gpPromptArrow">&#9654;</span>
+    </div>
+    <div class="prompt-editor" id="gpPromptEditor">
+      <div class="field">
+        <label for="gpSystemPrompt">System Prompt</label>
+        <textarea id="gpSystemPrompt" rows="3"></textarea>
+      </div>
+      <div class="field">
+        <label for="gpExecSummaryPrompt">Exec Summary Prompt <span class="hint">(use {{data}} for audit JSON)</span></label>
+        <textarea id="gpExecSummaryPrompt" rows="6"></textarea>
+      </div>
+      <div class="field">
+        <label for="gpRowReviewPrompt">Per-Row Review Prompt <span class="hint">(use {{row}} for shipment JSON)</span></label>
+        <textarea id="gpRowReviewPrompt" rows="4"></textarea>
+      </div>
+      <div class="prompt-btn-row">
+        <span class="save-status" id="gpSaveStatus"></span>
+        <button id="gpResetPromptsBtn">Reset</button>
+        <button id="gpSavePromptsBtn">Save</button>
+      </div>
+    </div>
   </div><!-- end gpAuditTab -->
 
+  <div id="invoiceAuditTab" class="tab-content">
+    <div class="mode-toggle" id="invModeToggle">
+      <button data-mode="batch" class="active">Batch (from file)</button>
+      <button data-mode="single">Single Shipment</button>
+    </div>
+
+    <div id="invBatchFields">
+      <div class="file-upload-zone" id="invFileZone">
+        <div class="upload-label">Drop Carrier Bill XLSX here or click to browse</div>
+        <div class="file-name" id="invFileName"></div>
+        <input type="file" id="invFileInput" accept=".xlsx,.xls">
+      </div>
+      <div class="parsed-info" id="invParsedInfo"></div>
+    </div>
+
+    <div class="single-shipment-fields" id="invSingleFields">
+      <div class="field">
+        <label for="invSingleId">Shipment ID</label>
+        <input type="text" id="invSingleId" placeholder="e.g. 13069382">
+      </div>
+      <div class="field">
+        <label for="invSingleAmount">Carrier Bill Amount ($)</label>
+        <input type="number" id="invSingleAmount" step="0.01" placeholder="e.g. 700.00">
+      </div>
+    </div>
+
+    <div id="invDateInfo" class="gp-date-info">Fetching date...</div>
+
+    <div class="field">
+      <label>Lookback Period</label>
+      <div class="quick-filters" id="invLookbackFilters">
+        <button data-days="180" class="active">180 Days</button>
+        <button data-days="270">270 Days</button>
+        <button data-days="365">1 Year</button>
+        <button data-days="730">2 Years</button>
+        <button data-days="custom">Custom</button>
+      </div>
+      <div class="custom-date-row" id="invCustomDateRow">
+        <input type="date" id="invCustomFrom">
+        <span>to</span>
+        <input type="date" id="invCustomTo">
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="invShipmentType">Shipment Type</label>
+      <select id="invShipmentType">
+        <option value="non-parcel" selected>Non-Parcel</option>
+        <option value="parcel">Parcel</option>
+        <option value="all">All (Parcel + Non-Parcel)</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="invCustomerFilter">Customer Filter</label>
+      <input type="text" id="invCustomerFilter" placeholder="All Customers (type to filter)">
+      <div class="hint">Leave blank for all.</div>
+    </div>
+
+    <div class="field">
+      <label for="invAiAnalysis">AI Analysis</label>
+      <select id="invAiAnalysis">
+        <option value="off">Off — Compare Only</option>
+        <option value="summary" selected>Exec Summary</option>
+        <option value="full">Full (Summary + Per-Row Review)</option>
+      </select>
+    </div>
+
+    <div class="toggle-row">
+      <label class="toggle-label" for="invSkipReport">
+        <span class="toggle-switch">
+          <input type="checkbox" id="invSkipReport">
+          <span class="toggle-slider"></span>
+        </span>
+        Report already loaded
+      </label>
+      <span class="hint" style="margin:0">Skip report generation if the grid is already visible.</span>
+    </div>
+
+    <div class="btn-row">
+      <button id="invStartBtn">Start Invoice Audit</button>
+      <button id="invStopBtn" disabled>Stop</button>
+    </div>
+
+    <div id="invProgressText" class="progress-text"></div>
+    <div id="invProgressBar" class="progress-bar-container">
+      <div id="invProgressFill" class="progress-bar-fill"></div>
+    </div>
+
+    <div id="invStatus" class="field" style="background:#f3f4f6;border-radius:4px;padding:10px;min-height:20px;line-height:1.4;white-space:pre-wrap;word-break:break-word;">
+      Ready. Upload a file or enter a shipment ID, then click Start.
+    </div>
+
+    <div id="invNoDisc" class="no-discrepancies">All shipments match — no discrepancies found.</div>
+
+    <div id="invDiscAlert" class="discrepancy-alert">
+      <h4>Discrepancies Found</h4>
+      <div id="invDiscList"></div>
+    </div>
+
+    <div id="invAiSummarySection" class="ai-summary">
+      <h4>AI Executive Summary</h4>
+      <div id="invAiSummaryText"></div>
+    </div>
+
+    <div class="section-toggle" id="invPromptToggle">
+      <h4>Invoice Audit Prompt Settings</h4>
+      <span class="arrow" id="invPromptArrow">&#9654;</span>
+    </div>
+    <div class="prompt-editor" id="invPromptEditor">
+      <div class="field">
+        <label for="invSystemPrompt">System Prompt</label>
+        <textarea id="invSystemPrompt" rows="3"></textarea>
+      </div>
+      <div class="field">
+        <label for="invExecSummaryPrompt">Exec Summary Prompt <span class="hint">(use {{data}} for audit JSON)</span></label>
+        <textarea id="invExecSummaryPrompt" rows="6"></textarea>
+      </div>
+      <div class="field">
+        <label for="invRowReviewPrompt">Per-Row Review Prompt <span class="hint">(use {{row}} for shipment JSON)</span></label>
+        <textarea id="invRowReviewPrompt" rows="4"></textarea>
+      </div>
+      <div class="prompt-btn-row">
+        <span class="save-status" id="invSaveStatus"></span>
+        <button id="invResetPromptsBtn">Reset</button>
+        <button id="invSavePromptsBtn">Save</button>
+      </div>
+    </div>
+  </div><!-- end invoiceAuditTab -->
+
+  <script src="xlsx.full.min.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>

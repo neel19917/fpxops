@@ -1,5 +1,14 @@
 config.js
 server/.env
-server/node_modules/
+.env
+.env.local
+
 node_modules/
+dashboard/dist/
+*.tsbuildinfo
+
+# Customer data exports — never commit
+*.xlsx
+*.xls
+
 .DS_Store

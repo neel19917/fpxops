@@ -1,15 +1,21 @@
 {
-  "name": "fpx-langgraph-server",
-  "version": "1.0.0",
+  "name": "fpx-api-server",
+  "version": "2.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/graph.test.js"
+    "dev": "node --watch index.js",
+    "test": "node --test tests/graph.test.js tests/gp-audit.test.js tests/inv-audit.test.js",
+    "create-key": "node scripts/create-api-key.js"
   },
   "dependencies": {
     "@langchain/anthropic": "^0.3.0",
     "@langchain/core": "^0.3.0",
     "@langchain/langgraph": "^0.2.0",
+    "@supabase/supabase-js": "^2.45.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
     "express": "^4.21.0"

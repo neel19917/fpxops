@@ -1,5 +1,72 @@
-importScripts("config.js");
+try {
+  importScripts("config.js");
+} catch (e) {
+  console.warn("[FPXpress] config.js not found — copy config.example.js to config.js and set FPX_API_URL + FPX_API_KEY.");
+  self.FPX_API_URL = "";
+  self.FPX_API_KEY = "";
+}
 
+// ---------- API key & URL resolution ----------
+// User-set key in chrome.storage.local takes precedence over config.js.
+async function getApiKey() {
+  try {
+    const { fpxApiKey } = await chrome.storage.local.get("fpxApiKey");
+    if (typeof fpxApiKey === "string" && fpxApiKey.length > 0) return fpxApiKey;
+  } catch {}
+  return typeof FPX_API_KEY === "string" ? FPX_API_KEY : "";
+}
+
+async function getApiUrl() {
+  try {
+    const { fpxApiUrl } = await chrome.storage.local.get("fpxApiUrl");
+    if (typeof fpxApiUrl === "string" && fpxApiUrl.length > 0) return fpxApiUrl.replace(/\/$/, "");
+  } catch {}
+  return (typeof FPX_API_URL === "string" ? FPX_API_URL : "").replace(/\/$/, "");
+}
+
+function isValidKey(k) {
+  return typeof k === "string" && k.length > 10 && k !== "YOUR_FPX_API_KEY_HERE";
+}
+
+function base64EncodeUtf8(str) {
+  const bytes = new TextEncoder().encode(str);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+async function getKeySource() {
+  try {
+    const { fpxApiKey } = await chrome.storage.local.get("fpxApiKey");
+    if (typeof fpxApiKey === "string" && fpxApiKey.length > 0) return "storage";
+  } catch {}
+  if (isValidKey(FPX_API_KEY)) return "config.js";
+  return "none";
+}
+
+// ---------- State ----------
+let state = {
+  running: false,
+  status: "Ready. Set your filter, then click Start.",
+};
+
+let sessionCost = { inputTokens: 0, outputTokens: 0, totalUsd: 0, calls: 0 };
+let keepaliveTimer = null;
+
+function startKeepalive() {
+  if (keepaliveTimer) return;
+  keepaliveTimer = setInterval(() => {
+    chrome.runtime.getPlatformInfo(() => {});
+  }, 25000);
+}
+function stopKeepalive() {
+  if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+}
+
+// ---------- Prompts (still stored locally so users can tweak) ----------
 const DEFAULT_PROMPTS = {
   system:
     "You are a freight brokerage logistics analyst reviewing a live shipment tracking record.",
@@ -9,339 +76,267 @@ const DEFAULT_PROMPTS = {
     "You are reviewing a summary of shipment records scraped from the FreightPOP dashboard.\n\nThe data includes aggregate counts and two lists: actionItems (shipments needing action) and sample (a sample of on-track shipments). Provide a brief executive summary for the brokerage team:\n- How many shipments need immediate action?\n- What are the most common issues?\n- Which shipments are top priority and why?\n- Any patterns the team should be aware of?\n\nUse plain English. Be direct and actionable.\n\nShipment summary:\n{{allShipments}}",
 };
 
-let state = {
-  running: false,
-  status: "Ready. Set your filter, then click Start.",
-};
-
-let keepaliveTimer = null;
-
-function startKeepalive() {
-  if (keepaliveTimer) return;
-  keepaliveTimer = setInterval(() => {
-    chrome.runtime.getPlatformInfo(() => {});
-  }, 25000);
-}
-
-function stopKeepalive() {
-  if (keepaliveTimer) {
-    clearInterval(keepaliveTimer);
-    keepaliveTimer = null;
-  }
-}
-
-const NATIVE_HOST = "com.fpxpress.server";
-let nativePort = null;
-let pendingNativeCallback = null;
-
-function connectNativeHost() {
-  if (nativePort) return nativePort;
-  try {
-    nativePort = chrome.runtime.connectNative(NATIVE_HOST);
-    nativePort.onMessage.addListener((msg) => {
-      if (pendingNativeCallback) {
-        const cb = pendingNativeCallback;
-        pendingNativeCallback = null;
-        cb(msg);
-      }
-    });
-    nativePort.onDisconnect.addListener(() => {
-      nativePort = null;
-      if (pendingNativeCallback) {
-        const cb = pendingNativeCallback;
-        pendingNativeCallback = null;
-        cb({ error: chrome.runtime.lastError?.message || "Native host disconnected" });
-      }
-    });
-  } catch (e) {
-    nativePort = null;
-    return null;
-  }
-  return nativePort;
-}
-
-function sendNativeMessage(action) {
-  return new Promise((resolve) => {
-    const port = connectNativeHost();
-    if (!port) {
-      resolve({ error: "Native host not installed. Run install-native-host.command first." });
-      return;
-    }
-    pendingNativeCallback = resolve;
-    setTimeout(() => {
-      if (pendingNativeCallback === resolve) {
-        pendingNativeCallback = null;
-        resolve({ error: "Native host timeout" });
-      }
-    }, 10000);
-    port.postMessage({ action });
-  });
-}
-
 async function getPrompts() {
   const stored = await chrome.storage.local.get("prompts");
   return stored.prompts || { ...DEFAULT_PROMPTS };
 }
 
-// Send full scraped modal + grid fields to Claude (no per-field truncation). Strip only
-// internal FPX keys. Optional FPX_MAX_FIELD_CHARS in config.js caps extremely long values.
-function slimShipmentData(data) {
-  const out = {};
-  const excludeKeys = new Set([
-    "_aiRawAnalysis",
-    "_inputSummary",
-    "_outputSummary",
-    "_needsActionSheet",
-  ]);
-  const maxField =
-    typeof FPX_MAX_FIELD_CHARS === "number" &&
-    FPX_MAX_FIELD_CHARS > 0 &&
-    Number.isFinite(FPX_MAX_FIELD_CHARS)
-      ? FPX_MAX_FIELD_CHARS
-      : null;
-  for (const [k, v] of Object.entries(data)) {
-    if (excludeKeys.has(k)) continue;
-    if (k.startsWith("_") && k !== "_trackingNumber") continue;
-    if (v === undefined || v === null) continue;
-    let s;
-    if (typeof v === "string") {
-      s = v;
-    } else if (typeof v === "object") {
-      try {
-        s = JSON.stringify(v);
-      } catch {
-        s = String(v);
-      }
-    } else {
-      s = String(v);
+// ---------- Railway API helper ----------
+async function callApi(path, body, options = {}) {
+  const [apiUrl, apiKey] = await Promise.all([getApiUrl(), getApiKey()]);
+  if (!apiUrl) return { error: "FPX_API_URL not configured. Open the popup and set it." };
+  if (!isValidKey(apiKey)) return { error: "FPX API key not configured. Open the popup to paste your key." };
+
+  try {
+    const resp = await fetch(`${apiUrl}${path}`, {
+      method: options.method || "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: options.signal,
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { error: `API ${resp.status}: ${text.slice(0, 200)}` };
     }
-    if (!s.trim()) continue;
-    if (maxField != null && s.length > maxField) {
-      s = s.slice(0, maxField) + "…";
-    }
-    out[k] = s;
+    return await resp.json();
+  } catch (e) {
+    return { error: e.message };
   }
-  return out;
 }
 
-function resolveClaudeRouting(systemPrompt, userMessage, opts) {
-  const threshold =
-    typeof FPX_LARGE_PROMPT_CHARS === "number" ? FPX_LARGE_PROMPT_CHARS : 12000;
-  const inputChars = String(systemPrompt ?? "").length + String(userMessage ?? "").length;
-  const useLarge = inputChars >= threshold;
-  const modelDefault =
-    typeof FPX_MODEL_DEFAULT === "string" && FPX_MODEL_DEFAULT
-      ? FPX_MODEL_DEFAULT
-      : "claude-haiku-4-5-20251001";
-  const modelLarge =
-    typeof FPX_MODEL_LARGE_PROMPT === "string" && FPX_MODEL_LARGE_PROMPT
-      ? FPX_MODEL_LARGE_PROMPT
-      : "claude-sonnet-4-5-20250929";
-  const maxLarge =
-    typeof FPX_MAX_TOKENS_LARGE === "number" && FPX_MAX_TOKENS_LARGE > 0
-      ? FPX_MAX_TOKENS_LARGE
-      : 4096;
-  const requestedSmall = opts.maxTokens != null ? opts.maxTokens : 1024;
-  return {
-    model: useLarge ? modelLarge : modelDefault,
-    maxTokens: useLarge ? maxLarge : requestedSmall,
-    useLarge,
-    inputChars,
-  };
+function accumulateCost(result) {
+  if (!result || result.error) return;
+  const inTok = result.input_tokens || 0;
+  const outTok = result.output_tokens || 0;
+  const cost = Number(result.cost_usd) || 0;
+  if (inTok || outTok || cost) {
+    sessionCost.inputTokens += inTok;
+    sessionCost.outputTokens += outTok;
+    sessionCost.totalUsd += cost;
+    sessionCost.calls++;
+  }
 }
 
-async function callClaude(systemPrompt, userMessage, opts) {
-  if (
-    !ANTHROPIC_API_KEY ||
-    ANTHROPIC_API_KEY === "YOUR_API_KEY_HERE"
-  ) {
-    return { error: "API key not configured. Edit config.js with your Anthropic key." };
-  }
-
-  const options = typeof opts === "number" ? { maxTokens: opts } : (opts || {});
-  const route = resolveClaudeRouting(systemPrompt, userMessage, options);
-  console.log(
-    "[FPX] Claude:",
-    route.model,
-    "max_tokens:",
-    route.maxTokens,
-    "prompt_chars:",
-    route.inputChars,
-    route.useLarge ? "(large prompt tier)" : ""
-  );
-
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: route.model,
-      max_tokens: route.maxTokens,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userMessage }],
-    }),
-  });
-
-  if (!resp.ok) {
-    const body = await resp.text();
-    console.error("[FPX] Anthropic API error:", resp.status, body);
-    return { error: `API ${resp.status}: ${body.slice(0, 200)}` };
-  }
-
-  const json = await resp.json();
-  const text =
-    json.content && json.content[0] ? json.content[0].text : "";
-  return { text };
-}
-
+// ---------- Message router ----------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "status") {
+  if (msg.type === "status" || msg.type === "gpAuditStatus" || msg.type === "invoiceAuditStatus") {
     state.status = msg.text;
     state.running = true;
     startKeepalive();
-  } else if (msg.type === "complete") {
+  } else if (msg.type === "complete" || msg.type === "gpAuditComplete" || msg.type === "invoiceAuditComplete") {
     state.status = msg.text || "Done.";
     state.running = false;
     stopKeepalive();
   } else if (msg.type === "getState") {
-    sendResponse(state);
-    return;
+    sendResponse(state); return;
   } else if (msg.type === "setRunning") {
     state.running = msg.running;
-    if (msg.running) startKeepalive();
-    else stopKeepalive();
+    if (msg.running) startKeepalive(); else stopKeepalive();
   } else if (msg.type === "getPrompts") {
     getPrompts().then((p) => sendResponse(p));
     return true;
   } else if (msg.type === "savePrompts") {
-    chrome.storage.local.set({ prompts: msg.prompts }).then(() => {
-      sendResponse({ ok: true });
-    });
+    chrome.storage.local.set({ prompts: msg.prompts }).then(() => sendResponse({ ok: true }));
     return true;
   } else if (msg.type === "analyzeShipment") {
     (async () => {
       const prompts = await getPrompts();
-      const slim = slimShipmentData(msg.data);
-      const userMsg = prompts.perShipment.replace(
-        "{{data}}",
-        JSON.stringify(slim)
-      );
-      const result = await callClaude(prompts.system, userMsg, { maxTokens: 512 });
-      sendResponse(result);
+      const result = await callApi("/api/analyze/shipment", {
+        shipment: msg.data,
+        system: prompts.system,
+        template: prompts.perShipment,
+      });
+      accumulateCost(result);
+      sendResponse(result.error ? { error: result.error } : { text: result.text });
     })();
     return true;
   } else if (msg.type === "summarizeAll") {
     (async () => {
       const prompts = await getPrompts();
-      const data = msg.payload || msg.rows;
-      const userMsg = prompts.summary.replace(
-        "{{allShipments}}",
-        JSON.stringify(data)
-      );
-      const result = await callClaude(prompts.system, userMsg, { maxTokens: 2048 });
-      sendResponse(result);
+      const result = await callApi("/api/analyze/summary", {
+        payload: msg.payload || msg.rows,
+        system: prompts.system,
+        template: prompts.summary,
+      });
+      accumulateCost(result);
+      sendResponse(result.error ? { error: result.error } : { text: result.text });
+    })();
+    return true;
+  } else if (msg.type === "upsertShipment") {
+    (async () => {
+      const result = await callApi("/api/shipments", { shipment: msg.data });
+      sendResponse(result.error ? { ok: false, error: result.error } : { ok: true, id: result.shipment?.id });
+    })();
+    return true;
+  } else if (msg.type === "upsertShipmentsBulk") {
+    (async () => {
+      const result = await callApi("/api/shipments", { shipments: msg.rows });
+      sendResponse(result.error ? { ok: false, error: result.error } : { ok: true, count: result.count });
     })();
     return true;
   } else if (msg.type === "analyzeBatch") {
     (async () => {
-      const payload = JSON.stringify({ shipments: msg.rows });
+      // Uses the LangGraph /analyze endpoint on the server.
+      const payload = { shipments: msg.rows };
       for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const resp = await fetch("http://localhost:3210/analyze", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload,
-          });
-          if (!resp.ok) {
-            const body = await resp.text();
-            sendResponse({ error: `Server ${resp.status}: ${body.slice(0, 200)}` });
-            return;
-          }
-          const result = await resp.json();
-          sendResponse(result);
-          return;
-        } catch (e) {
-          if (attempt === 0) {
-            console.log("[FPX] analyzeBatch retry after network error:", e.message);
-            await new Promise((r) => setTimeout(r, 2000));
-          } else {
-            sendResponse({ error: e.message });
-          }
-        }
+        const result = await callApi("/analyze", payload);
+        if (!result.error) { sendResponse(result); return; }
+        if (attempt === 0) {
+          console.log("[FPX] analyzeBatch retry after error:", result.error);
+          await new Promise((r) => setTimeout(r, 2000));
+        } else sendResponse({ error: result.error });
       }
     })();
     return true;
   } else if (msg.type === "checkServer") {
     (async () => {
       try {
-        const resp = await fetch("http://localhost:3210/health", {
-          method: "GET",
-          signal: AbortSignal.timeout(3000),
-        });
+        const apiUrl = await getApiUrl();
+        if (!apiUrl) { sendResponse({ online: false, reason: "no_url" }); return; }
+        const resp = await fetch(`${apiUrl}/health`, { method: "GET", signal: AbortSignal.timeout(3000) });
         if (resp.ok) {
           const data = await resp.json();
-          sendResponse({ online: true, version: data.version, uptime: data.uptime });
-        } else {
-          sendResponse({ online: false });
-        }
-      } catch {
-        sendResponse({ online: false });
-      }
+          sendResponse({ online: true, version: data.version, uptime: data.uptime, db: data.db });
+        } else sendResponse({ online: false });
+      } catch { sendResponse({ online: false }); }
     })();
     return true;
   } else if (msg.type === "checkApiKey") {
-    const configured =
-      typeof ANTHROPIC_API_KEY === "string" &&
-      ANTHROPIC_API_KEY !== "YOUR_API_KEY_HERE" &&
-      ANTHROPIC_API_KEY.length > 0;
-    sendResponse({ configured });
-    return;
+    (async () => {
+      const k = await getApiKey();
+      sendResponse({ configured: isValidKey(k), source: await getKeySource() });
+    })();
+    return true;
+  } else if (msg.type === "getApiKey") {
+    (async () => {
+      const { fpxApiKey, fpxApiUrl } = await chrome.storage.local.get(["fpxApiKey", "fpxApiUrl"]);
+      sendResponse({ key: fpxApiKey || "", url: fpxApiUrl || "", source: await getKeySource() });
+    })();
+    return true;
+  } else if (msg.type === "saveDashboard") {
+    (async () => {
+      try {
+        const html = String(msg.html || "");
+        if (!html) { sendResponse({ ok: false, error: "Empty dashboard html." }); return; }
+        const b64 = base64EncodeUtf8(html);
+        const dataUrl = `data:text/html;base64,${b64}`;
+        const filename = (msg.filename || "fpx-dashboard-latest.html").replace(/[\\/:*?"<>|]/g, "_");
+        chrome.downloads.download({ url: dataUrl, filename, conflictAction: "overwrite", saveAs: false }, (downloadId) => {
+          if (chrome.runtime.lastError) sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+          else sendResponse({ ok: true, downloadId });
+        });
+      } catch (e) { sendResponse({ ok: false, error: e?.message || String(e) }); }
+    })();
+    return true;
+  } else if (msg.type === "saveApiKey") {
+    (async () => {
+      const k = (msg.key || "").trim();
+      const url = (msg.url || "").trim();
+      const updates = {};
+      if (k) updates.fpxApiKey = k; else await chrome.storage.local.remove("fpxApiKey");
+      if (url) updates.fpxApiUrl = url;
+      if (Object.keys(updates).length) await chrome.storage.local.set(updates);
+      sendResponse({ ok: true, cleared: !k });
+    })();
+    return true;
   } else if (msg.type === "fetchNtpDate") {
     (async () => {
+      function fmtDate(d) {
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        return `${mm}/${dd}/${d.getFullYear()}`;
+      }
       function calcLastBizDay(today) {
         const day = today.getDay();
         const offset = day === 0 ? 2 : day === 1 ? 3 : day === 6 ? 1 : 1;
         const bizDate = new Date(today);
         bizDate.setDate(bizDate.getDate() - offset);
-        const mm = String(bizDate.getMonth() + 1).padStart(2, "0");
-        const dd = String(bizDate.getDate()).padStart(2, "0");
-        const yyyy = bizDate.getFullYear();
-        return { date: `${mm}/${dd}/${yyyy}`, iso: bizDate.toISOString().slice(0, 10) };
+        return { date: fmtDate(bizDate), iso: bizDate.toISOString().slice(0, 10) };
       }
-
-      let today;
-      let source = "ntp";
+      let today; let source = "ntp";
       try {
-        const resp = await fetch(
-          "https://worldtimeapi.org/api/timezone/America/New_York",
-          { signal: AbortSignal.timeout(5000) }
-        );
+        const resp = await fetch("https://worldtimeapi.org/api/timezone/America/New_York", { signal: AbortSignal.timeout(5000) });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         today = new Date(data.datetime);
-      } catch {
-        today = new Date();
-        source = "local";
-        console.log("[FPX] NTP fetch failed, falling back to local time");
-      }
-
+      } catch { today = new Date(); source = "local"; }
       const result = calcLastBizDay(today);
-      result.source = source;
+      result.source = source; result.today = fmtDate(today); result.todayIso = today.toISOString().slice(0, 10);
       sendResponse(result);
     })();
     return true;
-  } else if (msg.type === "startServer") {
-    sendNativeMessage("start").then(sendResponse);
+  } else if (msg.type === "gpAuditAiSummary") {
+    (async () => {
+      const stored = await chrome.storage.local.get("gpPrompts");
+      const p = stored.gpPrompts || {};
+      const result = await callApi("/api/analyze/gp-summary", {
+        system: p.system,
+        template: p.execSummary,
+        payload: msg.payload,
+        gp_audit_id: msg.gpAuditId,
+      });
+      accumulateCost(result);
+      sendResponse(result.error ? { error: result.error } : { text: result.text });
+    })();
     return true;
-  } else if (msg.type === "stopServer") {
-    sendNativeMessage("stop").then(sendResponse);
+  } else if (msg.type === "gpAuditRowReview") {
+    (async () => {
+      const stored = await chrome.storage.local.get("gpPrompts");
+      const p = stored.gpPrompts || {};
+      const result = await callApi("/api/analyze/gp-row", {
+        system: p.system,
+        template: p.rowReview,
+        row: msg.row,
+        gp_audit_id: msg.gpAuditId,
+      });
+      accumulateCost(result);
+      sendResponse(result.error ? { error: result.error } : { text: result.text });
+    })();
     return true;
-  } else if (msg.type === "serverStatus") {
-    sendNativeMessage("status").then(sendResponse);
+  } else if (msg.type === "invoiceAuditAiSummary") {
+    (async () => {
+      const stored = await chrome.storage.local.get("invoicePrompts");
+      const p = stored.invoicePrompts || {};
+      const result = await callApi("/api/analyze/invoice-summary", {
+        system: p.system,
+        template: p.execSummary,
+        payload: msg.payload,
+        invoice_audit_id: msg.invoiceAuditId,
+      });
+      accumulateCost(result);
+      sendResponse(result.error ? { error: result.error } : { text: result.text });
+    })();
     return true;
+  } else if (msg.type === "invoiceAuditRowReview") {
+    (async () => {
+      const stored = await chrome.storage.local.get("invoicePrompts");
+      const p = stored.invoicePrompts || {};
+      const result = await callApi("/api/analyze/invoice-row", {
+        system: p.system,
+        template: p.rowReview,
+        row: msg.row,
+        invoice_audit_id: msg.invoiceAuditId,
+      });
+      accumulateCost(result);
+      sendResponse(result.error ? { error: result.error } : { text: result.text });
+    })();
+    return true;
+  } else if (msg.type === "invoiceScreenshotParse") {
+    (async () => {
+      try {
+        const windowId = sender.tab ? sender.tab.windowId : chrome.windows.WINDOW_ID_CURRENT;
+        const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+        const base64 = dataUrl.replace(/^data:image\/[a-z]+;base64,/, "");
+        const result = await callApi("/api/analyze/vision", { image_base64: base64 });
+        if (result.error) { sendResponse({ error: result.error }); return; }
+        sendResponse({ data: result.data, raw: result.raw });
+      } catch (e) { sendResponse({ error: e.message }); }
+    })();
+    return true;
+  } else if (msg.type === "getApiCost") {
+    sendResponse({ ...sessionCost }); return;
+  } else if (msg.type === "resetApiCost") {
+    sessionCost = { inputTokens: 0, outputTokens: 0, totalUsd: 0, calls: 0 };
+    sendResponse({ ok: true }); return;
   }
 });
