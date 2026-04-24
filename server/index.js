@@ -3,17 +3,23 @@ import express from "express";
 import cors from "cors";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { buildGraph } from "./graph.js";
-import { requireApiKey, bootstrapAdminKey } from "./lib/auth.js";
+import { requireAuth, bootstrapAdminKey, bootstrapAdminEmail } from "./lib/auth.js";
 import { isDbReady } from "./lib/supabase.js";
 import { shipmentsRouter } from "./routes/shipments.js";
 import { analysesRouter } from "./routes/analyses.js";
 import { analyzeRouter } from "./routes/analyze.js";
 import { auditsRouter } from "./routes/audits.js";
 import { apiKeysRouter } from "./routes/apiKeys.js";
+import { meRouter } from "./routes/me.js";
+import { usersRouter } from "./routes/users.js";
+import { shareLinksRouter } from "./routes/shareLinks.js";
+import { publicShareRouter } from "./routes/publicShare.js";
 
 const app = express();
+app.set("trust proxy", 1);
 
-// CORS — comma-separated origin allowlist, wildcard support for chrome-extension.
+// CORS — comma-separated origin allowlist. Wildcards supported via `host/*` suffix
+// and the chrome-extension://* pattern.
 const rawOrigins = (process.env.CORS_ORIGINS || "chrome-extension://*,http://localhost:5173")
   .split(",").map((s) => s.trim()).filter(Boolean);
 app.use(cors({
@@ -47,26 +53,34 @@ const startedAt = Date.now();
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.0.0",
+    version: "2.1.0",
     uptime: Math.round((Date.now() - startedAt) / 1000),
     db: isDbReady(),
   });
 });
 
-// All /api/* routes require an API key.
+// Public share viewer — no auth, rate-limited by token validity.
+app.use("/share", publicShareRouter);
+
+// Identity probe for the dashboard/extension — accepts either auth method.
+app.use("/api/me", meRouter);
+
+// Authenticated API (API key OR JWT with enabled=true).
 const api = express.Router();
-api.use(requireApiKey());
+api.use(requireAuth());
 api.use("/shipments", shipmentsRouter);
 api.use("/analyses", analysesRouter);
 api.use("/analyze", analyzeRouter);
 api.use("/audits", auditsRouter);
+api.use("/share-links", shareLinksRouter);
 app.use("/api", api);
 
-// Admin routes (admin scope enforced inside the router).
+// Admin routes (admin scope OR admin role).
+app.use("/api/users", usersRouter);
 app.use("/api-keys", apiKeysRouter);
 
 // ---------- Legacy LangGraph batch endpoint ----------
-// Kept for extension backwards-compat; now protected by API key.
+// Kept for extension backwards-compat; now dual-auth.
 const model = new ChatAnthropic({
   model: process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   maxTokens: 512,
@@ -75,7 +89,7 @@ const model = new ChatAnthropic({
 const graph = buildGraph();
 const ANALYZE_TIMEOUT_MS = 5 * 60 * 1000;
 
-app.post("/analyze", requireApiKey(), async (req, res) => {
+app.post("/analyze", requireAuth(), async (req, res) => {
   const { shipments } = req.body;
   if (!Array.isArray(shipments) || shipments.length === 0) {
     return res.status(400).json({ error: "shipments array is required" });
@@ -109,5 +123,6 @@ app.listen(PORT, async () => {
   console.log(`[FPX] API server running on :${PORT}`);
   console.log(`[FPX] CORS origins: ${rawOrigins.join(", ") || "(none)"}`);
   if (!isDbReady()) console.warn("[FPX] ⚠️  Supabase env vars missing — reads/writes will fail");
-  try { await bootstrapAdminKey(); } catch (e) { console.warn("[FPX] bootstrap failed:", e.message); }
+  try { await bootstrapAdminKey(); } catch (e) { console.warn("[FPX] bootstrapAdminKey failed:", e.message); }
+  try { await bootstrapAdminEmail(); } catch (e) { console.warn("[FPX] bootstrapAdminEmail failed:", e.message); }
 });

@@ -6,6 +6,7 @@ import type { AiAnalysis, Shipment } from "../lib/types";
 import { ActionBadge } from "../components/Badge";
 import { KPI } from "../components/KPI";
 import { Drawer, Field, Section } from "../components/Drawer";
+import { ShareButton } from "../components/ShareButton";
 
 export function ShipmentsPage() {
   const [rows, setRows] = useState<Shipment[]>([]);
@@ -163,6 +164,13 @@ export function ShipmentsPage() {
       >
         {drawerData ? (
           <>
+            <div className="flex justify-end mb-4">
+              <ShareButton
+                resourceType="shipment"
+                resourceId={drawerData.shipment.id}
+                defaultLabel={`Shipment ${drawerData.shipment.tracking_number || ""}`.trim()}
+              />
+            </div>
             <Section title="Shipment">
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Carrier">{drawerData.shipment.carrier_name || drawerData.shipment.carrier}</Field>

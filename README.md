@@ -9,12 +9,15 @@ Internal tool for the FreightPOP freight support team. Three pieces:
 | `./dashboard/` | Vite + React + TypeScript + Tailwind dashboard (reads everything through the API) |
 
 ```
-Chrome extension ─┐
-                  ├──► Railway API ──► Anthropic (AI)
-TS Dashboard  ────┘                 └──► Supabase (shipments, AI log, audits, API keys)
+Chrome extension (x-api-key) ─┐
+                               ├──► Railway API ──► Anthropic (AI)
+TS Dashboard   (Supabase JWT) ─┘                 └──► Supabase (shipments, AI log, audits, users, share links)
 ```
 
-All AI calls are authenticated with `x-api-key`, logged to `fpx_ai_analyses`, and billed once (on the server). No Anthropic key on the client.
+- Extension uses a long-lived `fpx_live_…` **API key** minted in the dashboard.
+- Dashboard users sign in with **Microsoft** via Supabase Auth; the JWT gates every API call. Access is manually granted per-user.
+- AI calls are logged to `fpx_ai_analyses` (tokens, cost, duration). No Anthropic key on the client.
+- Shareable URLs (`/share/:token`) let you send a single shipment or audit to someone without an account; every view is logged.
 
 ---
 

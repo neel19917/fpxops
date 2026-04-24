@@ -124,3 +124,38 @@ export interface ApiKey {
   revoked_at: string | null;
   created_at: string;
 }
+
+export interface UserProfileRow {
+  id: string;
+  email: string;
+  full_name: string | null;
+  avatar_url: string | null;
+  role: "viewer" | "member" | "admin";
+  enabled: boolean;
+  last_login_at: string | null;
+  created_at: string;
+}
+
+export interface ShareLink {
+  id: string;
+  token: string;
+  resource_type: "shipment" | "gp_audit" | "invoice_audit" | "analysis";
+  resource_id: string;
+  label: string | null;
+  created_by: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  view_count: number;
+  last_viewed_at: string | null;
+  created_at: string;
+}
+
+export interface ShareLinkView {
+  id: string;
+  link_id: string;
+  viewed_at: string;
+  viewer_ip: string | null;
+  viewer_user_agent: string | null;
+  viewer_user_id: string | null;
+  referrer: string | null;
+}

@@ -3,6 +3,7 @@ import { api } from "../lib/api";
 import { fmtDate, fmtDateTime, fmtNum, fmtPct } from "../lib/format";
 import type { GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditRow } from "../lib/types";
 import { Drawer, Field, Section } from "../components/Drawer";
+import { ShareButton } from "../components/ShareButton";
 
 export function GpAuditsPage() {
   const [rows, setRows] = useState<GpAudit[]>([]);
@@ -52,6 +53,9 @@ export function GpAuditsPage() {
       <Drawer open={!!openId} onClose={() => setOpenId(null)} title="GP Audit" subtitle={detail ? fmtDateTime(detail.run.created_at) : undefined}>
         {detail ? (
           <>
+            <div className="flex justify-end mb-4">
+              <ShareButton resourceType="gp_audit" resourceId={detail.run.id} defaultLabel={`GP Audit ${fmtDate(detail.run.date_from)}–${fmtDate(detail.run.date_to)}`} />
+            </div>
             <Section title="Run">
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Range">{fmtDate(detail.run.date_from)} → {fmtDate(detail.run.date_to)}</Field>
@@ -133,6 +137,9 @@ export function InvoiceAuditsPage() {
       <Drawer open={!!openId} onClose={() => setOpenId(null)} title="Invoice Audit" subtitle={detail ? fmtDateTime(detail.run.created_at) : undefined}>
         {detail ? (
           <>
+            <div className="flex justify-end mb-4">
+              <ShareButton resourceType="invoice_audit" resourceId={detail.run.id} defaultLabel={`Invoice Audit ${fmtDate(detail.run.date_from)}–${fmtDate(detail.run.date_to)}`} />
+            </div>
             <Section title="Run">
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Range">{fmtDate(detail.run.date_from)} → {fmtDate(detail.run.date_to)}</Field>

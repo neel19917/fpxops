@@ -1,0 +1,26 @@
+[build]
+  base = "dashboard"
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# SPA fallback — every path falls through to index.html so the client-side router
+# handles it, including the public /share/:token viewer.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Block search engines and iframes. The app also requires sign-in at runtime.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Robots-Tag = "noindex, nofollow, noarchive"
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+# The share viewer should be indexable? No — keep it gated too; recipients arrive
+# via direct link. (Public ≠ indexed.)
