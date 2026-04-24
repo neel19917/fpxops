@@ -5,9 +5,11 @@ import { mapShipment, mapShipmentsBulk } from "../lib/shipments.js";
 export const shipmentsRouter = Router();
 
 // GET /shipments?limit=500&customer=Acme&action=YES&status=Issue&q=track123
+// Reads from fpx_shipments_latest (view) — one row per tracking_number, most recent
+// scrape. Base table fpx_shipments keeps the full history; hit /shipments/:id to see it.
 shipmentsRouter.get("/", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 500, 5000);
-  let q = supabase.from("fpx_shipments").select("*").order("scraped_at", { ascending: false }).limit(limit);
+  let q = supabase.from("fpx_shipments_latest").select("*").order("scraped_at", { ascending: false }).limit(limit);
   if (req.query.customer) q = q.eq("customer_name", String(req.query.customer));
   if (req.query.action) q = q.eq("action_required", String(req.query.action));
   if (req.query.status) q = q.eq("shipment_status", String(req.query.status));
@@ -24,13 +26,18 @@ shipmentsRouter.get("/:id", async (req, res) => {
   const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
-  const { data: analyses } = await supabase
-    .from("fpx_ai_analyses")
-    .select("*")
-    .or(`shipment_uuid.eq.${ship.id},tracking_number.eq.${ship.tracking_number || "__none__"}`)
-    .order("created_at", { ascending: false })
-    .limit(50);
-  res.json({ shipment: ship, analyses: analyses || [] });
+  const [analysesRes, historyRes] = await Promise.all([
+    supabase
+      .from("fpx_ai_analyses").select("*")
+      .or(`shipment_uuid.eq.${ship.id},tracking_number.eq.${ship.tracking_number || "__none__"}`)
+      .order("created_at", { ascending: false }).limit(50),
+    ship.tracking_number
+      ? supabase.from("fpx_shipments").select("id, scraped_at, shipment_status, action_required, ai_issue")
+          .eq("tracking_number", ship.tracking_number).neq("id", ship.id)
+          .order("scraped_at", { ascending: false }).limit(20)
+      : Promise.resolve({ data: [] }),
+  ]);
+  res.json({ shipment: ship, analyses: analysesRes.data || [], history: historyRes.data || [] });
 });
 
 // POST /shipments — single or bulk upsert. Body: { shipment: {...} } or { shipments: [...] }
