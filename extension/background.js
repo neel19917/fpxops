@@ -1,7 +1,10 @@
+// Optional baked-in defaults. Most users set API URL + key from the popup
+// (saved in chrome.storage.local), which always wins. Drop a config.js next
+// to background.js if you want a pre-configured zip; otherwise this is a
+// no-op and the popup is the source of truth.
 try {
   importScripts("config.js");
-} catch (e) {
-  console.warn("[FPXpress] config.js not found — copy config.example.js to config.js and set FPX_API_URL + FPX_API_KEY.");
+} catch {
   self.FPX_API_URL = "";
   self.FPX_API_KEY = "";
 }
