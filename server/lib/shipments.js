@@ -19,6 +19,28 @@ const pick = (raw, keys) => {
   return null;
 };
 
+// Some scraped fields (signed_by, comments, status, pickup_response) get
+// polluted with the full modal text when the page layout nests labels inside
+// a parent that contains everything. The scraper's fallback `parent.textContent`
+// grabs the whole blob. Detect that here and drop it; cap reasonable fields
+// to a readable length.
+const MODAL_BLOB_MARKERS = ["Tracking Number:", "Ship From:", "Ship To:", "Carrier:", "Service:", "Number of Pieces:", "Total Weight:"];
+function cleanField(v, opts = {}) {
+  if (v === null || v === undefined) return null;
+  let s = String(v).replace(/\s+/g, " ").trim();
+  if (!s) return null;
+  const hits = MODAL_BLOB_MARKERS.filter((m) => s.includes(m)).length;
+  if (hits >= 3) return null;                                  // full-modal blob — drop
+  // Strings that are pure label residue from a stripped sibling — e.g.
+  // "Delivered Date: Event History:" — are not real values.
+  if (/^(Status|Delivered Date|Date|Event History|Notes|Details)\s*:/i.test(s) && s.length < 80) {
+    return null;
+  }
+  const max = opts.maxLen ?? 300;
+  if (s.length > max) s = s.slice(0, max).replace(/\s+\S*$/, "") + "…";
+  return s;
+}
+
 // FreightPOP returns shipment origin/destination as a single comma-separated
 // blob like "ASSOCIATED PACKAGING, INC., 435 Calvert Dr, Gallatin, TN, 37066, US".
 // We don't get a clean customer_name field, so guess it: take leading comma
@@ -54,11 +76,11 @@ export function mapShipment(raw, runnerName) {
     carrier: pick(raw, ["CARRIER", "Carrier"]),
     carrier_name: pick(raw, ["CARRIER NAME", "Carrier Name"]),
     mode: pick(raw, ["MODE", "Mode"]),
-    shipment_status: pick(raw, ["SHIPMENT STATUS", "Shipment Status", "Status"]),
-    comments: pick(raw, ["COMMENTS", "Comments"]),
-    pickup_response: pick(raw, ["PICKUP RESPONSE", "Pickup Response"]),
-    pickup_request_number: pick(raw, ["PICKUP REQUEST NUMBER"]),
-    confirmation_number: pick(raw, ["CONFIRMATION NUMBER"]),
+    shipment_status: cleanField(pick(raw, ["SHIPMENT STATUS", "Shipment Status", "Status"]), { maxLen: 80 }),
+    comments: cleanField(pick(raw, ["COMMENTS", "Comments"]), { maxLen: 500 }),
+    pickup_response: cleanField(pick(raw, ["PICKUP RESPONSE", "Pickup Response"]), { maxLen: 200 }),
+    pickup_request_number: cleanField(pick(raw, ["PICKUP REQUEST NUMBER"]), { maxLen: 60 }),
+    confirmation_number: cleanField(pick(raw, ["CONFIRMATION NUMBER"]), { maxLen: 60 }),
     pickup_date: toIso(pick(raw, ["PICKUP DATE", "Pickup Date"])),
     updated_eta: toIso(pick(raw, ["UPDATED ETA", "Updated ETA"])),
     estimated_departure: toIso(pick(raw, ["ESTIMATED DEPARTURE DATE"])),
@@ -66,7 +88,7 @@ export function mapShipment(raw, runnerName) {
     estimated_arrival: toIso(pick(raw, ["ESTIMATED ARRIVAL DATE"])),
     actual_arrival: toIso(pick(raw, ["ACTUAL ARRIVAL DATE"])),
     delivery_date: toIso(pick(raw, ["DELIVERY DATE", "Delivery Date"])),
-    signed_by: pick(raw, ["SIGNED BY", "Signed By"]),
+    signed_by: cleanField(pick(raw, ["SIGNED BY", "Signed By"]), { maxLen: 80 }),
     booking_date: toIso(pick(raw, ["BOOKING DATE"])),
     inbound_customs_date: toIso(pick(raw, ["INBOUND CUSTOMS DATE"])),
     port_departure_date: toIso(pick(raw, ["PORT DEPARTURE DATE"])),

@@ -35,6 +35,8 @@ export interface Shipment {
   scraped_at: string;
   created_at: string;
   updated_at: string;
+  created_by: string | null;
+  seen_count: number;
 }
 
 export type AnalysisKind = "per_shipment" | "summary" | "gp_audit" | "invoice_audit" | "other";

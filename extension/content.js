@@ -424,27 +424,36 @@ function scrapeModal() {
     document.querySelector(".modal.in, .modal.show, .k-window, [role='dialog']") ||
     document.body;
 
-  // Pattern A: <label>FIELD</label> next to <span>/<div>/<input> with value
+  // Pattern A: <label>FIELD</label> next to <span>/<div>/<input> with value.
+  // We deliberately do NOT fall back to `parent.textContent` if the sibling is
+  // empty — for nested modal layouts that grabs the entire surrounding text
+  // (full event-history blob, ship-from + ship-to + comments mashed together)
+  // and stamps it onto whatever label was nearest. Better to leave the field
+  // empty than to corrupt it.
+  const MAX_VALUE_LEN = 300;
   const labels = modal.querySelectorAll("label, strong, b, .field-label, .control-label, dt");
   for (const lbl of labels) {
     const key = lbl.textContent.trim().replace(/:$/, "");
-    if (!key || key.length > 200) continue;
+    if (!key || key.length > 80) continue;
+    if (key === "CLOSE") continue;
+    if (data[key]) continue;                                // first-write-wins; don't overwrite
 
     let val = "";
     const next = lbl.nextElementSibling;
     if (next) {
       val = (next.value || next.textContent || "").trim();
     }
-    if (!val) {
-      const parent = lbl.closest(".form-group, .field-row, .row, dd, div");
-      if (parent) {
-        const allText = parent.textContent.trim();
-        val = allText.replace(key, "").replace(/^[:\s]+/, "").trim();
-      }
+    // Sibling-of-parent: <div><label/></div><div>VALUE</div>
+    if (!val && lbl.parentElement && lbl.parentElement.nextElementSibling) {
+      const sib = lbl.parentElement.nextElementSibling;
+      const sibText = (sib.textContent || "").trim();
+      if (sibText && sibText.length < MAX_VALUE_LEN) val = sibText;
     }
-    if (key && key !== "CLOSE") {
-      data[key] = val;
-    }
+
+    if (!val) continue;
+    val = val.replace(/\s+/g, " ").trim();
+    if (val.length > MAX_VALUE_LEN) val = val.slice(0, MAX_VALUE_LEN).replace(/\s+\S*$/, "") + "…";
+    data[key] = val;
   }
 
   // Pattern B: table rows with th/td pairs inside the modal
