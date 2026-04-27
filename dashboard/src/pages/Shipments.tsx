@@ -8,7 +8,12 @@ import { KPI } from "../components/KPI";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
 
-export function ShipmentsPage() {
+interface ShipmentsPageProps {
+  initialShipmentId?: string | null;
+  onShipmentConsumed?: () => void;
+}
+
+export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: ShipmentsPageProps = {}) {
   const [rows, setRows] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -55,6 +60,17 @@ export function ShipmentsPage() {
     setLoading(false);
   }
   useEffect(() => { load(); }, []);
+
+  // When another page (e.g. AI Analyses) asks to deep-link a shipment, open
+  // the drawer for it and tell the parent we've consumed the request so a
+  // subsequent navigation event can re-trigger.
+  useEffect(() => {
+    if (initialShipmentId) {
+      setDrawerId(initialShipmentId);
+      onShipmentConsumed?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialShipmentId]);
 
   // Drawer-level tab navigation.
   const [drawerTab, setDrawerTab] = useState<"overview" | "tasks" | "email" | "drafts" | "history" | "raw">("overview");

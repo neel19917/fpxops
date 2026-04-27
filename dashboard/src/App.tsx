@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Layout, type TabId } from "./components/Layout";
 import { AuthProvider, useAuth } from "./lib/auth";
+import { NavCtx, type NavApi } from "./lib/nav";
 import { SignInPage } from "./pages/SignIn";
 import { PendingApprovalPage } from "./pages/PendingApproval";
 import { ShipmentsPage } from "./pages/Shipments";
@@ -32,6 +33,13 @@ export default function App() {
 function AuthedApp() {
   const { session, profile, loading } = useAuth();
   const [tab, setTab] = useState<TabId>("tracking");
+  // When a non-tracking page asks to open a shipment drawer, stash the id here.
+  // ShipmentsPage consumes it on next mount/render and clears it back.
+  const [pendingShipmentId, setPendingShipmentId] = useState<string | null>(null);
+  const nav: NavApi = useMemo(() => ({
+    setTab: (t) => setTab(t as TabId),
+    openShipment: (id: string) => { setPendingShipmentId(id); setTab("tracking"); },
+  }), []);
 
   // On successful OAuth callback Supabase puts a hash fragment in the URL;
   // clear it once the session is ready so refreshes don't re-process it.
@@ -56,17 +64,24 @@ function AuthedApp() {
   const safeTab: TabId = (adminOnlyTabs.includes(tab) && !isAdmin) ? "tracking" : tab;
 
   return (
-    <Layout tab={safeTab} onTab={setTab}>
-      {safeTab === "tracking" && <ShipmentsPage />}
-      {safeTab === "tasks"    && <TasksPage />}
-      {safeTab === "analyses" && <AnalysesPage />}
-      {safeTab === "gp"       && <GpAuditsPage />}
-      {safeTab === "invoice"  && <InvoiceAuditsPage />}
-      {safeTab === "shares"   && <ShareLinksPage />}
-      {safeTab === "feedback" && <FeedbackPage />}
-      {safeTab === "users"    && isAdmin && <UsersPage />}
-      {safeTab === "keys"     && isAdmin && <ApiKeysPage />}
-      {safeTab === "audit"    && isAdmin && <AuditLogPage />}
-    </Layout>
+    <NavCtx.Provider value={nav}>
+      <Layout tab={safeTab} onTab={setTab}>
+        {safeTab === "tracking" && (
+          <ShipmentsPage
+            initialShipmentId={pendingShipmentId}
+            onShipmentConsumed={() => setPendingShipmentId(null)}
+          />
+        )}
+        {safeTab === "tasks"    && <TasksPage />}
+        {safeTab === "analyses" && <AnalysesPage />}
+        {safeTab === "gp"       && <GpAuditsPage />}
+        {safeTab === "invoice"  && <InvoiceAuditsPage />}
+        {safeTab === "shares"   && <ShareLinksPage />}
+        {safeTab === "feedback" && <FeedbackPage />}
+        {safeTab === "users"    && isAdmin && <UsersPage />}
+        {safeTab === "keys"     && isAdmin && <ApiKeysPage />}
+        {safeTab === "audit"    && isAdmin && <AuditLogPage />}
+      </Layout>
+    </NavCtx.Provider>
   );
 }

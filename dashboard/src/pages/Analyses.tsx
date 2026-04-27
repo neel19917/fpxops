@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Sparkles, Coins, Gauge, ArrowDownToLine } from "lucide-react";
+import { Sparkles, Coins, Gauge, ArrowDownToLine, ExternalLink } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtNum, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis } from "../lib/types";
 import { KindBadge } from "../components/Badge";
 import { KPI } from "../components/KPI";
 import { Drawer, Field, Section } from "../components/Drawer";
+import { useNav } from "../lib/nav";
 
 export function AnalysesPage() {
+  const nav = useNav();
   const [rows, setRows] = useState<AiAnalysis[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -84,22 +86,44 @@ export function AnalysesPage() {
                 <th className="px-4 py-2.5 font-medium">Issue</th>
                 <th className="px-4 py-2.5 font-medium text-right">Cost</th>
                 <th className="px-4 py-2.5 font-medium text-right">Tokens</th>
+                <th className="px-4 py-2.5 font-medium text-right w-12">Open</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading ? (
-                <tr><td colSpan={7} className="p-8 text-center text-slate-500">Loading…</td></tr>
+                <tr><td colSpan={8} className="p-8 text-center text-slate-500">Loading…</td></tr>
               ) : filtered.length === 0 ? (
-                <tr><td colSpan={7} className="p-8 text-center text-slate-500">No analyses yet. Run the extension to populate.</td></tr>
+                <tr><td colSpan={8} className="p-8 text-center text-slate-500">No analyses yet. Run the extension to populate.</td></tr>
               ) : filtered.map((a) => (
                 <tr key={a.id} className="hover:bg-sky-50/50 cursor-pointer" onClick={() => setSelected(a)}>
                   <td className="px-4 py-2.5 text-slate-500 whitespace-nowrap">{fmtRelative(a.created_at)}</td>
                   <td className="px-4 py-2.5"><KindBadge kind={a.kind} /></td>
-                  <td className="px-4 py-2.5 font-mono text-xs">{a.tracking_number || "—"}</td>
+                  <td className="px-4 py-2.5 font-mono text-xs">
+                    {a.shipment_uuid ? (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); nav.openShipment(a.shipment_uuid as string); }}
+                        className="text-sky-700 hover:text-sky-900 hover:underline font-medium"
+                        title="Open this shipment in the Tracking tab"
+                      >
+                        {a.tracking_number || "(no tracking #)"}
+                      </button>
+                    ) : (a.tracking_number || "—")}
+                  </td>
                   <td className="px-4 py-2.5 text-slate-600 text-xs">{a.model}</td>
                   <td className="px-4 py-2.5 max-w-[360px] truncate">{a.issue || "—"}</td>
                   <td className="px-4 py-2.5 text-right font-variant-numeric:tabular-nums">{fmtUsd(a.cost_usd)}</td>
                   <td className="px-4 py-2.5 text-right text-slate-500">{a.input_tokens ?? 0}/{a.output_tokens ?? 0}</td>
+                  <td className="px-4 py-2.5 text-right">
+                    {a.shipment_uuid ? (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); nav.openShipment(a.shipment_uuid as string); }}
+                        className="p-1.5 text-slate-400 hover:text-sky-700 hover:bg-sky-50 rounded-md"
+                        title="Open shipment drawer"
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                      </button>
+                    ) : null}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -115,6 +139,16 @@ export function AnalysesPage() {
       >
         {selected ? (
           <>
+            {selected.shipment_uuid ? (
+              <div className="flex justify-end mb-4">
+                <button
+                  onClick={() => { nav.openShipment(selected.shipment_uuid as string); setSelected(null); }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800"
+                >
+                  <ExternalLink className="h-4 w-4" /> View shipment
+                </button>
+              </div>
+            ) : null}
             <Section title="Summary">
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Model">{selected.model}</Field>
