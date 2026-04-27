@@ -1,11 +1,12 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
-import { requireApiKey, hashApiKey, generateApiKey } from "../lib/auth.js";
+import { requireAuth, hashApiKey, generateApiKey } from "../lib/auth.js";
 
 export const apiKeysRouter = Router();
 
-// All routes in here require admin scope.
-apiKeysRouter.use(requireApiKey({ scope: "admin" }));
+// Admin scope (API key) OR admin role (Microsoft sign-in JWT). The latter
+// is required so the first key can be minted from the dashboard.
+apiKeysRouter.use(requireAuth({ scope: "admin", role: "admin" }));
 
 // GET /api-keys — list non-revoked + revoked, sorted newest first. Plaintext NEVER returned.
 apiKeysRouter.get("/", async (_req, res) => {
@@ -29,7 +30,7 @@ apiKeysRouter.post("/", async (req, res) => {
   const key_prefix = plaintext.slice(0, 12);
   const { data, error } = await supabase
     .from("fpx_api_keys")
-    .insert({ name, key_hash, key_prefix, scopes, created_by: req.apiKey?.name || "admin" })
+    .insert({ name, key_hash, key_prefix, scopes, created_by: req.apiKey?.name || req.user?.email || "admin" })
     .select("id, name, key_prefix, scopes, created_at")
     .single();
   if (error) return res.status(500).json({ error: error.message });
