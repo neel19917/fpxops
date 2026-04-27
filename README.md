@@ -46,6 +46,7 @@ Create a Railway project from `server/`. In **Variables**, set:
 | `SUPABASE_SERVICE_ROLE_KEY` | from Supabase project settings (service role — server-only) |
 | `CORS_ORIGINS` | `chrome-extension://*,http://localhost:5173,https://your-dashboard.example` |
 | `FPX_BOOTSTRAP_ADMIN_KEY` *(optional)* | plaintext like `fpx_live_BOOTSTRAP...` — on startup the server inserts this as an admin key. Useful for first boot; remove after. |
+| `FPX_BOOTSTRAP_ADMIN_EMAIL` *(optional)* | on startup, promote this user's `fpx_user_profiles` row to `role=admin, enabled=true`. Idempotent. Use it to seed the first dashboard admin without SQL. |
 
 Railway deploys automatically from Git. Health check: `GET /health`.
 
@@ -76,10 +77,20 @@ You can also set the URL + key at runtime from the popup (click the extension ic
 
 ### 4 · Run the dashboard
 
+The dashboard reads its config from build-time env vars — there's no in-app
+setup screen. Set these in `dashboard/.env.local` for dev, or in your host's
+build environment (e.g. Netlify) for prod:
+
+| Variable | Value |
+|---|---|
+| `VITE_FPX_API_URL` | the Railway API URL |
+| `VITE_SUPABASE_URL` | `https://vvplkjgymahavqrejmgm.supabase.co` |
+| `VITE_SUPABASE_ANON_KEY` | Supabase anon key (publishable) |
+
 Local dev:
 ```bash
 cd dashboard
-cp .env.example .env.local   # optional: pre-fill VITE_FPX_API_URL
+cp .env.example .env.local   # fill in VITE_* values
 npm install
 npm run dev                  # http://localhost:5173
 ```
@@ -89,7 +100,10 @@ Production build:
 npm run build                # outputs dashboard/dist — host anywhere
 ```
 
-On first load the dashboard asks for the Railway URL + API key; they're saved to `localStorage` on that browser. Sign out from the header to clear.
+Users sign in with **Microsoft** via Supabase Auth. New accounts land on a
+"Pending approval" screen until an admin enables them on the Users tab. To
+seed the first admin without SQL, set `FPX_BOOTSTRAP_ADMIN_EMAIL` on the
+server (see Variables table above).
 
 ---
 
