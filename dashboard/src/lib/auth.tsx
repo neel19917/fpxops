@@ -71,13 +71,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     sb.auth.getSession().then(async ({ data }) => {
       if (!mounted) return;
       setSession(data.session);
-      await loadProfile(data.session);
-      setLoading(false);
+      try { await loadProfile(data.session); } catch (e) { setError((e as Error).message); }
+      finally { if (mounted) setLoading(false); }
     });
     const { data: sub } = sb.auth.onAuthStateChange(async (_event, s) => {
       setSession(s);
-      await loadProfile(s);
-      setLoading(false);
+      try { await loadProfile(s); } catch (e) { setError((e as Error).message); }
+      finally { setLoading(false); }
     });
     return () => { mounted = false; sub.subscription.unsubscribe(); };
   }, []);

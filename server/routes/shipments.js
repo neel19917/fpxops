@@ -40,21 +40,30 @@ shipmentsRouter.get("/:id", async (req, res) => {
   res.json({ shipment: ship, analyses: analysesRes.data || [], history: historyRes.data || [] });
 });
 
-// POST /shipments — single or bulk upsert. Body: { shipment: {...} } or { shipments: [...] }
+// POST /shipments — single or bulk upsert keyed on tracking_number. Repeat
+// scrapes update the existing row (seen_count auto-bumps via trigger) instead
+// of growing the table. Body: { shipment: {...} } or { shipments: [...] }
 shipmentsRouter.post("/", async (req, res) => {
   const single = req.body.shipment;
   const bulk = req.body.shipments;
   if (single) {
     const mapped = mapShipment(single);
     if (!mapped || !mapped.tracking_number) return res.status(400).json({ error: "tracking_number required" });
-    const { data, error } = await supabase.from("fpx_shipments").insert(mapped).select().single();
+    const { data, error } = await supabase
+      .from("fpx_shipments")
+      .upsert(mapped, { onConflict: "tracking_number" })
+      .select()
+      .single();
     if (error) return res.status(500).json({ error: error.message });
     return res.json({ shipment: data });
   }
   if (Array.isArray(bulk)) {
     const mapped = mapShipmentsBulk(bulk);
     if (!mapped.length) return res.json({ count: 0, ids: [] });
-    const { data, error } = await supabase.from("fpx_shipments").insert(mapped).select("id,tracking_number");
+    const { data, error } = await supabase
+      .from("fpx_shipments")
+      .upsert(mapped, { onConflict: "tracking_number" })
+      .select("id,tracking_number,seen_count");
     if (error) return res.status(500).json({ error: error.message });
     return res.json({ count: data.length, ids: data.map((r) => r.id) });
   }

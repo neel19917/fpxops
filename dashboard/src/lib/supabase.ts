@@ -9,6 +9,10 @@ export const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     persistSession: true,
     autoRefreshToken: true,
     detectSessionInUrl: true,
+    // No-op lock. Default uses navigator.locks which orphans under React Strict Mode
+    // (effect runs twice; first unmount doesn't release the lock, second mount waits 5s
+    // before forcefully recovering, leaving the dashboard stuck on "Loading…").
+    lock: async (_name, _acquireTimeout, fn) => fn(),
   },
 });
 
