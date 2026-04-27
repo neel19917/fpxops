@@ -89,18 +89,34 @@ app.use("/api-keys", apiKeysRouter);
 
 // ---------- Legacy LangGraph batch endpoint ----------
 // Kept for extension backwards-compat; now dual-auth.
-const model = new ChatAnthropic({
-  model: process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
-  maxTokens: 512,
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-});
+// Model is constructed lazily so a missing ANTHROPIC_API_KEY doesn't crash
+// boot — /health stays up and only /analyze fails until the env var is set.
 const graph = buildGraph();
 const ANALYZE_TIMEOUT_MS = 5 * 60 * 1000;
+let _cachedModel = null;
+function getModel() {
+  if (_cachedModel) return _cachedModel;
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error("ANTHROPIC_API_KEY is not configured on the server");
+  }
+  _cachedModel = new ChatAnthropic({
+    model: process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
+    maxTokens: 512,
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+  });
+  return _cachedModel;
+}
 
 app.post("/analyze", requireAuth(), async (req, res) => {
   const { shipments } = req.body;
   if (!Array.isArray(shipments) || shipments.length === 0) {
     return res.status(400).json({ error: "shipments array is required" });
+  }
+  let model;
+  try {
+    model = getModel();
+  } catch (e) {
+    return res.status(503).json({ error: e.message });
   }
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; }, ANALYZE_TIMEOUT_MS);
