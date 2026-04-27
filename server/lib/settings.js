@@ -17,7 +17,7 @@ const FALLBACKS = {
   "action.threshold": 0.7,
   "action.auto_draft_enabled": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
-  "model.large": process.env.ANTHROPIC_MODEL_LARGE || "claude-sonnet-4-5-20250929",
+  "model.large": process.env.ANTHROPIC_MODEL_LARGE || "claude-sonnet-4-6",
 };
 
 const TTL_MS = 30_000;

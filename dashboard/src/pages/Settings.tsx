@@ -27,6 +27,20 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "model.large": "Large model (long prompts ≥ ~12k chars)",
 };
 
+// Per-setting enum options. Keys without an entry render as free-text/JSON.
+// Model list mirrors MODEL_PRICING in server/lib/anthropic.js — keep in sync,
+// otherwise selecting an unpriced model logs analyses with the wrong cost.
+const MODEL_OPTIONS = [
+  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5 (fast, cheap — $0.80 / $4.00 per 1M)" },
+  { value: "claude-sonnet-4-6",          label: "Sonnet 4.6 (balanced — $3.00 / $15.00 per 1M)" },
+  { value: "claude-sonnet-4-5-20250929", label: "Sonnet 4.5 (legacy — $3.00 / $15.00 per 1M)" },
+  { value: "claude-opus-4-7",            label: "Opus 4.7 (most capable — $15.00 / $75.00 per 1M)" },
+];
+const ENUM_OPTIONS: Record<string, { value: string; label: string }[]> = {
+  "model.default": MODEL_OPTIONS,
+  "model.large": MODEL_OPTIONS,
+};
+
 function valueShape(v: unknown): "string" | "number" | "boolean" | "json" {
   if (typeof v === "string") return "string";
   if (typeof v === "number") return "number";
@@ -162,7 +176,13 @@ export function SettingsPage() {
                       </div>
                     </div>
                     <div className="mt-3">
-                      {shape === "boolean" ? (
+                      {ENUM_OPTIONS[row.key] ? (
+                        <SelectEditor
+                          value={String(current ?? "")}
+                          options={ENUM_OPTIONS[row.key]}
+                          onChange={(s) => setEdit(row.key, s)}
+                        />
+                      ) : shape === "boolean" ? (
                         <label className="inline-flex items-center gap-2 text-sm text-slate-700">
                           <input
                             type="checkbox"
@@ -193,6 +213,27 @@ export function SettingsPage() {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function SelectEditor({ value, options, onChange }: { value: string; options: { value: string; label: string }[]; onChange: (v: string) => void }) {
+  const known = options.some((o) => o.value === value);
+  return (
+    <div className="space-y-1.5">
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full md:w-auto md:min-w-[28rem] px-3 py-2 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
+      >
+        {!known && value ? <option value={value}>{value} (unrecognized)</option> : null}
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>{o.label}</option>
+        ))}
+      </select>
+      {!known && value ? (
+        <div className="text-xs text-amber-600">Current value isn't in the known options list — make sure pricing/cost logging is set up for it server-side.</div>
+      ) : null}
     </div>
   );
 }

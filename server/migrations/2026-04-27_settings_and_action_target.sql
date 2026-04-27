@@ -97,7 +97,7 @@ Shipment summary:
    to_jsonb('claude-haiku-4-5-20251001'::text),
    'Default Anthropic model for short prompts.'),
   ('model.large',
-   to_jsonb('claude-sonnet-4-5-20250929'::text),
+   to_jsonb('claude-sonnet-4-6'::text),
    'Model used when prompt+message exceeds the large-prompt threshold (~12k chars).')
 on conflict (key) do nothing;
 

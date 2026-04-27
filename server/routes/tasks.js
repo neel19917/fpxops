@@ -89,6 +89,23 @@ tasksRouter.post("/bulk-update", async (req, res) => {
   res.json({ updated: data.length });
 });
 
+// POST /tasks/bulk-delete  { ids: string[] }
+// Delete many tasks at once. Used by the Tasks page "clear out" toolbar.
+tasksRouter.post("/bulk-delete", async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((x) => typeof x === "string") : [];
+  if (!ids.length) return res.status(400).json({ error: "ids required" });
+  const { data: before } = await supabase
+    .from("fpx_shipment_tasks").select("id, title").in("id", ids);
+  const { error } = await supabase.from("fpx_shipment_tasks").delete().in("id", ids);
+  if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "bulk_delete", entity_type: "task",
+    summary: `Bulk-deleted ${ids.length} task(s)`,
+    metadata: { count: ids.length, ids, titles: (before || []).map((b) => b.title) },
+  });
+  res.json({ deleted: ids.length });
+});
+
 // PATCH /tasks/:id  { status?, priority?, assigned_to?, title?, description?, due_at? }
 tasksRouter.patch("/:id", async (req, res) => {
   const allowed = ["status", "priority", "assigned_to", "title", "description", "due_at"];

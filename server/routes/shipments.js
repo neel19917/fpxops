@@ -5,6 +5,7 @@ import { logAudit } from "../lib/audit.js";
 import { generateEmailDraft } from "../lib/emailDraft.js";
 import { getSettings } from "../lib/settings.js";
 import { analyzeExistingShipment } from "./analyze.js";
+import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
 
 export const shipmentsRouter = Router();
 
@@ -26,7 +27,15 @@ function preserveExistingAi(rows) {
 // updated rows so autoCreateActionTasks / autoDraftEmails can fan out from
 // fresh analyses.
 const AUTO_ANALYZE_CONCURRENCY = 4;
-async function autoAnalyzeUpserted(req, upsertedIds) {
+
+// Decide which upserted shipments deserve a (re)analysis pass:
+//   - never analyzed yet (no action_required)               → analyze
+//   - manually overridden                                   → skip (always)
+//   - material data changed since last scrape               → re-analyze
+//   - already analyzed and no new info                      → skip
+// `materialChangedIds` is a Set of fpx_shipments.id that had a non-null diff
+// from the prior scrape. The bulk POST flow builds it before calling this.
+async function autoAnalyzeUpserted(req, upsertedIds, { materialChangedIds = new Set() } = {}) {
   if (!upsertedIds.length) return [];
   const { data: rows, error } = await supabase
     .from("fpx_shipments")
@@ -36,9 +45,12 @@ async function autoAnalyzeUpserted(req, upsertedIds) {
     console.warn("[FPX] auto-analyze fetch failed:", error.message);
     return [];
   }
-  const candidates = (rows || []).filter(
-    (r) => !r.action_required && r.action_source !== "manual"
-  );
+  const candidates = (rows || []).filter((r) => {
+    if (r.action_source === "manual") return false;
+    if (!r.action_required) return true;
+    if (materialChangedIds.has(r.id)) return true;
+    return false;
+  });
   if (!candidates.length) return [];
 
   const updated = [];
@@ -224,41 +236,109 @@ shipmentsRouter.post("/", async (req, res) => {
   if (Array.isArray(bulk)) {
     const mapped = mapShipmentsBulk(bulk, runnerName);
     if (!mapped.length) return res.json({ count: 0, ids: [] });
+
     // Scrape-only extension uploads carry no AI fields. Preserve whatever the
     // server has already analyzed instead of overwriting with nulls.
     preserveExistingAi(mapped);
+
+    // ---- Scrape history ------------------------------------------------
+    // Pull the prior snapshot for every tracking_number so we can compute a
+    // material-field diff before the upsert clobbers the row. Only the
+    // fields we compare on are pulled — keeps the query small.
+    const trackingNumbers = mapped.map((m) => m.tracking_number).filter(Boolean);
+    const priorByTracking = new Map();
+    if (trackingNumbers.length) {
+      const cols = ["id", "tracking_number", "action_source", ...MATERIAL_FIELDS].join(", ");
+      const { data: priors } = await supabase
+        .from("fpx_shipments").select(cols).in("tracking_number", trackingNumbers);
+      for (const p of priors || []) priorByTracking.set(p.tracking_number, p);
+    }
+    // Compute the diff per scraped row (null if first sighting / no change).
+    const diffByTracking = new Map();
+    for (const m of mapped) {
+      const prev = priorByTracking.get(m.tracking_number);
+      const diff = computeMaterialDiff(prev, m);
+      if (diff) diffByTracking.set(m.tracking_number, diff);
+    }
+    // ---- Upsert (latest-snapshot table) --------------------------------
     const { data, error } = await supabase
       .from("fpx_shipments")
       .upsert(mapped, { onConflict: "tracking_number" })
       .select("id,tracking_number,seen_count,created_by,action_required,action_source,action_target,ai_issue,ai_recommendation");
     if (error) return res.status(500).json({ error: error.message });
 
-    // Run analysis + downstream fan-out in the background so the extension's
-    // POST returns fast. The audit log records the upsert immediately; task
-    // creation + email drafts wait for AI to settle.
     const upsertedIds = data.map((r) => r.id);
+    const idByTracking = new Map(data.map((r) => [r.tracking_number, r.id]));
+    // Set of fpx_shipments.id whose latest scrape had material changes.
+    const materialChangedIds = new Set(
+      Array.from(diffByTracking.keys())
+        .map((t) => idByTracking.get(t))
+        .filter(Boolean),
+    );
+
+    // ---- Persist one fpx_shipment_scrapes row per scraped item ----------
+    const scrapePayloads = mapped.map((m, i) => ({
+      shipmentId: idByTracking.get(m.tracking_number),
+      trackingNumber: m.tracking_number,
+      scrapedBy: runnerName,
+      raw: bulk[i],                       // full raw extension payload, not the mapped row
+      diff: diffByTracking.get(m.tracking_number) || null,
+      triggeredReanalysis: false,         // flipped after we know which got re-analyzed
+    }));
+    // Fire off scrape recording in parallel with the rest of background work.
+    const scrapeRecordPromise = recordScrapeBatch(scrapePayloads);
+
+    // ---- Mark manual overrides as stale when new material data arrives -
+    // We don't change action_required (operator's choice still wins), but we
+    // raise a flag so the dashboard can prompt "this override may be out of
+    // date." Cleared back to false on next clean scrape (handled below).
+    const staleTargets = mapped
+      .filter((m) => diffByTracking.has(m.tracking_number) && priorByTracking.get(m.tracking_number)?.action_source === "manual")
+      .map((m) => idByTracking.get(m.tracking_number))
+      .filter(Boolean);
+    if (staleTargets.length) {
+      await supabase.from("fpx_shipments")
+        .update({ action_override_stale: true })
+        .in("id", staleTargets);
+    }
+    // Conversely, if a manual override row scraped with no material change,
+    // and was previously marked stale, leave it as-is — only operator action
+    // clears stale once it's set. (Avoids flapping if the carrier flips a
+    // status field then flips it back.)
+
+    // ---- Background: re-analyze + tasks + drafts -----------------------
     const backgroundWork = (async () => {
-      const freshlyAnalyzed = await autoAnalyzeUpserted(req, upsertedIds);
-      // For task creation we want the freshest snapshot of every upserted
-      // row — newly analyzed rows fold in here, and rows that already had
-      // action_required set use whatever the upsert returned.
+      const freshlyAnalyzed = await autoAnalyzeUpserted(req, upsertedIds, { materialChangedIds });
       const byId = new Map(data.map((r) => [r.id, r]));
       for (const r of freshlyAnalyzed) byId.set(r.id, r);
       const settled = Array.from(byId.values());
       const tasks = await autoCreateActionTasks(req, settled);
       const drafts = await autoDraftEmails(settled);
-      if (tasks || drafts) console.log(`[FPX] post-upload: ${tasks} task(s), ${drafts} draft(s)`);
+      if (tasks || drafts || freshlyAnalyzed.length) {
+        console.log(`[FPX] post-upload: ${freshlyAnalyzed.length} (re)analyzed, ${tasks} task(s), ${drafts} draft(s)`);
+      }
     })().catch((e) => console.warn("[FPX] post-upload background failed:", e.message));
 
     logAudit(req, {
       action: "bulk_create",
       entity_type: "shipment",
-      summary: `Upserted ${data.length} shipments`,
-      metadata: { count: data.length, runner: runnerName },
+      summary: `Upserted ${data.length} shipments` + (materialChangedIds.size ? ` (${materialChangedIds.size} with material changes)` : ""),
+      metadata: {
+        count: data.length,
+        runner: runnerName,
+        material_changes: materialChangedIds.size,
+        stale_overrides_flagged: staleTargets.length,
+      },
     });
-    // Don't await background — let it drain.
+    // Don't await background — let it drain. scrapeRecordPromise is logged-only.
     void backgroundWork;
-    return res.json({ count: data.length, ids: upsertedIds });
+    void scrapeRecordPromise;
+    return res.json({
+      count: data.length,
+      ids: upsertedIds,
+      material_changes: materialChangedIds.size,
+      stale_overrides: staleTargets.length,
+    });
   }
   res.status(400).json({ error: "Provide { shipment } or { shipments: [] }" });
 });
