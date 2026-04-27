@@ -82,7 +82,7 @@ export const api = {
   shipments: {
     list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string }) =>
       request<{ data: Shipment[] }>("/api/shipments", { params }),
-    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[] }>(`/api/shipments/${id}`),
+    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[] }>(`/api/shipments/${id}`),
     overrideAction: (id: string, body: { action_required: string | null; reason?: string }) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>

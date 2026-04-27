@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { requireAuth } from "../lib/auth.js";
+import { sendCachedJson } from "../lib/httpCache.js";
 
 export const usersRouter = Router();
 
@@ -8,13 +9,13 @@ export const usersRouter = Router();
 usersRouter.use(requireAuth({ role: "admin", scope: "admin" }));
 
 // GET /api/users — list all profiles.
-usersRouter.get("/", async (_req, res) => {
+usersRouter.get("/", async (req, res) => {
   const { data, error } = await supabase
     .from("fpx_user_profiles")
     .select("id, email, full_name, avatar_url, role, enabled, last_login_at, created_at")
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data: data || [] });
+  sendCachedJson(req, res, { data: data || [] });
 });
 
 // PATCH /api/users/:id  { enabled?, role? }

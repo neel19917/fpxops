@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { requireAuth, hashApiKey, generateApiKey } from "../lib/auth.js";
+import { sendCachedJson } from "../lib/httpCache.js";
 
 export const apiKeysRouter = Router();
 
@@ -9,13 +10,13 @@ export const apiKeysRouter = Router();
 apiKeysRouter.use(requireAuth({ scope: "admin", role: "admin" }));
 
 // GET /api-keys — list non-revoked + revoked, sorted newest first. Plaintext NEVER returned.
-apiKeysRouter.get("/", async (_req, res) => {
+apiKeysRouter.get("/", async (req, res) => {
   const { data, error } = await supabase
     .from("fpx_api_keys")
     .select("id, name, key_prefix, scopes, created_by, last_used_at, revoked_at, created_at")
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data: data || [] });
+  sendCachedJson(req, res, { data: data || [] });
 });
 
 // POST /api-keys  { name, scopes?: ['read','write','admin'] } → returns PLAINTEXT once.

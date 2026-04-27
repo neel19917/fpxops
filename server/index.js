@@ -12,7 +12,7 @@ process.on("unhandledRejection", (e) => {
 import { ChatAnthropic } from "@langchain/anthropic";
 import { buildGraph } from "./graph.js";
 import { requireAuth, bootstrapAdminKey, bootstrapAdminEmail } from "./lib/auth.js";
-import { isDbReady } from "./lib/supabase.js";
+import { isDbReady, supabase } from "./lib/supabase.js";
 import { shipmentsRouter } from "./routes/shipments.js";
 import { analysesRouter } from "./routes/analyses.js";
 import { analyzeRouter } from "./routes/analyze.js";
@@ -68,14 +68,20 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3210;
 const startedAt = Date.now();
 
-// Public health check — no auth.
-app.get("/health", (_req, res) => {
-  res.json({
+// Public health check — no auth. Pings Supabase with a tiny count query so
+// uptime monitors see real DB connectivity + latency, not just env-var presence.
+app.get("/health", async (_req, res) => {
+  const base = {
     ok: true,
     version: "2.1.0",
     uptime: Math.round((Date.now() - startedAt) / 1000),
     db: isDbReady(),
-  });
+  };
+  if (!isDbReady()) return res.json({ ...base, dbOk: false, dbLatencyMs: null });
+  const t0 = Date.now();
+  const { error } = await supabase.from("fpx_settings").select("key", { count: "exact", head: true }).limit(1);
+  const dbLatencyMs = Date.now() - t0;
+  res.json({ ...base, dbOk: !error, dbLatencyMs, dbError: error?.message || null });
 });
 
 // Public share viewer — no auth, rate-limited by token validity.

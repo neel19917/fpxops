@@ -9,6 +9,30 @@ import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/
 
 export const shipmentsRouter = Router();
 
+// Columns selected by the list endpoint. Excludes raw_data (multi-KB JSON blob
+// per row, never rendered on the list) and other drawer-only fields. Cuts the
+// list-view payload roughly 10-50x at scale; the drawer (`/shipments/:id`)
+// still returns full rows.
+const LIST_COLUMNS = [
+  "id", "scraped_at",
+  "tracking_number", "shipment_id", "order_number",
+  "customer_name", "customer_id", "company_name",
+  "account_manager", "created_by", "seen_count",
+  "carrier", "carrier_name", "mode", "service",
+  "shipment_status", "action_required", "action_source",
+  "ai_issue", "ai_recommendation",
+  "ship_from", "ship_to",
+  "shipment_date", "pickup_date", "updated_eta", "original_eta", "delivery_date",
+  "appointment_set", "appointment_date", "required_arrival_date",
+  "ready_time", "cut_off_time",
+  "shipper_spot_quote", "spot_quote_fulfilled_by", "pickup_tendered",
+  "tracking_comments", "updated_via", "last_modified_at",
+  "signed_by",
+  "shipment_marked_up_rate", "shipment_rate_without_markup", "shipment_gross_profit",
+  "reference_one", "reference_two", "reference_three",
+  "reference_four", "reference_five", "reference_six",
+].join(", ");
+
 // Strip null AI fields from the upsert payload so re-scrapes from a
 // scrape-only extension don't blow away analysis the server has already
 // performed. mapShipment always emits these keys; if the scraper didn't fill
@@ -178,7 +202,7 @@ async function autoDraftEmails(upsertedRows) {
 // scrape. Base table fpx_shipments keeps the full history; hit /shipments/:id to see it.
 shipmentsRouter.get("/", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 500, 5000);
-  let q = supabase.from("fpx_shipments_latest").select("*").order("scraped_at", { ascending: false }).limit(limit);
+  let q = supabase.from("fpx_shipments_latest").select(LIST_COLUMNS).order("scraped_at", { ascending: false }).limit(limit);
   if (req.query.customer) q = q.eq("customer_name", String(req.query.customer));
   if (req.query.action) q = q.eq("action_required", String(req.query.action));
   if (req.query.source && ["ai", "manual", "none"].includes(String(req.query.source))) {
@@ -198,7 +222,7 @@ shipmentsRouter.get("/:id", async (req, res) => {
   const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
-  const [analysesRes, historyRes] = await Promise.all([
+  const [analysesRes, historyRes, tasksRes] = await Promise.all([
     supabase
       .from("fpx_ai_analyses").select("*")
       .or(`shipment_uuid.eq.${ship.id},tracking_number.eq.${ship.tracking_number || "__none__"}`)
@@ -208,8 +232,14 @@ shipmentsRouter.get("/:id", async (req, res) => {
           .eq("tracking_number", ship.tracking_number).neq("id", ship.id)
           .order("scraped_at", { ascending: false }).limit(20)
       : Promise.resolve({ data: [] }),
+    supabase.from("fpx_shipment_tasks").select("*").eq("shipment_id", ship.id).order("created_at", { ascending: false }),
   ]);
-  res.json({ shipment: ship, analyses: analysesRes.data || [], history: historyRes.data || [] });
+  res.json({
+    shipment: ship,
+    analyses: analysesRes.data || [],
+    history: historyRes.data || [],
+    tasks: tasksRes.data || [],
+  });
 });
 
 // POST /shipments — single or bulk upsert keyed on tracking_number. Repeat

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireAuth } from "../lib/auth.js";
 import { getAllSettingsForAdmin, setSetting, invalidateSettingsCache } from "../lib/settings.js";
 import { logAudit } from "../lib/audit.js";
+import { sendCachedJson } from "../lib/httpCache.js";
 
 export const settingsRouter = Router();
 
@@ -9,10 +10,10 @@ export const settingsRouter = Router();
 settingsRouter.use(requireAuth({ scope: "admin", role: "admin" }));
 
 // GET /api/settings — return every editable setting, merged with defaults.
-settingsRouter.get("/", async (_req, res) => {
+settingsRouter.get("/", async (req, res) => {
   try {
     const list = await getAllSettingsForAdmin();
-    res.json({ data: list });
+    sendCachedJson(req, res, { data: list });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

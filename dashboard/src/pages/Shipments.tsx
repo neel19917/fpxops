@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2 } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -13,6 +13,7 @@ import {
   saveColumnPrefs,
   type ColumnPrefs,
 } from "../lib/shipmentColumns";
+import { exportShipmentsXlsx } from "../lib/exportShipments";
 
 // FreightPOP-style stat pills. Pills are mutually exclusive click-to-filter.
 // Status matchers run against shipment_status; ISSUES uses action_required.
@@ -92,7 +93,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }, [columnPrefs]);
 
   const [drawerId, setDrawerIdState] = useState<string | null>(null);
-  const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[] } | null>(null);
+  const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[]; tasks: ShipmentTask[] } | null>(null);
   // Wrap state changes so opening / closing the drawer also updates the URL.
   function setDrawerId(next: string | null) {
     setDrawerIdState(next);
@@ -129,6 +130,23 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   // Re-analyze button state — busy flag prevents double-click during a Claude
   // round-trip (typically 2-3s).
   const [reanalyzing, setReanalyzing] = useState(false);
+
+  // "Export all" pulls every shipment fresh (ignores filters / pill / search)
+  // so the workbook reflects the database, not the current view.
+  const [exporting, setExporting] = useState(false);
+  async function exportAll() {
+    if (exporting) return;
+    setExporting(true); setErr(null);
+    try {
+      const r = await api.shipments.list({ limit: 5000 });
+      if (!r.data?.length) {
+        setErr("No shipments to export.");
+        return;
+      }
+      exportShipmentsXlsx(r.data);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setExporting(false); }
+  }
 
   async function load() {
     setLoading(true); setErr(null);
@@ -172,8 +190,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       setNewTaskTitle("");
       return;
     }
-    api.shipments.get(drawerId).then(setDrawerData).catch(() => setDrawerData(null));
-    api.tasks.listForShipment(drawerId).then((r) => setDrawerTasks(r.data)).catch(() => setDrawerTasks([]));
+    api.shipments.get(drawerId)
+      .then((d) => { setDrawerData(d); setDrawerTasks(d.tasks || []); })
+      .catch(() => { setDrawerData(null); setDrawerTasks([]); });
   }, [drawerId]);
 
   async function addDrawerTask() {
@@ -389,6 +408,15 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             <option value="manual">Manual override</option>
           </select>
           <ColumnSelector prefs={columnPrefs} onChange={setColumnPrefs} />
+          <button
+            onClick={exportAll}
+            disabled={exporting}
+            title="Download every shipment as a branded XLSX"
+            className="px-3 py-2 text-sm font-semibold rounded-lg text-white bg-gradient-to-br from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 shadow-sm ring-1 ring-sky-600/20 disabled:opacity-60 disabled:cursor-default inline-flex items-center gap-1.5"
+          >
+            <Download className="h-4 w-4" />
+            {exporting ? "Exporting…" : "Export all"}
+          </button>
           <button
             onClick={load}
             className="px-3 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800"

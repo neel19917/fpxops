@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
+import { sendCachedJson } from "../lib/httpCache.js";
 
 export const auditLogRouter = Router();
 
@@ -18,5 +19,5 @@ auditLogRouter.get("/", async (req, res) => {
   if (req.query.actor_email) q = q.eq("actor_email", String(req.query.actor_email));
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data: data || [] });
+  sendCachedJson(req, res, { data: data || [] });
 });
