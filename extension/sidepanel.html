@@ -526,30 +526,16 @@
     <div class="hint">Pick a column first, then choose a value.</div>
   </div>
 
-  <div class="toggle-row">
-    <label class="toggle-label" for="aiToggle">
-      <span class="toggle-switch">
-        <input type="checkbox" id="aiToggle" checked>
-        <span class="toggle-slider"></span>
-      </span>
-      AI Analysis
-    </label>
-    <span class="hint" style="margin:0">When off, scrapes data only — no API calls.</span>
-  </div>
-
-  <div class="toggle-row">
-    <label class="toggle-label" for="smartGateToggle">
-      <span class="toggle-switch">
-        <input type="checkbox" id="smartGateToggle">
-        <span class="toggle-slider"></span>
-      </span>
-      Smart Gate
-    </label>
-    <span class="hint" style="margin:0">Skip AI for clearly routine shipments to save API calls.</span>
+  <!-- Extension is scrape-only as of 2026-04. The Tracking flow uploads
+       to /api/shipments and the server runs per-shipment Claude in the
+       background. Reps see results in the dashboard. -->
+  <div class="info-banner" style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:8px 10px;font-size:12px;color:#1e40af;margin-bottom:10px;line-height:1.4;">
+    <b>Scrape &amp; upload</b> — analysis runs in the dashboard after upload.
+    Open the dashboard's Tracking tab to review results.
   </div>
 
   <div class="btn-row">
-    <button id="startBtn">Start</button>
+    <button id="startBtn">Scrape &amp; upload</button>
     <button id="stopBtn" disabled>Stop</button>
   </div>
 
@@ -559,35 +545,6 @@
   </div>
 
   <div id="status">Ready. Set your filter, then click Start.</div>
-
-  <div id="aiSummarySection" class="ai-summary">
-    <h4>AI Summary</h4>
-    <div id="aiSummaryText"></div>
-  </div>
-
-  <div class="section-toggle" id="promptToggle">
-    <h4>Prompt Settings</h4>
-    <span class="arrow" id="promptArrow">&#9654;</span>
-  </div>
-  <div class="prompt-editor" id="promptEditor">
-    <div class="field">
-      <label for="systemPrompt">System Prompt</label>
-      <textarea id="systemPrompt" rows="3"></textarea>
-    </div>
-    <div class="field">
-      <label for="perShipmentPrompt">Per-Shipment Prompt <span class="hint">(use {{data}} for shipment JSON)</span></label>
-      <textarea id="perShipmentPrompt" rows="4"></textarea>
-    </div>
-    <div class="field">
-      <label for="summaryPrompt">Summary Prompt <span class="hint">(use {{allShipments}} for all data)</span></label>
-      <textarea id="summaryPrompt" rows="3"></textarea>
-    </div>
-    <div class="prompt-btn-row">
-      <span class="save-status" id="saveStatus"></span>
-      <button id="resetPromptsBtn">Reset</button>
-      <button id="savePromptsBtn">Save</button>
-    </div>
-  </div>
 
   </div><!-- end trackingTab -->
 
@@ -628,7 +585,9 @@
       </select>
     </div>
 
-    <div class="field">
+    <!-- GP audit AI moved to the dashboard. Kept hidden so sidepanel.js can
+         still read the value (sent to the server as `ai_level`). -->
+    <div class="field" style="display:none;">
       <label for="gpAiAnalysis">AI Analysis</label>
       <select id="gpAiAnalysis">
         <option value="off">Off — Stats Only</option>
@@ -636,6 +595,11 @@
         <option value="full">Full (Summary + Per-Row Review)</option>
       </select>
       <div class="hint">Exec Summary uses one API call. Full analyzes every flagged row.</div>
+    </div>
+
+    <div class="info-banner" style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:8px 10px;font-size:12px;color:#1e40af;margin-bottom:10px;line-height:1.4;">
+      <b>Scrape &amp; upload</b> — analysis runs in the dashboard after upload.
+      Open the dashboard's Audits tab to review results.
     </div>
 
     <div class="btn-row">
@@ -659,16 +623,16 @@
       <div id="gpOutlierList"></div>
     </div>
 
-    <div id="gpAiSummarySection" class="ai-summary">
+    <div id="gpAiSummarySection" class="ai-summary" style="display:none;">
       <h4>AI Executive Summary</h4>
       <div id="gpAiSummaryText"></div>
     </div>
 
-    <div class="section-toggle" id="gpPromptToggle">
+    <div class="section-toggle" id="gpPromptToggle" style="display:none;">
       <h4>GP Audit Prompt Settings</h4>
       <span class="arrow" id="gpPromptArrow">&#9654;</span>
     </div>
-    <div class="prompt-editor" id="gpPromptEditor">
+    <div class="prompt-editor" id="gpPromptEditor" style="display:none;">
       <div class="field">
         <label for="gpSystemPrompt">System Prompt</label>
         <textarea id="gpSystemPrompt" rows="3"></textarea>
@@ -748,13 +712,20 @@
       <div class="hint">Leave blank for all.</div>
     </div>
 
-    <div class="field">
+    <!-- Invoice audit AI moved to the dashboard. Hidden but retained so
+         sidepanel.js can still read the level and forward it as `ai_level`. -->
+    <div class="field" style="display:none;">
       <label for="invAiAnalysis">AI Analysis</label>
       <select id="invAiAnalysis">
         <option value="off">Off — Compare Only</option>
         <option value="summary" selected>Exec Summary</option>
         <option value="full">Full (Summary + Per-Row Review)</option>
       </select>
+    </div>
+
+    <div class="info-banner" style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:8px 10px;font-size:12px;color:#1e40af;margin-bottom:10px;line-height:1.4;">
+      <b>Scrape &amp; upload</b> — analysis runs in the dashboard after upload.
+      Open the dashboard's Audits tab to review results.
     </div>
 
     <div class="toggle-row">
@@ -789,16 +760,16 @@
       <div id="invDiscList"></div>
     </div>
 
-    <div id="invAiSummarySection" class="ai-summary">
+    <div id="invAiSummarySection" class="ai-summary" style="display:none;">
       <h4>AI Executive Summary</h4>
       <div id="invAiSummaryText"></div>
     </div>
 
-    <div class="section-toggle" id="invPromptToggle">
+    <div class="section-toggle" id="invPromptToggle" style="display:none;">
       <h4>Invoice Audit Prompt Settings</h4>
       <span class="arrow" id="invPromptArrow">&#9654;</span>
     </div>
-    <div class="prompt-editor" id="invPromptEditor">
+    <div class="prompt-editor" id="invPromptEditor" style="display:none;">
       <div class="field">
         <label for="invSystemPrompt">System Prompt</label>
         <textarea id="invSystemPrompt" rows="3"></textarea>

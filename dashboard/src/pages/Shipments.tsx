@@ -1,19 +1,73 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, CheckCircle2, Package, Search, Users, XOctagon, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle } from "lucide-react";
 import { api } from "../lib/api";
-import { fmtDate, fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
+import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
 import { ActionBadge } from "../components/Badge";
-import { KPI } from "../components/KPI";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
+import { ColumnSelector } from "../components/ColumnSelector";
+import {
+  SHIPMENT_COLUMNS,
+  loadColumnPrefs,
+  saveColumnPrefs,
+  type ColumnPrefs,
+} from "../lib/shipmentColumns";
+
+// FreightPOP-style stat pills. Pills are mutually exclusive click-to-filter.
+// Status matchers run against shipment_status; ISSUES uses action_required.
+type PillId = "all" | "booked" | "in_transit" | "issues" | "out_for_delivery";
+const STATUS_MATCHERS: Record<Exclude<PillId, "all" | "issues">, (s: string) => boolean> = {
+  booked: (s) => /\bbooked\b|\btendered\b|pickup\s*scheduled|\bnew\b/i.test(s),
+  in_transit: (s) => /in\s*transit|picked\s*up|en\s*route|departed|\btransit\b/i.test(s),
+  out_for_delivery: (s) => /out\s+for\s+delivery|\bofd\b|\bdelivered\b/i.test(s),
+};
+function shipmentMatchesPill(r: Shipment, pill: PillId): boolean {
+  if (pill === "all") return true;
+  if (pill === "issues") return String(r.action_required || "").toUpperCase() === "YES";
+  const status = String(r.shipment_status || "");
+  return STATUS_MATCHERS[pill](status);
+}
+
+interface StatPillProps {
+  label: string;
+  count: number;
+  active: boolean;
+  tone: "gray" | "blue" | "green";
+  onClick: () => void;
+}
+function StatPill({ label, count, active, tone, onClick }: StatPillProps) {
+  const TONES = {
+    gray: { active: "bg-slate-900 text-white ring-slate-900", idle: "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50" },
+    blue: { active: "bg-sky-600 text-white ring-sky-600", idle: "bg-white text-sky-700 ring-sky-200 hover:bg-sky-50" },
+    green: { active: "bg-emerald-600 text-white ring-emerald-600", idle: "bg-white text-emerald-700 ring-emerald-200 hover:bg-emerald-50" },
+  } as const;
+  const cls = active ? TONES[tone].active : TONES[tone].idle;
+  return (
+    <button
+      onClick={onClick}
+      className={`inline-flex items-center gap-2 px-4 py-2 rounded-full ring-1 text-xs font-semibold uppercase tracking-wide shadow-sm transition ${cls}`}
+    >
+      <span>{label}</span>
+      <span className={`tabular-nums text-sm font-bold ${active ? "text-white" : "text-slate-900"}`}>{count}</span>
+    </button>
+  );
+}
 
 interface ShipmentsPageProps {
   initialShipmentId?: string | null;
+  drawerSection?: string | null;
   onShipmentConsumed?: () => void;
+  onDrawerChange?: (id: string | null, section: string | null) => void;
 }
 
-export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: ShipmentsPageProps = {}) {
+const DRAWER_TABS = ["overview", "tasks", "email", "drafts", "history", "raw"] as const;
+type DrawerTabId = typeof DRAWER_TABS[number];
+function asDrawerTab(s: string | null | undefined): DrawerTabId {
+  return DRAWER_TABS.includes(s as DrawerTabId) ? (s as DrawerTabId) : "overview";
+}
+
+export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange }: ShipmentsPageProps = {}) {
   const [rows, setRows] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -22,9 +76,28 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
   const [actionFilter, setActionFilter] = useState<string>("");
   const [customerFilter, setCustomerFilter] = useState<string>("");
   const [sourceFilter, setSourceFilter] = useState<string>("");
+  const [pillFilter, setPillFilter] = useState<PillId>("all");
 
-  const [drawerId, setDrawerId] = useState<string | null>(null);
+  const [columnPrefs, setColumnPrefs] = useState<ColumnPrefs>(() => loadColumnPrefs());
+  useEffect(() => { saveColumnPrefs(columnPrefs); }, [columnPrefs]);
+  const visibleColumns = useMemo(() => {
+    const visible = new Set(columnPrefs.visibleIds);
+    const byId = new Map(SHIPMENT_COLUMNS.map((c) => [c.id, c] as const));
+    const out = [];
+    for (const id of columnPrefs.orderIds) {
+      const col = byId.get(id);
+      if (col && visible.has(col.id)) out.push(col);
+    }
+    return out;
+  }, [columnPrefs]);
+
+  const [drawerId, setDrawerIdState] = useState<string | null>(null);
   const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[] } | null>(null);
+  // Wrap state changes so opening / closing the drawer also updates the URL.
+  function setDrawerId(next: string | null) {
+    setDrawerIdState(next);
+    onDrawerChange?.(next, null);
+  }
 
   // Bulk selection for "create task on N shipments at once".
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -51,6 +124,10 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
   // Action override modal (manual YES/NO/clear).
   const [overrideModal, setOverrideModal] = useState<null | { value: "YES" | "NO" | null; reason: string; busy: boolean }>(null);
 
+  // Re-analyze button state — busy flag prevents double-click during a Claude
+  // round-trip (typically 2-3s).
+  const [reanalyzing, setReanalyzing] = useState(false);
+
   async function load() {
     setLoading(true); setErr(null);
     try {
@@ -61,25 +138,34 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
   }
   useEffect(() => { load(); }, []);
 
-  // When another page (e.g. AI Analyses) asks to deep-link a shipment, open
-  // the drawer for it and tell the parent we've consumed the request so a
-  // subsequent navigation event can re-trigger.
+  // When the URL says a shipment is open, mirror it into local state. The
+  // initialShipmentId / drawerSection props are sourced from useParams in App.tsx.
+  // We use the raw setter here so syncing FROM the URL doesn't push back to it.
   useEffect(() => {
-    if (initialShipmentId) {
-      setDrawerId(initialShipmentId);
+    if (initialShipmentId !== undefined) {
+      setDrawerIdState(initialShipmentId || null);
       onShipmentConsumed?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialShipmentId]);
 
-  // Drawer-level tab navigation.
-  const [drawerTab, setDrawerTab] = useState<"overview" | "tasks" | "email" | "drafts" | "history" | "raw">("overview");
+  // Drawer-level tab navigation. The URL drives this — `drawerSection` is the
+  // route param, and we mirror it locally so existing handlers don't need to
+  // round-trip through navigate() to read the current sub-tab.
+  const [drawerTab, setDrawerTabState] = useState<DrawerTabId>(asDrawerTab(drawerSection));
+  useEffect(() => {
+    setDrawerTabState(asDrawerTab(drawerSection));
+  }, [drawerSection]);
+  function setDrawerTab(next: DrawerTabId) {
+    setDrawerTabState(next);
+    if (drawerId) onDrawerChange?.(drawerId, next === "overview" ? null : next);
+  }
 
   useEffect(() => {
     if (!drawerId) {
       setDrawerData(null);
       setDrawerTasks([]);
-      setDrawerTab("overview");
+      setDrawerTabState("overview");
       setEmailModal(null);
       setNewTaskTitle("");
       return;
@@ -191,6 +277,7 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
 
   const filtered = useMemo(() => {
     return rows.filter((r) => {
+      if (!shipmentMatchesPill(r, pillFilter)) return false;
       if (actionFilter && String(r.action_required || "").toUpperCase() !== actionFilter) return false;
       if (customerFilter && r.customer_name !== customerFilter) return false;
       if (sourceFilter && r.action_source !== sourceFilter) return false;
@@ -201,7 +288,7 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
       }
       return true;
     });
-  }, [rows, q, actionFilter, customerFilter, sourceFilter]);
+  }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter]);
 
   const allFilteredSelected = filtered.length > 0 && filtered.every((r) => selectedIds.has(r.id));
   function toggleRow(id: string) {
@@ -242,23 +329,22 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
     }
   }
 
-  const kpis = useMemo(() => {
-    const total = rows.length;
-    const action = rows.filter((r) => String(r.action_required || "").toUpperCase() === "YES").length;
-    const ontrack = rows.filter((r) => String(r.action_required || "").toUpperCase() === "NO").length;
-    const errors = rows.filter((r) => String(r.action_required || "").toUpperCase() === "ERROR").length;
-    const custs = new Set(rows.map((r) => r.customer_name).filter(Boolean)).size;
-    return { total, action, ontrack, errors, custs };
-  }, [rows]);
+  const pillCounts = useMemo(() => ({
+    total: rows.length,
+    booked: rows.filter((r) => shipmentMatchesPill(r, "booked")).length,
+    in_transit: rows.filter((r) => shipmentMatchesPill(r, "in_transit")).length,
+    issues: rows.filter((r) => shipmentMatchesPill(r, "issues")).length,
+    out_for_delivery: rows.filter((r) => shipmentMatchesPill(r, "out_for_delivery")).length,
+  }), [rows]);
 
   return (
     <div className="space-y-5">
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <KPI label="Shipments" value={kpis.total} icon={Package} tone="brand" />
-        <KPI label="Action needed" value={kpis.action} icon={AlertTriangle} tone="danger" />
-        <KPI label="On track" value={kpis.ontrack} icon={CheckCircle2} tone="success" />
-        <KPI label="Errors" value={kpis.errors} icon={XOctagon} tone="warn" />
-        <KPI label="Customers" value={kpis.custs} icon={Users} />
+      <div className="flex flex-wrap gap-2">
+        <StatPill label="Total"            count={pillCounts.total}            tone="gray"  active={pillFilter === "all"}              onClick={() => setPillFilter("all")} />
+        <StatPill label="Booked"           count={pillCounts.booked}           tone="blue"  active={pillFilter === "booked"}           onClick={() => setPillFilter(pillFilter === "booked" ? "all" : "booked")} />
+        <StatPill label="In Transit"       count={pillCounts.in_transit}       tone="blue"  active={pillFilter === "in_transit"}       onClick={() => setPillFilter(pillFilter === "in_transit" ? "all" : "in_transit")} />
+        <StatPill label="Issues"           count={pillCounts.issues}           tone="blue"  active={pillFilter === "issues"}           onClick={() => setPillFilter(pillFilter === "issues" ? "all" : "issues")} />
+        <StatPill label="Out for Delivery" count={pillCounts.out_for_delivery} tone="green" active={pillFilter === "out_for_delivery"} onClick={() => setPillFilter(pillFilter === "out_for_delivery" ? "all" : "out_for_delivery")} />
       </div>
 
       <div className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm">
@@ -300,6 +386,7 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
             <option value="ai">From AI</option>
             <option value="manual">Manual override</option>
           </select>
+          <ColumnSelector prefs={columnPrefs} onChange={setColumnPrefs} />
           <button
             onClick={load}
             className="px-3 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800"
@@ -342,21 +429,16 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
                     className="cursor-pointer"
                   />
                 </th>
-                <th className="px-4 py-2.5 font-medium">Scraped</th>
-                <th className="px-4 py-2.5 font-medium">Tracking</th>
-                <th className="px-4 py-2.5 font-medium">Customer</th>
-                <th className="px-4 py-2.5 font-medium">Carrier</th>
-                <th className="px-4 py-2.5 font-medium">Status</th>
-                <th className="px-4 py-2.5 font-medium">Action</th>
-                <th className="px-4 py-2.5 font-medium">Issue</th>
-                <th className="px-4 py-2.5 font-medium">Delivery</th>
+                {visibleColumns.map((col) => (
+                  <th key={col.id} className="px-4 py-2.5 font-medium">{col.label}</th>
+                ))}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading ? (
-                <tr><td colSpan={9} className="p-8 text-center text-slate-500">Loading…</td></tr>
+                <tr><td colSpan={visibleColumns.length + 1} className="p-8 text-center text-slate-500">Loading…</td></tr>
               ) : filtered.length === 0 ? (
-                <tr><td colSpan={9} className="p-8 text-center text-slate-500">No shipments match your filters.</td></tr>
+                <tr><td colSpan={visibleColumns.length + 1} className="p-8 text-center text-slate-500">No shipments match your filters.</td></tr>
               ) : filtered.map((r) => (
                 <tr
                   key={r.id}
@@ -371,14 +453,16 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
                       className="cursor-pointer"
                     />
                   </td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 text-slate-500 whitespace-nowrap cursor-pointer" title={fmtDateTime(r.scraped_at)}>{fmtRelative(r.scraped_at)}</td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 font-medium whitespace-nowrap cursor-pointer">{r.tracking_number || "—"}</td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 whitespace-nowrap cursor-pointer">{r.customer_name || "—"}</td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 whitespace-nowrap cursor-pointer">{r.carrier_name || r.carrier || "—"}</td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 cursor-pointer">{r.shipment_status || "—"}</td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 cursor-pointer"><ActionBadge action={r.action_required} size="sm" /></td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 max-w-[320px] truncate cursor-pointer" title={r.ai_issue || ""}>{r.ai_issue || "—"}</td>
-                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 whitespace-nowrap text-slate-600 cursor-pointer">{fmtDate(r.delivery_date)}</td>
+                  {visibleColumns.map((col) => (
+                    <td
+                      key={col.id}
+                      onClick={() => setDrawerId(r.id)}
+                      className={"px-4 py-2.5 cursor-pointer " + (col.tdClass || "")}
+                      title={col.title?.(r)}
+                    >
+                      {col.render(r)}
+                    </td>
+                  ))}
                 </tr>
               ))}
             </tbody>
@@ -527,6 +611,26 @@ export function ShipmentsPage({ initialShipmentId, onShipmentConsumed }: Shipmen
                   </div>
                 </Section>
                 <Section title="AI summary">
+                  <div className="flex justify-end mb-2">
+                    <button
+                      disabled={reanalyzing || !drawerId}
+                      onClick={async () => {
+                        if (!drawerId || reanalyzing) return;
+                        setReanalyzing(true);
+                        try {
+                          const r = await api.shipments.reanalyze(drawerId);
+                          setDrawerData((p) => p ? { ...p, shipment: r.shipment } : p);
+                          setRows((prev) => prev.map((row) => row.id === r.shipment.id ? r.shipment : row));
+                        } catch (e) { setErr((e as Error).message); }
+                        finally { setReanalyzing(false); }
+                      }}
+                      className="text-xs px-2.5 py-1 rounded-md bg-sky-50 text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
+                      title="Run per-shipment AI analysis again"
+                    >
+                      <span className={reanalyzing ? "inline-block animate-spin" : ""}>↻</span>
+                      {reanalyzing ? "Analyzing…" : "Re-analyze"}
+                    </button>
+                  </div>
                   <Field label="Issue">{drawerData.shipment.ai_issue}</Field>
                   <div className="h-3" />
                   <Field label="Recommendation">{drawerData.shipment.ai_recommendation}</Field>

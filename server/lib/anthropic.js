@@ -1,4 +1,5 @@
 import { supabase } from "./supabase.js";
+import { getSettings } from "./settings.js";
 
 const MODEL_PRICING = {
   "claude-haiku-4-5-20251001": { input: 0.80, output: 4.00 },
@@ -6,25 +7,53 @@ const MODEL_PRICING = {
 };
 
 const LARGE_PROMPT_CHARS = 12000;
-const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
-const LARGE_MODEL = process.env.ANTHROPIC_MODEL_LARGE || "claude-sonnet-4-5-20250929";
 
-function extractAiJsonFields(text) {
-  if (!text) return { action_required: null, issue: null, recommendation: null };
-  let issue = null, recommendation = null, action = null;
-  const iM = text.match(/"issue"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  if (iM) issue = iM[1];
-  const rM = text.match(/"recommendation"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  if (rM) recommendation = rM[1];
-  if (/"actionRequired"\s*:\s*true\b/.test(text)) action = "YES";
-  else if (/"actionRequired"\s*:\s*false\b/.test(text)) action = "NO";
-  return { action_required: action, issue, recommendation };
-}
-
-function pickModel(systemPrompt, userMessage, override) {
+// Settings-aware model picker. Reads model.default and model.large from
+// fpx_settings (with env-var fallback) so admins can switch models without a
+// redeploy.
+async function pickModel(systemPrompt, userMessage, override) {
   if (override) return override;
   const len = (systemPrompt || "").length + (userMessage || "").length;
-  return len >= LARGE_PROMPT_CHARS ? LARGE_MODEL : DEFAULT_MODEL;
+  const { "model.default": defaultModel, "model.large": largeModel } =
+    await getSettings("model.default", "model.large");
+  return len >= LARGE_PROMPT_CHARS ? largeModel : defaultModel;
+}
+
+// Extract structured fields from a Claude JSON response. Supports both the
+// legacy `actionRequired: bool` shape and the newer `actionConfidence` +
+// `actionTarget` shape. The threshold (default 0.7) is applied here so callers
+// always see a YES/NO answer in `action_required`.
+export function extractAiJsonFields(text, threshold = 0.7) {
+  const out = {
+    action_required: null,
+    action_confidence: null,
+    action_target: null,
+    issue: null,
+    recommendation: null,
+  };
+  if (!text) return out;
+  const iM = text.match(/"issue"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (iM) out.issue = iM[1];
+  const rM = text.match(/"recommendation"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (rM) out.recommendation = rM[1];
+
+  const cM = text.match(/"actionConfidence"\s*:\s*([0-9.]+)/);
+  if (cM) {
+    const n = Number(cM[1]);
+    if (Number.isFinite(n)) out.action_confidence = Math.max(0, Math.min(1, n));
+  }
+  const tM = text.match(/"actionTarget"\s*:\s*"(customer|carrier|none)"/i);
+  if (tM) out.action_target = tM[1].toLowerCase();
+
+  // New shape wins: derive YES/NO from confidence.
+  if (out.action_confidence !== null) {
+    out.action_required = out.action_confidence >= threshold && out.action_target !== "none" ? "YES" : "NO";
+  } else if (/"actionRequired"\s*:\s*true\b/.test(text)) {
+    out.action_required = "YES";
+  } else if (/"actionRequired"\s*:\s*false\b/.test(text)) {
+    out.action_required = "NO";
+  }
+  return out;
 }
 
 export async function callClaude({
@@ -36,7 +65,7 @@ export async function callClaude({
 }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return { error: "ANTHROPIC_API_KEY not configured" };
-  const model = pickModel(systemPrompt, userMessage, modelOverride);
+  const model = await pickModel(systemPrompt, userMessage, modelOverride);
   const startedAt = Date.now();
 
   let resp;
@@ -85,7 +114,7 @@ export async function callClaude({
   const text = json.content?.[0]?.text || "";
   const inTok = json.usage?.input_tokens || 0;
   const outTok = json.usage?.output_tokens || 0;
-  const pricing = MODEL_PRICING[model] || MODEL_PRICING[DEFAULT_MODEL];
+  const pricing = MODEL_PRICING[model] || { input: 0.80, output: 4.00 };
   const costUsd = (inTok * pricing.input + outTok * pricing.output) / 1_000_000;
 
   const analysisId = await logAnalysis({
@@ -100,7 +129,19 @@ export async function callClaude({
     duration_ms: durationMs,
   });
 
-  return { text, model, input_tokens: inTok, output_tokens: outTok, cost_usd: costUsd, analysis_id: analysisId };
+  // Re-parse so callers can see the structured fields without parsing the
+  // response themselves. Threshold comes from settings; missing-on-failure
+  // falls back to the default 0.7.
+  let parsed = { action_required: null, action_confidence: null, action_target: null, issue: null, recommendation: null };
+  try {
+    const { "action.threshold": threshold } = await getSettings("action.threshold");
+    parsed = extractAiJsonFields(text, Number(threshold) || 0.7);
+  } catch {}
+
+  return {
+    text, model, input_tokens: inTok, output_tokens: outTok, cost_usd: costUsd, analysis_id: analysisId,
+    parsed,
+  };
 }
 
 async function logAnalysis(entry) {

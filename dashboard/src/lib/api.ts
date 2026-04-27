@@ -6,9 +6,32 @@ import { sb } from "./supabase";
 
 const API_URL = (import.meta.env.VITE_FPX_API_URL || "http://localhost:3210").replace(/\/$/, "");
 
+// Auth gate. Pages can mount before Supabase finishes hydrating the session
+// from localStorage / processing the OAuth hash, so the first request after a
+// hard refresh sometimes fires before `access_token` is available — that 401
+// surfaces as "loaded the page, no data, refresh fixes it." Wait briefly for
+// the session to appear via onAuthStateChange before giving up.
+const AUTH_GATE_TIMEOUT_MS = 2500;
+async function getAccessTokenOrWait(): Promise<string> {
+  const { data } = await sb.auth.getSession();
+  if (data.session?.access_token) return data.session.access_token;
+  return new Promise<string>((resolve, reject) => {
+    const { data: sub } = sb.auth.onAuthStateChange((_event, s) => {
+      if (s?.access_token) {
+        sub.subscription.unsubscribe();
+        clearTimeout(timer);
+        resolve(s.access_token);
+      }
+    });
+    const timer = setTimeout(() => {
+      sub.subscription.unsubscribe();
+      reject(new Error("Not signed in."));
+    }, AUTH_GATE_TIMEOUT_MS);
+  });
+}
+
 async function request<T>(path: string, init?: RequestInit & { params?: Record<string, string | number | undefined> }): Promise<T> {
-  const { data: { session } } = await sb.auth.getSession();
-  if (!session?.access_token) throw new Error("Not signed in.");
+  const accessToken = await getAccessTokenOrWait();
   const search = new URLSearchParams();
   for (const [k, v] of Object.entries(init?.params || {})) {
     if (v !== undefined && v !== "") search.set(k, String(v));
@@ -19,7 +42,7 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
     ...init,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${session.access_token}`,
+      Authorization: `Bearer ${accessToken}`,
       ...(init?.headers || {}),
     },
   });
@@ -62,6 +85,8 @@ export const api = {
     get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[] }>(`/api/shipments/${id}`),
     overrideAction: (id: string, body: { action_required: string | null; reason?: string }) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
+    reanalyze: (id: string) =>
+      request<{ shipment: Shipment }>(`/api/shipments/${id}/reanalyze`, { method: "POST" }),
   },
   analyses: {
     list: (params?: { limit?: number; kind?: string; tracking_number?: string }) =>
@@ -137,7 +162,26 @@ export const api = {
     list: (params?: { entity_type?: string; entity_id?: string; action?: string; actor_email?: string; limit?: number }) =>
       request<{ data: AuditLogEntry[] }>("/api/audit-log", { params }),
   },
+  settings: {
+    list: () => request<{ data: SettingRow[] }>("/api/settings"),
+    update: (key: string, value: unknown) =>
+      request<{ setting: SettingRow }>(`/api/settings/${encodeURIComponent(key)}`, {
+        method: "PUT",
+        body: JSON.stringify({ value }),
+      }),
+    refresh: () => request<{ ok: boolean }>("/api/settings/refresh", { method: "POST" }),
+  },
 };
+
+export interface SettingRow {
+  key: string;
+  value: unknown;
+  default: unknown;
+  isDefault: boolean;
+  description: string | null;
+  updated_by: string | null;
+  updated_at: string | null;
+}
 
 export const publicShare = {
   // Returns metadata and, if no password, the resource itself.

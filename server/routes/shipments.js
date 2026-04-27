@@ -1,10 +1,58 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { mapShipment, mapShipmentsBulk } from "../lib/shipments.js";
-import { callClaude } from "../lib/anthropic.js";
 import { logAudit } from "../lib/audit.js";
+import { generateEmailDraft } from "../lib/emailDraft.js";
+import { getSettings } from "../lib/settings.js";
+import { analyzeExistingShipment } from "./analyze.js";
 
 export const shipmentsRouter = Router();
+
+// Strip null AI fields from the upsert payload so re-scrapes from a
+// scrape-only extension don't blow away analysis the server has already
+// performed. mapShipment always emits these keys; if the scraper didn't fill
+// them in, we want the existing DB values preserved by the upsert.
+function preserveExistingAi(rows) {
+  const aiFields = ["action_required", "ai_issue", "ai_recommendation", "action_target", "action_confidence"];
+  for (const r of rows) {
+    for (const f of aiFields) if (r[f] == null) delete r[f];
+  }
+}
+
+// Per-shipment AI runs in the background after upsert returns, so the
+// extension's POST is fast. Concurrency is capped to avoid hammering Claude
+// for big bulk uploads. Skips rows already analyzed (action_required set) and
+// rows the user manually overrode (action_source === 'manual'). Returns the
+// updated rows so autoCreateActionTasks / autoDraftEmails can fan out from
+// fresh analyses.
+const AUTO_ANALYZE_CONCURRENCY = 4;
+async function autoAnalyzeUpserted(req, upsertedIds) {
+  if (!upsertedIds.length) return [];
+  const { data: rows, error } = await supabase
+    .from("fpx_shipments")
+    .select("id, tracking_number, action_required, action_source, action_target, raw_data, ai_issue, ai_recommendation, created_by")
+    .in("id", upsertedIds);
+  if (error) {
+    console.warn("[FPX] auto-analyze fetch failed:", error.message);
+    return [];
+  }
+  const candidates = (rows || []).filter(
+    (r) => !r.action_required && r.action_source !== "manual"
+  );
+  if (!candidates.length) return [];
+
+  const updated = [];
+  for (let i = 0; i < candidates.length; i += AUTO_ANALYZE_CONCURRENCY) {
+    const batch = candidates.slice(i, i + AUTO_ANALYZE_CONCURRENCY);
+    const settled = await Promise.allSettled(
+      batch.map((row) => analyzeExistingShipment(row, { reqContext: req }))
+    );
+    for (const s of settled) {
+      if (s.status === "fulfilled" && s.value) updated.push(s.value);
+    }
+  }
+  return updated;
+}
 
 // After an upsert batch, look at the newly-flagged action-needed shipments and
 // create one open task per shipment that doesn't already have one. The task
@@ -59,6 +107,58 @@ async function autoCreateActionTasks(req, upsertedRows) {
     });
   }
   return (data || []).length;
+}
+
+// Fire-and-forget: for each action-required shipment with a known target,
+// generate one email draft addressed to that target. Drafts are persisted as
+// fpx_ai_analyses rows with metadata.subkind=email_draft_<audience>, which is
+// what the dashboard's Drafts sub-tab already reads. Skips shipments that
+// already have a recent draft for the same audience.
+async function autoDraftEmails(upsertedRows) {
+  const { "action.auto_draft_enabled": enabled } = await getSettings("action.auto_draft_enabled");
+  if (!enabled) return 0;
+
+  const candidates = (upsertedRows || []).filter((s) => {
+    if (String(s.action_required || "").toUpperCase() !== "YES") return false;
+    const tgt = String(s.action_target || "").toLowerCase();
+    return tgt === "customer" || tgt === "carrier";
+  });
+  if (!candidates.length) return 0;
+
+  // Skip shipments that already have a draft for this audience in the last 24h
+  // — auto-drafts shouldn't pile up on every re-scrape.
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const ids = candidates.map((s) => s.id);
+  const { data: recent } = await supabase
+    .from("fpx_ai_analyses")
+    .select("shipment_uuid, metadata")
+    .in("shipment_uuid", ids)
+    .gte("created_at", since);
+  const drafted = new Set();
+  for (const r of recent || []) {
+    const sub = r?.metadata?.subkind;
+    if (typeof sub === "string" && sub.startsWith("email_draft_")) {
+      drafted.add(`${r.shipment_uuid}::${sub.slice("email_draft_".length)}`);
+    }
+  }
+
+  let count = 0;
+  // Need the full shipment row for context; fetch in one query.
+  const todo = candidates.filter((s) => !drafted.has(`${s.id}::${String(s.action_target).toLowerCase()}`));
+  if (!todo.length) return 0;
+  const { data: ships } = await supabase
+    .from("fpx_shipments").select("*").in("id", todo.map((s) => s.id));
+  for (const ship of ships || []) {
+    const audience = String(ship.action_target || "").toLowerCase();
+    if (audience !== "customer" && audience !== "carrier") continue;
+    try {
+      const draft = await generateEmailDraft({ ship, audience, callMeta: { metadata: { auto: true } } });
+      if (!draft.error) count++;
+    } catch (e) {
+      console.warn("[FPX] auto email draft failed:", ship.tracking_number, e.message);
+    }
+  }
+  return count;
 }
 
 // GET /shipments?limit=500&customer=Acme&action=YES&status=Issue&q=track123&source=ai|manual
@@ -124,21 +224,64 @@ shipmentsRouter.post("/", async (req, res) => {
   if (Array.isArray(bulk)) {
     const mapped = mapShipmentsBulk(bulk, runnerName);
     if (!mapped.length) return res.json({ count: 0, ids: [] });
+    // Scrape-only extension uploads carry no AI fields. Preserve whatever the
+    // server has already analyzed instead of overwriting with nulls.
+    preserveExistingAi(mapped);
     const { data, error } = await supabase
       .from("fpx_shipments")
       .upsert(mapped, { onConflict: "tracking_number" })
-      .select("id,tracking_number,seen_count,created_by,action_required,ai_issue,ai_recommendation");
+      .select("id,tracking_number,seen_count,created_by,action_required,action_source,action_target,ai_issue,ai_recommendation");
     if (error) return res.status(500).json({ error: error.message });
-    const autoTaskCount = await autoCreateActionTasks(req, data || []);
+
+    // Run analysis + downstream fan-out in the background so the extension's
+    // POST returns fast. The audit log records the upsert immediately; task
+    // creation + email drafts wait for AI to settle.
+    const upsertedIds = data.map((r) => r.id);
+    const backgroundWork = (async () => {
+      const freshlyAnalyzed = await autoAnalyzeUpserted(req, upsertedIds);
+      // For task creation we want the freshest snapshot of every upserted
+      // row — newly analyzed rows fold in here, and rows that already had
+      // action_required set use whatever the upsert returned.
+      const byId = new Map(data.map((r) => [r.id, r]));
+      for (const r of freshlyAnalyzed) byId.set(r.id, r);
+      const settled = Array.from(byId.values());
+      const tasks = await autoCreateActionTasks(req, settled);
+      const drafts = await autoDraftEmails(settled);
+      if (tasks || drafts) console.log(`[FPX] post-upload: ${tasks} task(s), ${drafts} draft(s)`);
+    })().catch((e) => console.warn("[FPX] post-upload background failed:", e.message));
+
     logAudit(req, {
       action: "bulk_create",
       entity_type: "shipment",
-      summary: `Upserted ${data.length} shipments` + (autoTaskCount ? ` (${autoTaskCount} auto-tasks)` : ""),
-      metadata: { count: data.length, runner: runnerName, auto_tasks: autoTaskCount },
+      summary: `Upserted ${data.length} shipments`,
+      metadata: { count: data.length, runner: runnerName },
     });
-    return res.json({ count: data.length, ids: data.map((r) => r.id), auto_tasks: autoTaskCount });
+    // Don't await background — let it drain.
+    void backgroundWork;
+    return res.json({ count: data.length, ids: upsertedIds });
   }
   res.status(400).json({ error: "Provide { shipment } or { shipments: [] }" });
+});
+
+// POST /shipments/:id/reanalyze — manual trigger from the dashboard. Runs
+// per-shipment AI again (regardless of last_analyzed_at), updates the row,
+// and returns the fresh shipment + a one-row analysis result. Manual
+// overrides are still preserved by analyzeExistingShipment.
+shipmentsRouter.post("/:id/reanalyze", async (req, res) => {
+  const { data: row, error } = await supabase
+    .from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!row) return res.status(404).json({ error: "Shipment not found" });
+  const updated = await analyzeExistingShipment(row, { reqContext: req });
+  logAudit(req, {
+    action: "reanalyze",
+    entity_type: "shipment",
+    entity_id: row.id,
+    summary: `Re-analyzed ${row.tracking_number || row.id}`,
+    before: { action_required: row.action_required, ai_issue: row.ai_issue },
+    after:  { action_required: updated?.action_required, ai_issue: updated?.ai_issue },
+  });
+  res.json({ shipment: updated || row });
 });
 
 // PATCH /shipments/:id/action  { action_required, reason? }
@@ -243,46 +386,12 @@ shipmentsRouter.post("/:id/email-draft", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
 
-  const slim = {
-    tracking_number: ship.tracking_number,
-    carrier: ship.carrier_name || ship.carrier,
-    customer: ship.customer_name,
-    mode: ship.mode,
-    status: ship.shipment_status,
-    pickup_date: ship.pickup_date,
-    eta: ship.updated_eta || ship.estimated_arrival,
-    delivered: ship.delivery_date,
-    pickup_response: ship.pickup_response,
-    confirmation_number: ship.confirmation_number,
-    pickup_request_number: ship.pickup_request_number,
-    origin: ship.origin || ship.ship_from,
-    destination: ship.destination || ship.ship_to,
-    issue: ship.ai_issue,
-    recommendation: ship.ai_recommendation,
-    action_required: ship.action_required,
-    notes: req.body?.notes || null,
-  };
-
-  const audienceCopy = audience === "carrier"
-    ? "Write a concise, professional email FROM the FPX brokerage operations team TO the carrier handling this shipment. Ask for the specific information needed to resolve the issue or confirm status. Reference carrier-side identifiers (PRO, pickup number, carrier-issued tracking)."
-    : "Write a concise, professional email FROM the FPX brokerage account team TO the end customer (the shipper or consignee, not the carrier). Update them on shipment status in plain English; avoid carrier jargon. If action is required from the customer, state it clearly. Otherwise reassure them FPX is monitoring and following up directly with the carrier.";
-
-  const systemPrompt = `You are a freight brokerage operations assistant at FPX. FPX is the freight broker — not the carrier and not the customer. You always write FROM FPX. Drafting an email now. ${audienceCopy} Output strict JSON: {"subject": "...", "body": "..."}. Body should be plain text with line breaks ('\\n') — no markdown. Sign as "[Your name]\\nFPX Operations" (do not invent a name).`;
-  const userMessage = `Shipment context (you, FPX, are the broker for this shipment):\n${JSON.stringify(slim, null, 2)}\n\nWrite the email now. JSON only, no preamble.`;
-
-  const result = await callClaude({
-    systemPrompt, userMessage, maxTokens: 700,
-    metadata: { kind: "other", tracking_number: ship.tracking_number, shipment_uuid: ship.id, api_key_id: req.apiKey?.id, user_email: req.user?.email, metadata: { subkind: `email_draft_${audience}` } },
+  const result = await generateEmailDraft({
+    ship,
+    audience,
+    notes: req.body?.notes,
+    callMeta: { api_key_id: req.apiKey?.id, user_email: req.user?.email },
   });
   if (result.error) return res.status(500).json({ error: result.error });
-
-  let parsed = null;
-  try {
-    const m = result.text.match(/\{[\s\S]*\}/);
-    if (m) parsed = JSON.parse(m[0]);
-  } catch {}
-  if (!parsed?.subject || !parsed?.body) {
-    return res.json({ subject: "(draft)", body: result.text, raw: result.text });
-  }
-  res.json({ subject: parsed.subject, body: parsed.body });
+  res.json(result);
 });

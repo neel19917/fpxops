@@ -89,17 +89,41 @@ function parseSingle(shipment) {
   const parsed = extractJsonObject(aiText);
   if (!parsed) return { ...shipment, _parseError: true };
 
-  const actionRaw =
-    parsed.actionRequired ?? parsed.ActionRequired ?? parsed.action_required;
   const issue = String(parsed.issue ?? parsed.Issue ?? "").trim();
   const recommendation = String(parsed.recommendation ?? parsed.Recommendation ?? "").trim();
 
-  const coerced = coerceActionRequired(actionRaw);
-  const action = deriveActionRequired(coerced, issue);
+  // New shape: actionConfidence (0–1) + actionTarget (customer | carrier | none).
+  // Threshold here matches the default in fpx_settings ('action.threshold' = 0.7).
+  // The LangGraph path doesn't have async access to settings, so we treat 0.7 as
+  // the contract — admins editing the setting need the per-shipment route.
+  const confidenceRaw = parsed.actionConfidence ?? parsed.action_confidence;
+  const targetRaw = parsed.actionTarget ?? parsed.action_target;
+  let action = "";
+  let confidence = null;
+  let target = null;
+  if (confidenceRaw !== undefined && confidenceRaw !== null) {
+    const n = Number(confidenceRaw);
+    if (Number.isFinite(n)) confidence = Math.max(0, Math.min(1, n));
+  }
+  if (typeof targetRaw === "string") {
+    const t = targetRaw.toLowerCase();
+    if (["customer", "carrier", "none"].includes(t)) target = t;
+  }
+
+  if (confidence !== null) {
+    action = (confidence >= 0.7 && target !== "none") ? "YES" : "NO";
+  } else {
+    // Legacy fallback: old `actionRequired: bool` shape.
+    const actionRaw = parsed.actionRequired ?? parsed.ActionRequired ?? parsed.action_required;
+    const coerced = coerceActionRequired(actionRaw);
+    action = deriveActionRequired(coerced, issue);
+  }
 
   return {
     ...shipment,
     _actionRequired: action,
+    _actionConfidence: confidence,
+    _actionTarget: target,
     _aiIssue: issue,
     _aiRecommendation: recommendation,
     _parseError: false,

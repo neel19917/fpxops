@@ -25,6 +25,7 @@ import { publicShareRouter } from "./routes/publicShare.js";
 import { tasksRouter } from "./routes/tasks.js";
 import { feedbackRouter } from "./routes/feedback.js";
 import { auditLogRouter } from "./routes/auditLog.js";
+import { settingsRouter } from "./routes/settings.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -90,6 +91,7 @@ api.use("/audit-log", auditLogRouter);
 app.use("/api", api);
 
 // Admin routes (admin scope OR admin role).
+app.use("/api/settings", settingsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api-keys", apiKeysRouter);
 

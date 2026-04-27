@@ -1,134 +1,182 @@
-const openBtn = document.getElementById("openBtn");
-const apiBadge = document.getElementById("apiBadge");
-const serverBadge = document.getElementById("serverBadge");
-const toggleKey = document.getElementById("toggleKey");
-const keyPanel = document.getElementById("keyPanel");
-const keyInput = document.getElementById("keyInput");
-const urlInput = document.getElementById("urlInput");
-const nameInput = document.getElementById("nameInput");
-const showHideBtn = document.getElementById("showHideBtn");
-const saveKeyBtn = document.getElementById("saveKeyBtn");
-const clearKeyBtn = document.getElementById("clearKeyBtn");
-const keySource = document.getElementById("keySource");
-const keyMsg = document.getElementById("keyMsg");
+// Wires the simplified, FreightPOP-branded popup. Background-message API
+// (checkApiKey / getApiKey / saveApiKey / checkServer) is unchanged from the
+// previous popup so background.js needs no changes.
 
-function setBadge(configured) {
+const $ = (id) => document.getElementById(id);
+
+const els = {
+  openBtn:        $("openBtn"),
+  status:         $("status"),
+  statusLabel:    $("statusLabel"),
+  statusSub:      $("statusSub"),
+  setup:          $("setup"),
+  setupTitle:     $("setupTitle"),
+  nameInput:      $("nameInput"),
+  keyInput:       $("keyInput"),
+  urlInput:       $("urlInput"),
+  advToggle:      $("advToggle"),
+  advBlock:       $("advBlock"),
+  saveKeyBtn:     $("saveKeyBtn"),
+  cancelSetupBtn: $("cancelSetupBtn"),
+  settingsBtn:    $("settingsBtn"),
+  keyMsg:         $("keyMsg"),
+  serverState:    $("serverState"),
+  serverLabel:    $("serverLabel"),
+};
+
+// Track configured-ness so the status pill, primary CTA, and setup form
+// can re-render without round-tripping to the background again.
+let isConfigured = false;
+let savedName = "";
+
+function setStatus(configured, name) {
   if (configured) {
-    apiBadge.textContent = "API Key OK";
-    apiBadge.classList.remove("missing");
-    apiBadge.classList.add("ok");
+    els.status.classList.remove("setup");
+    els.status.classList.add("connected");
+    els.statusLabel.textContent = name ? `Connected as ${name}` : "Connected";
+    els.statusSub.textContent = "Your scrapes are stamped with your name.";
   } else {
-    apiBadge.textContent = "No API Key";
-    apiBadge.classList.remove("ok");
-    apiBadge.classList.add("missing");
+    els.status.classList.remove("connected");
+    els.status.classList.add("setup");
+    els.statusLabel.textContent = "Setup needed";
+    els.statusSub.textContent = "Add your name and API key to get started.";
   }
+  els.openBtn.disabled = !configured;
+}
+
+function showSetup({ firstTime, prefill }) {
+  els.setup.classList.add("visible");
+  els.setupTitle.textContent = firstTime ? "First-time setup" : "Settings";
+  els.keyMsg.textContent = "";
+  els.keyMsg.className = "save-msg";
+  if (prefill) {
+    chrome.runtime.sendMessage({ type: "getApiKey" }, (res) => {
+      if (chrome.runtime.lastError) return;
+      els.nameInput.value = (res && res.name) || "";
+      els.urlInput.value  = (res && res.url) || "";
+      els.keyInput.value  = (res && res.key) || "";
+    });
+  } else {
+    els.nameInput.value = "";
+    els.urlInput.value = "";
+    els.keyInput.value = "";
+  }
+  setTimeout(() => els.nameInput.focus(), 50);
+}
+
+function hideSetup() {
+  els.setup.classList.remove("visible");
+  els.advBlock.classList.remove("visible");
+  els.keyInput.type = "password";
 }
 
 function refreshKeyState() {
   chrome.runtime.sendMessage({ type: "checkApiKey" }, (res) => {
     if (chrome.runtime.lastError) return;
-    setBadge(!!(res && res.configured));
-    if (keySource) {
-      const src = res && res.source;
-      keySource.textContent =
-        src === "storage" ? "Source: saved in extension"
-        : src === "config.js" ? "Source: config.js (fallback)"
-        : "Source: none — paste a key above";
-    }
+    const configured = !!(res && res.configured);
+    isConfigured = configured;
+    // Pull the saved name for the status sub-line.
+    chrome.runtime.sendMessage({ type: "getApiKey" }, (nameRes) => {
+      if (chrome.runtime.lastError) return;
+      savedName = (nameRes && nameRes.name) || "";
+      setStatus(configured, savedName);
+      // First-time users see setup unfolded immediately; configured users
+      // get the setup hidden behind the Settings cog.
+      if (!configured) showSetup({ firstTime: true, prefill: true });
+      else hideSetup();
+    });
   });
 }
 
-function openKeyPanel(prefill) {
-  keyPanel.classList.remove("hidden");
-  toggleKey.textContent = "Hide";
-  keyMsg.textContent = "";
-  if (prefill) {
-    chrome.runtime.sendMessage({ type: "getApiKey" }, (res) => {
-      if (chrome.runtime.lastError) return;
-      keyInput.value = (res && res.key) || "";
-      if (urlInput) urlInput.value = (res && res.url) || "";
-      if (nameInput) nameInput.value = (res && res.name) || "";
-    });
-  }
+function refreshServerState() {
+  chrome.runtime.sendMessage({ type: "checkServer" }, (res) => {
+    if (chrome.runtime.lastError) return;
+    const online = !!(res && res.online);
+    els.serverState.classList.toggle("online", online);
+    els.serverState.classList.toggle("offline", !online);
+    els.serverLabel.textContent = online ? "Server online" : "Server offline";
+  });
 }
 
-function closeKeyPanel() {
-  keyPanel.classList.add("hidden");
-  toggleKey.textContent = "Edit API Key";
-  keyInput.type = "password";
-  showHideBtn.textContent = "Show";
-}
+// ─── Wiring ───────────────────────────────────────────────────────────
 
-refreshKeyState();
+els.status.addEventListener("click", () => {
+  // Tapping the status pill jumps straight to setup.
+  showSetup({ firstTime: !isConfigured, prefill: true });
+});
 
-chrome.runtime.sendMessage({ type: "checkServer" }, (res) => {
-  if (chrome.runtime.lastError) return;
-  if (res && res.online) {
-    serverBadge.className = "badge ok";
-    serverBadge.innerHTML = '<span class="dot"></span> Online';
-  } else {
-    serverBadge.className = "badge missing";
-    serverBadge.innerHTML = '<span class="dot"></span> Offline';
+els.settingsBtn.addEventListener("click", () => {
+  if (els.setup.classList.contains("visible")) hideSetup();
+  else showSetup({ firstTime: !isConfigured, prefill: true });
+});
+
+els.advToggle.addEventListener("click", () => {
+  els.advBlock.classList.toggle("visible");
+});
+
+els.cancelSetupBtn.addEventListener("click", () => {
+  hideSetup();
+  els.keyMsg.textContent = "";
+});
+
+els.saveKeyBtn.addEventListener("click", () => {
+  const key  = els.keyInput.value.trim();
+  const url  = els.urlInput.value.trim();
+  const name = els.nameInput.value.trim();
+  els.keyMsg.textContent = "";
+  els.keyMsg.className = "save-msg";
+
+  // Require name + key — URL is optional (background.js falls back to config.js
+  // or the production default).
+  if (!name) {
+    els.keyMsg.textContent = "Add your name so we can stamp your scrapes.";
+    els.keyMsg.className = "save-msg err";
+    els.nameInput.focus();
+    return;
   }
-});
-
-apiBadge.addEventListener("click", () => {
-  if (keyPanel.classList.contains("hidden")) openKeyPanel(true);
-  else closeKeyPanel();
-});
-
-toggleKey.addEventListener("click", () => {
-  if (keyPanel.classList.contains("hidden")) openKeyPanel(true);
-  else closeKeyPanel();
-});
-
-showHideBtn.addEventListener("click", () => {
-  if (keyInput.type === "password") {
-    keyInput.type = "text";
-    showHideBtn.textContent = "Hide";
-  } else {
-    keyInput.type = "password";
-    showHideBtn.textContent = "Show";
+  if (!key) {
+    els.keyMsg.textContent = "Paste the API key your admin gave you.";
+    els.keyMsg.className = "save-msg err";
+    els.keyInput.focus();
+    return;
   }
-});
 
-saveKeyBtn.addEventListener("click", () => {
-  const key = keyInput.value.trim();
-  const url = (urlInput && urlInput.value || "").trim();
-  const name = (nameInput && nameInput.value || "").trim();
-  keyMsg.textContent = "";
-  keyMsg.className = "msg";
   chrome.runtime.sendMessage({ type: "saveApiKey", key, url, name }, (res) => {
     if (chrome.runtime.lastError) {
-      keyMsg.textContent = chrome.runtime.lastError.message;
-      keyMsg.className = "msg err";
+      els.keyMsg.textContent = chrome.runtime.lastError.message;
+      els.keyMsg.className = "save-msg err";
       return;
     }
     if (res && res.ok) {
-      keyMsg.textContent = res.cleared ? "Cleared." : "Saved.";
-      keyMsg.className = "msg ok";
+      els.keyMsg.textContent = "Saved. You're all set.";
+      els.keyMsg.className = "save-msg ok";
       refreshKeyState();
+      // Auto-close the setup form a moment after a successful save so the user
+      // sees the green check, then the primary CTA.
+      setTimeout(hideSetup, 700);
     } else {
-      keyMsg.textContent = (res && res.error) || "Save failed.";
-      keyMsg.className = "msg err";
+      els.keyMsg.textContent = (res && res.error) || "Save failed.";
+      els.keyMsg.className = "save-msg err";
     }
   });
 });
 
-clearKeyBtn.addEventListener("click", () => {
-  keyInput.value = "";
-  chrome.runtime.sendMessage({ type: "saveApiKey", key: "" }, (res) => {
-    if (chrome.runtime.lastError) return;
-    keyMsg.textContent = "Cleared.";
-    keyMsg.className = "msg ok";
-    refreshKeyState();
-  });
-});
-
-openBtn.addEventListener("click", async () => {
+els.openBtn.addEventListener("click", async () => {
+  if (els.openBtn.disabled) return;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab) {
     await chrome.sidePanel.open({ tabId: tab.id });
   }
   window.close();
 });
+
+// Keyboard niceties: Enter inside the setup form saves; Escape closes it.
+for (const inp of [els.nameInput, els.keyInput, els.urlInput]) {
+  inp.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); els.saveKeyBtn.click(); }
+    if (e.key === "Escape") { e.preventDefault(); hideSetup(); }
+  });
+}
+
+refreshKeyState();
+refreshServerState();

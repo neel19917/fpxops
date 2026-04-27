@@ -3,17 +3,6 @@ const stopBtn = document.getElementById("stopBtn");
 const statusDiv = document.getElementById("status");
 const filterColSelect = document.getElementById("filterCol");
 const filterValSelect = document.getElementById("filterVal");
-const aiToggle = document.getElementById("aiToggle");
-const smartGateToggle = document.getElementById("smartGateToggle");
-const promptToggle = document.getElementById("promptToggle");
-const promptArrow = document.getElementById("promptArrow");
-const promptEditor = document.getElementById("promptEditor");
-const systemPromptEl = document.getElementById("systemPrompt");
-const perShipmentPromptEl = document.getElementById("perShipmentPrompt");
-const summaryPromptEl = document.getElementById("summaryPrompt");
-const savePromptsBtn = document.getElementById("savePromptsBtn");
-const resetPromptsBtn = document.getElementById("resetPromptsBtn");
-const saveStatusEl = document.getElementById("saveStatus");
 const apiBadge = document.getElementById("apiBadge");
 const costBadge = document.getElementById("costBadge");
 const serverBadge = document.getElementById("serverBadge");
@@ -22,8 +11,6 @@ const serverToggleBtn = document.getElementById("serverToggleBtn");
 const serverInfo = document.getElementById("serverInfo");
 const serverSub = document.getElementById("serverSub");
 const serverHint = document.getElementById("serverHint");
-const aiSummarySection = document.getElementById("aiSummarySection");
-const aiSummaryText = document.getElementById("aiSummaryText");
 const progressBar = document.getElementById("progressBar");
 const progressFill = document.getElementById("progressFill");
 const progressText = document.getElementById("progressText");
@@ -36,15 +23,6 @@ const VALUE_OPTIONS = {
   ],
   "Carrier Name": [],
   "Company Name": [],
-};
-
-const DEFAULT_PROMPTS = {
-  system:
-    "You are a freight brokerage logistics analyst reviewing a live shipment tracking record.",
-  perShipment:
-    'Analyze the shipment data below and answer three questions:\n1. Does this shipment require action right now?\n2. If yes, what is the problem?\n3. What should the broker do next to keep the customer informed or resolve the issue?\n\nRules:\n- Use plain English. No jargon the customer wouldn\'t understand.\n- If the shipment is on track, say so clearly.\n- If there is a delay, exception, or missed appointment, state it directly.\n- Base your answer ONLY on the data provided. Do not assume or invent information.\n\nRespond in this exact JSON format:\n{\n  "actionRequired": true or false,\n  "issue": "One sentence describing the problem, or \'None - shipment is on track\'",\n  "recommendation": "One to two sentences on what the broker should do or communicate to the customer"\n}\n\nShipment data:\n{{data}}',
-  summary:
-    "You are reviewing a summary of shipment records scraped from the FreightPOP dashboard.\n\nThe data includes aggregate counts and two lists: actionItems (shipments needing action) and sample (a sample of on-track shipments). Provide a brief executive summary for the brokerage team:\n- How many shipments need immediate action?\n- What are the most common issues?\n- Which shipments are top priority and why?\n- Any patterns the team should be aware of?\n\nUse plain English. Be direct and actionable.\n\nShipment summary:\n{{allShipments}}",
 };
 
 // --- Filter dropdowns ---
@@ -223,22 +201,6 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "apiKeyUpdated") refreshServerCard();
 });
 
-// --- AI toggle persistence ---
-
-chrome.storage.local.get("aiEnabled", (res) => {
-  aiToggle.checked = res.aiEnabled !== false;
-});
-aiToggle.addEventListener("change", () => {
-  chrome.storage.local.set({ aiEnabled: aiToggle.checked });
-});
-
-chrome.storage.local.get("smartGateEnabled", (res) => {
-  smartGateToggle.checked = res.smartGateEnabled === true;
-});
-smartGateToggle.addEventListener("change", () => {
-  chrome.storage.local.set({ smartGateEnabled: smartGateToggle.checked });
-});
-
 // --- Content script injection ---
 
 async function ensureContentScript(tabId) {
@@ -268,20 +230,17 @@ async function sendToTab(action, data) {
 startBtn.addEventListener("click", async () => {
   const filterCol = filterColSelect.value;
   const filterVal = filterValSelect.value;
-  const aiEnabled = aiToggle.checked;
-  const smartGate = smartGateToggle.checked;
 
   setRunning(true);
   progressBar.classList.add("visible");
   progressText.classList.add("visible");
   progressFill.style.width = "0%";
   progressText.textContent = "";
-  statusDiv.textContent = aiEnabled ? "Starting with AI analysis..." : "Starting (scrape only)...";
-  aiSummarySection.classList.remove("visible");
+  statusDiv.textContent = "Scraping shipments — analysis runs in the dashboard after upload.";
   chrome.runtime.sendMessage({ type: "setRunning", running: true });
 
   try {
-    await sendToTab("start", { filterCol, filterVal, aiEnabled, smartGate });
+    await sendToTab("start", { filterCol, filterVal });
   } catch (e) {
     statusDiv.textContent = "Error: " + e.message;
     setRunning(false);
@@ -297,50 +256,6 @@ stopBtn.addEventListener("click", async () => {
   } catch (e) {
     statusDiv.textContent = "Error: " + e.message;
   }
-});
-
-// --- Prompt editor toggle ---
-
-promptToggle.addEventListener("click", () => {
-  const isOpen = promptEditor.classList.toggle("visible");
-  promptArrow.classList.toggle("open", isOpen);
-});
-
-// --- Load prompts ---
-
-chrome.runtime.sendMessage({ type: "getPrompts" }, (prompts) => {
-  if (prompts) {
-    systemPromptEl.value = prompts.system || DEFAULT_PROMPTS.system;
-    perShipmentPromptEl.value = prompts.perShipment || DEFAULT_PROMPTS.perShipment;
-    summaryPromptEl.value = prompts.summary || DEFAULT_PROMPTS.summary;
-  }
-});
-
-// --- Save prompts ---
-
-savePromptsBtn.addEventListener("click", () => {
-  const prompts = {
-    system: systemPromptEl.value,
-    perShipment: perShipmentPromptEl.value,
-    summary: summaryPromptEl.value,
-  };
-  chrome.runtime.sendMessage({ type: "savePrompts", prompts }, () => {
-    saveStatusEl.textContent = "Saved!";
-    setTimeout(() => { saveStatusEl.textContent = ""; }, 2000);
-  });
-});
-
-// --- Reset prompts ---
-
-resetPromptsBtn.addEventListener("click", () => {
-  systemPromptEl.value = DEFAULT_PROMPTS.system;
-  perShipmentPromptEl.value = DEFAULT_PROMPTS.perShipment;
-  summaryPromptEl.value = DEFAULT_PROMPTS.summary;
-  const prompts = { ...DEFAULT_PROMPTS };
-  chrome.runtime.sendMessage({ type: "savePrompts", prompts }, () => {
-    saveStatusEl.textContent = "Reset to defaults!";
-    setTimeout(() => { saveStatusEl.textContent = ""; }, 2000);
-  });
 });
 
 // --- Listen for status, complete, progress, and AI summary ---
@@ -568,11 +483,13 @@ gpStartBtn.addEventListener("click", async () => {
   gpStatus.textContent = "Starting GP Audit...";
   gpOutlierAlert.classList.remove("visible");
   gpNoOutliers.classList.remove("visible");
-  gpAiSummarySection.classList.remove("visible");
+  gpAiSummarySection?.classList.remove("visible");
   chrome.runtime.sendMessage({ type: "setRunning", running: true });
 
   const shipmentType = document.getElementById("gpShipmentType").value;
-  const aiAnalysis = document.getElementById("gpAiAnalysis").value;
+  // The AI dropdown is hidden (analysis runs server-side); fall back to
+  // 'summary' if the element was removed entirely.
+  const aiAnalysis = document.getElementById("gpAiAnalysis")?.value || "summary";
   const customerFilter = gpCustomerFilter.value.trim();
 
   try {
@@ -649,37 +566,46 @@ const gpPromptToggle = document.getElementById("gpPromptToggle");
 const gpPromptArrow = document.getElementById("gpPromptArrow");
 const gpPromptEditor = document.getElementById("gpPromptEditor");
 
-gpPromptToggle.addEventListener("click", () => {
+// GP audit prompt editor is hidden (analysis runs in the dashboard now).
+// We keep the wiring so users with stale prompts in chrome.storage.local
+// can still see them if the elements are restored, but every binding
+// optional-chains so a future hard-removal won't crash sidepanel.js.
+gpPromptToggle?.addEventListener("click", () => {
+  if (!gpPromptEditor) return;
   const isOpen = gpPromptEditor.classList.toggle("visible");
-  gpPromptArrow.classList.toggle("open", isOpen);
+  gpPromptArrow?.classList.toggle("open", isOpen);
 });
 
 chrome.storage.local.get("gpPrompts", (res) => {
   const p = res.gpPrompts || {};
-  gpSystemPromptEl.value = p.system || GP_DEFAULT_PROMPTS.system;
-  gpExecSummaryPromptEl.value = p.execSummary || GP_DEFAULT_PROMPTS.execSummary;
-  gpRowReviewPromptEl.value = p.rowReview || GP_DEFAULT_PROMPTS.rowReview;
+  if (gpSystemPromptEl) gpSystemPromptEl.value = p.system || GP_DEFAULT_PROMPTS.system;
+  if (gpExecSummaryPromptEl) gpExecSummaryPromptEl.value = p.execSummary || GP_DEFAULT_PROMPTS.execSummary;
+  if (gpRowReviewPromptEl) gpRowReviewPromptEl.value = p.rowReview || GP_DEFAULT_PROMPTS.rowReview;
 });
 
-gpSavePromptsBtn.addEventListener("click", () => {
+gpSavePromptsBtn?.addEventListener("click", () => {
   const gpPrompts = {
-    system: gpSystemPromptEl.value,
-    execSummary: gpExecSummaryPromptEl.value,
-    rowReview: gpRowReviewPromptEl.value,
+    system: gpSystemPromptEl?.value || "",
+    execSummary: gpExecSummaryPromptEl?.value || "",
+    rowReview: gpRowReviewPromptEl?.value || "",
   };
   chrome.storage.local.set({ gpPrompts }, () => {
-    gpSaveStatusEl.textContent = "Saved!";
-    setTimeout(() => { gpSaveStatusEl.textContent = ""; }, 2000);
+    if (gpSaveStatusEl) {
+      gpSaveStatusEl.textContent = "Saved!";
+      setTimeout(() => { gpSaveStatusEl.textContent = ""; }, 2000);
+    }
   });
 });
 
-gpResetPromptsBtn.addEventListener("click", () => {
-  gpSystemPromptEl.value = GP_DEFAULT_PROMPTS.system;
-  gpExecSummaryPromptEl.value = GP_DEFAULT_PROMPTS.execSummary;
-  gpRowReviewPromptEl.value = GP_DEFAULT_PROMPTS.rowReview;
+gpResetPromptsBtn?.addEventListener("click", () => {
+  if (gpSystemPromptEl) gpSystemPromptEl.value = GP_DEFAULT_PROMPTS.system;
+  if (gpExecSummaryPromptEl) gpExecSummaryPromptEl.value = GP_DEFAULT_PROMPTS.execSummary;
+  if (gpRowReviewPromptEl) gpRowReviewPromptEl.value = GP_DEFAULT_PROMPTS.rowReview;
   chrome.storage.local.set({ gpPrompts: { ...GP_DEFAULT_PROMPTS } }, () => {
-    gpSaveStatusEl.textContent = "Reset to defaults!";
-    setTimeout(() => { gpSaveStatusEl.textContent = ""; }, 2000);
+    if (gpSaveStatusEl) {
+      gpSaveStatusEl.textContent = "Reset to defaults!";
+      setTimeout(() => { gpSaveStatusEl.textContent = ""; }, 2000);
+    }
   });
 });
 
@@ -907,12 +833,14 @@ invStartBtn.addEventListener("click", async () => {
   invStatus.textContent = "Starting Invoice Audit...";
   invDiscAlert.classList.remove("visible");
   invNoDisc.classList.remove("visible");
-  invAiSummarySection.classList.remove("visible");
+  invAiSummarySection?.classList.remove("visible");
   chrome.runtime.sendMessage({ type: "setRunning", running: true });
 
   const shipmentType = document.getElementById("invShipmentType").value;
   const customerFilter = document.getElementById("invCustomerFilter").value.trim();
-  const aiAnalysis = document.getElementById("invAiAnalysis").value;
+  // The AI dropdown is hidden (analysis runs server-side); fall back to
+  // 'summary' if the element was removed entirely.
+  const aiAnalysis = document.getElementById("invAiAnalysis")?.value || "summary";
   const skipReport = document.getElementById("invSkipReport").checked;
 
   try {
@@ -998,37 +926,43 @@ const invPromptToggle = document.getElementById("invPromptToggle");
 const invPromptArrow = document.getElementById("invPromptArrow");
 const invPromptEditor = document.getElementById("invPromptEditor");
 
-invPromptToggle.addEventListener("click", () => {
+// Invoice audit prompt editor — hidden, same pattern as GP.
+invPromptToggle?.addEventListener("click", () => {
+  if (!invPromptEditor) return;
   const isOpen = invPromptEditor.classList.toggle("visible");
-  invPromptArrow.classList.toggle("open", isOpen);
+  invPromptArrow?.classList.toggle("open", isOpen);
 });
 
 chrome.storage.local.get("invoicePrompts", (res) => {
   const p = res.invoicePrompts || {};
-  invSystemPromptEl.value = p.system || INV_DEFAULT_PROMPTS.system;
-  invExecSummaryPromptEl.value = p.execSummary || INV_DEFAULT_PROMPTS.execSummary;
-  invRowReviewPromptEl.value = p.rowReview || INV_DEFAULT_PROMPTS.rowReview;
+  if (invSystemPromptEl) invSystemPromptEl.value = p.system || INV_DEFAULT_PROMPTS.system;
+  if (invExecSummaryPromptEl) invExecSummaryPromptEl.value = p.execSummary || INV_DEFAULT_PROMPTS.execSummary;
+  if (invRowReviewPromptEl) invRowReviewPromptEl.value = p.rowReview || INV_DEFAULT_PROMPTS.rowReview;
 });
 
-invSavePromptsBtn.addEventListener("click", () => {
+invSavePromptsBtn?.addEventListener("click", () => {
   const invoicePrompts = {
-    system: invSystemPromptEl.value,
-    execSummary: invExecSummaryPromptEl.value,
-    rowReview: invRowReviewPromptEl.value,
+    system: invSystemPromptEl?.value || "",
+    execSummary: invExecSummaryPromptEl?.value || "",
+    rowReview: invRowReviewPromptEl?.value || "",
   };
   chrome.storage.local.set({ invoicePrompts }, () => {
-    invSaveStatusEl.textContent = "Saved!";
-    setTimeout(() => { invSaveStatusEl.textContent = ""; }, 2000);
+    if (invSaveStatusEl) {
+      invSaveStatusEl.textContent = "Saved!";
+      setTimeout(() => { invSaveStatusEl.textContent = ""; }, 2000);
+    }
   });
 });
 
-invResetPromptsBtn.addEventListener("click", () => {
-  invSystemPromptEl.value = INV_DEFAULT_PROMPTS.system;
-  invExecSummaryPromptEl.value = INV_DEFAULT_PROMPTS.execSummary;
-  invRowReviewPromptEl.value = INV_DEFAULT_PROMPTS.rowReview;
+invResetPromptsBtn?.addEventListener("click", () => {
+  if (invSystemPromptEl) invSystemPromptEl.value = INV_DEFAULT_PROMPTS.system;
+  if (invExecSummaryPromptEl) invExecSummaryPromptEl.value = INV_DEFAULT_PROMPTS.execSummary;
+  if (invRowReviewPromptEl) invRowReviewPromptEl.value = INV_DEFAULT_PROMPTS.rowReview;
   chrome.storage.local.set({ invoicePrompts: { ...INV_DEFAULT_PROMPTS } }, () => {
-    invSaveStatusEl.textContent = "Reset to defaults!";
-    setTimeout(() => { invSaveStatusEl.textContent = ""; }, 2000);
+    if (invSaveStatusEl) {
+      invSaveStatusEl.textContent = "Reset to defaults!";
+      setTimeout(() => { invSaveStatusEl.textContent = ""; }, 2000);
+    }
   });
 });
 
@@ -1053,9 +987,6 @@ chrome.runtime.onMessage.addListener((msg) => {
       progressBar.classList.remove("visible");
       progressText.classList.remove("visible");
     }, 3000);
-  } else if (msg.type === "aiSummary" && msg.text) {
-    aiSummaryText.textContent = msg.text;
-    aiSummarySection.classList.add("visible");
   } else if (msg.type === "gpAuditStatus") {
     gpStatus.textContent = msg.text;
     const p = parseProgress(msg.text);
@@ -1075,8 +1006,10 @@ chrome.runtime.onMessage.addListener((msg) => {
       gpProgressText.classList.remove("visible");
     }, 3000);
   } else if (msg.type === "gpAiSummary" && msg.text) {
-    gpAiSummaryText.textContent = msg.text;
-    gpAiSummarySection.classList.add("visible");
+    // Section is hidden (AI now runs server-side) but we keep the handler
+    // so legacy / future re-enabled flows still update the text safely.
+    if (gpAiSummaryText) gpAiSummaryText.textContent = msg.text;
+    gpAiSummarySection?.classList.add("visible");
   } else if (msg.type === "gpAuditOutliers") {
     const outliers = msg.outliers || [];
     if (outliers.length === 0) {
@@ -1118,8 +1051,8 @@ chrome.runtime.onMessage.addListener((msg) => {
       invProgressText.classList.remove("visible");
     }, 3000);
   } else if (msg.type === "invoiceAiSummary" && msg.text) {
-    invAiSummaryText.textContent = msg.text;
-    invAiSummarySection.classList.add("visible");
+    if (invAiSummaryText) invAiSummaryText.textContent = msg.text;
+    invAiSummarySection?.classList.add("visible");
   } else if (msg.type === "invoiceAuditDiscrepancies") {
     const discs = msg.discrepancies || [];
     if (discs.length === 0) {

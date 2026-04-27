@@ -11,6 +11,16 @@ const toIso = (v) => {
   const d = new Date(v);
   return isNaN(d) ? null : d.toISOString();
 };
+// FreightPOP appointment cells come through as "Yes"/"No"/"true"/"1"/etc.
+// Returns null when we genuinely don't know.
+const toBool = (v) => {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "boolean") return v;
+  const s = String(v).trim().toLowerCase();
+  if (["true", "yes", "y", "1"].includes(s)) return true;
+  if (["false", "no", "n", "0"].includes(s)) return false;
+  return null;
+};
 const pick = (raw, keys) => {
   for (const k of keys) {
     const v = raw[k];
@@ -105,7 +115,30 @@ export function mapShipment(raw, runnerName) {
     shipment_rate_without_markup: toNum(pick(raw, ["Shipment Rate Without Markup"])),
     shipment_gross_profit: toNum(pick(raw, ["Shipment Gross Profit"])),
     total_weight: toNum(pick(raw, ["Total Weight", "TOTAL WEIGHT"])),
-    total_packages: toNum(pick(raw, ["Total Packages", "TOTAL PACKAGES"])),
+    total_packages: toNum(pick(raw, ["Total Packages", "TOTAL PACKAGES", "Number of Pieces"])),
+    // FreightPOP grid column parity — kendo column titles vary in case/spacing,
+    // so accept the common variants. All optional; fall through to null when absent.
+    company_name: pick(raw, ["Company Name", "Company", "COMPANY NAME", "CompanyName"]),
+    shipment_date: toIso(pick(raw, ["Shipment Date", "Ship Date", "Shipped Date", "SHIPMENT DATE", "ShipmentDate"])),
+    tracking_comments: cleanField(pick(raw, ["Tracking Comments", "TRACKING COMMENTS", "TrackingComments"]), { maxLen: 500 }),
+    shipper_spot_quote: pick(raw, ["Shipper Spot Quote", "Spot Quote", "SHIPPER SPOT QUOTE", "SpotQuote"]),
+    pickup_tendered: pick(raw, ["Pickup Tendered", "PICKUP TENDERED", "PickupTendered"]),
+    last_modified_at: toIso(pick(raw, ["Last Modified", "Last Modified At", "LAST MODIFIED", "LastModified", "Modified Date", "Modified On"])),
+    updated_via: pick(raw, ["Updated Via", "UPDATED VIA", "UpdatedVia"]),
+    original_eta: toIso(pick(raw, ["Original ETA", "ORIGINAL ETA", "OriginalETA"])),
+    order_number: pick(raw, ["Order Number", "Order #", "Order#", "ORDER NUMBER", "OrderNumber"]),
+    reference_one: pick(raw, ["Reference 1", "Reference1", "Reference One", "Ref1", "REFERENCE 1"]),
+    reference_two: pick(raw, ["Reference 2", "Reference2", "Reference Two", "Ref2", "REFERENCE 2"]),
+    reference_three: pick(raw, ["Reference 3", "Reference3", "Reference Three", "Ref3", "REFERENCE 3"]),
+    reference_four: pick(raw, ["Reference 4", "Reference4", "Reference Four", "Ref4", "REFERENCE 4"]),
+    reference_five: pick(raw, ["Reference 5", "Reference5", "Reference Five", "Ref5", "REFERENCE 5"]),
+    reference_six: pick(raw, ["Reference 6", "Reference6", "Reference Six", "Ref6", "REFERENCE 6"]),
+    ready_time: pick(raw, ["Ready Time", "READY TIME", "ReadyTime"]),
+    cut_off_time: pick(raw, ["Cut Off Time", "Cut-off Time", "CUT OFF TIME", "CutOffTime"]),
+    appointment_set: toBool(pick(raw, ["Appointment Set", "APPOINTMENT SET", "AppointmentSet", "Appointment"])),
+    appointment_date: toIso(pick(raw, ["Appointment Date", "APPOINTMENT DATE", "AppointmentDate"])),
+    required_arrival_date: toIso(pick(raw, ["Required Arrival Date", "REQUIRED ARRIVAL DATE", "RequiredArrivalDate", "RAD"])),
+    spot_quote_fulfilled_by: pick(raw, ["Spot Quote Fulfilled By", "SPOT QUOTE FULFILLED BY", "SpotQuoteFulfilledBy"]),
     action_required: pick(raw, ["_actionRequired"]),
     ai_issue: pick(raw, ["_aiIssue"]),
     ai_recommendation: pick(raw, ["_aiRecommendation"]),

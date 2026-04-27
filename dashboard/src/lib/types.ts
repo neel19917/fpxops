@@ -41,6 +41,34 @@ export interface Shipment {
   action_overridden_by: string | null;
   action_overridden_at: string | null;
   action_override_reason: string | null;
+  // FreightPOP grid parity (added 2026-04 — may be null on shipments scraped before the column rollout)
+  company_name: string | null;
+  shipment_date: string | null;
+  tracking_comments: string | null;
+  shipper_spot_quote: string | null;
+  pickup_tendered: string | null;
+  last_modified_at: string | null;
+  updated_via: string | null;
+  original_eta: string | null;
+  order_number: string | null;
+  reference_one: string | null;
+  reference_two: string | null;
+  reference_three: string | null;
+  reference_four: string | null;
+  reference_five: string | null;
+  reference_six: string | null;
+  ready_time: string | null;
+  cut_off_time: string | null;
+  appointment_set: boolean | null;
+  appointment_date: string | null;
+  required_arrival_date: string | null;
+  spot_quote_fulfilled_by: string | null;
+  // Pre-existing optional fields used by some columns
+  service: string | null;
+  pickup_request_number: string | null;
+  confirmation_number: string | null;
+  total_weight: number | null;
+  total_packages: number | null;
 }
 
 export interface AuditLogEntry {

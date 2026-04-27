@@ -1,8 +1,5 @@
 let stopRequested = false;
 let logRows = [];
-let aiEnabled = true;
-let smartGateEnabled = false;
-let useBatchMode = false;
 
 // Tracks the active MutationObserver so it can be disconnected before re-registering
 // on the next "View Shipment" click (one observer per shipment interaction).
@@ -525,202 +522,6 @@ const DISPLAY_COLUMNS = [
   { key: "_error", header: "Error" },
 ];
 
-function repairModelJson(s) {
-  let t = s;
-  t = t.replace(
-    /"actionRequired"\s*:\s*true\s+or\s+false/gi,
-    '"actionRequired": false'
-  );
-  t = t.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
-  return t;
-}
-
-function findAnalysisObject(obj, depth) {
-  const d = depth ?? 0;
-  if (d > 10 || obj == null || typeof obj !== "object") return null;
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      const f = findAnalysisObject(item, d + 1);
-      if (f) return f;
-    }
-    return null;
-  }
-  const keys = Object.keys(obj);
-  const hasSignal = keys.some((k) =>
-    /actionrequired|issue|recommendation|action_required|requiresaction/i.test(
-      k.replace(/_/g, "")
-    )
-  );
-  if (hasSignal) return obj;
-  for (const k of keys) {
-    const v = obj[k];
-    if (v != null && typeof v === "object") {
-      const f = findAnalysisObject(v, d + 1);
-      if (f) return f;
-    }
-  }
-  return null;
-}
-
-function extractJsonObject(text) {
-  if (!text || typeof text !== "string") return null;
-  let t = text.trim();
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/im);
-  if (fence) t = fence[1].trim();
-  t = repairModelJson(t);
-  try {
-    const p = JSON.parse(t);
-    return findAnalysisObject(p, 0) || p;
-  } catch {}
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    try {
-      const slice = repairModelJson(t.slice(start, end + 1));
-      const p = JSON.parse(slice);
-      return findAnalysisObject(p, 0) || p;
-    } catch {}
-  }
-  return null;
-}
-
-function coerceActionRequired(val) {
-  if (val === undefined || val === null) return "";
-  if (val === true || val === 1) return "YES";
-  if (val === false || val === 0) return "NO";
-  if (typeof val === "string") {
-    const s = val.trim().toLowerCase();
-    if (["true", "yes", "y", "1"].includes(s)) return "YES";
-    if (["false", "no", "n", "0"].includes(s)) return "NO";
-  }
-  return "";
-}
-
-function stringifyField(v) {
-  if (v == null) return "";
-  if (typeof v === "object") return JSON.stringify(v);
-  return String(v).trim();
-}
-
-function normalizeAiFields(obj) {
-  if (!obj || typeof obj !== "object") return null;
-  const actionRaw =
-    obj.actionRequired ??
-    obj.ActionRequired ??
-    obj.action_required ??
-    obj.requiresAction ??
-    obj.requires_action;
-  const issue = stringifyField(obj.issue ?? obj.Issue);
-  const recommendation = stringifyField(
-    obj.recommendation ?? obj.Recommendation
-  );
-  return { actionRaw, issue, recommendation };
-}
-
-function isClearlyOnTrackIssue(issue) {
-  if (!issue || typeof issue !== "string") return true;
-  const s = issue.trim().toLowerCase();
-  return (
-    /^(none|n\/a)\b/.test(s) ||
-    /\bon track\b/.test(s) ||
-    /\bno issue\b/.test(s) ||
-    /\bno action needed\b/.test(s) ||
-    /\bno immediate action\b/.test(s) ||
-    /\bshipment is on track\b/.test(s) ||
-    /\bproceeding normally\b/.test(s) ||
-    /\bas expected\b/.test(s)
-  );
-}
-
-function deriveActionRequired(actionCoerced, issue) {
-  if (actionCoerced === "YES") return "YES";
-  const actionable =
-    issue.length > 0 && !isClearlyOnTrackIssue(issue);
-  if (actionCoerced === "NO" && actionable) return "YES";
-  if (actionCoerced === "" && actionable) return "YES";
-  return actionCoerced;
-}
-
-function scrapeFieldsFromLooseJson(text) {
-  let issueM = text.match(/"issue"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  if (!issueM) {
-    const m2 = text.match(
-      /"issue"\s*:\s*"([\s\S]*?)"\s*,\s*"recommendation"/i
-    );
-    if (m2) issueM = m2;
-  }
-  const recM = text.match(/"recommendation"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  const arTrue =
-    /"actionRequired"\s*:\s*true\b/.test(text) ||
-    /'actionRequired'\s*:\s*true\b/.test(text);
-  const arFalse =
-    /"actionRequired"\s*:\s*false\b/.test(text) ||
-    /'actionRequired'\s*:\s*false\b/.test(text);
-  return {
-    issue: issueM ? issueM[1].replace(/\\"/g, '"').replace(/\\n/g, "\n") : "",
-    recommendation: recM
-      ? recM[1].replace(/\\"/g, '"').replace(/\\n/g, "\n")
-      : "",
-    arTrue,
-    arFalse,
-  };
-}
-
-function applyAiResponseToRow(modalData, aiText) {
-  const parsed = extractJsonObject(aiText);
-  if (!parsed) {
-    const loose = scrapeFieldsFromLooseJson(aiText);
-    let coerced = "";
-    if (loose.arTrue) coerced = "YES";
-    else if (loose.arFalse) coerced = "NO";
-    modalData._aiRawAnalysis = aiText;
-    modalData._aiIssue = loose.issue || aiText;
-    modalData._aiRecommendation = loose.recommendation;
-    if (loose.issue || loose.arTrue || loose.arFalse) {
-      modalData._actionRequired = deriveActionRequired(
-        coerced,
-        modalData._aiIssue
-      );
-    } else {
-      modalData._actionRequired = "";
-    }
-    return;
-  }
-  const norm = normalizeAiFields(parsed);
-  if (!norm) {
-    modalData._aiRawAnalysis = aiText;
-    modalData._actionRequired = "";
-    modalData._aiIssue = aiText;
-    modalData._aiRecommendation = "";
-    return;
-  }
-  modalData._aiRawAnalysis = aiText;
-  const coerced = coerceActionRequired(norm.actionRaw);
-  modalData._actionRequired = deriveActionRequired(coerced, norm.issue);
-  modalData._aiIssue = norm.issue;
-  modalData._aiRecommendation = norm.recommendation;
-}
-
-function computeNeedsActionForSheet(r) {
-  const ar = String(r._actionRequired ?? "").trim().toUpperCase();
-  const issue = String(r._aiIssue ?? "").trim();
-  if (ar === "ERROR") return true;
-  if (ar === "YES" || ar === "TRUE" || ar === "Y" || ar === "1") return true;
-  if (ar === "NO") return false;
-  if (!issue) return false;
-  if (isClearlyOnTrackIssue(issue)) return false;
-  if (issue.length > 4000) {
-    return /\b(error|failed|delay|contact|missing|stuck|exception|damaged|refused|undeliverable)\b/i.test(
-      issue
-    );
-  }
-  return true;
-}
-
-function finalizeActionSheetFlag(r) {
-  r._needsActionSheet = computeNeedsActionForSheet(r);
-}
-
 function buildInputSummary(data) {
   const parts = [];
   const v = (k) => (data[k] || "").trim();
@@ -1010,33 +811,6 @@ function buildActionRowForSheet(r, allRows) {
     _carrierEmailDraft: buildCarrierEmailDraft(r),
     _inputsSheetLink: linkHint,
     _inputExcelRow: excelRow,
-  };
-}
-
-function buildSummaryPayload(rows) {
-  const actionRows = rows.filter((r) => r._needsActionSheet === true);
-  const errorCount = rows.filter((r) => r._actionRequired === "ERROR").length;
-  const noActionCount = rows.filter((r) => r._actionRequired === "NO").length;
-  const SUMMARY_KEYS = [
-    "_trackingNumber", "SHIPMENT STATUS", "CARRIER NAME", "MODE",
-    "UPDATED ETA", "DELIVERY DATE", "_actionRequired", "_aiIssue",
-    "_aiRecommendation",
-  ];
-  const compact = (r) => {
-    const o = {};
-    for (const k of SUMMARY_KEYS) {
-      const v = r[k];
-      if (v !== undefined && v !== "") o[k] = v;
-    }
-    return o;
-  };
-  return {
-    total: rows.length,
-    actionNeeded: actionRows.length,
-    noAction: noActionCount,
-    errors: errorCount,
-    actionItems: actionRows.map(compact),
-    sample: rows.filter((r) => !r._needsActionSheet).slice(0, 30).map(compact),
   };
 }
 
@@ -1678,21 +1452,6 @@ function waitForGridReady(timeout = 3000) {
   });
 }
 
-const ROUTINE_STATUSES = new Set([
-  "delivered", "in transit", "booked", "scheduled/tendered",
-]);
-const EXCEPTION_KEYWORDS = /\b(delay|exception|missed|failed|refused|damaged|lost|hold|return|cancel|wrong|incorrect|urgent|rescheduled|appointment missed)\b/i;
-
-function shipmentNeedsAi(modalData) {
-  if (!smartGateEnabled) return true;
-  const status = (modalData["SHIPMENT STATUS"] || "").trim().toLowerCase();
-  const comments = (modalData["COMMENTS"] || "").trim();
-  if (status === "issue") return true;
-  if (EXCEPTION_KEYWORDS.test(comments)) return true;
-  if (ROUTINE_STATUSES.has(status) && !EXCEPTION_KEYWORDS.test(comments)) return false;
-  return true;
-}
-
 async function processPage() {
   const jobs = collectShipmentJobs();
   const total = jobs.length;
@@ -1701,6 +1460,11 @@ async function processPage() {
     sendStatus("No tracking links found on this page.");
     return;
   }
+
+  // One kendo prefetch per page-scrape; merged into each row by tracking number.
+  // Captures grid-only columns the modal doesn't expose (Order #, References,
+  // Company, Shipment Date, Spot Quote, Appointments, etc.).
+  const kendoRowMap = await fetchKendoRowMap();
 
   for (let i = 0; i < total; i++) {
     if (stopRequested) {
@@ -1728,43 +1492,14 @@ async function processPage() {
       modalData._trackingNumber = trackingNum;
       modalData._timestamp = new Date().toISOString();
       applyGridPickupResponse(modalData, pickupResponse);
+      mergeKendoRow(modalData, kendoRowMap.get(trackingNum));
 
-      if (aiEnabled && !useBatchMode) {
-        if (shipmentNeedsAi(modalData)) {
-          sendStatus(`Analyzing ${trackingNum} with AI...`);
-          try {
-            const aiResult = await chrome.runtime.sendMessage({
-              type: "analyzeShipment",
-              data: modalData,
-            });
-            if (aiResult && aiResult.text) {
-              applyAiResponseToRow(modalData, aiResult.text);
-            } else if (aiResult && aiResult.error) {
-              modalData._aiRawAnalysis = aiResult.error;
-              modalData._actionRequired = "ERROR";
-              modalData._aiIssue = aiResult.error;
-              modalData._aiRecommendation = "";
-            }
-          } catch (e) {
-            modalData._aiRawAnalysis = e.message;
-            modalData._actionRequired = "ERROR";
-            modalData._aiIssue = e.message;
-            modalData._aiRecommendation = "";
-          }
-        } else {
-          modalData._actionRequired = "NO";
-          modalData._aiIssue = "None - shipment is on track";
-          modalData._aiRecommendation = "No action needed (auto-classified by smart gate).";
-        }
-        finalizeActionSheetFlag(modalData);
-      } else if (!useBatchMode) {
-        modalData._needsActionSheet = modalData._actionRequired === "ERROR";
-      }
-
+      // Extension is scrape-only — analysis runs server-side after upload.
+      // We still build input/output summaries for the local XLSX export so
+      // reps have a record on disk that mirrors what they uploaded.
       modalData._inputSummary = buildInputSummary(modalData);
       modalData._outputSummary = buildOutputSummary(modalData);
       delete modalData["FULL MODAL TEXT"];
-      delete modalData["_aiRawAnalysis"];
       logRows.push(modalData);
 
       if (logRows.length % 25 === 0) {
@@ -1788,6 +1523,7 @@ async function processPage() {
         _needsActionSheet: false,
       };
       applyGridPickupResponse(timeoutRow, pickupResponse);
+      mergeKendoRow(timeoutRow, kendoRowMap.get(trackingNum));
       timeoutRow._inputSummary = buildInputSummary(timeoutRow);
       logRows.push(timeoutRow);
       sendStatus(`Timeout on ${trackingNum} — no modal appeared, skipping.`);
@@ -1798,118 +1534,22 @@ async function processPage() {
   }
 }
 
-const BATCH_CHUNK_SIZE = 25;
-
-async function tryBatchAnalyze(rows) {
-  const total = rows.length;
-  const allAnalyzed = [];
-  const summaries = [];
-  let totalErrors = 0;
-
-  sendStatus(`Batch analysis: ${total} shipment(s) in chunks of ${BATCH_CHUNK_SIZE}...`);
-
-  for (let offset = 0; offset < total; offset += BATCH_CHUNK_SIZE) {
-    if (stopRequested) return null;
-
-    const chunk = rows.slice(offset, offset + BATCH_CHUNK_SIZE);
-    const chunkEnd = Math.min(offset + BATCH_CHUNK_SIZE, total);
-    sendStatus(`Analyzing batch ${offset + 1}–${chunkEnd} of ${total}...`);
-
-    try {
-      const result = await chrome.runtime.sendMessage({
-        type: "analyzeBatch",
-        rows: chunk,
-      });
-
-      if (result && result.error) {
-        sendStatus(`Batch ${offset + 1}–${chunkEnd} failed: ${result.error}. Continuing...`);
-        for (const row of chunk) {
-          allAnalyzed.push({ ...row, _actionRequired: "ERROR", _aiIssue: result.error, _aiRecommendation: "" });
-        }
-        totalErrors += chunk.length;
-        continue;
-      }
-
-      if (result && Array.isArray(result.analyzed)) {
-        allAnalyzed.push(...result.analyzed);
-        if (result.summary) summaries.push(result.summary);
-        totalErrors += result.errors || 0;
-      } else {
-        return null;
-      }
-    } catch {
-      return null;
-    }
-  }
-
-  return {
-    analyzed: allAnalyzed,
-    summary: summaries.join("\n\n"),
-    errors: totalErrors,
-  };
-}
-
-async function fallbackPerRowAnalysis() {
-  sendStatus("LangGraph server unavailable — falling back to per-row AI analysis...");
-  for (let i = 0; i < logRows.length; i++) {
-    if (stopRequested) return;
-    const row = logRows[i];
-    if (row._actionRequired) continue;
-
-    sendStatus(`Fallback AI: ${i + 1}/${logRows.length} — ${row._trackingNumber || "?"}`);
-    if (shipmentNeedsAi(row)) {
-      try {
-        const aiResult = await chrome.runtime.sendMessage({
-          type: "analyzeShipment",
-          data: row,
-        });
-        if (aiResult && aiResult.text) {
-          applyAiResponseToRow(row, aiResult.text);
-        } else if (aiResult && aiResult.error) {
-          row._aiRawAnalysis = aiResult.error;
-          row._actionRequired = "ERROR";
-          row._aiIssue = aiResult.error;
-          row._aiRecommendation = "";
-        }
-      } catch (e) {
-        row._aiRawAnalysis = e.message;
-        row._actionRequired = "ERROR";
-        row._aiIssue = e.message;
-        row._aiRecommendation = "";
-      }
-    } else {
-      row._actionRequired = "NO";
-      row._aiIssue = "None - shipment is on track";
-      row._aiRecommendation = "No action needed (auto-classified by smart gate).";
-    }
-    finalizeActionSheetFlag(row);
-    row._inputSummary = buildInputSummary(row);
-    row._outputSummary = buildOutputSummary(row);
-  }
-}
-
-async function run(filterCol, filterVal, useAi, useSmartGate) {
+async function run(filterCol, filterVal) {
+  // Extension is scrape-only as of 2026-04. Analysis happens server-side
+  // after upload (POST /api/shipments → background per-row Claude).
   stopRequested = false;
   logRows = [];
-  aiEnabled = useAi !== false;
-  smartGateEnabled = useSmartGate === true;
-  // Per-row mode only. Batch mode (legacy /analyze LangGraph endpoint) skips
-  // the fpx_ai_analyses log table, so the dashboard's API cost / token KPIs
-  // stay at zero. Per-row hits /api/analyze/shipment which logs each call.
-  useBatchMode = false;
 
-  if (aiEnabled) {
-    sendStatus("Checking server...");
-    try {
-      const serverCheck = await chrome.runtime.sendMessage({ type: "checkServer" });
-      if (serverCheck && serverCheck.online) {
-        sendStatus(`Server online (v${serverCheck.version || "?"}) — running per-row analysis.`);
-      } else {
-        sendStatus("Server offline — analyses will fail until it's reachable.");
-      }
-    } catch {
-      sendStatus("Server check failed.");
+  sendStatus("Checking server...");
+  try {
+    const serverCheck = await chrome.runtime.sendMessage({ type: "checkServer" });
+    if (serverCheck && serverCheck.online) {
+      sendStatus(`Server online (v${serverCheck.version || "?"}) — uploads will be analyzed in the dashboard.`);
+    } else {
+      sendStatus("Server offline — uploads will fail until it's reachable.");
     }
+  } catch {
+    sendStatus("Server check failed.");
   }
 
   if (filterCol && filterVal) {
@@ -1952,81 +1592,40 @@ async function run(filterCol, filterVal, useAi, useSmartGate) {
     await waitForGridReady(3000);
   }
 
-  let summaryText = "";
-  if (logRows.length > 0 && aiEnabled) {
-    if (useBatchMode) {
-      const batchResult = await tryBatchAnalyze(logRows);
-      if (batchResult) {
-        const analyzedMap = new Map();
-        for (const a of batchResult.analyzed) {
-          analyzedMap.set(a._trackingNumber || "", a);
-        }
-        for (const row of logRows) {
-          const match = analyzedMap.get(row._trackingNumber || "");
-          if (match) {
-            row._actionRequired = match._actionRequired || "";
-            row._aiIssue = match._aiIssue || "";
-            row._aiRecommendation = match._aiRecommendation || "";
-            row._needsActionSheet = match._needsActionSheet;
-          }
-          finalizeActionSheetFlag(row);
-          row._inputSummary = buildInputSummary(row);
-          row._outputSummary = buildOutputSummary(row);
-          delete row._aiRawAnalysis;
-        }
-        summaryText = batchResult.summary || "";
-        sendStatus(`Batch analysis complete — ${logRows.length} shipments processed.`);
-      } else {
-        await fallbackPerRowAnalysis();
-        sendStatus(`Requesting AI summary for ${logRows.length} shipment(s)...`);
-        try {
-          const summaryResult = await chrome.runtime.sendMessage({
-            type: "summarizeAll",
-            payload: buildSummaryPayload(logRows),
-          });
-          if (summaryResult && summaryResult.text) summaryText = summaryResult.text;
-          else if (summaryResult && summaryResult.error)
-            summaryText = "Summary error: " + summaryResult.error;
-        } catch (e) {
-          summaryText = "Summary error: " + e.message;
-        }
-      }
-    } else {
-      sendStatus(`Requesting AI summary for ${logRows.length} shipment(s)...`);
-      try {
-        const summaryResult = await chrome.runtime.sendMessage({
-          type: "summarizeAll",
-          payload: buildSummaryPayload(logRows),
-        });
-        if (summaryResult && summaryResult.text) summaryText = summaryResult.text;
-        else if (summaryResult && summaryResult.error)
-          summaryText = "Summary error: " + summaryResult.error;
-      } catch (e) {
-        summaryText = "Summary error: " + e.message;
-      }
-    }
-  }
-
+  // Push to dashboard. Server analyzes new rows in the background and creates
+  // any necessary tasks / drafts; this extension just hands off raw data.
   if (logRows.length > 0) {
-    sendStatus(`Downloading XLSX + dashboard with ${logRows.length} row(s)...`);
+    sendStatus(`Uploading ${logRows.length} shipment(s) to the dashboard...`);
+    let uploadOk = false;
     try {
-      chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: logRows }, (r) => {
-        if (r && r.ok) console.log(`[FPX] Pushed ${r.count} shipments to Supabase`);
-        else if (r && r.error) console.warn("[FPX] Supabase upsert error:", r.error);
+      const uploadResp = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: logRows }, (r) => resolve(r));
       });
-    } catch (e) { console.warn("[FPX] Supabase push failed:", e.message); }
-    downloadXLSX(logRows, summaryText);
-    downloadDashboard(logRows, summaryText);
+      if (uploadResp && uploadResp.ok) {
+        uploadOk = true;
+        console.log(`[FPX] Pushed ${uploadResp.count} shipments to dashboard`);
+      } else if (uploadResp && uploadResp.error) {
+        console.warn("[FPX] Dashboard upsert error:", uploadResp.error);
+        sendStatus(`Upload error: ${uploadResp.error}`);
+      }
+    } catch (e) {
+      console.warn("[FPX] Dashboard push failed:", e.message);
+      sendStatus(`Upload failed: ${e.message}`);
+    }
+    // Local XLSX export still happens — reps want a copy on disk.
+    downloadXLSX(logRows, "");
+    downloadDashboard(logRows, "");
+    if (uploadOk) {
+      sendStatus(`Uploaded ${logRows.length} shipment(s). The dashboard is analyzing them now.`);
+    }
   }
 
   try { chrome.storage.local.remove("_fpxCheckpoint"); } catch {}
 
-  const actionCount = logRows.filter((r) => r._needsActionSheet === true).length;
-  try {
-    chrome.runtime.sendMessage({ type: "aiSummary", text: summaryText });
-  } catch {}
+  // No AI summary in the extension anymore — clear any stale summary in the UI.
+  try { chrome.runtime.sendMessage({ type: "aiSummary", text: "" }); } catch {}
   sendComplete(
-    `Done — ${pageNum} page(s), ${logRows.length} shipment(s). ${actionCount} need action.\n\n${summaryText}`
+    `Done — ${pageNum} page(s), ${logRows.length} shipment(s) uploaded. Open the dashboard to see analysis.`
   );
 }
 
@@ -2080,6 +1679,28 @@ function normalizeRowKeys(row) {
     normalized[mapped] = val;
   }
   return normalized;
+}
+
+// "MM/DD/YYYY" → "YYYY-MM-DD" so the server can store dates as PG `date` values.
+// Returns null when the input doesn't match the expected shape.
+function isoDateFromMmDdYyyy(s) {
+  if (!s) return null;
+  const m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  return `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+}
+
+// Strip our internal `_` keys before persisting raw row JSON — the server's
+// audit row table stores `raw` as jsonb, and we don't want UI bookkeeping
+// (_gpPct, _isOutlier, _customerMean, ...) leaking into the canonical record.
+function stripUnderscoreKeys(row) {
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (k.startsWith("_")) continue;
+    if (v === undefined || v === null || v === "") continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 function gpComputeGpPct(grossProfit, markupRate) {
@@ -2156,6 +1777,44 @@ function kendoItemToRow(item, fieldMap) {
     row[displayName] = typeof val === "object" ? JSON.stringify(val) : String(val);
   }
   return row;
+}
+
+// Fetch kendo grid rows once and key them by tracking number so the per-row
+// scrape loop can fold in grid-only fields (Order #, References, Company,
+// Spot Quote, etc.) without doing a separate kendo round-trip per click.
+// Returns an empty Map if the kendo widget isn't reachable — callers can
+// safely lookup() with no merge effect.
+async function fetchKendoRowMap() {
+  try {
+    const rows = await getKendoGridAllRows();
+    if (!rows || !rows.length) return new Map();
+    const map = new Map();
+    for (const row of rows) {
+      const tn = String(
+        row["Tracking Number"] || row["TrackingNumber"] || row["Tracking"] || ""
+      ).trim();
+      if (tn) map.set(tn, row);
+    }
+    console.log("[FPX] Kendo row map: keyed", map.size, "of", rows.length);
+    return map;
+  } catch (e) {
+    console.log("[FPX] Kendo prefetch failed:", e.message);
+    return new Map();
+  }
+}
+
+// Modal data wins for shared keys (it's richer / has freshest timestamps).
+// Kendo row only fills keys not already present, and skips internal keys.
+function mergeKendoRow(modalData, kendoRow) {
+  if (!kendoRow) return;
+  for (const k of Object.keys(kendoRow)) {
+    if (k.startsWith("_")) continue;
+    const existing = modalData[k];
+    if (existing !== undefined && existing !== null && existing !== "") continue;
+    const v = kendoRow[k];
+    if (v === null || v === undefined || v === "") continue;
+    modalData[k] = v;
+  }
 }
 
 function getKendoGridAllRows() {
@@ -2517,7 +2176,7 @@ async function gpAuditRun(fromDate, toDate, shipmentType, aiAnalysis, customerFi
       return;
     }
     sendGpStatus(`Combined ${allRows.length} total transaction(s). Computing GP stats...`);
-    await gpFinalize(allRows, dateLabel, aiLevel);
+    await gpFinalize(allRows, dateLabel, aiLevel, { fromDate, toDate, shipmentType });
     return;
   }
 
@@ -2527,7 +2186,7 @@ async function gpAuditRun(fromDate, toDate, shipmentType, aiAnalysis, customerFi
     sendGpComplete("No transactions found for " + dateLabel + ".");
     return;
   }
-  await gpFinalize(rows, dateLabel, aiLevel);
+  await gpFinalize(rows, dateLabel, aiLevel, { fromDate, toDate, shipmentType });
 }
 
 function gpIdentifyNeedsReview(allRows, stats) {
@@ -2611,7 +2270,7 @@ function gpBuildAiPayload(allRows, stats, outliers, reviewRows) {
   };
 }
 
-async function gpFinalize(allRows, bizDate, aiLevel) {
+async function gpFinalize(allRows, bizDate, aiLevel, runMeta = {}) {
   for (let i = 0; i < allRows.length; i++) {
     allRows[i] = normalizeRowKeys(allRows[i]);
   }
@@ -2638,65 +2297,60 @@ async function gpFinalize(allRows, bizDate, aiLevel) {
     chrome.runtime.sendMessage({ type: "gpAuditOutliers", outliers: outlierSummary });
   } catch {}
 
+  // GP audit AI moved to the dashboard server. The extension now scrapes +
+  // uploads only; analysis runs in the background after POST /api/audits/gp.
+  // `aiLevel` is still passed through to the server so users can opt out.
   let execSummaryText = "";
   let perRowNotes = null;
 
-  if (aiLevel !== "off") {
-    const payload = gpBuildAiPayload(allRows, stats, outliers, reviewRows);
-
-    sendGpStatus("Requesting AI executive summary...");
-    try {
-      const result = await chrome.runtime.sendMessage({
-        type: "gpAuditAiSummary",
-        payload,
-      });
-      if (result && result.text) {
-        execSummaryText = result.text;
-        try {
-          chrome.runtime.sendMessage({ type: "gpAiSummary", text: execSummaryText });
-        } catch {}
-      } else if (result && result.error) {
-        execSummaryText = "AI Summary error: " + result.error;
-      }
-    } catch (e) {
-      execSummaryText = "AI Summary error: " + e.message;
+  // Upload the audit run + rows to the server. The POST handler kicks off AI
+  // in the background based on `ai_level`. Failures here only log; the local
+  // XLSX download still happens so users aren't blocked on connectivity.
+  try {
+    const allPctValues = allRows.map((r) => r._gpPct).filter((v) => Number.isFinite(v));
+    const meanGpPct = allPctValues.length
+      ? allPctValues.reduce((a, b) => a + b, 0) / allPctValues.length
+      : null;
+    const variance = allPctValues.length
+      ? allPctValues.reduce((a, v) => a + (v - meanGpPct) ** 2, 0) / allPctValues.length
+      : null;
+    const stdevGpPct = variance !== null ? Math.sqrt(variance) : null;
+    const runPayload = {
+      run: {
+        date_from: isoDateFromMmDdYyyy(runMeta.fromDate) || null,
+        date_to: isoDateFromMmDdYyyy(runMeta.toDate) || null,
+        shipment_type: runMeta.shipmentType || null,
+        total_rows: allRows.length,
+        outlier_count: outliers.length,
+        mean_gp_pct: meanGpPct != null ? +meanGpPct.toFixed(4) : null,
+        stdev_gp_pct: stdevGpPct != null ? +stdevGpPct.toFixed(4) : null,
+      },
+      rows: allRows.map((r) => ({
+        shipment_id: String(r["ShipmentID"] || r["Shipment Id"] || ""),
+        customer_name: r["Customer Name"] || null,
+        invoice_number: r["Invoice Number"] || null,
+        gross_profit: parseFloat(r["Shipment Gross Profit"]) || null,
+        gp_pct: r._gpPct != null ? +r._gpPct.toFixed(4) : null,
+        rate_without_markup: parseFloat(r["Shipment Rate without mark up"]) || null,
+        marked_up_rate: parseFloat(r["Shipment Marked-Up Rate"]) || null,
+        is_outlier: !!r._isOutlier,
+        std_deviations: r._deviation != null && r._customerStdev
+          ? +(r._deviation / r._customerStdev).toFixed(2)
+          : null,
+        raw: stripUnderscoreKeys(r),
+      })),
+      ai_level: aiLevel,
+    };
+    sendGpStatus("Uploading audit run to dashboard...");
+    const resp = await chrome.runtime.sendMessage({ type: "uploadGpAudit", payload: runPayload });
+    if (resp && resp.ok) {
+      sendGpStatus(`Uploaded ${resp.row_count || allRows.length} row(s). Analysis runs in the dashboard.`);
+    } else if (resp && resp.error) {
+      console.warn("[FPX-GP] Upload failed:", resp.error);
+      sendGpStatus("Upload failed: " + resp.error);
     }
-
-    if (aiLevel === "full" && reviewRows.length > 0) {
-      sendGpStatus(`Running per-row AI review on ${reviewRows.length} flagged row(s)...`);
-      perRowNotes = new Map();
-      for (let i = 0; i < reviewRows.length; i++) {
-        if (stopRequested) break;
-        const r = reviewRows[i];
-        const sid = r["ShipmentID"] || `row-${i}`;
-        sendGpStatus(`AI review ${i + 1}/${reviewRows.length} — ShipID ${sid}...`);
-        try {
-          const result = await chrome.runtime.sendMessage({
-            type: "gpAuditRowReview",
-            row: {
-              shipmentId: sid,
-              customerId: r["Customer Id"] || "",
-              customerName: r["Customer Name"] || "",
-              markedUpRate: r["Shipment Marked-Up Rate"] || "",
-              rateWithoutMarkup: r["Shipment Rate without mark up"] || "",
-              grossProfit: r["Shipment Gross Profit"] || "",
-              gpPct: r._gpPct != null ? +r._gpPct.toFixed(2) : null,
-              customerAvgGpPct: r._customerMean != null ? +r._customerMean.toFixed(2) : null,
-              stdev: r._customerStdev != null ? +r._customerStdev.toFixed(2) : null,
-              deviation: r._deviation != null ? +r._deviation.toFixed(2) : null,
-              reason: r._reviewReason || "",
-              carrier: r["Carrier"] || "",
-              service: r["Service"] || "",
-              accountManager: r["Account Manager"] || "",
-            },
-          });
-          if (result && result.text) perRowNotes.set(sid, result.text);
-          else if (result && result.error) perRowNotes.set(sid, "Error: " + result.error);
-        } catch (e) {
-          perRowNotes.set(sid, "Error: " + e.message);
-        }
-      }
-    }
+  } catch (e) {
+    console.warn("[FPX-GP] Upload threw:", e.message);
   }
 
   let apiCost = null;
@@ -4183,81 +3837,54 @@ async function invoiceFinalize(results, skippedRows, dateLabel, aiLevel) {
     });
   } catch {}
 
+  // Invoice audit AI moved to the dashboard server. The extension scrapes +
+  // uploads only; analysis runs in the background after POST /api/audits/invoice.
   let execSummaryText = "";
   let perRowNotes = null;
 
-  if (aiLevel !== "off") {
-    const payload = {
-      totalAudited: results.length,
-      totalMatched: matches.length,
-      totalDiscrepancies: discrepancies.length,
-      totalSkipped: (skippedRows || []).length,
-      totalVariance: +totalVariance.toFixed(2),
-      totalErrors: errors.length,
-      discrepancies: discrepancies.map((d) => ({
-        shipmentId: d.shipmentId,
-        vendor: d.vendor,
-        invoiceNumber: d.invoiceNumber,
-        billAmount: d.billAmount,
-        shipmentSale: d.shipmentSale,
-        shipmentCost: d.shipmentCost,
-        grossProfit: d.grossProfit,
-        difference: d.difference,
-        pctDifference: d.pctDifference,
-        direction: d.direction,
+  // Upload the audit run + rows to the dashboard server. AI runs in the
+  // background per `ai_level` — no extension-side Claude calls anymore.
+  try {
+    const runPayload = {
+      run: {
+        shipment_type: null, // not currently captured by invoiceAuditRun
+        total_rows: results.length,
+        match_count: matches.length,
+        discrepancy_count: discrepancies.length,
+        unmatched_count: errors.length,
+      },
+      rows: results.map((r) => ({
+        shipment_id: String(r.shipmentId || ""),
+        carrier: r.vendor || null,
+        customer_name: r.customerName || null,
+        bill_amount: typeof r.billAmount === "number" ? r.billAmount : null,
+        shipment_cost: typeof r.shipmentCost === "number" ? r.shipmentCost : null,
+        difference: typeof r.difference === "number" ? r.difference : null,
+        status: r.error ? "error" : (r.matched ? "match" : (r.shipmentCost == null ? "error" : "discrepancy")),
+        raw: {
+          invoiceNumber: r.invoiceNumber,
+          shipmentSale: r.shipmentSale,
+          grossProfit: r.grossProfit,
+          pctDifference: r.pctDifference,
+          direction: r.direction,
+          marginDollars: r.marginDollars,
+          marginPct: r.marginPct,
+          memo: r.memo,
+          error: r.error,
+        },
       })),
-      matches: matches.slice(0, 20).map((m) => ({
-        shipmentId: m.shipmentId,
-        vendor: m.vendor,
-        billAmount: m.billAmount,
-        shipmentSale: m.shipmentSale,
-        shipmentCost: m.shipmentCost,
-      })),
+      ai_level: aiLevel,
     };
-
-    sendInvStatus("Requesting AI executive summary...");
-    try {
-      const resp = await chrome.runtime.sendMessage({ type: "invoiceAuditAiSummary", payload });
-      if (resp && resp.text) {
-        execSummaryText = resp.text;
-        try { chrome.runtime.sendMessage({ type: "invoiceAiSummary", text: execSummaryText }); } catch {}
-      } else if (resp && resp.error) {
-        execSummaryText = "AI error: " + resp.error;
-      }
-    } catch (e) {
-      execSummaryText = "AI error: " + e.message;
+    sendInvStatus("Uploading audit run to dashboard...");
+    const resp = await chrome.runtime.sendMessage({ type: "uploadInvoiceAudit", payload: runPayload });
+    if (resp && resp.ok) {
+      sendInvStatus(`Uploaded ${resp.row_count || results.length} row(s). Analysis runs in the dashboard.`);
+    } else if (resp && resp.error) {
+      console.warn("[FPX-INV] Upload failed:", resp.error);
+      sendInvStatus("Upload failed: " + resp.error);
     }
-
-    if (aiLevel === "full" && discrepancies.length > 0) {
-      sendInvStatus(`Running per-row AI review on ${discrepancies.length} discrepancy(ies)...`);
-      perRowNotes = new Map();
-      for (let i = 0; i < discrepancies.length; i++) {
-        if (stopRequested) break;
-        const d = discrepancies[i];
-        sendInvStatus(`AI row ${i + 1}/${discrepancies.length} — ShipID ${d.shipmentId}...`);
-        try {
-          const resp = await chrome.runtime.sendMessage({
-            type: "invoiceAuditRowReview",
-            row: {
-              shipmentId: d.shipmentId,
-              vendor: d.vendor,
-              invoiceNumber: d.invoiceNumber,
-              billAmount: d.billAmount,
-              shipmentSale: d.shipmentSale,
-              shipmentCost: d.shipmentCost,
-              grossProfit: d.grossProfit,
-              difference: d.difference,
-              pctDifference: d.pctDifference,
-              direction: d.direction,
-            },
-          });
-          if (resp && resp.text) perRowNotes.set(d.shipmentId, resp.text);
-          else if (resp && resp.error) perRowNotes.set(d.shipmentId, "Error: " + resp.error);
-        } catch (e) {
-          perRowNotes.set(d.shipmentId, "Error: " + e.message);
-        }
-      }
-    }
+  } catch (e) {
+    console.warn("[FPX-INV] Upload threw:", e.message);
   }
 
   // Grab API cost snapshot before downloading
@@ -4480,7 +4107,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "ping") {
     sendResponse({ ok: true });
   } else if (msg.action === "start") {
-    run(msg.filterCol, msg.filterVal, msg.aiEnabled, msg.smartGate);
+    run(msg.filterCol, msg.filterVal);
     sendResponse({ ok: true });
   } else if (msg.action === "stop") {
     stopRequested = true;

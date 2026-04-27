@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node --test tests/graph.test.js tests/gp-audit.test.js tests/inv-audit.test.js",
+    "test": "node --test tests/graph.test.js tests/gp-audit.test.js tests/inv-audit.test.js tests/shipments.test.js",
     "create-key": "node scripts/create-api-key.js"
   },
   "dependencies": {

@@ -304,6 +304,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse(result);
     })();
     return true;
+  } else if (msg.type === "uploadGpAudit") {
+    (async () => {
+      const result = await callApi("/api/audits/gp", msg.payload);
+      sendResponse(result.error
+        ? { ok: false, error: result.error }
+        : { ok: true, run_id: result.run?.id, row_count: result.row_count });
+    })();
+    return true;
+  } else if (msg.type === "uploadInvoiceAudit") {
+    (async () => {
+      const result = await callApi("/api/audits/invoice", msg.payload);
+      sendResponse(result.error
+        ? { ok: false, error: result.error }
+        : { ok: true, run_id: result.run?.id, row_count: result.row_count });
+    })();
+    return true;
   } else if (msg.type === "gpAuditAiSummary") {
     (async () => {
       const stored = await chrome.storage.local.get("gpPrompts");

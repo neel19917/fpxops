@@ -3,161 +3,340 @@
 <head>
   <meta charset="utf-8">
   <style>
+    :root {
+      --fp-blue-50:  #eff6ff;
+      --fp-blue-100: #dbeafe;
+      --fp-blue-500: #0ea5e9;
+      --fp-blue-600: #2563eb;
+      --fp-blue-700: #1d4ed8;
+      --fp-slate-50: #f8fafc;
+      --fp-slate-100:#f1f5f9;
+      --fp-slate-200:#e2e8f0;
+      --fp-slate-300:#cbd5e1;
+      --fp-slate-500:#64748b;
+      --fp-slate-700:#334155;
+      --fp-slate-900:#0f172a;
+      --fp-emerald-50: #ecfdf5;
+      --fp-emerald-100:#d1fae5;
+      --fp-emerald-600:#059669;
+      --fp-emerald-700:#047857;
+      --fp-rose-50:    #fff1f2;
+      --fp-rose-600:   #e11d48;
+      --fp-rose-700:   #be123c;
+    }
+    * { box-sizing: border-box; }
     body {
-      width: 280px;
+      width: 320px;
+      margin: 0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 13px;
-      padding: 16px;
-      margin: 0;
-      color: #1a1a1a;
-      text-align: center;
+      color: var(--fp-slate-900);
+      background: #fff;
     }
-    h3 {
-      margin: 0 0 12px;
-      font-size: 15px;
-    }
-    .badges {
+
+    /* ── Branded header ─────────────────────────────── */
+    .header {
+      background: linear-gradient(135deg, var(--fp-blue-500) 0%, var(--fp-blue-600) 100%);
+      color: #fff;
+      padding: 14px 16px;
       display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .logo {
+      width: 32px;
+      height: 32px;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.28);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
       justify-content: center;
-      gap: 6px;
+      font-weight: 700;
+      font-size: 14px;
+      letter-spacing: -0.5px;
+    }
+    .brand-name {
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.1;
+    }
+    .brand-tag {
+      font-size: 11px;
+      opacity: 0.85;
+      line-height: 1.2;
+      margin-top: 1px;
+    }
+
+    /* ── Body ───────────────────────────────────────── */
+    .body { padding: 16px; }
+
+    /* Status pill (single, plain-language) */
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--fp-slate-200);
+      background: var(--fp-slate-50);
       margin-bottom: 14px;
     }
-    .badge {
-      font-size: 10px;
-      font-weight: 600;
-      padding: 2px 6px;
-      border-radius: 3px;
-      text-transform: uppercase;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      cursor: pointer;
+    .status .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--fp-slate-300);
+      flex: none;
     }
-    .badge.ok { background: #dcfce7; color: #166534; }
-    .badge.missing { background: #fee2e2; color: #991b1b; }
-    .badge .dot {
-      display: inline-block;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-    }
-    .badge.ok .dot { background: #22c55e; }
-    .badge.missing .dot { background: #ef4444; }
-    #openBtn {
+    .status.connected { background: var(--fp-emerald-50); border-color: #a7f3d0; }
+    .status.connected .dot { background: var(--fp-emerald-600); box-shadow: 0 0 0 3px rgba(5,150,105,0.18); }
+    .status.connected .label { color: var(--fp-emerald-700); }
+    .status.setup    { background: #fef3c7; border-color: #fde68a; }
+    .status.setup    .dot { background: #d97706; }
+    .status.setup    .label { color: #92400e; }
+    .status .label   { font-weight: 600; font-size: 12px; }
+    .status .sub     { font-size: 11px; color: var(--fp-slate-500); margin-top: 1px; }
+
+    /* Primary action */
+    .btn-primary {
       width: 100%;
-      padding: 10px 0;
+      padding: 11px 0;
       border: none;
-      border-radius: 4px;
-      font-size: 13px;
+      border-radius: 10px;
+      font-size: 14px;
       font-weight: 600;
       cursor: pointer;
-      background: #2563eb;
+      background: linear-gradient(135deg, var(--fp-blue-500), var(--fp-blue-600));
       color: #fff;
+      transition: filter 0.15s, transform 0.05s;
+      box-shadow: 0 1px 2px rgba(15,23,42,0.08);
     }
-    #openBtn:hover { opacity: 0.9; }
+    .btn-primary:hover { filter: brightness(1.05); }
+    .btn-primary:active { transform: translateY(1px); }
+    .btn-primary[disabled] { opacity: 0.55; cursor: default; filter: none; }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--fp-slate-200);
+      color: var(--fp-slate-700);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-ghost:hover { background: var(--fp-slate-100); }
+
     .hint {
       font-size: 11px;
-      color: #6b7280;
+      color: var(--fp-slate-500);
       margin-top: 8px;
+      text-align: center;
     }
-    .keyPanel {
-      margin: 0 0 12px;
-      padding: 10px;
-      border: 1px solid #e5e7eb;
-      border-radius: 4px;
-      background: #f9fafb;
-      text-align: left;
+
+    /* ── Setup form ─────────────────────────────────── */
+    .setup {
+      display: none;
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid var(--fp-slate-200);
+      border-radius: 10px;
+      background: var(--fp-slate-50);
     }
-    .keyPanel.hidden { display: none; }
-    .keyPanel label {
+    .setup.visible { display: block; }
+    .setup h4 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--fp-slate-700);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .setup-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .setup-step .num {
+      flex: none;
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: var(--fp-blue-100);
+      color: var(--fp-blue-700);
+      font-size: 11px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 2px;
+    }
+    .setup-step .body-col { flex: 1; min-width: 0; }
+    .setup-step label {
       display: block;
       font-size: 11px;
       font-weight: 600;
-      color: #374151;
+      color: var(--fp-slate-700);
       margin-bottom: 4px;
     }
-    .keyPanel .row {
-      display: flex;
-      gap: 4px;
-    }
-    .keyPanel input {
-      flex: 1;
-      min-width: 0;
-      padding: 6px 8px;
-      border: 1px solid #d1d5db;
-      border-radius: 3px;
-      font-size: 11px;
-      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    }
-    .keyPanel button {
-      padding: 6px 10px;
-      border: 1px solid #d1d5db;
-      border-radius: 3px;
+    .setup-step input {
+      width: 100%;
+      padding: 7px 9px;
+      font-size: 12px;
+      border: 1px solid var(--fp-slate-300);
+      border-radius: 6px;
+      font-family: inherit;
       background: #fff;
+    }
+    .setup-step input:focus {
+      outline: none;
+      border-color: var(--fp-blue-500);
+      box-shadow: 0 0 0 3px rgba(14,165,233,0.18);
+    }
+    .setup-step input.mono {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
     }
-    .keyPanel button.primary {
-      background: #2563eb;
-      color: #fff;
-      border-color: #2563eb;
+    .setup-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 12px;
     }
-    .keyPanel .source {
-      font-size: 10px;
-      color: #6b7280;
-      margin-top: 6px;
-    }
-    .keyPanel .msg {
+    .setup-actions .btn-primary { padding: 8px 0; font-size: 13px; }
+    .save-msg {
+      margin-top: 8px;
       font-size: 11px;
-      margin-top: 6px;
       min-height: 14px;
     }
-    .keyPanel .msg.ok { color: #166534; }
-    .keyPanel .msg.err { color: #991b1b; }
-    .toggleLink {
+    .save-msg.ok  { color: var(--fp-emerald-700); }
+    .save-msg.err { color: var(--fp-rose-700); }
+
+    .advanced-toggle {
       font-size: 11px;
-      color: #2563eb;
+      color: var(--fp-blue-600);
       cursor: pointer;
-      text-decoration: underline;
       display: inline-block;
-      margin-bottom: 10px;
+      margin-top: 4px;
+      user-select: none;
     }
+    .advanced-toggle:hover { text-decoration: underline; }
+    .advanced-block { display: none; }
+    .advanced-block.visible { display: block; }
+
+    /* Footer settings link */
+    .footer {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--fp-slate-200);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .footer .left,
+    .footer .right {
+      font-size: 11px;
+      color: var(--fp-slate-500);
+    }
+    .footer button {
+      background: none;
+      border: none;
+      color: var(--fp-slate-500);
+      font-size: 11px;
+      cursor: pointer;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .footer button:hover { color: var(--fp-slate-900); }
+    .server-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .server-state .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--fp-slate-300);
+    }
+    .server-state.online .dot  { background: var(--fp-emerald-600); }
+    .server-state.offline .dot { background: var(--fp-rose-600); }
   </style>
 </head>
 <body>
-  <h3>FPXpress Tracking Refresh</h3>
-  <div class="badges">
-    <span id="apiBadge" class="badge missing" title="Click to edit API key">No API Key</span>
-    <span id="serverBadge" class="badge missing"><span class="dot"></span> Offline</span>
+  <div class="header">
+    <div class="logo">FP</div>
+    <div>
+      <div class="brand-name">FPXpress</div>
+      <div class="brand-tag">Shipment intelligence</div>
+    </div>
   </div>
 
-  <span id="toggleKey" class="toggleLink">Edit API Key</span>
+  <div class="body">
+    <!-- One-line status, plain language -->
+    <div id="status" class="status setup" title="Click to edit setup">
+      <span class="dot"></span>
+      <div style="flex:1;min-width:0;">
+        <div class="label" id="statusLabel">Setup needed</div>
+        <div class="sub" id="statusSub">Add your name and API key to get started.</div>
+      </div>
+    </div>
 
-  <div id="keyPanel" class="keyPanel hidden">
-    <label for="nameInput">Your Name (stamped on shipments you scrape)</label>
-    <div class="row" style="margin-bottom:8px;">
-      <input id="nameInput" type="text" placeholder="e.g. Neel Patel" autocomplete="off" spellcheck="false">
+    <!-- Primary CTA -->
+    <button id="openBtn" class="btn-primary">Open workspace</button>
+    <div class="hint">The workspace opens as a side panel and stays open while you work.</div>
+
+    <!-- Inline setup form: visible when not configured, or when user clicks Settings -->
+    <div id="setup" class="setup">
+      <h4 id="setupTitle">First-time setup</h4>
+
+      <div class="setup-step">
+        <div class="num">1</div>
+        <div class="body-col">
+          <label for="nameInput">Your name</label>
+          <input id="nameInput" type="text" placeholder="e.g. Neel Patel" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="setup-step">
+        <div class="num">2</div>
+        <div class="body-col">
+          <label for="keyInput">API key <span style="color:var(--fp-slate-500);font-weight:400;">(get from your admin)</span></label>
+          <input id="keyInput" class="mono" type="password" placeholder="fpx_live_..." autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="advanced-toggle" id="advToggle">⚙ Advanced</div>
+      <div class="advanced-block" id="advBlock">
+        <div class="setup-step" style="margin-top:8px;">
+          <div class="num" style="background:var(--fp-slate-200);color:var(--fp-slate-700);">3</div>
+          <div class="body-col">
+            <label for="urlInput">API URL <span style="color:var(--fp-slate-500);font-weight:400;">(default works for most reps)</span></label>
+            <input id="urlInput" class="mono" type="text" placeholder="https://your-app.up.railway.app" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+      </div>
+
+      <div class="setup-actions">
+        <button id="saveKeyBtn" class="btn-primary" type="button" style="flex:2;">Save</button>
+        <button id="cancelSetupBtn" class="btn-ghost" type="button" style="flex:1;">Cancel</button>
+      </div>
+      <div id="keyMsg" class="save-msg"></div>
     </div>
-    <label for="urlInput">FPX API URL</label>
-    <div class="row" style="margin-bottom:8px;">
-      <input id="urlInput" type="text" placeholder="https://your-app.up.railway.app" autocomplete="off" spellcheck="false">
+
+    <!-- Footer: server state + settings link -->
+    <div class="footer">
+      <div class="left">
+        <span id="serverState" class="server-state offline">
+          <span class="dot"></span>
+          <span id="serverLabel">Server offline</span>
+        </span>
+      </div>
+      <div class="right">
+        <button id="settingsBtn" type="button" title="Edit setup">⚙ Settings</button>
+      </div>
     </div>
-    <label for="keyInput">FPX API Key</label>
-    <div class="row">
-      <input id="keyInput" type="password" placeholder="fpx_live_..." autocomplete="off" spellcheck="false">
-      <button id="showHideBtn" type="button" title="Show/hide">Show</button>
-    </div>
-    <div class="row" style="margin-top:6px;">
-      <button id="saveKeyBtn" class="primary" type="button" style="flex:1;">Save</button>
-      <button id="clearKeyBtn" type="button">Clear</button>
-    </div>
-    <div id="keySource" class="source"></div>
-    <div id="keyMsg" class="msg"></div>
   </div>
 
-  <button id="openBtn">Open Side Panel</button>
-  <div class="hint">The side panel stays open while you work.</div>
   <script src="popup.js"></script>
 </body>
 </html>

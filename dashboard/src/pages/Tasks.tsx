@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { ListChecks, RefreshCw, Trash2, CheckCircle2, Circle } from "lucide-react";
+import { ListChecks, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink } from "lucide-react";
 import { api } from "../lib/api";
 import type { ShipmentTask, TaskStatus } from "../lib/types";
+import { useNav } from "../lib/nav";
 
 const STATUS_LABEL: Record<TaskStatus, string> = {
   open: "Open",
@@ -19,6 +20,7 @@ const PRIORITY_COLOR: Record<string, string> = {
 };
 
 export function TasksPage() {
+  const nav = useNav();
   const [tasks, setTasks] = useState<ShipmentTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<string>("");
@@ -106,8 +108,13 @@ export function TasksPage() {
             ) : tasks.length === 0 ? (
               <tr><td colSpan={7} className="text-center text-slate-400 py-8">No tasks yet. Open a shipment and add one.</td></tr>
             ) : tasks.map((t) => (
-              <tr key={t.id} className="border-t border-slate-100 hover:bg-slate-50/60">
-                <td className="px-4 py-3">
+              <tr
+                key={t.id}
+                onClick={() => t.shipment_id && nav.openShipment(t.shipment_id)}
+                className={"border-t border-slate-100 hover:bg-sky-50/50 " + (t.shipment_id ? "cursor-pointer" : "")}
+                title={t.shipment_id ? "Open shipment drawer" : undefined}
+              >
+                <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                   <button
                     onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
                     title={STATUS_LABEL[t.status]}
@@ -125,10 +132,25 @@ export function TasksPage() {
                 <td className="px-4 py-3">
                   <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${PRIORITY_COLOR[t.priority] || PRIORITY_COLOR.normal}`}>{t.priority}</span>
                 </td>
-                <td className="px-4 py-3 text-slate-600 font-mono text-xs">{t.tracking_number || "—"}</td>
+                <td className="px-4 py-3 font-mono text-xs">
+                  {t.shipment_id ? (
+                    <span className="text-sky-700 group-hover:text-sky-900 hover:underline font-medium">
+                      {t.tracking_number || "(no tracking #)"}
+                    </span>
+                  ) : (t.tracking_number || "—")}
+                </td>
                 <td className="px-4 py-3 text-slate-600">{t.assigned_to || "—"}</td>
                 <td className="px-4 py-3 text-slate-500 text-xs">{new Date(t.created_at).toLocaleString()}</td>
-                <td className="px-4 py-3 text-right">
+                <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                  {t.shipment_id ? (
+                    <button
+                      onClick={() => nav.openShipment(t.shipment_id)}
+                      className="p-1.5 text-slate-400 hover:text-sky-700 hover:bg-sky-50 rounded-md mr-1"
+                      title="Open shipment drawer"
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                    </button>
+                  ) : null}
                   <button onClick={() => remove(t)} className="text-slate-400 hover:text-red-600" title="Delete">
                     <Trash2 className="h-4 w-4" />
                   </button>
