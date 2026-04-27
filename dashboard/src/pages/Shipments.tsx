@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2 } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -107,6 +107,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [bulkAssignee, setBulkAssignee] = useState("");
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
   const [bulkResult, setBulkResult] = useState<string | null>(null);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkDeleteBusy, setBulkDeleteBusy] = useState(false);
 
   // Per-shipment tasks shown inside the drawer.
   const [drawerTasks, setDrawerTasks] = useState<ShipmentTask[]>([]);
@@ -410,6 +412,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             >
               <ListChecks className="h-4 w-4" /> Bulk-create task
             </button>
+            <button
+              onClick={() => setBulkDeleteOpen(true)}
+              className="px-3 py-1.5 rounded-lg bg-rose-600 text-white text-xs font-medium hover:bg-rose-700 flex items-center gap-1.5"
+            >
+              <Trash2 className="h-4 w-4" /> Bulk delete
+            </button>
             <button onClick={clearSelection} className="text-xs text-sky-700 hover:text-sky-900 flex items-center gap-1">
               <X className="h-3.5 w-3.5" /> Clear selection
             </button>
@@ -524,6 +532,45 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   className="px-4 py-2 text-sm rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
                 >{bulkSubmitting ? "Creating…" : `Create ${selectedIds.size} task${selectedIds.size === 1 ? "" : "s"}`}</button>
               </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {bulkDeleteOpen ? (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm" onClick={() => !bulkDeleteBusy && setBulkDeleteOpen(false)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold mb-1 flex items-center gap-2 text-rose-700">
+              <Trash2 className="h-5 w-5" /> Delete {selectedIds.size} shipment{selectedIds.size === 1 ? "" : "s"}?
+            </h2>
+            <p className="text-sm text-slate-600 mb-4">
+              This permanently removes the selected shipments and any open tasks attached to them. AI analysis history is kept (the shipment link is just cleared). This cannot be undone — if these tracking numbers re-scrape later they'll come back as fresh rows.
+            </p>
+            <div className="flex gap-2 justify-end pt-2">
+              <button
+                onClick={() => setBulkDeleteOpen(false)}
+                disabled={bulkDeleteBusy}
+                className="px-4 py-2 text-sm rounded-lg text-slate-600 hover:bg-slate-100"
+              >Cancel</button>
+              <button
+                onClick={async () => {
+                  setBulkDeleteBusy(true);
+                  try {
+                    const r = await api.shipments.bulkDelete(Array.from(selectedIds));
+                    setRows((prev) => prev.filter((row) => !selectedIds.has(row.id)));
+                    clearSelection();
+                    setBulkDeleteOpen(false);
+                    setBulkResult(`Deleted ${r.deleted} shipment${r.deleted === 1 ? "" : "s"}.`);
+                    setTimeout(() => setBulkResult(null), 4000);
+                  } catch (e) { setErr((e as Error).message); }
+                  setBulkDeleteBusy(false);
+                }}
+                disabled={bulkDeleteBusy}
+                className="px-4 py-2 text-sm rounded-lg bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+              >
+                <Trash2 className="h-4 w-4" />
+                {bulkDeleteBusy ? "Deleting…" : `Delete ${selectedIds.size}`}
+              </button>
             </div>
           </div>
         </div>

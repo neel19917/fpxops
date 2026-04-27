@@ -87,6 +87,11 @@ export const api = {
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/reanalyze`, { method: "POST" }),
+    bulkDelete: (ids: string[]) =>
+      request<{ deleted: number }>(`/api/shipments/bulk-delete`, {
+        method: "POST",
+        body: JSON.stringify({ ids }),
+      }),
   },
   analyses: {
     list: (params?: { limit?: number; kind?: string; tracking_number?: string }) =>

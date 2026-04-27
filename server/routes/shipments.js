@@ -263,6 +263,36 @@ shipmentsRouter.post("/", async (req, res) => {
   res.status(400).json({ error: "Provide { shipment } or { shipments: [] }" });
 });
 
+// POST /shipments/bulk-delete  { ids: [uuid, ...] }
+// Hard-deletes shipments. fpx_shipment_tasks rows cascade automatically;
+// fpx_ai_analyses rows have their shipment_uuid set to NULL so the analysis
+// history survives. Returns the count actually removed (after RLS / missing IDs
+// are filtered out).
+shipmentsRouter.post("/bulk-delete", async (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids.map(String).filter(Boolean)
+    : [];
+  if (!ids.length) return res.status(400).json({ error: "body.ids array required" });
+
+  // Snapshot for audit before the delete fires.
+  const { data: before } = await supabase
+    .from("fpx_shipments").select("id, tracking_number, customer_name").in("id", ids);
+  const { error, data } = await supabase
+    .from("fpx_shipments").delete().in("id", ids).select("id");
+  if (error) return res.status(500).json({ error: error.message });
+  const deleted = (data || []).length;
+
+  logAudit(req, {
+    action: "bulk_delete",
+    entity_type: "shipment",
+    summary: `Deleted ${deleted} shipment${deleted === 1 ? "" : "s"}`,
+    before: { rows: before || [] },
+    metadata: { count: deleted, requested: ids.length },
+  });
+
+  res.json({ deleted });
+});
+
 // POST /shipments/:id/reanalyze — manual trigger from the dashboard. Runs
 // per-shipment AI again (regardless of last_analyzed_at), updates the row,
 // and returns the fresh shipment + a one-row analysis result. Manual
