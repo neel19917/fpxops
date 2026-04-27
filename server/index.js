@@ -31,8 +31,15 @@ const app = express();
 app.set("trust proxy", 1);
 
 // CORS — comma-separated origin allowlist. Wildcards supported via `host/*` suffix
-// and the chrome-extension://* pattern.
-const rawOrigins = (process.env.CORS_ORIGINS || "chrome-extension://*,http://localhost:5173")
+// and the chrome-extension://* pattern. The default covers the Chrome
+// extension, Vite dev (localhost:5173), and the deployed Netlify dashboard so a
+// blank/missing CORS_ORIGINS env var doesn't take prod down.
+const DEFAULT_CORS_ORIGINS = [
+  "chrome-extension://*",
+  "http://localhost:5173",
+  "https://fpxpress.netlify.app",
+].join(",");
+const rawOrigins = (process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS)
   .split(",").map((s) => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
