@@ -7,24 +7,22 @@ extension and paste a key — no server to run, no terminal to keep open.
 
 1. **Unzip FPXpress** to a permanent folder (e.g. `~/FPXpress` or `C:\FPXpress`).
 
-2. **Open `config.js`** in any text editor. It should already have:
-   ```js
-   const FPX_API_URL = "https://YOUR-APP.up.railway.app";
-   const FPX_API_KEY = "fpx_live_...";
-   ```
-   If the key is still `YOUR_FPX_API_KEY_HERE`, ask your admin for a key.
-
-3. **Load the extension**
+2. **Load the extension**
    - Open `chrome://extensions`
    - Toggle **Developer mode** (top-right)
-   - Click **Load unpacked** → pick the FPXpress folder
+   - Click **Load unpacked** → select the **`extension/`** subfolder (not the
+     repo root)
    - Pin the extension to your toolbar
 
-4. **Verify** — click the FPXpress icon. You should see:
-   - 🟢 **API Key OK**
-   - 🟢 **API v2.0.0 (up Xs)**
+3. **Paste your API URL + key**
+   - Click the FPXpress icon → enter:
+     - **API URL** — your team's Railway URL (your admin will give it to you)
+     - **API key** — `fpx_live_...` (your admin will issue one)
+   - Click **Save**. Values are stored in the browser; you only do this once.
 
-If the badge is red: click it → paste the URL and key → Save.
+4. **Verify** — the popup should show:
+   - 🟢 **API Key OK**
+   - 🟢 **API v2.x.x (up Xs)**
 
 ## Daily use
 
@@ -61,5 +59,5 @@ machine:
 2. Register the native host (one-time): double-click
    `install-native-host.command` (Mac) or `install-native-host.bat` (Windows)
    and paste your extension ID when asked.
-3. Update `config.js` to point at `http://localhost:3210`.
+3. In the FPXpress popup, set **API URL** to `http://localhost:3210` and Save.
 4. Open the side panel → click **Start Server**.
