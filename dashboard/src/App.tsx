@@ -10,6 +10,8 @@ import { ApiKeysPage } from "./pages/ApiKeys";
 import { UsersPage } from "./pages/Users";
 import { ShareLinksPage } from "./pages/ShareLinks";
 import { SharedViewPage } from "./pages/SharedView";
+import { TasksPage } from "./pages/Tasks";
+import { FeedbackPage } from "./pages/Feedback";
 
 export default function App() {
   // Public share viewer bypasses all auth. Path-based match so the same Netlify
@@ -28,7 +30,7 @@ export default function App() {
 
 function AuthedApp() {
   const { session, profile, loading } = useAuth();
-  const [tab, setTab] = useState<TabId>("shipments");
+  const [tab, setTab] = useState<TabId>("tracking");
 
   // On successful OAuth callback Supabase puts a hash fragment in the URL;
   // clear it once the session is ready so refreshes don't re-process it.
@@ -49,15 +51,17 @@ function AuthedApp() {
   if (!profile?.enabled) return <PendingApprovalPage />;
 
   const isAdmin = profile.role === "admin";
-  const safeTab: TabId = ((tab === "users" || tab === "keys") && !isAdmin) ? "shipments" : tab;
+  const safeTab: TabId = ((tab === "users" || tab === "keys") && !isAdmin) ? "tracking" : tab;
 
   return (
     <Layout tab={safeTab} onTab={setTab}>
-      {safeTab === "shipments" && <ShipmentsPage />}
+      {safeTab === "tracking" && <ShipmentsPage />}
+      {safeTab === "tasks"    && <TasksPage />}
       {safeTab === "analyses" && <AnalysesPage />}
       {safeTab === "gp"       && <GpAuditsPage />}
       {safeTab === "invoice"  && <InvoiceAuditsPage />}
       {safeTab === "shares"   && <ShareLinksPage />}
+      {safeTab === "feedback" && <FeedbackPage />}
       {safeTab === "users"    && isAdmin && <UsersPage />}
       {safeTab === "keys"     && isAdmin && <ApiKeysPage />}
     </Layout>

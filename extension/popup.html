@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 280px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      padding: 16px;
+      margin: 0;
+      color: #1a1a1a;
+      text-align: center;
+    }
+    h3 {
+      margin: 0 0 12px;
+      font-size: 15px;
+    }
+    .badges {
+      display: flex;
+      justify-content: center;
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+    .badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 3px;
+      text-transform: uppercase;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+    }
+    .badge.ok { background: #dcfce7; color: #166534; }
+    .badge.missing { background: #fee2e2; color: #991b1b; }
+    .badge .dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+    .badge.ok .dot { background: #22c55e; }
+    .badge.missing .dot { background: #ef4444; }
+    #openBtn {
+      width: 100%;
+      padding: 10px 0;
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      background: #2563eb;
+      color: #fff;
+    }
+    #openBtn:hover { opacity: 0.9; }
+    .hint {
+      font-size: 11px;
+      color: #6b7280;
+      margin-top: 8px;
+    }
+    .keyPanel {
+      margin: 0 0 12px;
+      padding: 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 4px;
+      background: #f9fafb;
+      text-align: left;
+    }
+    .keyPanel.hidden { display: none; }
+    .keyPanel label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 4px;
+    }
+    .keyPanel .row {
+      display: flex;
+      gap: 4px;
+    }
+    .keyPanel input {
+      flex: 1;
+      min-width: 0;
+      padding: 6px 8px;
+      border: 1px solid #d1d5db;
+      border-radius: 3px;
+      font-size: 11px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .keyPanel button {
+      padding: 6px 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 3px;
+      background: #fff;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .keyPanel button.primary {
+      background: #2563eb;
+      color: #fff;
+      border-color: #2563eb;
+    }
+    .keyPanel .source {
+      font-size: 10px;
+      color: #6b7280;
+      margin-top: 6px;
+    }
+    .keyPanel .msg {
+      font-size: 11px;
+      margin-top: 6px;
+      min-height: 14px;
+    }
+    .keyPanel .msg.ok { color: #166534; }
+    .keyPanel .msg.err { color: #991b1b; }
+    .toggleLink {
+      font-size: 11px;
+      color: #2563eb;
+      cursor: pointer;
+      text-decoration: underline;
+      display: inline-block;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h3>FPXpress Tracking Refresh</h3>
+  <div class="badges">
+    <span id="apiBadge" class="badge missing" title="Click to edit API key">No API Key</span>
+    <span id="serverBadge" class="badge missing"><span class="dot"></span> Offline</span>
+  </div>
+
+  <span id="toggleKey" class="toggleLink">Edit API Key</span>
+
+  <div id="keyPanel" class="keyPanel hidden">
+    <label for="nameInput">Your Name (stamped on shipments you scrape)</label>
+    <div class="row" style="margin-bottom:8px;">
+      <input id="nameInput" type="text" placeholder="e.g. Neel Patel" autocomplete="off" spellcheck="false">
+    </div>
+    <label for="urlInput">FPX API URL</label>
+    <div class="row" style="margin-bottom:8px;">
+      <input id="urlInput" type="text" placeholder="https://your-app.up.railway.app" autocomplete="off" spellcheck="false">
+    </div>
+    <label for="keyInput">FPX API Key</label>
+    <div class="row">
+      <input id="keyInput" type="password" placeholder="fpx_live_..." autocomplete="off" spellcheck="false">
+      <button id="showHideBtn" type="button" title="Show/hide">Show</button>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="saveKeyBtn" class="primary" type="button" style="flex:1;">Save</button>
+      <button id="clearKeyBtn" type="button">Clear</button>
+    </div>
+    <div id="keySource" class="source"></div>
+    <div id="keyMsg" class="msg"></div>
+  </div>
+
+  <button id="openBtn">Open Side Panel</button>
+  <div class="hint">The side panel stays open while you work.</div>
+  <script src="popup.js"></script>
+</body>
+</html>

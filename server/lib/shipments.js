@@ -19,12 +19,36 @@ const pick = (raw, keys) => {
   return null;
 };
 
-export function mapShipment(raw) {
+// FreightPOP returns shipment origin/destination as a single comma-separated
+// blob like "ASSOCIATED PACKAGING, INC., 435 Calvert Dr, Gallatin, TN, 37066, US".
+// We don't get a clean customer_name field, so guess it: take leading comma
+// segments that don't start with a digit. Stops at the first street-address
+// segment. Returns null if nothing usable.
+export function guessCustomerNameFromAddress(addr) {
+  if (!addr || typeof addr !== "string") return null;
+  const parts = addr.split(",").map((p) => p.trim()).filter(Boolean);
+  const out = [];
+  for (const p of parts) {
+    if (/^\d/.test(p)) break;            // street number — stop
+    if (/\b(US|USA|CA|MX)\b/i.test(p) && p.length <= 3) break;
+    out.push(p);
+  }
+  if (!out.length) return null;
+  // Strip trailing entity suffix punctuation oddities like "INC." -> keep as-is.
+  return out.join(", ");
+}
+
+export function mapShipment(raw, runnerName) {
   if (!raw || typeof raw !== "object") return null;
+  const explicitCustomer = pick(raw, ["Customer Name", "CUSTOMER NAME", "Customer"]);
+  const origin = pick(raw, ["Ship From", "Origin"]);
+  const destination = pick(raw, ["Ship To", "Destination"]);
+  const guessedCustomer = explicitCustomer || guessCustomerNameFromAddress(origin);
   return {
+    created_by: runnerName || null,
     tracking_number: pick(raw, ["_trackingNumber", "Tracking Number", "TRACKING"]),
     shipment_id: pick(raw, ["Shipment ID", "SHIPMENT ID", "shipment_id"]),
-    customer_name: pick(raw, ["Customer Name", "CUSTOMER NAME", "Customer"]),
+    customer_name: guessedCustomer,
     customer_id: pick(raw, ["Customer ID", "CUSTOMER ID"]),
     account_manager: pick(raw, ["Account Manager", "ACCOUNT MANAGER"]),
     carrier: pick(raw, ["CARRIER", "Carrier"]),
@@ -50,8 +74,8 @@ export function mapShipment(raw) {
     on_board_date: toIso(pick(raw, ["ON-BOARD DATE"])),
     longitude: toNum(pick(raw, ["LONGITUDE"])),
     latitude: toNum(pick(raw, ["LATITUDE"])),
-    origin: pick(raw, ["Ship From", "Origin"]),
-    destination: pick(raw, ["Ship To", "Destination"]),
+    origin,
+    destination,
     ship_from: pick(raw, ["Ship From"]),
     ship_to: pick(raw, ["Ship To"]),
     service: pick(raw, ["Service"]),
@@ -68,6 +92,6 @@ export function mapShipment(raw) {
   };
 }
 
-export function mapShipmentsBulk(rows) {
-  return (rows || []).map(mapShipment).filter((r) => r && r.tracking_number);
+export function mapShipmentsBulk(rows, runnerName) {
+  return (rows || []).map((r) => mapShipment(r, runnerName)).filter((r) => r && r.tracking_number);
 }

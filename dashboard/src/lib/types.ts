@@ -159,3 +159,50 @@ export interface ShareLinkView {
   viewer_user_id: string | null;
   referrer: string | null;
 }
+
+export type TaskStatus = "open" | "in_progress" | "done" | "blocked" | "cancelled";
+export type TaskPriority = "low" | "normal" | "high" | "urgent";
+
+export interface ShipmentTask {
+  id: string;
+  shipment_id: string;
+  tracking_number: string | null;
+  title: string;
+  description: string | null;
+  status: TaskStatus;
+  priority: TaskPriority;
+  assigned_to: string | null;
+  created_by: string | null;
+  due_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type FeedbackCategory = "bug" | "feature" | "support" | "other";
+export type FeedbackStatus = "open" | "triaged" | "in_progress" | "resolved" | "wont_fix";
+export type FeedbackSeverity = "low" | "normal" | "high" | "urgent";
+
+export interface Feedback {
+  id: string;
+  user_id: string | null;
+  user_email: string | null;
+  category: FeedbackCategory;
+  title: string;
+  body: string;
+  severity: FeedbackSeverity;
+  status: FeedbackStatus;
+  source: string | null;
+  context: Record<string, unknown> | null;
+  admin_notes: string | null;
+  resolved_at: string | null;
+  resolved_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmailDraft {
+  subject: string;
+  body: string;
+  raw?: string;
+}

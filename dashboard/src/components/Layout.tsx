@@ -1,19 +1,21 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2 } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare } from "lucide-react";
 import type { ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 
-export type TabId = "shipments" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares";
+export type TabId = "tracking" | "tasks" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback";
 
 interface TabDef { id: TabId; label: string; Icon: typeof Package; adminOnly?: boolean }
 
 const ALL_TABS: TabDef[] = [
-  { id: "shipments", label: "Shipments", Icon: Package },
-  { id: "analyses",  label: "AI Analyses", Icon: Sparkles },
-  { id: "gp",        label: "GP Audits", Icon: TrendingUp },
-  { id: "invoice",   label: "Invoice Audits", Icon: ReceiptText },
-  { id: "shares",    label: "Share Links", Icon: Link2 },
-  { id: "users",     label: "Users", Icon: Users, adminOnly: true },
-  { id: "keys",      label: "API Keys", Icon: KeyRound, adminOnly: true },
+  { id: "tracking", label: "Tracking", Icon: Package },
+  { id: "tasks",    label: "Tasks", Icon: ListChecks },
+  { id: "analyses", label: "AI Analyses", Icon: Sparkles },
+  { id: "gp",       label: "GP Audits", Icon: TrendingUp },
+  { id: "invoice",  label: "Invoice Audits", Icon: ReceiptText },
+  { id: "shares",   label: "Share Links", Icon: Link2 },
+  { id: "feedback", label: "Feedback", Icon: MessageSquare },
+  { id: "users",    label: "Users", Icon: Users, adminOnly: true },
+  { id: "keys",     label: "API Keys", Icon: KeyRound, adminOnly: true },
 ];
 
 interface Props {

@@ -1,6 +1,6 @@
 import type {
-  AiAnalysis, ApiKey, GpAudit, GpAuditRow, InvoiceAudit,
-  InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, UserProfileRow,
+  AiAnalysis, ApiKey, EmailDraft, Feedback, GpAudit, GpAuditRow, InvoiceAudit,
+  InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentTask, UserProfileRow,
 } from "./types";
 import { sb } from "./supabase";
 
@@ -100,6 +100,36 @@ export const api = {
       password?: string;
     }) => request<{ link: ShareLink }>("/api/share-links", { method: "POST", body: JSON.stringify(body) }),
     revoke: (id: string) => request<{ ok: boolean }>(`/api/share-links/${id}`, { method: "DELETE" }),
+  },
+  tasks: {
+    list: (params?: { status?: string; assigned_to?: string; priority?: string; limit?: number }) =>
+      request<{ data: ShipmentTask[] }>("/api/tasks", { params }),
+    listForShipment: (shipmentId: string) =>
+      request<{ data: ShipmentTask[] }>(`/api/shipments/${shipmentId}/tasks`),
+    create: (shipmentId: string, body: { title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string }) =>
+      request<{ task: ShipmentTask }>(`/api/shipments/${shipmentId}/tasks`, { method: "POST", body: JSON.stringify(body) }),
+    update: (id: string, patch: Partial<Pick<ShipmentTask, "status" | "priority" | "assigned_to" | "title" | "description" | "due_at">>) =>
+      request<{ task: ShipmentTask }>(`/api/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+    remove: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
+    bulkCreate: (body: { shipment_ids: string[]; title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string }) =>
+      request<{ created: number; missing: string[] }>("/api/tasks/bulk", { method: "POST", body: JSON.stringify(body) }),
+    bulkUpdate: (body: { ids: string[]; status?: string; priority?: string; assigned_to?: string }) =>
+      request<{ updated: number }>("/api/tasks/bulk-update", { method: "POST", body: JSON.stringify(body) }),
+  },
+  feedback: {
+    list: (params?: { status?: string; category?: string }) =>
+      request<{ data: Feedback[] }>("/api/feedback", { params }),
+    create: (body: { category: Feedback["category"]; title: string; body: string; severity?: Feedback["severity"]; source?: string; context?: Record<string, unknown> }) =>
+      request<{ feedback: Feedback }>("/api/feedback", { method: "POST", body: JSON.stringify(body) }),
+    update: (id: string, patch: Partial<Pick<Feedback, "status" | "admin_notes" | "severity" | "category">>) =>
+      request<{ feedback: Feedback }>(`/api/feedback/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  },
+  emailDraft: {
+    generate: (shipmentId: string, audience: "carrier" | "customer", notes?: string) =>
+      request<EmailDraft>(`/api/shipments/${shipmentId}/email-draft`, {
+        method: "POST",
+        body: JSON.stringify({ audience, notes }),
+      }),
   },
 };
 

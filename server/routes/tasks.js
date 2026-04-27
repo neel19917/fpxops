@@ -1,0 +1,99 @@
+import { Router } from "express";
+import { supabase } from "../lib/supabase.js";
+
+export const tasksRouter = Router();
+
+// GET /tasks?status=open&assigned_to=...&limit=200
+// Cross-shipment task list; defaults to open tasks.
+tasksRouter.get("/", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  let q = supabase.from("fpx_shipment_tasks").select("*").order("created_at", { ascending: false }).limit(limit);
+  if (req.query.status) q = q.eq("status", String(req.query.status));
+  if (req.query.assigned_to) q = q.eq("assigned_to", String(req.query.assigned_to));
+  if (req.query.priority) q = q.eq("priority", String(req.query.priority));
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: data || [] });
+});
+
+// POST /tasks/bulk  { shipment_ids: string[], title, description?, priority?, assigned_to? }
+// Creates one task per shipment. assigned_to defaults to that shipment's
+// created_by (the runner who scraped it). Skips already-completed shipments? No —
+// we let the user fan out tasks to any selection. Returns { created, errors }.
+tasksRouter.post("/bulk", async (req, res) => {
+  const ids = Array.isArray(req.body?.shipment_ids) ? req.body.shipment_ids.filter((x) => typeof x === "string") : [];
+  const title = String(req.body?.title || "").trim();
+  if (!ids.length) return res.status(400).json({ error: "shipment_ids required" });
+  if (!title) return res.status(400).json({ error: "title required" });
+  const description = req.body?.description ? String(req.body.description) : null;
+  const priority = ["low","normal","high","urgent"].includes(req.body?.priority) ? req.body.priority : "normal";
+  const overrideAssignee = req.body?.assigned_to ? String(req.body.assigned_to) : null;
+  const creatorName = req.user?.email || req.apiKey?.name || req.header("x-fpx-user-name") || null;
+  const due_at = req.body?.due_at || null;
+
+  // Fetch the target shipments so we can pull tracking_number + created_by per row.
+  const { data: ships, error: shipErr } = await supabase
+    .from("fpx_shipments").select("id, tracking_number, created_by").in("id", ids);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  const found = new Map(ships.map((s) => [s.id, s]));
+
+  const rows = [];
+  const missing = [];
+  for (const id of ids) {
+    const s = found.get(id);
+    if (!s) { missing.push(id); continue; }
+    rows.push({
+      shipment_id: s.id,
+      tracking_number: s.tracking_number,
+      title,
+      description,
+      priority,
+      status: "open",
+      assigned_to: overrideAssignee || s.created_by || null,
+      created_by: creatorName,
+      due_at,
+    });
+  }
+  if (!rows.length) return res.status(404).json({ error: "No matching shipments found", missing });
+
+  const { data, error } = await supabase.from("fpx_shipment_tasks").insert(rows).select("id, shipment_id, assigned_to");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ created: data.length, missing, tasks: data });
+});
+
+// POST /tasks/bulk-update  { ids: string[], status?, priority?, assigned_to? }
+// Apply the same patch to many tasks at once.
+tasksRouter.post("/bulk-update", async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((x) => typeof x === "string") : [];
+  if (!ids.length) return res.status(400).json({ error: "ids required" });
+  const allowed = ["status","priority","assigned_to"];
+  const patch = {};
+  for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+  if (!Object.keys(patch).length) return res.status(400).json({ error: "no fields to update" });
+  if (patch.status === "done") patch.completed_at = new Date().toISOString();
+  if (patch.status && patch.status !== "done") patch.completed_at = null;
+  const { data, error } = await supabase
+    .from("fpx_shipment_tasks").update(patch).in("id", ids).select("id");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ updated: data.length });
+});
+
+// PATCH /tasks/:id  { status?, priority?, assigned_to?, title?, description?, due_at? }
+tasksRouter.patch("/:id", async (req, res) => {
+  const allowed = ["status", "priority", "assigned_to", "title", "description", "due_at"];
+  const patch = {};
+  for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+  if (patch.status === "done" && !patch.completed_at) patch.completed_at = new Date().toISOString();
+  if (patch.status && patch.status !== "done") patch.completed_at = null;
+  const { data, error } = await supabase
+    .from("fpx_shipment_tasks").update(patch).eq("id", req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ task: data });
+});
+
+// DELETE /tasks/:id
+tasksRouter.delete("/:id", async (req, res) => {
+  const { error } = await supabase.from("fpx_shipment_tasks").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});

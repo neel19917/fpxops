@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, CheckCircle2, Package, Search, Users, XOctagon } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Package, Search, Users, XOctagon, ListChecks, X } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDate, fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, Shipment } from "../lib/types";
@@ -19,6 +19,15 @@ export function ShipmentsPage() {
 
   const [drawerId, setDrawerId] = useState<string | null>(null);
   const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[] } | null>(null);
+
+  // Bulk selection for "create task on N shipments at once".
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkTitle, setBulkTitle] = useState("");
+  const [bulkPriority, setBulkPriority] = useState<"low" | "normal" | "high" | "urgent">("normal");
+  const [bulkAssignee, setBulkAssignee] = useState("");
+  const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  const [bulkResult, setBulkResult] = useState<string | null>(null);
 
   async function load() {
     setLoading(true); setErr(null);
@@ -53,6 +62,45 @@ export function ShipmentsPage() {
       return true;
     });
   }, [rows, q, actionFilter, customerFilter]);
+
+  const allFilteredSelected = filtered.length > 0 && filtered.every((r) => selectedIds.has(r.id));
+  function toggleRow(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+  function toggleAllFiltered() {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) for (const r of filtered) next.delete(r.id);
+      else for (const r of filtered) next.add(r.id);
+      return next;
+    });
+  }
+  function clearSelection() { setSelectedIds(new Set()); }
+
+  async function submitBulk() {
+    if (!bulkTitle.trim() || selectedIds.size === 0) return;
+    setBulkSubmitting(true); setBulkResult(null);
+    try {
+      const r = await api.tasks.bulkCreate({
+        shipment_ids: Array.from(selectedIds),
+        title: bulkTitle.trim(),
+        priority: bulkPriority,
+        assigned_to: bulkAssignee.trim() || undefined,
+      });
+      setBulkResult(`Created ${r.created} task${r.created === 1 ? "" : "s"}` + (r.missing.length ? ` · ${r.missing.length} not found` : ""));
+      setBulkTitle(""); setBulkAssignee("");
+      clearSelection();
+      setTimeout(() => { setBulkOpen(false); setBulkResult(null); }, 1500);
+    } catch (e) {
+      setBulkResult("Error: " + (e as Error).message);
+    } finally {
+      setBulkSubmitting(false);
+    }
+  }
 
   const kpis = useMemo(() => {
     const total = rows.length;
@@ -116,10 +164,34 @@ export function ShipmentsPage() {
           </div>
         ) : null}
 
+        {selectedIds.size > 0 ? (
+          <div className="flex items-center gap-3 px-4 py-2.5 bg-sky-50 border-b border-sky-200 text-sm">
+            <span className="font-medium text-sky-900">{selectedIds.size} selected</span>
+            <button
+              onClick={() => setBulkOpen(true)}
+              className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 flex items-center gap-1.5"
+            >
+              <ListChecks className="h-4 w-4" /> Bulk-create task
+            </button>
+            <button onClick={clearSelection} className="text-xs text-sky-700 hover:text-sky-900 flex items-center gap-1">
+              <X className="h-3.5 w-3.5" /> Clear selection
+            </button>
+          </div>
+        ) : null}
+
         <div className="overflow-auto max-h-[calc(100vh-340px)]">
           <table className="w-full text-sm">
             <thead className="bg-slate-50/80 backdrop-blur sticky top-0">
               <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500">
+                <th className="px-3 py-2.5 w-10">
+                  <input
+                    type="checkbox"
+                    checked={allFilteredSelected}
+                    onChange={toggleAllFiltered}
+                    aria-label="Select all"
+                    className="cursor-pointer"
+                  />
+                </th>
                 <th className="px-4 py-2.5 font-medium">Scraped</th>
                 <th className="px-4 py-2.5 font-medium">Tracking</th>
                 <th className="px-4 py-2.5 font-medium">Customer</th>
@@ -132,29 +204,96 @@ export function ShipmentsPage() {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading ? (
-                <tr><td colSpan={8} className="p-8 text-center text-slate-500">Loading…</td></tr>
+                <tr><td colSpan={9} className="p-8 text-center text-slate-500">Loading…</td></tr>
               ) : filtered.length === 0 ? (
-                <tr><td colSpan={8} className="p-8 text-center text-slate-500">No shipments match your filters.</td></tr>
+                <tr><td colSpan={9} className="p-8 text-center text-slate-500">No shipments match your filters.</td></tr>
               ) : filtered.map((r) => (
                 <tr
                   key={r.id}
-                  onClick={() => setDrawerId(r.id)}
-                  className="hover:bg-sky-50/50 cursor-pointer"
+                  className={(selectedIds.has(r.id) ? "bg-sky-50/70 " : "") + "hover:bg-sky-50/50"}
                 >
-                  <td className="px-4 py-2.5 text-slate-500 whitespace-nowrap" title={fmtDateTime(r.scraped_at)}>{fmtRelative(r.scraped_at)}</td>
-                  <td className="px-4 py-2.5 font-medium whitespace-nowrap">{r.tracking_number || "—"}</td>
-                  <td className="px-4 py-2.5 whitespace-nowrap">{r.customer_name || "—"}</td>
-                  <td className="px-4 py-2.5 whitespace-nowrap">{r.carrier_name || r.carrier || "—"}</td>
-                  <td className="px-4 py-2.5">{r.shipment_status || "—"}</td>
-                  <td className="px-4 py-2.5"><ActionBadge action={r.action_required} size="sm" /></td>
-                  <td className="px-4 py-2.5 max-w-[320px] truncate" title={r.ai_issue || ""}>{r.ai_issue || "—"}</td>
-                  <td className="px-4 py-2.5 whitespace-nowrap text-slate-600">{fmtDate(r.delivery_date)}</td>
+                  <td className="px-3 py-2.5 w-10" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(r.id)}
+                      onChange={() => toggleRow(r.id)}
+                      aria-label={`Select ${r.tracking_number}`}
+                      className="cursor-pointer"
+                    />
+                  </td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 text-slate-500 whitespace-nowrap cursor-pointer" title={fmtDateTime(r.scraped_at)}>{fmtRelative(r.scraped_at)}</td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 font-medium whitespace-nowrap cursor-pointer">{r.tracking_number || "—"}</td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 whitespace-nowrap cursor-pointer">{r.customer_name || "—"}</td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 whitespace-nowrap cursor-pointer">{r.carrier_name || r.carrier || "—"}</td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 cursor-pointer">{r.shipment_status || "—"}</td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 cursor-pointer"><ActionBadge action={r.action_required} size="sm" /></td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 max-w-[320px] truncate cursor-pointer" title={r.ai_issue || ""}>{r.ai_issue || "—"}</td>
+                  <td onClick={() => setDrawerId(r.id)} className="px-4 py-2.5 whitespace-nowrap text-slate-600 cursor-pointer">{fmtDate(r.delivery_date)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       </div>
+
+      {bulkOpen ? (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm" onClick={() => !bulkSubmitting && setBulkOpen(false)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold mb-1">Bulk-create task</h2>
+            <p className="text-sm text-slate-500 mb-4">Creates one task on each of the {selectedIds.size} selected shipments. If no assignee is set, each task auto-assigns to whoever scraped that shipment.</p>
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs text-slate-500 block mb-1">Title</label>
+                <input
+                  value={bulkTitle}
+                  onChange={(e) => setBulkTitle(e.target.value)}
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  placeholder="e.g. Follow up with carrier on missed delivery"
+                  required
+                  autoFocus
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-500 block mb-1">Priority</label>
+                  <select
+                    value={bulkPriority}
+                    onChange={(e) => setBulkPriority(e.target.value as typeof bulkPriority)}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white"
+                  >
+                    <option value="low">Low</option>
+                    <option value="normal">Normal</option>
+                    <option value="high">High</option>
+                    <option value="urgent">Urgent</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-500 block mb-1">Assignee (override)</label>
+                  <input
+                    value={bulkAssignee}
+                    onChange={(e) => setBulkAssignee(e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    placeholder="(blank = runner)"
+                  />
+                </div>
+              </div>
+              {bulkResult ? <div className="text-sm text-emerald-700">{bulkResult}</div> : null}
+              <div className="flex gap-2 justify-end pt-2">
+                <button
+                  onClick={() => setBulkOpen(false)}
+                  disabled={bulkSubmitting}
+                  className="px-4 py-2 text-sm rounded-lg text-slate-600 hover:bg-slate-100"
+                >Cancel</button>
+                <button
+                  onClick={submitBulk}
+                  disabled={bulkSubmitting || !bulkTitle.trim()}
+                  className="px-4 py-2 text-sm rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
+                >{bulkSubmitting ? "Creating…" : `Create ${selectedIds.size} task${selectedIds.size === 1 ? "" : "s"}`}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <Drawer
         open={!!drawerId}

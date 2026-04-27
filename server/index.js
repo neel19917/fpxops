@@ -22,6 +22,8 @@ import { meRouter } from "./routes/me.js";
 import { usersRouter } from "./routes/users.js";
 import { shareLinksRouter } from "./routes/shareLinks.js";
 import { publicShareRouter } from "./routes/publicShare.js";
+import { tasksRouter } from "./routes/tasks.js";
+import { feedbackRouter } from "./routes/feedback.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -81,6 +83,8 @@ api.use("/analyses", analysesRouter);
 api.use("/analyze", analyzeRouter);
 api.use("/audits", auditsRouter);
 api.use("/share-links", shareLinksRouter);
+api.use("/tasks", tasksRouter);
+api.use("/feedback", feedbackRouter);
 app.use("/api", api);
 
 // Admin routes (admin scope OR admin role).
