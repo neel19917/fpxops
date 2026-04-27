@@ -37,6 +37,27 @@ export interface Shipment {
   updated_at: string;
   created_by: string | null;
   seen_count: number;
+  action_source: "ai" | "manual" | "none";
+  action_overridden_by: string | null;
+  action_overridden_at: string | null;
+  action_override_reason: string | null;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  actor_id: string | null;
+  actor_email: string | null;
+  actor_name: string | null;
+  actor_source: "jwt" | "api_key" | "system" | null;
+  api_key_id: string | null;
+  action: string;
+  entity_type: string;
+  entity_id: string | null;
+  summary: string | null;
+  before: unknown;
+  after: unknown;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
 }
 
 export type AnalysisKind = "per_shipment" | "summary" | "gp_audit" | "invoice_audit" | "other";

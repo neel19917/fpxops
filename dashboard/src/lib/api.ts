@@ -1,6 +1,6 @@
 import type {
-  AiAnalysis, ApiKey, EmailDraft, Feedback, GpAudit, GpAuditRow, InvoiceAudit,
-  InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentTask, UserProfileRow,
+  AiAnalysis, ApiKey, AuditLogEntry, EmailDraft, Feedback, GpAudit, GpAuditRow,
+  InvoiceAudit, InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentTask, UserProfileRow,
 } from "./types";
 import { sb } from "./supabase";
 
@@ -57,9 +57,11 @@ export const api = {
   health: () => fetch(`${API_URL}/health`).then((r) => r.json()),
 
   shipments: {
-    list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string }) =>
+    list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string }) =>
       request<{ data: Shipment[] }>("/api/shipments", { params }),
     get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[] }>(`/api/shipments/${id}`),
+    overrideAction: (id: string, body: { action_required: string | null; reason?: string }) =>
+      request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
   },
   analyses: {
     list: (params?: { limit?: number; kind?: string; tracking_number?: string }) =>
@@ -130,6 +132,10 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ audience, notes }),
       }),
+  },
+  auditLog: {
+    list: (params?: { entity_type?: string; entity_id?: string; action?: string; actor_email?: string; limit?: number }) =>
+      request<{ data: AuditLogEntry[] }>("/api/audit-log", { params }),
   },
 };
 

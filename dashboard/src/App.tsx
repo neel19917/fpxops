@@ -12,6 +12,7 @@ import { ShareLinksPage } from "./pages/ShareLinks";
 import { SharedViewPage } from "./pages/SharedView";
 import { TasksPage } from "./pages/Tasks";
 import { FeedbackPage } from "./pages/Feedback";
+import { AuditLogPage } from "./pages/AuditLog";
 
 export default function App() {
   // Public share viewer bypasses all auth. Path-based match so the same Netlify
@@ -51,7 +52,8 @@ function AuthedApp() {
   if (!profile?.enabled) return <PendingApprovalPage />;
 
   const isAdmin = profile.role === "admin";
-  const safeTab: TabId = ((tab === "users" || tab === "keys") && !isAdmin) ? "tracking" : tab;
+  const adminOnlyTabs: TabId[] = ["users", "keys", "audit"];
+  const safeTab: TabId = (adminOnlyTabs.includes(tab) && !isAdmin) ? "tracking" : tab;
 
   return (
     <Layout tab={safeTab} onTab={setTab}>
@@ -64,6 +66,7 @@ function AuthedApp() {
       {safeTab === "feedback" && <FeedbackPage />}
       {safeTab === "users"    && isAdmin && <UsersPage />}
       {safeTab === "keys"     && isAdmin && <ApiKeysPage />}
+      {safeTab === "audit"    && isAdmin && <AuditLogPage />}
     </Layout>
   );
 }

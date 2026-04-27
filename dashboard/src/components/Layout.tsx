@@ -1,8 +1,8 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText } from "lucide-react";
 import type { ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 
-export type TabId = "tracking" | "tasks" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback";
+export type TabId = "tracking" | "tasks" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "audit";
 
 interface TabDef { id: TabId; label: string; Icon: typeof Package; adminOnly?: boolean }
 
@@ -16,6 +16,7 @@ const ALL_TABS: TabDef[] = [
   { id: "feedback", label: "Feedback", Icon: MessageSquare },
   { id: "users",    label: "Users", Icon: Users, adminOnly: true },
   { id: "keys",     label: "API Keys", Icon: KeyRound, adminOnly: true },
+  { id: "audit",    label: "Audit", Icon: ScrollText, adminOnly: true },
 ];
 
 interface Props {

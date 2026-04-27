@@ -16,6 +16,7 @@ export function ShipmentsPage() {
   const [q, setQ] = useState("");
   const [actionFilter, setActionFilter] = useState<string>("");
   const [customerFilter, setCustomerFilter] = useState<string>("");
+  const [sourceFilter, setSourceFilter] = useState<string>("");
 
   const [drawerId, setDrawerId] = useState<string | null>(null);
   const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[] } | null>(null);
@@ -42,6 +43,9 @@ export function ShipmentsPage() {
     copied: boolean;
   } | null>(null);
 
+  // Action override modal (manual YES/NO/clear).
+  const [overrideModal, setOverrideModal] = useState<null | { value: "YES" | "NO" | null; reason: string; busy: boolean }>(null);
+
   async function load() {
     setLoading(true); setErr(null);
     try {
@@ -53,7 +57,7 @@ export function ShipmentsPage() {
   useEffect(() => { load(); }, []);
 
   // Drawer-level tab navigation.
-  const [drawerTab, setDrawerTab] = useState<"overview" | "tasks" | "email" | "history" | "raw">("overview");
+  const [drawerTab, setDrawerTab] = useState<"overview" | "tasks" | "email" | "drafts" | "history" | "raw">("overview");
 
   useEffect(() => {
     if (!drawerId) {
@@ -103,6 +107,66 @@ export function ShipmentsPage() {
     setTimeout(() => setEmailModal((m) => (m ? { ...m, copied: false } : m)), 1500);
   }
 
+  // Parse a stored AI analysis row into a friendly shape for rendering.
+  // Email drafts get their JSON parsed; per-shipment analyses surface
+  // issue + recommendation instead of dumping the raw JSON response.
+  function parseAnalysis(a: AiAnalysis): {
+    flavor: "email_draft" | "shipment" | "summary" | "raw";
+    audience?: "carrier" | "customer";
+    subject?: string;
+    body?: string;
+    issue?: string | null;
+    recommendation?: string | null;
+    raw?: string;
+  } {
+    const meta = (a.metadata || {}) as Record<string, unknown>;
+    const subkind = typeof meta.subkind === "string" ? meta.subkind : "";
+    if (a.kind === "other" && subkind.startsWith("email_draft_")) {
+      let subject = "";
+      let body = "";
+      if (a.response_text) {
+        const m = a.response_text.match(/\{[\s\S]*\}/);
+        if (m) {
+          try {
+            const obj = JSON.parse(m[0]);
+            subject = String(obj.subject || "");
+            body = String(obj.body || "");
+          } catch { body = a.response_text; }
+        } else { body = a.response_text; }
+      }
+      return { flavor: "email_draft", audience: subkind.includes("carrier") ? "carrier" : "customer", subject, body };
+    }
+    if (a.kind === "per_shipment") {
+      return { flavor: "shipment", issue: a.issue, recommendation: a.recommendation };
+    }
+    if (a.kind === "summary") {
+      return { flavor: "summary", body: a.response_text || "" };
+    }
+    return { flavor: "raw", raw: a.response_text || "" };
+  }
+
+  async function copyText(text: string) {
+    try { await navigator.clipboard.writeText(text); } catch {}
+  }
+
+  async function applyOverride() {
+    if (!drawerId || !overrideModal) return;
+    setOverrideModal({ ...overrideModal, busy: true });
+    try {
+      const r = await api.shipments.overrideAction(drawerId, {
+        action_required: overrideModal.value,
+        reason: overrideModal.reason || undefined,
+      });
+      // Refresh drawer + table
+      setDrawerData((prev) => prev ? { ...prev, shipment: r.shipment } : prev);
+      setRows((prev) => prev.map((row) => row.id === r.shipment.id ? r.shipment : row));
+      setOverrideModal(null);
+    } catch (e) {
+      setOverrideModal({ ...overrideModal, busy: false });
+      setErr((e as Error).message);
+    }
+  }
+
   const customers = useMemo(() => {
     const set = new Set<string>();
     for (const r of rows) if (r.customer_name) set.add(r.customer_name);
@@ -113,6 +177,7 @@ export function ShipmentsPage() {
     return rows.filter((r) => {
       if (actionFilter && String(r.action_required || "").toUpperCase() !== actionFilter) return false;
       if (customerFilter && r.customer_name !== customerFilter) return false;
+      if (sourceFilter && r.action_source !== sourceFilter) return false;
       if (q) {
         const hay = [r.tracking_number, r.customer_name, r.carrier_name, r.carrier, r.ai_issue, r.shipment_status]
           .map((x) => (x || "").toLowerCase()).join(" ");
@@ -120,7 +185,7 @@ export function ShipmentsPage() {
       }
       return true;
     });
-  }, [rows, q, actionFilter, customerFilter]);
+  }, [rows, q, actionFilter, customerFilter, sourceFilter]);
 
   const allFilteredSelected = filtered.length > 0 && filtered.every((r) => selectedIds.has(r.id));
   function toggleRow(id: string) {
@@ -208,6 +273,16 @@ export function ShipmentsPage() {
           >
             <option value="">All customers</option>
             {customers.map((c) => <option key={c}>{c}</option>)}
+          </select>
+          <select
+            className="px-3 py-2 rounded-lg border border-slate-300 text-sm"
+            value={sourceFilter}
+            onChange={(e) => setSourceFilter(e.target.value)}
+            title="Action set by AI vs. manually overridden"
+          >
+            <option value="">All sources</option>
+            <option value="ai">From AI</option>
+            <option value="manual">Manual override</option>
           </select>
           <button
             onClick={load}
@@ -374,7 +449,8 @@ export function ShipmentsPage() {
                 { id: "overview", label: "Overview", count: null },
                 { id: "tasks", label: "Tasks", count: drawerTasks.length },
                 { id: "email", label: "Email", count: null },
-                { id: "history", label: "Analysis", count: drawerData.analyses.length },
+                { id: "drafts", label: "Drafts", count: drawerData.analyses.filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_")).length },
+                { id: "history", label: "Analysis", count: drawerData.analyses.filter((a) => a.kind === "per_shipment" || a.kind === "summary").length },
                 { id: "raw", label: "Raw", count: null },
               ] as const).map((t) => (
                 <button
@@ -402,7 +478,28 @@ export function ShipmentsPage() {
                     <Field label="Carrier">{drawerData.shipment.carrier_name || drawerData.shipment.carrier}</Field>
                     <Field label="Mode">{drawerData.shipment.mode}</Field>
                     <Field label="Status">{drawerData.shipment.shipment_status}</Field>
-                    <Field label="Action"><ActionBadge action={drawerData.shipment.action_required} /></Field>
+                    <div className="flex flex-col gap-0.5">
+                      <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Action</div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <ActionBadge action={drawerData.shipment.action_required} />
+                        <span className={
+                          "text-[10px] px-2 py-0.5 rounded-full font-medium " +
+                          (drawerData.shipment.action_source === "manual"
+                            ? "bg-amber-100 text-amber-800 ring-1 ring-amber-200"
+                            : "bg-slate-100 text-slate-600")
+                        } title={
+                          drawerData.shipment.action_source === "manual"
+                            ? `Overridden by ${drawerData.shipment.action_overridden_by || "?"}${drawerData.shipment.action_override_reason ? ` — ${drawerData.shipment.action_override_reason}` : ""}`
+                            : "Set by AI"
+                        }>
+                          {drawerData.shipment.action_source === "manual" ? "Manual" : "From AI"}
+                        </span>
+                        <button
+                          onClick={() => setOverrideModal({ value: drawerData.shipment.action_required === "YES" ? "NO" : "YES", reason: "", busy: false })}
+                          className="text-[11px] text-sky-700 hover:text-sky-900 underline"
+                        >Override</button>
+                      </div>
+                    </div>
                     <Field label="Pickup">{fmtDateTime(drawerData.shipment.pickup_date)}</Field>
                     <Field label="ETA">{fmtDateTime(drawerData.shipment.updated_eta)}</Field>
                     <Field label="Delivery">{fmtDateTime(drawerData.shipment.delivery_date)}</Field>
@@ -491,25 +588,102 @@ export function ShipmentsPage() {
               </Section>
             )}
 
-            {drawerTab === "history" && (
-              <Section title={`Analysis history (${drawerData.analyses.length})`}>
-                {drawerData.analyses.length === 0 ? (
-                  <div className="text-sm text-slate-500">No analyses yet.</div>
-                ) : drawerData.analyses.map((a) => (
-                  <div key={a.id} className="rounded-xl bg-slate-50 ring-1 ring-slate-200 p-3 mb-2">
-                    <div className="flex items-center justify-between text-xs text-slate-500 mb-1">
-                      <span>{fmtDateTime(a.created_at)} · {a.model}</span>
-                      <span>{fmtUsd(a.cost_usd)}</span>
+            {drawerTab === "drafts" && (() => {
+              const drafts = drawerData.analyses
+                .filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_"))
+                .map((a) => ({ a, parsed: parseAnalysis(a) }));
+              return (
+                <Section title={`Saved email drafts (${drafts.length})`}>
+                  {drafts.length === 0 ? (
+                    <div className="text-sm text-slate-500">No saved drafts. Generate one from the Email tab.</div>
+                  ) : drafts.map(({ a, parsed }) => (
+                    <div key={a.id} className="rounded-xl bg-white ring-1 ring-slate-200 p-4 mb-3">
+                      <div className="flex items-center justify-between text-xs text-slate-500 mb-2">
+                        <div className="flex items-center gap-2">
+                          <span className={"text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full " + (parsed.audience === "carrier" ? "bg-slate-200 text-slate-700" : "bg-sky-100 text-sky-700")}>
+                            {parsed.audience === "carrier" ? "Carrier" : "Customer"}
+                          </span>
+                          <span>{fmtDateTime(a.created_at)}</span>
+                        </div>
+                        <span className="text-slate-500">{fmtUsd(a.cost_usd)}</span>
+                      </div>
+                      {parsed.subject ? (
+                        <div className="text-sm font-semibold text-slate-900 mb-2">{parsed.subject}</div>
+                      ) : null}
+                      <pre className="text-sm whitespace-pre-wrap font-sans text-slate-700 leading-relaxed bg-slate-50 ring-1 ring-slate-200 rounded-lg p-3 max-h-72 overflow-auto">{parsed.body || "(empty)"}</pre>
+                      <div className="flex items-center justify-end gap-3 mt-2">
+                        {parsed.subject || parsed.body ? (
+                          <a
+                            href={`mailto:?subject=${encodeURIComponent(parsed.subject || "")}&body=${encodeURIComponent(parsed.body || "")}`}
+                            className="text-xs text-sky-700 hover:text-sky-900 font-medium"
+                          >Open in mail →</a>
+                        ) : null}
+                        <button
+                          onClick={() => copyText(`Subject: ${parsed.subject || ""}\n\n${parsed.body || ""}`)}
+                          className="text-xs px-2 py-1 rounded-lg bg-slate-900 text-white hover:bg-slate-800 flex items-center gap-1"
+                        >
+                          <Copy className="h-3 w-3" /> Copy
+                        </button>
+                      </div>
                     </div>
-                    {a.issue ? <div className="text-sm"><b className="text-slate-700">Issue:</b> {a.issue}</div> : null}
-                    {a.recommendation ? <div className="text-sm mt-0.5"><b className="text-slate-700">Rec:</b> {a.recommendation}</div> : null}
-                    {a.response_text ? (
-                      <pre className="mt-2 text-[11px] bg-white p-2 rounded-lg ring-1 ring-slate-200 whitespace-pre-wrap max-h-40 overflow-auto">{a.response_text}</pre>
-                    ) : null}
-                  </div>
-                ))}
-              </Section>
-            )}
+                  ))}
+                </Section>
+              );
+            })()}
+
+            {drawerTab === "history" && (() => {
+              const items = drawerData.analyses
+                .filter((a) => a.kind === "per_shipment" || a.kind === "summary")
+                .map((a) => ({ a, parsed: parseAnalysis(a) }));
+              return (
+                <Section title={`Analysis history (${items.length})`}>
+                  {items.length === 0 ? (
+                    <div className="text-sm text-slate-500">No analyses yet. Run the extension on this shipment.</div>
+                  ) : items.map(({ a, parsed }) => (
+                    <div key={a.id} className="rounded-xl bg-white ring-1 ring-slate-200 p-4 mb-3">
+                      <div className="flex items-center justify-between text-xs text-slate-500 mb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">
+                            {parsed.flavor === "summary" ? "Run summary" : "Per-shipment"}
+                          </span>
+                          <span>{fmtDateTime(a.created_at)}</span>
+                          <span className="text-slate-400">·</span>
+                          <span className="text-slate-400">{a.model}</span>
+                        </div>
+                        <span>{fmtUsd(a.cost_usd)}</span>
+                      </div>
+                      {parsed.flavor === "shipment" ? (
+                        <>
+                          {parsed.issue ? (
+                            <div className="text-sm mb-2">
+                              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500 mb-0.5">Issue</div>
+                              <div className="text-slate-800">{parsed.issue}</div>
+                            </div>
+                          ) : null}
+                          {parsed.recommendation ? (
+                            <div className="text-sm">
+                              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500 mb-0.5">Recommendation</div>
+                              <div className="text-slate-800">{parsed.recommendation}</div>
+                            </div>
+                          ) : null}
+                          {!parsed.issue && !parsed.recommendation ? (
+                            <div className="text-sm text-slate-500 italic">No structured fields parsed from this run.</div>
+                          ) : null}
+                        </>
+                      ) : (
+                        <pre className="text-sm whitespace-pre-wrap font-sans text-slate-800 leading-relaxed">{parsed.body || "(empty)"}</pre>
+                      )}
+                      {a.input_tokens != null && a.output_tokens != null ? (
+                        <div className="text-[11px] text-slate-400 mt-2">
+                          {a.input_tokens.toLocaleString()} in / {a.output_tokens.toLocaleString()} out tokens
+                          {a.duration_ms ? ` · ${(a.duration_ms / 1000).toFixed(1)}s` : ""}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </Section>
+              );
+            })()}
 
             {drawerTab === "raw" && (
               <Section title="Raw scrape">
@@ -521,6 +695,65 @@ export function ShipmentsPage() {
           </>
         ) : <div className="text-sm text-slate-500">Loading…</div>}
       </Drawer>
+
+      {overrideModal && drawerData ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm"
+          onClick={() => !overrideModal.busy && setOverrideModal(null)}
+        >
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold mb-1">Override action</h2>
+            <p className="text-sm text-slate-500 mb-4">Manually set this shipment's action. The AI's classification will be ignored on subsequent scrapes until you clear the override.</p>
+            <div className="flex gap-2 mb-4">
+              {(["YES", "NO"] as const).map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setOverrideModal({ ...overrideModal, value: v })}
+                  className={
+                    "flex-1 py-2.5 rounded-xl text-sm font-semibold ring-1 transition " +
+                    (overrideModal.value === v
+                      ? (v === "YES" ? "bg-rose-600 text-white ring-rose-700" : "bg-emerald-600 text-white ring-emerald-700")
+                      : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")
+                  }
+                >
+                  {v === "YES" ? "Action needed" : "On track"}
+                </button>
+              ))}
+              <button
+                onClick={() => setOverrideModal({ ...overrideModal, value: null })}
+                className={
+                  "flex-1 py-2.5 rounded-xl text-sm font-semibold ring-1 transition " +
+                  (overrideModal.value === null
+                    ? "bg-slate-700 text-white ring-slate-800"
+                    : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")
+                }
+              >
+                Clear override
+              </button>
+            </div>
+            <label className="text-xs text-slate-500 block mb-1">Reason (optional)</label>
+            <input
+              value={overrideModal.reason}
+              onChange={(e) => setOverrideModal({ ...overrideModal, reason: e.target.value })}
+              placeholder="Why are you overriding the AI?"
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm mb-4"
+              maxLength={500}
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setOverrideModal(null)}
+                disabled={overrideModal.busy}
+                className="px-4 py-2 text-sm rounded-lg text-slate-600 hover:bg-slate-100"
+              >Cancel</button>
+              <button
+                onClick={applyOverride}
+                disabled={overrideModal.busy}
+                className="px-4 py-2 text-sm rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
+              >{overrideModal.busy ? "Saving…" : (overrideModal.value === null ? "Clear override" : "Apply override")}</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {emailModal ? (
         <div

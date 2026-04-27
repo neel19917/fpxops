@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
+import { logAudit } from "../lib/audit.js";
 
 export const tasksRouter = Router();
 
@@ -56,8 +57,13 @@ tasksRouter.post("/bulk", async (req, res) => {
   }
   if (!rows.length) return res.status(404).json({ error: "No matching shipments found", missing });
 
-  const { data, error } = await supabase.from("fpx_shipment_tasks").insert(rows).select("id, shipment_id, assigned_to");
+  const { data, error } = await supabase.from("fpx_shipment_tasks").insert(rows).select("id, shipment_id, assigned_to, title");
   if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "bulk_create", entity_type: "task",
+    summary: `Bulk-created ${data.length} task(s): "${title}"`,
+    metadata: { count: data.length, missing, title, priority, assignee_override: overrideAssignee },
+  });
   res.json({ created: data.length, missing, tasks: data });
 });
 
@@ -75,6 +81,11 @@ tasksRouter.post("/bulk-update", async (req, res) => {
   const { data, error } = await supabase
     .from("fpx_shipment_tasks").update(patch).in("id", ids).select("id");
   if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "bulk_update", entity_type: "task",
+    summary: `Bulk-updated ${data.length} task(s)`,
+    metadata: { count: data.length, patch },
+  });
   res.json({ updated: data.length });
 });
 
@@ -85,15 +96,29 @@ tasksRouter.patch("/:id", async (req, res) => {
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
   if (patch.status === "done" && !patch.completed_at) patch.completed_at = new Date().toISOString();
   if (patch.status && patch.status !== "done") patch.completed_at = null;
+  const { data: before } = await supabase
+    .from("fpx_shipment_tasks").select("id, title, status, priority, assigned_to").eq("id", req.params.id).maybeSingle();
   const { data, error } = await supabase
     .from("fpx_shipment_tasks").update(patch).eq("id", req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "update", entity_type: "task", entity_id: data.id,
+    summary: `Updated task "${data.title}"`,
+    before, after: data,
+  });
   res.json({ task: data });
 });
 
 // DELETE /tasks/:id
 tasksRouter.delete("/:id", async (req, res) => {
+  const { data: before } = await supabase
+    .from("fpx_shipment_tasks").select("id, title, shipment_id").eq("id", req.params.id).maybeSingle();
   const { error } = await supabase.from("fpx_shipment_tasks").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "delete", entity_type: "task", entity_id: req.params.id,
+    summary: before ? `Deleted task "${before.title}"` : "Deleted task",
+    before,
+  });
   res.json({ ok: true });
 });
