@@ -41,16 +41,6 @@ function isValidKey(k) {
   return typeof k === "string" && k.length > 10 && k !== "YOUR_FPX_API_KEY_HERE";
 }
 
-function base64EncodeUtf8(str) {
-  const bytes = new TextEncoder().encode(str);
-  let binary = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}
-
 async function getKeySource() {
   try {
     const { fpxApiKey } = await chrome.storage.local.get("fpxApiKey");
@@ -251,21 +241,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const { fpxApiKey, fpxApiUrl, fpxUserName } = await chrome.storage.local.get(["fpxApiKey", "fpxApiUrl", "fpxUserName"]);
       sendResponse({ key: fpxApiKey || "", url: fpxApiUrl || "", name: fpxUserName || "", source: await getKeySource() });
-    })();
-    return true;
-  } else if (msg.type === "saveDashboard") {
-    (async () => {
-      try {
-        const html = String(msg.html || "");
-        if (!html) { sendResponse({ ok: false, error: "Empty dashboard html." }); return; }
-        const b64 = base64EncodeUtf8(html);
-        const dataUrl = `data:text/html;base64,${b64}`;
-        const filename = (msg.filename || "fpx-dashboard-latest.html").replace(/[\\/:*?"<>|]/g, "_");
-        chrome.downloads.download({ url: dataUrl, filename, conflictAction: "overwrite", saveAs: false }, (downloadId) => {
-          if (chrome.runtime.lastError) sendResponse({ ok: false, error: chrome.runtime.lastError.message });
-          else sendResponse({ ok: true, downloadId });
-        });
-      } catch (e) { sendResponse({ ok: false, error: e?.message || String(e) }); }
     })();
     return true;
   } else if (msg.type === "saveApiKey") {

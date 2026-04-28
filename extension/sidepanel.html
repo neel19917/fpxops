@@ -3,23 +3,93 @@
 <head>
   <meta charset="utf-8">
   <style>
+    :root {
+      --fp-blue-50:  #eff6ff;
+      --fp-blue-100: #dbeafe;
+      --fp-blue-500: #0ea5e9;
+      --fp-blue-600: #2563eb;
+      --fp-blue-700: #1d4ed8;
+      --fp-slate-50: #f8fafc;
+      --fp-slate-100:#f1f5f9;
+      --fp-slate-200:#e2e8f0;
+      --fp-slate-300:#cbd5e1;
+      --fp-slate-500:#64748b;
+      --fp-slate-700:#334155;
+      --fp-slate-900:#0f172a;
+      --fp-emerald-600:#059669;
+      --fp-emerald-700:#047857;
+      --fp-rose-600:   #e11d48;
+    }
+    * { box-sizing: border-box; }
     body {
       width: 100%;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 13px;
-      padding: 16px;
+      padding: 0;
       margin: 0;
-      color: #1a1a1a;
-      box-sizing: border-box;
+      color: var(--fp-slate-900);
+      background: var(--fp-slate-50);
     }
+
+    /* ── FP-branded header ─────────────────────────── */
+    .fp-header {
+      background: linear-gradient(135deg, var(--fp-blue-500) 0%, var(--fp-blue-600) 100%);
+      color: #fff;
+      padding: 14px 16px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .fp-logo {
+      width: 32px; height: 32px;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.28);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 13px; letter-spacing: -0.5px;
+      flex: none;
+    }
+    .fp-brand-name { font-size: 14px; font-weight: 600; line-height: 1.1; }
+    .fp-brand-tag  { font-size: 11px; opacity: 0.85; line-height: 1.2; margin-top: 1px; }
+    .fp-header-status {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: none;
+    }
+    .fp-status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: rgba(255,255,255,0.4);
+    }
+    .fp-status-dot.online  { background: #4ade80; box-shadow: 0 0 0 3px rgba(74,222,128,0.25); }
+    .fp-status-dot.offline { background: #fca5a5; }
+    .fp-status-text { font-size: 11px; opacity: 0.95; font-weight: 500; }
+
+    /* ── Container for everything below the header ─── */
+    .fp-body { padding: 14px 16px 18px; }
+
     h3 {
       margin: 0 0 12px;
       font-size: 15px;
+      display: none; /* Old header replaced by .fp-header */
+    }
+
+    /* ── Footer (quiet technical state) ────────────── */
+    .fp-footer {
+      margin-top: 14px;
+      padding-top: 10px;
+      border-top: 1px solid var(--fp-slate-200);
       display: flex;
       align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--fp-slate-500);
     }
+    .fp-footer-item { cursor: default; }
+    #fpFooterCost { cursor: pointer; }
+    #fpFooterCost:hover { color: var(--fp-slate-900); }
+    .fp-footer-sep { opacity: 0.5; }
     .api-badge {
       font-size: 10px;
       font-weight: 600;
@@ -99,20 +169,31 @@
     label {
       display: block;
       font-weight: 600;
-      margin-bottom: 3px;
+      font-size: 11px;
+      color: var(--fp-slate-700);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin-bottom: 4px;
     }
     input, select {
       width: 100%;
-      padding: 6px 8px;
-      border: 1px solid #d1d5db;
-      border-radius: 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--fp-slate-200);
+      border-radius: 7px;
       font-size: 13px;
-      box-sizing: border-box;
+      background: #fff;
+      color: var(--fp-slate-900);
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--fp-blue-500);
+      box-shadow: 0 0 0 3px rgba(14,165,233,0.18);
     }
     .hint {
       font-size: 11px;
-      color: #6b7280;
-      margin-top: 2px;
+      color: var(--fp-slate-500);
+      margin-top: 4px;
     }
     .btn-row {
       display: flex;
@@ -121,20 +202,30 @@
     }
     button {
       flex: 1;
-      padding: 8px 0;
+      padding: 10px 0;
       border: none;
-      border-radius: 4px;
+      border-radius: 8px;
       font-size: 13px;
       font-weight: 600;
       cursor: pointer;
-      transition: opacity 0.15s;
+      transition: filter 0.15s, transform 0.05s, opacity 0.15s;
     }
     button:disabled {
-      opacity: 0.4;
+      opacity: 0.45;
       cursor: default;
     }
-    #startBtn { background: #2563eb; color: #fff; }
-    #stopBtn { background: #dc2626; color: #fff; }
+    button:not(:disabled):hover { filter: brightness(1.05); }
+    button:not(:disabled):active { transform: translateY(1px); }
+    #startBtn {
+      background: linear-gradient(135deg, var(--fp-blue-500), var(--fp-blue-600));
+      color: #fff;
+      box-shadow: 0 1px 2px rgba(15,23,42,0.08);
+    }
+    #stopBtn {
+      background: #fff;
+      color: var(--fp-rose-600);
+      border: 1px solid #fecaca;
+    }
 
     .progress-bar-container {
       display: none;
@@ -162,13 +253,16 @@
     .progress-text.visible { display: block; }
 
     #status {
-      background: #f3f4f6;
-      border-radius: 4px;
-      padding: 10px;
+      background: #fff;
+      border: 1px solid var(--fp-slate-200);
+      border-radius: 8px;
+      padding: 10px 12px;
       min-height: 20px;
-      line-height: 1.4;
+      line-height: 1.45;
       white-space: pre-wrap;
       word-break: break-word;
+      font-size: 12px;
+      color: var(--fp-slate-700);
     }
 
     .toggle-row {
@@ -272,26 +366,29 @@
 
     .tab-bar {
       display: flex;
-      gap: 0;
-      margin-bottom: 14px;
-      border-bottom: 2px solid #e5e7eb;
+      gap: 4px;
+      margin: 0 0 14px;
+      padding: 4px;
+      background: var(--fp-slate-100);
+      border-radius: 10px;
     }
     .tab-bar button {
       flex: 1;
-      padding: 8px 0;
+      padding: 7px 8px;
       border: none;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -2px;
-      background: none;
-      font-size: 13px;
+      background: transparent;
+      font-size: 12px;
       font-weight: 600;
-      color: #6b7280;
+      color: var(--fp-slate-500);
       cursor: pointer;
-      border-radius: 0;
+      border-radius: 7px;
+      transition: background 0.15s, color 0.15s;
     }
+    .tab-bar button:hover { color: var(--fp-slate-900); }
     .tab-bar button.active {
-      color: #2563eb;
-      border-bottom-color: #2563eb;
+      background: #fff;
+      color: var(--fp-blue-700);
+      box-shadow: 0 1px 2px rgba(15,23,42,0.05);
     }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
@@ -479,13 +576,29 @@
   </style>
 </head>
 <body>
-  <h3>
-    FPXpress Tracking Refresh
-    <span id="apiBadge" class="api-badge missing">No API Key</span>
-    <span id="costBadge" class="api-badge ok" style="cursor:pointer;background:#eff6ff;color:#1e40af" title="Click to reset">$0.0000</span>
-    <span id="serverBadge" class="server-badge offline"><span class="dot"></span> Server Offline</span>
-  </h3>
+  <!-- Branded header (matches the popup) -->
+  <header class="fp-header">
+    <div class="fp-logo">FP</div>
+    <div style="min-width:0;">
+      <div class="fp-brand-name">FPXpress</div>
+      <div class="fp-brand-tag">Shipment intelligence</div>
+    </div>
+    <div class="fp-header-status" id="fpHeaderStatus" title="">
+      <span class="fp-status-dot offline" id="fpHeaderDot"></span>
+      <span class="fp-status-text" id="fpHeaderText">Connecting…</span>
+    </div>
+  </header>
 
+  <!-- Old badges kept in DOM (hidden) so existing JS can keep updating them
+       without crashing. The new header status reflects API + server state in
+       plain language. -->
+  <div style="display:none;">
+    <span id="apiBadge" class="api-badge missing">No API Key</span>
+    <span id="costBadge" class="api-badge ok" title="Click to reset">$0.0000</span>
+    <span id="serverBadge" class="server-badge offline"><span class="dot"></span> Server Offline</span>
+  </div>
+
+  <div class="fp-body">
   <div class="tab-bar">
     <button id="tabTracking" class="active">Tracking</button>
     <button id="tabGpAudit">GP Audit</button>
@@ -790,6 +903,18 @@
     </div>
   </div><!-- end invoiceAuditTab -->
 
+  <!-- Quiet footer for technical state: usage cost, server uptime. Click cost
+       to reset the session counter (existing behavior). -->
+  <div class="fp-footer" id="fpFooter">
+    <span class="fp-footer-item" id="fpFooterCost" title="Session API cost — click to reset">—</span>
+    <span class="fp-footer-sep">·</span>
+    <span class="fp-footer-item" id="fpFooterServer">checking…</span>
+  </div>
+  </div><!-- end fp-body -->
+
+  <!-- SheetJS is bundled for the Invoice Audit flow only — used to PARSE
+       carrier-bill XLSX uploads in the sidepanel. The content script no
+       longer generates XLSX output (analysis lives in the dashboard). -->
   <script src="xlsx.full.min.js"></script>
   <script src="sidepanel.js"></script>
 </body>

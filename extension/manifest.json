@@ -3,7 +3,7 @@
   "name": "FPXpress Tracking Refresh",
   "version": "3.0",
   "description": "Automates tracking refresh on the FPXpress dashboard with AI-powered issue analysis via Claude Haiku.",
-  "permissions": ["activeTab", "scripting", "storage", "sidePanel", "downloads", "nativeMessaging"],
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel", "nativeMessaging"],
   "host_permissions": [
     "*://app.freightpop.com/*",
     "http://localhost:3210/*",

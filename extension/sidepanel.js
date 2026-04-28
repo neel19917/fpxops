@@ -5,6 +5,43 @@ const filterColSelect = document.getElementById("filterCol");
 const filterValSelect = document.getElementById("filterVal");
 const apiBadge = document.getElementById("apiBadge");
 const costBadge = document.getElementById("costBadge");
+// New branded header status + footer (defined in the redesigned sidepanel.html).
+// Old apiBadge / costBadge / serverBadge stay in the DOM but hidden so this code
+// can keep updating them without crashing legacy callers / tests.
+const fpHeaderDot = document.getElementById("fpHeaderDot");
+const fpHeaderText = document.getElementById("fpHeaderText");
+const fpHeaderStatus = document.getElementById("fpHeaderStatus");
+const fpFooterCost = document.getElementById("fpFooterCost");
+const fpFooterServer = document.getElementById("fpFooterServer");
+
+// Track API-key + server state so the header dot can reflect both:
+// — green only when key is set AND server is reachable
+// — amber when key set but server offline
+// — red when key missing
+let _hasApiKey = false;
+let _serverOnline = false;
+let _serverVersion = "";
+let _serverUptime = null;
+function renderHeaderStatus() {
+  if (!fpHeaderDot || !fpHeaderText) return;
+  let dotClass, label, title;
+  if (!_hasApiKey) {
+    dotClass = "offline";
+    label = "Setup needed";
+    title = "Open the popup to paste your API key.";
+  } else if (!_serverOnline) {
+    dotClass = "offline";
+    label = "API offline";
+    title = "Server isn't reachable. Try again or check your URL.";
+  } else {
+    dotClass = "online";
+    label = "Connected";
+    title = `API v${_serverVersion || "?"}` + (_serverUptime != null ? ` · up ${Math.round(_serverUptime / 60)}m` : "");
+  }
+  fpHeaderDot.className = "fp-status-dot " + dotClass;
+  fpHeaderText.textContent = label;
+  if (fpHeaderStatus) fpHeaderStatus.title = title;
+}
 const serverBadge = document.getElementById("serverBadge");
 const serverCtrl = document.getElementById("serverCtrl");
 const serverToggleBtn = document.getElementById("serverToggleBtn");
@@ -63,17 +100,23 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
 
 // --- API key check ---
 
-chrome.runtime.sendMessage({ type: "checkApiKey" }, (res) => {
-  if (res && res.configured) {
-    apiBadge.textContent = "API Key OK";
-    apiBadge.classList.remove("missing");
-    apiBadge.classList.add("ok");
-  } else {
-    apiBadge.textContent = "No API Key";
-    apiBadge.classList.remove("ok");
-    apiBadge.classList.add("missing");
-  }
-});
+function refreshApiKeyState() {
+  chrome.runtime.sendMessage({ type: "checkApiKey" }, (res) => {
+    const configured = !!(res && res.configured);
+    _hasApiKey = configured;
+    if (configured) {
+      apiBadge.textContent = "API Key OK";
+      apiBadge.classList.remove("missing");
+      apiBadge.classList.add("ok");
+    } else {
+      apiBadge.textContent = "No API Key";
+      apiBadge.classList.remove("ok");
+      apiBadge.classList.add("missing");
+    }
+    renderHeaderStatus();
+  });
+}
+refreshApiKeyState();
 
 // --- Claude API cost tracking ---
 
@@ -81,20 +124,28 @@ function updateCostBadge() {
   chrome.runtime.sendMessage({ type: "getApiCost" }, (res) => {
     if (!res) return;
     const usd = res.totalUsd || 0;
-    costBadge.textContent = `$${usd.toFixed(4)}`;
-    costBadge.title = `${res.calls || 0} API call(s) | ${(res.inputTokens || 0).toLocaleString()} in / ${(res.outputTokens || 0).toLocaleString()} out tokens — click to reset`;
+    const txt = `$${usd.toFixed(4)}`;
+    const title = `${res.calls || 0} API call(s) · ${(res.inputTokens || 0).toLocaleString()} in / ${(res.outputTokens || 0).toLocaleString()} out tokens — click to reset`;
+    costBadge.textContent = txt;
+    costBadge.title = title;
     costBadge.style.background = usd > 1 ? "#fef2f2" : usd > 0.1 ? "#fffbeb" : "#eff6ff";
     costBadge.style.color = usd > 1 ? "#991b1b" : usd > 0.1 ? "#92400e" : "#1e40af";
+    if (fpFooterCost) {
+      fpFooterCost.textContent = `Session: ${txt}`;
+      fpFooterCost.title = title;
+    }
   });
 }
 updateCostBadge();
 setInterval(updateCostBadge, 5000);
 
-costBadge.addEventListener("click", () => {
+function resetCostHandler() {
   if (confirm("Reset session API cost to $0?")) {
     chrome.runtime.sendMessage({ type: "resetApiCost" }, () => updateCostBadge());
   }
-});
+}
+costBadge.addEventListener("click", resetCostHandler);
+fpFooterCost?.addEventListener("click", resetCostHandler);
 
 // --- API server health + (for localhost) Start/Stop control -----------------
 
@@ -117,6 +168,9 @@ function setBtn(label, cls, disabled) {
 
 function updateServerStatus(online, version, uptime) {
   serverOnline = online;
+  _serverOnline = !!online;
+  _serverVersion = version || "";
+  _serverUptime = uptime != null ? uptime : null;
   if (online) {
     const uptimeStr = uptime != null ? ` (up ${formatUptime(uptime)})` : "";
     serverBadge.className = "server-badge online";
@@ -127,6 +181,7 @@ function updateServerStatus(online, version, uptime) {
       setBtn("Stop", "stop", busy);
       serverHint.classList.remove("visible");
     }
+    if (fpFooterServer) fpFooterServer.textContent = `API v${version || "?"}${uptimeStr}`;
   } else {
     serverBadge.className = "server-badge offline";
     serverBadge.innerHTML = '<span class="dot"></span> API offline';
@@ -135,7 +190,9 @@ function updateServerStatus(online, version, uptime) {
       serverSub.textContent = "Click Start to launch the Node server on your machine.";
       setBtn("Start", "start", busy);
     }
+    if (fpFooterServer) fpFooterServer.textContent = "API offline";
   }
+  renderHeaderStatus();
 }
 
 function checkServer() {
@@ -198,7 +255,10 @@ setInterval(checkServer, 15000);
 
 // Re-evaluate when the popup saves a new URL/key.
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === "apiKeyUpdated") refreshServerCard();
+  if (msg && msg.type === "apiKeyUpdated") {
+    refreshServerCard();
+    refreshApiKeyState();
+  }
 });
 
 // --- Content script injection ---
@@ -207,10 +267,6 @@ async function ensureContentScript(tabId) {
   try {
     await chrome.tabs.sendMessage(tabId, { action: "ping" });
   } catch {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["xlsx.full.min.js"],
-    });
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["content.js"],
