@@ -381,10 +381,6 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     if (taskWalk?.nextTaskId) { taskWalk.onWalk(taskWalk.nextTaskId); return; }
     if (drawerNext) setDrawerId(drawerNext.id);
   }
-  function openShipmentSibling(target: Shipment | null) {
-    if (!target) return;
-    setDrawerId(target.id);
-  }
 
   // Keyboard shortcuts that fire only while the drawer is open. CRM-style:
   // step through the filtered list, jump to a tab, run the common drawer
