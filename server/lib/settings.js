@@ -9,6 +9,12 @@ const FALLBACKS = {
   "prompt.per_shipment_logic": DEFAULTS.PER_SHIPMENT_LOGIC,
   "prompt.priority": DEFAULTS.PRIORITY_PROMPT,
   "prompt.summary": DEFAULTS.SUMMARY_PROMPT,
+  "prompt.gp_system": DEFAULTS.GP_SYSTEM_PROMPT,
+  "prompt.gp_exec_summary": DEFAULTS.GP_EXEC_SUMMARY_PROMPT,
+  "prompt.gp_row_review": DEFAULTS.GP_ROW_REVIEW_PROMPT,
+  "prompt.invoice_system": DEFAULTS.INVOICE_SYSTEM_PROMPT,
+  "prompt.invoice_exec_summary": DEFAULTS.INVOICE_EXEC_SUMMARY_PROMPT,
+  "prompt.invoice_row_review": DEFAULTS.INVOICE_ROW_REVIEW_PROMPT,
   "prompt.email_draft.system_base":
     'You are a freight brokerage operations assistant at FPX. FPX is the freight broker — not the carrier and not the customer. You always write FROM FPX. Drafting an email now. {{audienceCopy}} Output strict JSON: {"subject": "...", "body": "..."}. Body should be plain text with line breaks (\'\\n\') — no markdown. Sign as "[Your name]\\nFPX Operations" (do not invent a name).',
   "prompt.email_draft.audience_carrier":

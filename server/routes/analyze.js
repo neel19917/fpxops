@@ -3,6 +3,16 @@ import { supabase } from "../lib/supabase.js";
 import { callClaude } from "../lib/anthropic.js";
 import { mapShipment } from "../lib/shipments.js";
 import { getSettings } from "../lib/settings.js";
+// GP/Invoice prompt defaults — editable in the Settings tab via prompt.gp_* /
+// prompt.invoice_* keys (registered in FALLBACKS in lib/settings.js).
+import {
+  GP_SYSTEM_PROMPT as GP_DEFAULT_SYSTEM,
+  GP_EXEC_SUMMARY_PROMPT as GP_DEFAULT_EXEC_SUMMARY,
+  GP_ROW_REVIEW_PROMPT as GP_DEFAULT_ROW_REVIEW,
+  INVOICE_SYSTEM_PROMPT as INV_DEFAULT_SYSTEM,
+  INVOICE_EXEC_SUMMARY_PROMPT as INV_DEFAULT_EXEC_SUMMARY,
+  INVOICE_ROW_REVIEW_PROMPT as INV_DEFAULT_ROW_REVIEW,
+} from "../prompts.js";
 
 export const analyzeRouter = Router();
 
@@ -141,72 +151,8 @@ analyzeRouter.post("/summary", async (req, res) => {
   res.json(result);
 });
 
-// ---------- GP audit defaults ----------
-// Mirror the prompts the extension used so the extension-only path and the
-// server-only path produce equivalent output. Settings overrides
-// (prompt.gp_*, prompt.invoice_*) win when present.
-const GP_DEFAULT_SYSTEM =
-  "You are a freight brokerage GP (gross profit) analyst. You review GP audit reports " +
-  "covering one or more business days from the FreightPOP transaction history. " +
-  "Your audience is brokerage operations management. Be precise with numbers, " +
-  "reference actual customer names and IDs, and clearly separate urgent items from informational observations.";
-
-const GP_DEFAULT_EXEC_SUMMARY =
-  "You are reviewing a GP audit for a freight brokerage. The JSON below contains:\n\n" +
-  "• date — the shipped date(s) covered\n" +
-  "• totalShipments, totalCustomers, outlierCount, reviewCount — aggregate counts\n" +
-  "• customerSummaries[] — per-customer: customerId, customerName, shipments (count), avgGpPct, stdev, outliers (count)\n" +
-  "• flaggedShipments[] — rows needing review: shipmentId, customerId, customerName, markedUpRate, grossProfit, gpPct, customerAvgGpPct, deviation, reason, carrier, service\n\n" +
-  "GP% = Gross Profit / Marked-Up Rate × 100. Outliers are >2 standard deviations from that customer's average. Borderline = 1.5–2 STDEV.\n\n" +
-  "Write an executive summary in markdown with these sections:\n" +
-  "1. **Overall GP Health** — one-line verdict, then 2-3 sentences on portfolio-wide margin trends.\n" +
-  "2. **Critical Outliers** — each outlier customer with ID, count, avg GP%, volatility, and specific flagged shipments.\n" +
-  "3. **Patterns & Trends** — systematic underperformance, auto-pricing floors, carrier-specific variance.\n" +
-  "4. **Recommended Actions** — prioritized (Immediate / This Week / Strategic). Be specific.\n\n" +
-  "Rules:\n" +
-  "- Reference actual customer names/IDs and shipment IDs from the data.\n" +
-  "- Healthy brokerage GP benchmark is 15-20%. Flag anything consistently below 10%.\n" +
-  "- Keep total length 250-400 words.\n\n" +
-  "Data:\n{{data}}";
-
-const GP_DEFAULT_ROW_REVIEW =
-  "You are reviewing a single flagged shipment from a freight brokerage GP audit.\n\n" +
-  "The JSON contains: shipmentId, customerId, customerName, markedUpRate, rateWithoutMarkup, " +
-  "grossProfit, gpPct, customerAvgGpPct, stdev, deviation, reason, carrier, service, accountManager.\n\n" +
-  "Provide a 2-3 sentence assessment:\n" +
-  "1. Why this GP% is unusual for this customer.\n" +
-  "2. Most likely cause.\n" +
-  "3. What the account manager should verify or do next.\n\n" +
-  "Be specific. Reference the actual numbers.\n\n" +
-  "Shipment:\n{{row}}";
-
-const INV_DEFAULT_SYSTEM =
-  "You are a freight brokerage accounting auditor. You compare carrier invoices (bills) against " +
-  "FreightPOP's recorded shipment cost to identify billing discrepancies. Be precise with dollar amounts and percentages.\n\n" +
-  "Primary comparison: Bill Amount [CI] vs Shipment Cost [FPX]";
-
-const INV_DEFAULT_EXEC_SUMMARY =
-  "You are reviewing an invoice audit for a freight brokerage. The JSON below contains:\n\n" +
-  "• totalAudited, totalMatched, totalDiscrepancies, totalErrors, totalSkipped, totalVariance\n" +
-  "• discrepancies[] — each: shipmentId, vendor, invoiceNumber, billAmount, shipmentCost, shipmentSale, grossProfit, difference, pctDifference, direction (OVER/UNDER)\n" +
-  "• matches[] — sample of shipments that matched (bill ≈ FPX cost within $0.01)\n\n" +
-  "Write an executive summary in markdown:\n" +
-  "1. **Overall Assessment** — verdict + totals + net $ variance.\n" +
-  "2. **Discrepancies** — each with shipment ID, vendor, invoice #, amounts, likely cause.\n" +
-  "3. **Vendor Patterns** — any vendor consistently over/under billing?\n" +
-  "4. **Recommended Actions** — prioritized: dispute / verify / accept.\n\n" +
-  "Rules:\n" +
-  "- Reference actual shipment IDs and vendor names.\n" +
-  "- OVER means carrier invoiced MORE than FPX cost.\n" +
-  "- Keep to 200-400 words.\n\n" +
-  "Data:\n{{data}}";
-
-const INV_DEFAULT_ROW_REVIEW =
-  "You are reviewing a single carrier bill discrepancy.\n\n" +
-  "The JSON contains: shipmentId, vendor, invoiceNumber, billAmount, shipmentCost, shipmentSale, " +
-  "grossProfit, difference, pctDifference, direction (OVER/UNDER).\n\n" +
-  "Provide a 2-3 sentence assessment of the most likely cause and what the accounting team should do.\n\n" +
-  "Shipment:\n{{row}}";
+// GP / Invoice prompt defaults imported at the top of the file — editable from
+// the dashboard's Settings tab via the prompt.gp_* / prompt.invoice_* keys.
 
 // Build the AI payload that the exec-summary prompt consumes from a list of
 // fpx_gp_audit_rows + the audit run record. Mirrors the shape the extension

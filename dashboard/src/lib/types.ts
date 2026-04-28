@@ -141,6 +141,7 @@ export interface GpAuditRow {
   gp_pct: number | null;
   is_outlier: boolean;
   std_deviations: number | null;
+  ai_notes: string | null;
 }
 
 export interface InvoiceAudit {
@@ -165,6 +166,7 @@ export interface InvoiceAuditRow {
   shipment_cost: number | null;
   difference: number | null;
   status: string | null;
+  ai_notes: string | null;
 }
 
 export interface ApiKey {

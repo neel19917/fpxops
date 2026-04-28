@@ -131,10 +131,20 @@ export const api = {
     gp: {
       list: () => request<{ data: GpAudit[] }>("/api/audits/gp"),
       get: (id: string) => request<{ run: GpAudit; rows: GpAuditRow[] }>(`/api/audits/gp/${id}`),
+      reanalyze: (id: string, level: "summary" | "full" = "summary") =>
+        request<{ run: GpAudit }>(`/api/audits/gp/${id}/reanalyze`, {
+          method: "POST",
+          body: JSON.stringify({ level }),
+        }),
     },
     invoice: {
       list: () => request<{ data: InvoiceAudit[] }>("/api/audits/invoice"),
       get: (id: string) => request<{ run: InvoiceAudit; rows: InvoiceAuditRow[] }>(`/api/audits/invoice/${id}`),
+      reanalyze: (id: string, level: "summary" | "full" = "summary") =>
+        request<{ run: InvoiceAudit }>(`/api/audits/invoice/${id}/reanalyze`, {
+          method: "POST",
+          body: JSON.stringify({ level }),
+        }),
     },
   },
   apiKeys: {

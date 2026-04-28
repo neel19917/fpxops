@@ -237,24 +237,27 @@ land or scope shifts.
   Supabase Auth → URL Configuration → Redirect URLs (extension ID is
   per-install for unpacked; stable once published to Web Store).
 
-### Cleaner extension sidepanel UI (partial — finish as needed)
+### Cleaner extension sidepanel UI
 - [x] Tracking / GP / Invoice tabs: AI controls + prompt editors removed;
   banners point reps to the dashboard
-- [ ] Hide the **Local API server** card unless URL is `localhost`
-- [ ] FP-branded header on the side panel (matches the new popup)
+- [x] Hide the **Local API server** card unless URL is `localhost`
+  (already gated via `isLocalApi` in `sidepanel.js`)
+- [x] FP-branded header on the side panel — gradient header with logo +
+  brand name matches the popup (`<header class="fp-header">` in
+  `sidepanel.html`)
 - [ ] Tighten paddings / font sizes; make Start/Stop visually dominant
+  (deferred — needs visual iteration in browser)
 
 ### Dashboard surfacing for new GP / Invoice AI output
-- [ ] Render `ai_notes` on per-row outlier / discrepancy lists in the
-  GP Audits + Invoice Audits drawer / detail views
-- [ ] Re-analyze button on the GP / Invoice audit run pages
-  (endpoints already wired: `POST /api/audits/{gp,invoice}/:id/reanalyze`)
-- [ ] Seed `prompt.gp_system` / `prompt.gp_exec_summary` /
-  `prompt.gp_row_review` / `prompt.invoice_system` /
-  `prompt.invoice_exec_summary` / `prompt.invoice_row_review` in
-  `fpx_settings` so admins can edit them from the Settings page
-  (helpers fall back to inline defaults today, which is fine but
-  not editable)
+- [x] Render `ai_notes` on per-row outlier / discrepancy lists in the
+  GP Audits + Invoice Audits drawer (sky-tinted block under each row)
+- [x] Re-analyze button on the GP / Invoice audit run pages — split
+  Re-analyze (summary) / Full (per-row notes); uses
+  `POST /api/audits/{gp,invoice}/:id/reanalyze`; refreshes the drawer
+  and the list row in place
+- [x] Seed `prompt.gp_*` / `prompt.invoice_*` in `FALLBACKS` so they
+  show up in the Settings tab. Defaults moved from `routes/analyze.js`
+  to `prompts.js` and registered in `lib/settings.js#FALLBACKS`.
 
 ### Other
 - [ ] Verify dedupe with a second extension run (smoke test)
