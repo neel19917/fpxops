@@ -104,6 +104,68 @@ describe("mapShipment — name fallback ladder", () => {
   });
 });
 
+describe("mapShipment — Shipment status sourcing", () => {
+  it("prefers the Kendo 'Shipment status' (lowercase 's') over modal-scraped 'Status'", () => {
+    const out = mapShipment({
+      _trackingNumber: "TRK-1",
+      "Shipment status": "In Transit",   // Kendo grid column
+      "Status": "Ship Date:",            // modal label residue
+    });
+    assert.equal(out.shipment_status, "In Transit");
+  });
+
+  it("falls through to 'Status' when the Kendo column is missing", () => {
+    const out = mapShipment({
+      _trackingNumber: "TRK-1",
+      "Status": "Delivered",
+    });
+    assert.equal(out.shipment_status, "Delivered");
+  });
+
+  it("drops label-only Status residue ('Ship Date:') and yields null", () => {
+    const out = mapShipment({
+      _trackingNumber: "TRK-1",
+      "Status": "Ship Date:",
+    });
+    assert.equal(out.shipment_status, null);
+  });
+
+  it("drops 'Origin Terminal:' label residue (seen on Ship Date in prod)", () => {
+    // cleanField runs on every text field; verify via the comments path.
+    const out = mapShipment({
+      _trackingNumber: "TRK-1",
+      "Comments": "Origin Terminal:",
+    });
+    assert.equal(out.comments, null);
+  });
+
+  it("drops compound label residue 'Delivered Date: Event History:'", () => {
+    const out = mapShipment({
+      _trackingNumber: "TRK-1",
+      "Status": "Delivered Date: Event History:",
+    });
+    assert.equal(out.shipment_status, null);
+  });
+
+  it("keeps clean status tokens unchanged ('Booked' / 'Out For Delivery')", () => {
+    const a = mapShipment({ _trackingNumber: "TRK-1", "Shipment status": "Booked" });
+    assert.equal(a.shipment_status, "Booked");
+    const b = mapShipment({ _trackingNumber: "TRK-2", "Shipment status": "Out For Delivery" });
+    assert.equal(b.shipment_status, "Out For Delivery");
+  });
+
+  it("does NOT drop a real status that happens to contain a colon (e.g. 'Arrived: terminal scan')", () => {
+    // Real values longer than 30 chars after the colon won't match the
+    // label-only regex, so they survive.
+    const out = mapShipment({
+      _trackingNumber: "TRK-1",
+      "Shipment status": "Arrived at terminal from SPARTANBURG, SC; Time: 10:03 AM",
+    });
+    assert.ok(out.shipment_status, "real status with a colon must survive");
+    assert.ok(out.shipment_status.includes("SPARTANBURG"));
+  });
+});
+
 describe("mapShipmentsBulk — additional cases", () => {
   it("forwards runnerName to every row", () => {
     const out = mapShipmentsBulk([

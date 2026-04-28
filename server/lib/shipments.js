@@ -35,17 +35,26 @@ const pick = (raw, keys) => {
 // grabs the whole blob. Detect that here and drop it; cap reasonable fields
 // to a readable length.
 const MODAL_BLOB_MARKERS = ["Tracking Number:", "Ship From:", "Ship To:", "Carrier:", "Service:", "Number of Pieces:", "Total Weight:"];
+
+// Drops "label-only" strings — short bare-label residue that the modal
+// scraper picks up when it overshoots an empty value cell into the next
+// field's title. Examples seen in prod: "Ship Date:", "Origin Terminal:",
+// "Delivered Date: Event History:", "Status:".
+function isLabelOnly(s) {
+  if (s.length >= 60) return false;
+  // 1–4 capitalized words optionally followed by a colon and very little
+  // else — that's a field label, not a real value.
+  return /^[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,3}\s*:\s*[A-Z][A-Za-z\s]{0,30}:?\s*$/.test(s)
+      || /^[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,3}\s*:\s*$/.test(s);
+}
+
 function cleanField(v, opts = {}) {
   if (v === null || v === undefined) return null;
   let s = String(v).replace(/\s+/g, " ").trim();
   if (!s) return null;
   const hits = MODAL_BLOB_MARKERS.filter((m) => s.includes(m)).length;
   if (hits >= 3) return null;                                  // full-modal blob — drop
-  // Strings that are pure label residue from a stripped sibling — e.g.
-  // "Delivered Date: Event History:" — are not real values.
-  if (/^(Status|Delivered Date|Date|Event History|Notes|Details)\s*:/i.test(s) && s.length < 80) {
-    return null;
-  }
+  if (isLabelOnly(s)) return null;
   const max = opts.maxLen ?? 300;
   if (s.length > max) s = s.slice(0, max).replace(/\s+\S*$/, "") + "…";
   return s;
@@ -90,7 +99,11 @@ export function mapShipment(raw, runnerName) {
     carrier: pick(raw, ["CARRIER", "Carrier"]),
     carrier_name: pick(raw, ["CARRIER NAME", "Carrier Name"]),
     mode: pick(raw, ["MODE", "Mode"]),
-    shipment_status: cleanField(pick(raw, ["SHIPMENT STATUS", "Shipment Status", "Status"]), { maxLen: 80 }),
+    // Prefer the Kendo grid's "Shipment status" column (clean tokens like
+    // "In Transit" / "Booked" / "Out For Delivery") over the modal-scraped
+    // "Status" — modal "Status" gets poisoned with adjacent label text
+    // ("Ship Date:") when the value cell is empty. Order matters here.
+    shipment_status: cleanField(pick(raw, ["Shipment status", "SHIPMENT STATUS", "Shipment Status", "Current Status", "Status"]), { maxLen: 80 }),
     comments: cleanField(pick(raw, ["COMMENTS", "Comments"]), { maxLen: 500 }),
     pickup_response: cleanField(pick(raw, ["PICKUP RESPONSE", "Pickup Response"]), { maxLen: 200 }),
     pickup_request_number: cleanField(pick(raw, ["PICKUP REQUEST NUMBER"]), { maxLen: 60 }),
