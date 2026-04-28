@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight } from "lucide-react";
 import { api } from "../lib/api";
 import type { ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { useNav } from "../lib/nav";
@@ -19,6 +19,8 @@ const SHORTCUTS: { keys: string[]; label: string }[] = [
   { keys: ["3"], label: "Priority: high" },
   { keys: ["4"], label: "Priority: urgent" },
   { keys: ["enter"], label: "Open shipment drawer" },
+  { keys: ["n"], label: "Walk to next task (opens its shipment)" },
+  { keys: ["p"], label: "Walk to previous task (opens its shipment)" },
   { keys: ["a"], label: "Add to bulk-select (toggle)" },
   { keys: ["e"], label: "Edit assignee inline" },
   { keys: ["d", "delete"], label: "Delete task (with confirm)" },
@@ -103,6 +105,17 @@ const PRIORITY_COLOR: Record<string, string> = {
 //   "open" / "in_progress" / "blocked" / "done" / "cancelled"
 //                → real status filter, sent to the server
 const FILTER_KEY = "fpx.tasks.statusFilter";
+const VIEW_KEY   = "fpx.tasks.view";   // "table" | "kanban"
+
+// Kanban columns. Order = left-to-right reading order = the workflow
+// progression. Cancelled is intentionally excluded (rare, hide it from the
+// daily flow; still reachable via the Table view's filter).
+const KANBAN_COLS: { id: TaskStatus; label: string; tone: string; chip: string }[] = [
+  { id: "open",        label: "Open",        tone: "bg-sky-50 ring-sky-200",         chip: "bg-sky-100 text-sky-800" },
+  { id: "in_progress", label: "In Progress", tone: "bg-indigo-50 ring-indigo-200",   chip: "bg-indigo-100 text-indigo-800" },
+  { id: "blocked",     label: "Blocked",     tone: "bg-amber-50 ring-amber-200",     chip: "bg-amber-100 text-amber-800" },
+  { id: "done",        label: "Done",        tone: "bg-emerald-50 ring-emerald-200", chip: "bg-emerald-100 text-emerald-800" },
+];
 
 export function TasksPage() {
   const nav = useNav();
@@ -113,10 +126,19 @@ export function TasksPage() {
   const [statusFilter, setStatusFilter] = useState<string>(() => {
     try { return localStorage.getItem(FILTER_KEY) ?? "active"; } catch { return "active"; }
   });
+  const [viewMode, setViewMode] = useState<"table" | "kanban">(() => {
+    try {
+      const v = localStorage.getItem(VIEW_KEY);
+      return v === "kanban" ? "kanban" : "table";
+    } catch { return "table"; }
+  });
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     try { localStorage.setItem(FILTER_KEY, statusFilter); } catch {}
   }, [statusFilter]);
+  useEffect(() => {
+    try { localStorage.setItem(VIEW_KEY, viewMode); } catch {}
+  }, [viewMode]);
 
   // Bulk selection + assign state.
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -251,10 +273,14 @@ export function TasksPage() {
   // only fetch on mount + on explicit Refresh.
   useEffect(() => { load(); }, []);
 
-  async function setStatus(t: ShipmentTask, status: TaskStatus) {
+  async function setStatus(t: ShipmentTask, status: TaskStatus, opts: { openDrawer?: boolean } = {}) {
     try {
       const { task } = await api.tasks.update(t.id, { status });
       setTasks((prev) => prev.map((p) => (p.id === task.id ? task : p)));
+      // Starting a task means starting work on the shipment — pop the drawer
+      // open so the user lands directly in context. Other transitions
+      // (Complete / Reopen) stay where they are.
+      if (opts.openDrawer && t.shipment_id) nav.openShipment(t.shipment_id);
     } catch (e) { setError((e as Error).message); }
   }
   async function updateAssignee(t: ShipmentTask, assigned_to: string | null) {
@@ -377,6 +403,21 @@ export function TasksPage() {
         if (t.shipment_id) { e.preventDefault(); nav.openShipment(t.shipment_id); }
         return;
       }
+      // Walk-through: n / p step through the visible task list and open
+      // each task's shipment in the drawer.
+      if (e.key === "n" || e.key === "p") {
+        e.preventDefault();
+        const dir = e.key === "n" ? 1 : -1;
+        const start = idx < 0 ? 0 : idx + dir;
+        // Find the next task that has a shipment; skip orphans rather than
+        // opening nothing.
+        for (let i = start; i >= 0 && i < visibleTasks.length; i += dir) {
+          const cand = visibleTasks[i];
+          setFocusedId(cand.id);
+          if (cand.shipment_id) { nav.openShipment(cand.shipment_id); break; }
+        }
+        return;
+      }
       if (e.key === "a") {
         e.preventDefault();
         toggle(t.id);
@@ -431,6 +472,24 @@ export function TasksPage() {
           <p className="text-sm text-slate-500 mt-0.5">Follow-ups across shipments. Auto-assigned to whoever scraped the shipment.</p>
         </div>
         <div className="flex items-center gap-2">
+          <div className="inline-flex rounded-lg ring-1 ring-slate-200 bg-white overflow-hidden">
+            <button
+              onClick={() => setViewMode("table")}
+              className={"px-2.5 py-2 text-sm flex items-center gap-1.5 " + (viewMode === "table" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50")}
+              title="Table view"
+              aria-pressed={viewMode === "table"}
+            >
+              <TableIcon className="h-4 w-4" />
+            </button>
+            <button
+              onClick={() => setViewMode("kanban")}
+              className={"px-2.5 py-2 text-sm flex items-center gap-1.5 " + (viewMode === "kanban" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50")}
+              title="Kanban view"
+              aria-pressed={viewMode === "kanban"}
+            >
+              <LayoutGrid className="h-4 w-4" />
+            </button>
+          </div>
           <button
             onClick={startAllOpen}
             disabled={bulkBusy || counts.open === 0}
@@ -438,6 +497,19 @@ export function TasksPage() {
             title="Mark every open task as In Progress"
           >
             <Rocket className="h-4 w-4" /> {bulkBusy ? "Starting…" : `Start all open (${counts.open})`}
+          </button>
+          <button
+            onClick={() => {
+              const first = visibleTasks.find((t) => t.shipment_id);
+              if (!first) { setError("No task with a shipment to walk through."); return; }
+              setFocusedId(first.id);
+              if (first.shipment_id) nav.openShipment(first.shipment_id);
+            }}
+            disabled={visibleTasks.length === 0}
+            className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Open the first visible task and walk through them with n / p"
+          >
+            <ChevronRight className="h-4 w-4" /> Walk through ({visibleTasks.length})
           </button>
           <select
             value={statusFilter}
@@ -551,6 +623,15 @@ export function TasksPage() {
         </div>
       ) : null}
 
+      {viewMode === "kanban" ? (
+        <KanbanBoard
+          tasks={tasks}
+          focusedId={focusedId}
+          onFocus={setFocusedId}
+          onSetStatus={(t, s) => setStatus(t, s, { openDrawer: s === "in_progress" && t.status === "open" })}
+          onOpenShipment={(id) => nav.openShipment(id)}
+        />
+      ) : (
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-xs uppercase text-slate-500">
@@ -619,7 +700,7 @@ export function TasksPage() {
                 </td>
                 <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                   <button
-                    onClick={() => setStatus(t, nextStatus)}
+                    onClick={() => setStatus(t, nextStatus, { openDrawer: t.status === "open" })}
                     title={`${statusLabel} (currently ${STATUS_LABEL[t.status]})`}
                     className={
                       "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 ring-1 transition " +
@@ -700,6 +781,7 @@ export function TasksPage() {
           </tbody>
         </table>
       </div>
+      )}
 
       <p className="text-xs text-slate-500 mt-3 text-center">
         Press <kbd className="px-1.5 py-0.5 rounded bg-white ring-1 ring-slate-200 font-mono text-[10px]">?</kbd> for keyboard shortcuts.
@@ -743,6 +825,136 @@ export function TasksPage() {
               Shortcuts pause while you're typing in an input. <kbd className="px-1 py-0.5 rounded bg-white ring-1 ring-slate-200 font-mono">esc</kbd> closes this.
             </div>
           </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ===========================================================================
+// Kanban
+// ===========================================================================
+
+interface KanbanBoardProps {
+  tasks: ShipmentTask[];
+  focusedId: string | null;
+  onFocus: (id: string) => void;
+  onSetStatus: (t: ShipmentTask, status: TaskStatus) => void;
+  onOpenShipment: (id: string) => void;
+}
+
+function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenShipment }: KanbanBoardProps) {
+  const grouped = useMemo(() => {
+    const m: Record<TaskStatus, ShipmentTask[]> = {
+      open: [], in_progress: [], blocked: [], done: [], cancelled: [],
+    };
+    for (const t of tasks) m[t.status]?.push(t);
+    return m;
+  }, [tasks]);
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+      {KANBAN_COLS.map((col) => {
+        const items = grouped[col.id] || [];
+        return (
+          <div key={col.id} className={`rounded-xl ring-1 ${col.tone} flex flex-col min-h-[200px]`}>
+            <div className="px-3 py-2.5 flex items-center justify-between border-b border-white/60">
+              <span className="text-sm font-semibold text-slate-800">{col.label}</span>
+              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${col.chip}`}>
+                {items.length}
+              </span>
+            </div>
+            <div className="p-2 space-y-2 flex-1">
+              {items.length === 0 ? (
+                <div className="text-xs text-slate-400 text-center py-6">Nothing here</div>
+              ) : items.map((t) => (
+                <KanbanCard
+                  key={t.id}
+                  task={t}
+                  focused={focusedId === t.id}
+                  onFocus={onFocus}
+                  onSetStatus={onSetStatus}
+                  onOpenShipment={onOpenShipment}
+                />
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+interface KanbanCardProps {
+  task: ShipmentTask;
+  focused: boolean;
+  onFocus: (id: string) => void;
+  onSetStatus: (t: ShipmentTask, s: TaskStatus) => void;
+  onOpenShipment: (id: string) => void;
+}
+
+function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenShipment }: KanbanCardProps) {
+  // Action choices per column. Open → Start. In Progress → Done | Block.
+  // Blocked → Reopen. Done → Reopen. Keeps the card terse — at most two
+  // buttons.
+  const actions: { label: string; status: TaskStatus; tone: string; icon: React.ReactNode }[] = (() => {
+    if (task.status === "open") return [
+      { label: "Start", status: "in_progress", tone: "bg-indigo-600 text-white hover:bg-indigo-700", icon: <Play className="h-3 w-3" /> },
+    ];
+    if (task.status === "in_progress") return [
+      { label: "Done",  status: "done",    tone: "bg-emerald-600 text-white hover:bg-emerald-700", icon: <CheckCircle2 className="h-3 w-3" /> },
+      { label: "Block", status: "blocked", tone: "bg-white text-amber-700 ring-1 ring-amber-200 hover:bg-amber-50", icon: <Ban className="h-3 w-3" /> },
+    ];
+    if (task.status === "blocked") return [
+      { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50", icon: <Circle className="h-3 w-3" /> },
+    ];
+    if (task.status === "done") return [
+      { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50", icon: <Circle className="h-3 w-3" /> },
+    ];
+    return [];
+  })();
+
+  return (
+    <div
+      onClick={() => onFocus(task.id)}
+      className={
+        "bg-white rounded-lg ring-1 p-2.5 cursor-pointer transition " +
+        (focused ? "ring-2 ring-sky-400 shadow-sm" : "ring-slate-200 hover:ring-slate-300")
+      }
+    >
+      <div className="text-sm text-slate-900 font-medium leading-snug line-clamp-3">
+        {task.title}
+      </div>
+      <div className="mt-2 flex items-center gap-2 flex-wrap">
+        <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold ${PRIORITY_COLOR[task.priority] || PRIORITY_COLOR.normal}`}>
+          {task.priority}
+        </span>
+        {task.tracking_number && task.shipment_id ? (
+          <button
+            onClick={(e) => { e.stopPropagation(); onOpenShipment(task.shipment_id!); }}
+            className="text-[11px] font-mono text-sky-700 hover:text-sky-900 hover:underline truncate"
+            title="Open shipment drawer"
+          >
+            {task.tracking_number}
+          </button>
+        ) : task.tracking_number ? (
+          <span className="text-[11px] font-mono text-slate-500 truncate">{task.tracking_number}</span>
+        ) : null}
+      </div>
+      {task.assigned_to ? (
+        <div className="mt-1.5 text-[11px] text-slate-500 truncate">{task.assigned_to}</div>
+      ) : null}
+      {actions.length > 0 ? (
+        <div className="mt-2 flex items-center gap-1.5">
+          {actions.map((a) => (
+            <button
+              key={a.label}
+              onClick={(e) => { e.stopPropagation(); onSetStatus(task, a.status); }}
+              className={`text-[11px] font-semibold rounded-md px-2 py-1 inline-flex items-center gap-1 ${a.tone}`}
+            >
+              {a.icon} {a.label}
+            </button>
+          ))}
         </div>
       ) : null}
     </div>
