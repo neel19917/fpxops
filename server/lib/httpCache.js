@@ -1,20 +1,15 @@
-import crypto from "node:crypto";
-
-// Send a JSON response with a strong ETag and a private Cache-Control window.
-// Honors If-None-Match to short-circuit to 304 (no body) when the client
-// already has the same payload — saves bandwidth on tab switches.
+// Send a JSON response with a private Cache-Control window. The browser
+// transparently caches within max-age and revalidates in the background
+// during the stale-while-revalidate window — no extra wiring on the client.
 //
 // `private` is intentional: every authenticated response is user-scoped via
 // Bearer JWT or API key, and must NEVER be cached by a shared/edge proxy.
-// max-age + stale-while-revalidate let the browser serve instantly on repeat
-// navigations within the window while revalidating in the background.
-export function sendCachedJson(req, res, body, { maxAge = 15, swr = 60 } = {}) {
-  const json = JSON.stringify(body);
-  const etag = `W/"${crypto.createHash("sha1").update(json).digest("base64")}"`;
-  res.set("ETag", etag);
+//
+// We deliberately do NOT short-circuit If-None-Match → 304 here. Express
+// already issues weak ETags, and a hand-rolled 304 path tripped the
+// dashboard's fetch wrapper (treats 304 as not-ok with an empty body) —
+// pages stuck on "Loading…" on repeat visits.
+export function sendCachedJson(_req, res, body, { maxAge = 15, swr = 60 } = {}) {
   res.set("Cache-Control", `private, max-age=${maxAge}, stale-while-revalidate=${swr}`);
-  if (req.header("If-None-Match") === etag) {
-    return res.status(304).end();
-  }
-  res.type("application/json").send(json);
+  res.json(body);
 }
