@@ -19,6 +19,91 @@ async function getApiKey() {
   return typeof FPX_API_KEY === "string" ? FPX_API_KEY : "";
 }
 
+// ---------- Supabase session (Microsoft sign-in) ----------
+// Stored shape: { access_token, refresh_token, expires_at, email, provider }
+// expires_at is a unix timestamp in seconds. Refresh handling is deferred —
+// once expired the popup re-prompts. Bearer auth always wins over x-api-key
+// in callApi, so adding a session implicitly upgrades the extension.
+const SUPABASE_URL = "https://vvplkjgymahavqrejmgm.supabase.co";
+
+async function getSupabaseSession() {
+  try {
+    const { fpxSupabaseSession } = await chrome.storage.local.get("fpxSupabaseSession");
+    if (fpxSupabaseSession && typeof fpxSupabaseSession.access_token === "string") {
+      return fpxSupabaseSession;
+    }
+  } catch {}
+  return null;
+}
+
+async function saveSupabaseSession(session) {
+  await chrome.storage.local.set({ fpxSupabaseSession: session });
+}
+
+async function clearSupabaseSession() {
+  await chrome.storage.local.remove("fpxSupabaseSession");
+}
+
+// True when the session expiry is in the future. We don't refresh proactively;
+// the user re-prompts via the popup if the token has lapsed.
+function isSessionLive(session) {
+  if (!session || !session.access_token) return false;
+  if (typeof session.expires_at === "number" && session.expires_at * 1000 <= Date.now()) return false;
+  return true;
+}
+
+// Decode a JWT payload safely (no signature check — just for the email claim).
+function decodeJwtPayload(jwt) {
+  try {
+    const part = jwt.split(".")[1];
+    if (!part) return null;
+    const padded = part + "=".repeat((4 - part.length % 4) % 4);
+    const b64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(atob(b64));
+  } catch { return null; }
+}
+
+async function signInWithMicrosoft() {
+  const redirectUrl = chrome.identity.getRedirectURL();
+  const authUrl =
+    `${SUPABASE_URL}/auth/v1/authorize` +
+    `?provider=azure&redirect_to=${encodeURIComponent(redirectUrl)}`;
+  return new Promise((resolve) => {
+    chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, async (responseUrl) => {
+      if (chrome.runtime.lastError || !responseUrl) {
+        resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "Sign-in cancelled" });
+        return;
+      }
+      // Supabase OAuth implicit flow returns tokens in the URL hash:
+      //   <redirect>#access_token=...&refresh_token=...&expires_in=...&token_type=bearer
+      const hashIdx = responseUrl.indexOf("#");
+      if (hashIdx === -1) {
+        resolve({ ok: false, error: "No token in OAuth response" });
+        return;
+      }
+      const params = new URLSearchParams(responseUrl.slice(hashIdx + 1));
+      const access_token = params.get("access_token");
+      const refresh_token = params.get("refresh_token") || null;
+      const expires_in = Number(params.get("expires_in") || 3600);
+      if (!access_token) {
+        const err = params.get("error_description") || params.get("error") || "Missing access_token";
+        resolve({ ok: false, error: err });
+        return;
+      }
+      const claims = decodeJwtPayload(access_token) || {};
+      const session = {
+        access_token,
+        refresh_token,
+        expires_at: Math.floor(Date.now() / 1000) + expires_in,
+        email: claims.email || null,
+        provider: "azure",
+      };
+      await saveSupabaseSession(session);
+      resolve({ ok: true, email: session.email });
+    });
+  });
+}
+
 async function getApiUrl() {
   try {
     const { fpxApiUrl } = await chrome.storage.local.get("fpxApiUrl");
@@ -110,11 +195,18 @@ async function getPrompts() {
 
 // ---------- Railway API helper ----------
 async function callApi(path, body, options = {}) {
-  const [apiUrl, apiKey, userName] = await Promise.all([getApiUrl(), getApiKey(), getUserName()]);
+  const [apiUrl, apiKey, userName, session] = await Promise.all([
+    getApiUrl(), getApiKey(), getUserName(), getSupabaseSession(),
+  ]);
   if (!apiUrl) return { error: "FPX_API_URL not configured. Open the popup and set it." };
-  if (!isValidKey(apiKey)) return { error: "FPX API key not configured. Open the popup to paste your key." };
+  const haveBearer = isSessionLive(session);
+  if (!haveBearer && !isValidKey(apiKey)) {
+    return { error: "Sign in or paste an API key from the popup." };
+  }
 
-  const headers = { "Content-Type": "application/json", "x-api-key": apiKey };
+  const headers = { "Content-Type": "application/json" };
+  if (haveBearer) headers["Authorization"] = `Bearer ${session.access_token}`;
+  else headers["x-api-key"] = apiKey;
   if (userName) headers["x-fpx-user-name"] = userName;
 
   try {
@@ -234,13 +326,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   } else if (msg.type === "checkApiKey") {
     (async () => {
       const k = await getApiKey();
-      sendResponse({ configured: isValidKey(k), source: await getKeySource() });
+      const session = await getSupabaseSession();
+      const sessionLive = isSessionLive(session);
+      // Configured = either auth path is present.
+      sendResponse({
+        configured: sessionLive || isValidKey(k),
+        source: sessionLive ? "supabase" : await getKeySource(),
+        signedInAs: sessionLive ? (session.email || null) : null,
+      });
     })();
     return true;
   } else if (msg.type === "getApiKey") {
     (async () => {
       const { fpxApiKey, fpxApiUrl, fpxUserName } = await chrome.storage.local.get(["fpxApiKey", "fpxApiUrl", "fpxUserName"]);
-      sendResponse({ key: fpxApiKey || "", url: fpxApiUrl || "", name: fpxUserName || "", source: await getKeySource() });
+      const session = await getSupabaseSession();
+      const sessionLive = isSessionLive(session);
+      sendResponse({
+        key: fpxApiKey || "",
+        url: fpxApiUrl || "",
+        name: fpxUserName || "",
+        source: sessionLive ? "supabase" : await getKeySource(),
+        signedInAs: sessionLive ? (session.email || null) : null,
+      });
     })();
     return true;
   } else if (msg.type === "saveApiKey") {
@@ -254,6 +361,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (name) updates.fpxUserName = name;
       if (Object.keys(updates).length) await chrome.storage.local.set(updates);
       sendResponse({ ok: true, cleared: !k });
+    })();
+    return true;
+  } else if (msg.type === "signInWithMicrosoft") {
+    (async () => {
+      const result = await signInWithMicrosoft();
+      sendResponse(result);
+    })();
+    return true;
+  } else if (msg.type === "signOutSupabase") {
+    (async () => {
+      await clearSupabaseSession();
+      sendResponse({ ok: true });
     })();
     return true;
   } else if (msg.type === "fetchNtpDate") {

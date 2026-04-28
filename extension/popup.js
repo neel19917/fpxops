@@ -24,6 +24,11 @@ const els = {
   serverLabel:    $("serverLabel"),
   importFileBtn:  $("importFileBtn"),
   importFileInput:$("importFileInput"),
+  msSignInBtn:    $("msSignInBtn"),
+  msSignInLabel:  $("msSignInLabel"),
+  msSignedInRow:  $("msSignedInRow"),
+  msSignedInEmail:$("msSignedInEmail"),
+  msSignOutLink:  $("msSignOutLink"),
 };
 
 // Parse a credentials file the admin downloaded from the dashboard. Handles
@@ -52,20 +57,40 @@ function parseCredentialsFile(text) {
 // can re-render without round-tripping to the background again.
 let isConfigured = false;
 let savedName = "";
+let signedInAs = null;
 
 function setStatus(configured, name) {
   if (configured) {
     els.status.classList.remove("setup");
     els.status.classList.add("connected");
-    els.statusLabel.textContent = name ? `Connected as ${name}` : "Connected";
-    els.statusSub.textContent = "Your scrapes are stamped with your name.";
+    if (signedInAs) {
+      els.statusLabel.textContent = `Signed in as ${signedInAs}`;
+      els.statusSub.textContent = name
+        ? `Your scrapes are stamped as ${name}.`
+        : "Your scrapes are tied to your Microsoft account.";
+    } else {
+      els.statusLabel.textContent = name ? `Connected as ${name}` : "Connected";
+      els.statusSub.textContent = "Your scrapes are stamped with your name.";
+    }
   } else {
     els.status.classList.remove("connected");
     els.status.classList.add("setup");
     els.statusLabel.textContent = "Setup needed";
-    els.statusSub.textContent = "Add your name and API key to get started.";
+    els.statusSub.textContent = "Sign in with Microsoft, or paste an API key to get started.";
   }
   els.openBtn.disabled = !configured;
+}
+
+function renderSignedIn(email) {
+  signedInAs = email || null;
+  if (email) {
+    if (els.msSignedInEmail) els.msSignedInEmail.textContent = email;
+    if (els.msSignedInRow) els.msSignedInRow.style.display = "";
+    if (els.msSignInLabel) els.msSignInLabel.textContent = "Re-authenticate";
+  } else {
+    if (els.msSignedInRow) els.msSignedInRow.style.display = "none";
+    if (els.msSignInLabel) els.msSignInLabel.textContent = "Sign in with Microsoft";
+  }
 }
 
 function showSetup({ firstTime, prefill }) {
@@ -99,6 +124,7 @@ function refreshKeyState() {
     if (chrome.runtime.lastError) return;
     const configured = !!(res && res.configured);
     isConfigured = configured;
+    renderSignedIn(res && res.signedInAs);
     // Pull the saved name for the status sub-line.
     chrome.runtime.sendMessage({ type: "getApiKey" }, (nameRes) => {
       if (chrome.runtime.lastError) return;
@@ -158,8 +184,10 @@ els.saveKeyBtn.addEventListener("click", () => {
     els.nameInput.focus();
     return;
   }
-  if (!key) {
-    els.keyMsg.textContent = "Paste the API key your admin gave you.";
+  // API key is optional when the user is signed in with Microsoft — the Bearer
+  // session is enough to authenticate API calls.
+  if (!key && !signedInAs) {
+    els.keyMsg.textContent = "Sign in with Microsoft above, or paste an API key.";
     els.keyMsg.className = "save-msg err";
     els.keyInput.focus();
     return;
@@ -201,6 +229,41 @@ for (const inp of [els.nameInput, els.keyInput, els.urlInput]) {
     if (e.key === "Escape") { e.preventDefault(); hideSetup(); }
   });
 }
+
+// "Sign in with Microsoft" — kicks off the Supabase OAuth flow in background.js
+// via chrome.identity.launchWebAuthFlow. The popup window can stay open during
+// the auth flow because the flow opens its own window.
+els.msSignInBtn?.addEventListener("click", () => {
+  els.keyMsg.textContent = "Opening Microsoft sign-in…";
+  els.keyMsg.className = "save-msg";
+  els.msSignInBtn.disabled = true;
+  chrome.runtime.sendMessage({ type: "signInWithMicrosoft" }, (res) => {
+    els.msSignInBtn.disabled = false;
+    if (chrome.runtime.lastError) {
+      els.keyMsg.textContent = chrome.runtime.lastError.message;
+      els.keyMsg.className = "save-msg err";
+      return;
+    }
+    if (res && res.ok) {
+      els.keyMsg.textContent = `Signed in as ${res.email || "Microsoft account"}.`;
+      els.keyMsg.className = "save-msg ok";
+      refreshKeyState();
+      refreshServerState();
+    } else {
+      els.keyMsg.textContent = (res && res.error) || "Sign-in failed.";
+      els.keyMsg.className = "save-msg err";
+    }
+  });
+});
+
+els.msSignOutLink?.addEventListener("click", (e) => {
+  e.preventDefault();
+  chrome.runtime.sendMessage({ type: "signOutSupabase" }, () => {
+    els.keyMsg.textContent = "Signed out.";
+    els.keyMsg.className = "save-msg";
+    refreshKeyState();
+  });
+});
 
 // "Import config file" — open the picker, parse the file, fill the inputs.
 els.importFileBtn.addEventListener("click", () => els.importFileInput.click());

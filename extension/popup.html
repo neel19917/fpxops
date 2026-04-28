@@ -297,10 +297,35 @@
         </div>
       </div>
 
+      <!-- Microsoft sign-in (preferred). Pop-up auth via chrome.identity. -->
       <div class="setup-step">
         <div class="num">2</div>
         <div class="body-col">
-          <label for="keyInput">API key <span style="color:var(--fp-slate-500);font-weight:400;">(get from your admin)</span></label>
+          <label>Sign in <span style="color:var(--fp-slate-500);font-weight:400;">(recommended)</span></label>
+          <button id="msSignInBtn" type="button" style="
+            width:100%;padding:8px 10px;font-size:12px;font-weight:600;
+            border:1px solid var(--fp-slate-300);border-radius:6px;background:#fff;
+            cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;
+            color:var(--fp-slate-900);">
+            <svg width="14" height="14" viewBox="0 0 23 23" aria-hidden="true">
+              <path fill="#f35325" d="M1 1h10v10H1z"/>
+              <path fill="#81bc06" d="M12 1h10v10H12z"/>
+              <path fill="#05a6f0" d="M1 12h10v10H1z"/>
+              <path fill="#ffba08" d="M12 12h10v10H12z"/>
+            </svg>
+            <span id="msSignInLabel">Sign in with Microsoft</span>
+          </button>
+          <div id="msSignedInRow" style="display:none;margin-top:6px;font-size:11px;color:var(--fp-emerald-700);">
+            Signed in as <b id="msSignedInEmail"></b> · <a href="#" id="msSignOutLink" style="color:var(--fp-slate-500);">Sign out</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- API key path stays for service-to-service / admin distribution. -->
+      <div class="setup-step">
+        <div class="num">3</div>
+        <div class="body-col">
+          <label for="keyInput">…or API key <span style="color:var(--fp-slate-500);font-weight:400;">(from your admin)</span></label>
           <input id="keyInput" class="mono" type="password" placeholder="fpx_live_..." autocomplete="off" spellcheck="false">
         </div>
       </div>
@@ -308,7 +333,7 @@
       <div class="advanced-toggle" id="advToggle">⚙ Advanced</div>
       <div class="advanced-block" id="advBlock">
         <div class="setup-step" style="margin-top:8px;">
-          <div class="num" style="background:var(--fp-slate-200);color:var(--fp-slate-700);">3</div>
+          <div class="num" style="background:var(--fp-slate-200);color:var(--fp-slate-700);">4</div>
           <div class="body-col">
             <label for="urlInput">API URL <span style="color:var(--fp-slate-500);font-weight:400;">(default works for most reps)</span></label>
             <input id="urlInput" class="mono" type="text" placeholder="https://your-app.up.railway.app" autocomplete="off" spellcheck="false">

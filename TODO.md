@@ -229,13 +229,19 @@ land or scope shifts.
 ## Pending
 
 ### Microsoft sign-in inside the Chrome extension
-- Currently extension uses API keys only.
-- Needs: `chrome.identity.launchWebAuthFlow` with Supabase OAuth URL,
-  parse tokens from chromiumapp.org callback, store in `chrome.storage`,
-  add Bearer header preference in `callApi`. Refresh handling deferred.
-- Operator step: add `https://<extension-id>.chromiumapp.org/` to
-  Supabase Auth → URL Configuration → Redirect URLs (extension ID is
-  per-install for unpacked; stable once published to Web Store).
+- [x] `chrome.identity.launchWebAuthFlow` with Supabase OAuth URL
+- [x] Parse tokens from `chromiumapp.org` callback hash
+- [x] Store in `chrome.storage.local` under `fpxSupabaseSession`
+- [x] Bearer header preference in `callApi` (Bearer wins over `x-api-key`)
+- [x] Popup gets a "Sign in with Microsoft" button + signed-in chip + Sign-out link;
+  API key path remains as a fallback for service-distribution use cases
+- [ ] **Refresh-token handling** — deferred. Once `expires_at` lapses, the popup
+  re-prompts the user; nothing auto-refreshes in the background yet.
+- [ ] **Operator step (one-time per install)**: in Supabase Auth → URL
+  Configuration → Redirect URLs, add `https://<extension-id>.chromiumapp.org/`.
+  For an unpacked dev extension the ID changes per install — copy it from
+  `chrome://extensions`. For the published Web Store version the ID is
+  stable.
 
 ### Cleaner extension sidepanel UI
 - [x] Tracking / GP / Invoice tabs: AI controls + prompt editors removed;
