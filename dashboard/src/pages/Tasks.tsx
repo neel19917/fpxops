@@ -97,12 +97,26 @@ const PRIORITY_COLOR: Record<string, string> = {
   urgent: "text-red-700 bg-red-100",
 };
 
+// statusFilter values:
+//   ""           → all (raw, no filter)
+//   "active"     → synthetic: open + in_progress (default landing view)
+//   "open" / "in_progress" / "blocked" / "done" / "cancelled"
+//                → real status filter, sent to the server
+const FILTER_KEY = "fpx.tasks.statusFilter";
+
 export function TasksPage() {
   const nav = useNav();
   const [tasks, setTasks] = useState<ShipmentTask[]>([]);
   const [loading, setLoading] = useState(true);
-  const [statusFilter, setStatusFilter] = useState<string>("");
+  // First-visit default = "active" (open + in_progress). Otherwise restore
+  // whatever the user last picked so the view sticks across reloads.
+  const [statusFilter, setStatusFilter] = useState<string>(() => {
+    try { return localStorage.getItem(FILTER_KEY) ?? "active"; } catch { return "active"; }
+  });
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    try { localStorage.setItem(FILTER_KEY, statusFilter); } catch {}
+  }, [statusFilter]);
 
   // Bulk selection + assign state.
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -114,7 +128,16 @@ export function TasksPage() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [editingAssigneeId, setEditingAssigneeId] = useState<string | null>(null);
   const lastGAt = useRef<number>(0); // for the gg jump-to-top sequence
-  const visibleIds = useMemo(() => tasks.map((t) => t.id), [tasks]);
+  // visibleIds tracks the *currently rendered* rows so select-all / focused
+  // navigation only act on what the user sees.
+  const visibleIds = useMemo(
+    () => (statusFilter === "active"
+      ? tasks.filter((t) => t.status === "open" || t.status === "in_progress")
+      : statusFilter
+        ? tasks.filter((t) => t.status === statusFilter)
+        : tasks).map((t) => t.id),
+    [tasks, statusFilter],
+  );
   const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
   function toggle(id: string) {
     setSelected((prev) => {
@@ -205,9 +228,9 @@ export function TasksPage() {
     setLoading(true);
     setError(null);
     try {
-      const params: { status?: string } = {};
-      if (statusFilter) params.status = statusFilter;
-      const r = await api.tasks.list(params);
+      // Always pull the full set so the KPI strip can show real totals
+      // regardless of which filter is active. Filtering happens below.
+      const r = await api.tasks.list({});
       setTasks(r.data);
     } catch (e) {
       setError((e as Error).message);
@@ -216,7 +239,17 @@ export function TasksPage() {
     }
   }
 
-  useEffect(() => { load(); }, [statusFilter]);
+  // Visible rows after applying the current filter. KPIs above use the raw
+  // `tasks` list so totals stay honest no matter which chip is selected.
+  const visibleTasks = useMemo(() => {
+    if (!statusFilter) return tasks;
+    if (statusFilter === "active") return tasks.filter((t) => t.status === "open" || t.status === "in_progress");
+    return tasks.filter((t) => t.status === statusFilter);
+  }, [tasks, statusFilter]);
+
+  // Filter changes are now client-side over the already-loaded list, so we
+  // only fetch on mount + on explicit Refresh.
+  useEffect(() => { load(); }, []);
 
   async function setStatus(t: ShipmentTask, status: TaskStatus) {
     try {
@@ -244,12 +277,14 @@ export function TasksPage() {
   }
 
   // Keep the focused row valid as the list mutates (load, delete, filter).
+  // Anchored on visibleTasks so changing the filter snaps focus to the new
+  // top of the visible list rather than something off-screen.
   useEffect(() => {
-    if (!tasks.length) { setFocusedId(null); return; }
-    if (!focusedId || !tasks.some((t) => t.id === focusedId)) {
-      setFocusedId(tasks[0].id);
+    if (!visibleTasks.length) { setFocusedId(null); return; }
+    if (!focusedId || !visibleTasks.some((t) => t.id === focusedId)) {
+      setFocusedId(visibleTasks[0].id);
     }
-  }, [tasks, focusedId]);
+  }, [visibleTasks, focusedId]);
 
   // Scroll the focused row into view as the user moves through the list.
   useEffect(() => {
@@ -296,16 +331,16 @@ export function TasksPage() {
         return;
       }
 
-      const idx = focusedId ? tasks.findIndex((t) => t.id === focusedId) : -1;
+      const idx = focusedId ? visibleTasks.findIndex((t) => t.id === focusedId) : -1;
       const moveDown = () => {
-        if (!tasks.length) return;
-        const next = idx < 0 ? 0 : Math.min(idx + 1, tasks.length - 1);
-        setFocusedId(tasks[next].id);
+        if (!visibleTasks.length) return;
+        const next = idx < 0 ? 0 : Math.min(idx + 1, visibleTasks.length - 1);
+        setFocusedId(visibleTasks[next].id);
       };
       const moveUp = () => {
-        if (!tasks.length) return;
+        if (!visibleTasks.length) return;
         const next = idx <= 0 ? 0 : idx - 1;
-        setFocusedId(tasks[next].id);
+        setFocusedId(visibleTasks[next].id);
       };
 
       if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); moveDown(); return; }
@@ -315,8 +350,8 @@ export function TasksPage() {
       if (e.key === "g" && !e.shiftKey) {
         e.preventDefault();
         const now = Date.now();
-        if (now - lastGAt.current < 600 && tasks.length) {
-          setFocusedId(tasks[0].id);
+        if (now - lastGAt.current < 600 && visibleTasks.length) {
+          setFocusedId(visibleTasks[0].id);
           lastGAt.current = 0;
         } else {
           lastGAt.current = now;
@@ -325,13 +360,13 @@ export function TasksPage() {
       }
       if (e.key === "G" || (e.key === "g" && e.shiftKey)) {
         e.preventDefault();
-        if (tasks.length) setFocusedId(tasks[tasks.length - 1].id);
+        if (visibleTasks.length) setFocusedId(visibleTasks[visibleTasks.length - 1].id);
         return;
       }
 
       // Per-row actions need a focused row.
       if (idx < 0) return;
-      const t = tasks[idx];
+      const t = visibleTasks[idx];
 
       if (e.key === " " || e.key === "x") {
         e.preventDefault();
@@ -376,7 +411,7 @@ export function TasksPage() {
     // setStatus / remove / nav / load are stable enough — listing them
     // would re-bind every render without changing behavior.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tasks, focusedId, helpOpen, selected.size]);
+  }, [visibleTasks, focusedId, helpOpen, selected.size]);
 
   // Status counts across the currently loaded list — drives the KPI strip
   // and the "Start all" enable/disable.
@@ -409,6 +444,7 @@ export function TasksPage() {
             onChange={(e) => setStatusFilter(e.target.value)}
             className="rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white"
           >
+            <option value="active">Active (open + in progress)</option>
             <option value="">All statuses</option>
             <option value="open">Open</option>
             <option value="in_progress">In Progress</option>
@@ -432,9 +468,10 @@ export function TasksPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4">
+      <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mb-4">
         {([
-          { id: "", label: "All",          count: tasks.length,        tone: "bg-slate-50 text-slate-700 ring-slate-200" },
+          { id: "active",      label: "Active",      count: counts.open + counts.in_progress, tone: "bg-violet-50 text-violet-800 ring-violet-200" },
+          { id: "",            label: "All",         count: tasks.length,        tone: "bg-slate-50 text-slate-700 ring-slate-200" },
           { id: "open",        label: "Open",        count: counts.open,         tone: "bg-sky-50 text-sky-800 ring-sky-200" },
           { id: "in_progress", label: "In Progress", count: counts.in_progress,  tone: "bg-indigo-50 text-indigo-800 ring-indigo-200" },
           { id: "blocked",     label: "Blocked",     count: counts.blocked,      tone: "bg-amber-50 text-amber-800 ring-amber-200" },
@@ -539,9 +576,13 @@ export function TasksPage() {
           <tbody>
             {loading ? (
               <tr><td colSpan={8} className="text-center text-slate-400 py-8">Loading…</td></tr>
-            ) : tasks.length === 0 ? (
-              <tr><td colSpan={8} className="text-center text-slate-400 py-8">No tasks yet. Open a shipment and add one.</td></tr>
-            ) : tasks.map((t) => {
+            ) : visibleTasks.length === 0 ? (
+              <tr><td colSpan={8} className="text-center text-slate-400 py-8">
+                {tasks.length === 0
+                  ? "No tasks yet. Open a shipment and add one."
+                  : `No ${statusFilter === "active" ? "active" : statusFilter || ""} tasks — try a different filter.`}
+              </td></tr>
+            ) : visibleTasks.map((t) => {
               // Status circle is the primary per-row action button:
               //   open → in_progress (Start)
               //   in_progress → done   (Complete)

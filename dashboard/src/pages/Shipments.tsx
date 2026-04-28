@@ -163,7 +163,10 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   async function load() {
     setLoading(true); setErr(null);
     try {
-      const r = await api.shipments.list({ limit: 2000 });
+      // Initial render is what users feel — keep it tight. Daily volume sits
+      // around 200 rows; 500 is generous headroom. Export pulls the full
+      // 5000-cap separately so this doesn't bound that workflow.
+      const r = await api.shipments.list({ limit: 500 });
       setRows(r.data);
     } catch (e) { setErr((e as Error).message); }
     setLoading(false);
