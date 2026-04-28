@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket } from "lucide-react";
 import { api } from "../lib/api";
 import type { ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { useNav } from "../lib/nav";
+import { UserPicker } from "../components/UserPicker";
 
 // Keyboard shortcut catalog — kept here so the help modal renders the same
 // thing the handler implements. Order matters; this is the help-modal order.
@@ -37,26 +38,20 @@ interface InlineAssigneeProps {
 }
 function InlineAssignee({ value, onSave, requestEdit, onEditingChange }: InlineAssigneeProps) {
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(value || "");
   const [busy, setBusy] = useState(false);
-  // External request to enter edit mode (keyboard shortcut).
   useEffect(() => {
-    if (requestEdit && !editing) {
-      setDraft(value || "");
-      setEditing(true);
-    }
+    if (requestEdit && !editing) setEditing(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestEdit]);
   useEffect(() => {
     onEditingChange?.(editing);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing]);
-  async function commit() {
-    const next = draft.trim();
-    if (next === (value || "").trim()) { setEditing(false); return; }
+  async function commit(next: string | null) {
+    if ((next || "") === (value || "")) { setEditing(false); return; }
     setBusy(true);
     try {
-      await onSave(next === "" ? null : next);
+      await onSave(next);
       setEditing(false);
     } catch (e) { alert((e as Error).message); }
     finally { setBusy(false); }
@@ -64,7 +59,7 @@ function InlineAssignee({ value, onSave, requestEdit, onEditingChange }: InlineA
   if (!editing) {
     return (
       <button
-        onClick={(e) => { e.stopPropagation(); setDraft(value || ""); setEditing(true); }}
+        onClick={(e) => { e.stopPropagation(); setEditing(true); }}
         className="group inline-flex items-center gap-1.5 text-left text-slate-600 hover:text-sky-700"
         title="Edit assignee"
       >
@@ -74,21 +69,16 @@ function InlineAssignee({ value, onSave, requestEdit, onEditingChange }: InlineA
     );
   }
   return (
-    <input
-      autoFocus
-      value={draft}
-      onChange={(e) => setDraft(e.target.value)}
-      onClick={(e) => e.stopPropagation()}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        e.stopPropagation();
-        if (e.key === "Enter") commit();
-        if (e.key === "Escape") { setDraft(value || ""); setEditing(false); }
-      }}
-      disabled={busy}
-      placeholder="email or name"
-      className="text-sm px-2 py-1 rounded-md border border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-300 min-w-[180px]"
-    />
+    <div onClick={(e) => e.stopPropagation()} className={busy ? "opacity-60 pointer-events-none" : ""}>
+      <UserPicker
+        value={value}
+        onChange={(next) => commit(next)}
+        placeholder="email or name"
+        size="sm"
+        autoFocus
+        className="min-w-[220px]"
+      />
+    </div>
   );
 }
 
@@ -156,13 +146,54 @@ export function TasksPage() {
     try {
       const ids = Array.from(selected);
       const r = await api.tasks.bulkUpdate({ ids, assigned_to: target });
-      // Optimistic local patch — server route returns just a count.
-      setTasks((prev) => prev.map((t) => selected.has(t.id) ? { ...t, assigned_to: target } : t));
       clearSelection();
       setAssignee("");
       if (r.updated !== ids.length) {
         setError(`Assigned ${r.updated} of ${ids.length} tasks.`);
       }
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function bulkSetStatus(status: TaskStatus) {
+    if (!selected.size || bulkBusy) return;
+    setBulkBusy(true);
+    setError(null);
+    try {
+      const ids = Array.from(selected);
+      const r = await api.tasks.bulkUpdate({ ids, status });
+      clearSelection();
+      if (r.updated !== ids.length) {
+        setError(`Updated ${r.updated} of ${ids.length} tasks.`);
+      }
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  // "Start all open" — one-click bulk-start of every currently visible
+  // open task. Acts on the local filtered list so it matches what the user
+  // sees on screen.
+  async function startAllOpen() {
+    if (bulkBusy) return;
+    const ids = tasks.filter((t) => t.status === "open").map((t) => t.id);
+    if (!ids.length) { setError("No open tasks to start."); return; }
+    if (!confirm(`Start ${ids.length} open task${ids.length === 1 ? "" : "s"}? Each moves to "In Progress".`)) return;
+    setBulkBusy(true);
+    setError(null);
+    try {
+      const r = await api.tasks.bulkUpdate({ ids, status: "in_progress" });
+      if (r.updated !== ids.length) {
+        setError(`Started ${r.updated} of ${ids.length} tasks.`);
+      }
+      await load();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -347,14 +378,32 @@ export function TasksPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tasks, focusedId, helpOpen, selected.size]);
 
+  // Status counts across the currently loaded list — drives the KPI strip
+  // and the "Start all" enable/disable.
+  const counts = useMemo(() => ({
+    open: tasks.filter((t) => t.status === "open").length,
+    in_progress: tasks.filter((t) => t.status === "in_progress").length,
+    blocked: tasks.filter((t) => t.status === "blocked").length,
+    done: tasks.filter((t) => t.status === "done").length,
+    cancelled: tasks.filter((t) => t.status === "cancelled").length,
+  }), [tasks]);
+
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-semibold flex items-center gap-2"><ListChecks className="h-6 w-6 text-slate-700" /> Tasks</h1>
           <p className="text-sm text-slate-500 mt-0.5">Follow-ups across shipments. Auto-assigned to whoever scraped the shipment.</p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={startAllOpen}
+            disabled={bulkBusy || counts.open === 0}
+            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Mark every open task as In Progress"
+          >
+            <Rocket className="h-4 w-4" /> {bulkBusy ? "Starting…" : `Start all open (${counts.open})`}
+          </button>
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
@@ -383,32 +432,85 @@ export function TasksPage() {
         </div>
       </div>
 
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4">
+        {([
+          { id: "", label: "All",          count: tasks.length,        tone: "bg-slate-50 text-slate-700 ring-slate-200" },
+          { id: "open",        label: "Open",        count: counts.open,         tone: "bg-sky-50 text-sky-800 ring-sky-200" },
+          { id: "in_progress", label: "In Progress", count: counts.in_progress,  tone: "bg-indigo-50 text-indigo-800 ring-indigo-200" },
+          { id: "blocked",     label: "Blocked",     count: counts.blocked,      tone: "bg-amber-50 text-amber-800 ring-amber-200" },
+          { id: "done",        label: "Done",        count: counts.done,         tone: "bg-emerald-50 text-emerald-800 ring-emerald-200" },
+        ] as { id: string; label: string; count: number; tone: string }[]).map((kpi) => (
+          <button
+            key={kpi.label}
+            onClick={() => setStatusFilter(kpi.id)}
+            className={`rounded-xl ring-1 px-3 py-2 text-left transition ${kpi.tone} ${statusFilter === kpi.id ? "ring-2 ring-offset-1" : "hover:ring-2"}`}
+          >
+            <div className="text-[11px] uppercase tracking-wide opacity-80">{kpi.label}</div>
+            <div className="text-xl font-semibold">{kpi.count}</div>
+          </button>
+        ))}
+      </div>
+
       {error ? <div className="mb-4 rounded-lg bg-red-50 text-red-700 px-4 py-2 text-sm">{error}</div> : null}
 
       {selected.size > 0 ? (
-        <div className="mb-3 rounded-xl bg-sky-50 ring-1 ring-sky-200 px-4 py-3 flex flex-wrap items-center gap-3">
-          <UserPlus className="h-4 w-4 text-sky-700" />
-          <span className="text-sm font-medium text-sky-900">{selected.size} selected</span>
-          <input
-            value={assignee}
-            onChange={(e) => setAssignee(e.target.value)}
-            placeholder="Assign to (email or name)…"
-            className="flex-1 min-w-[220px] rounded-lg border border-sky-200 bg-white px-3 py-1.5 text-sm focus:ring-2 focus:ring-sky-400 focus:border-sky-400"
-          />
-          <button
-            onClick={bulkAssign}
-            disabled={bulkBusy || !assignee.trim()}
-            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-1.5 hover:bg-sky-700 disabled:opacity-50"
-          >
-            {bulkBusy ? "Assigning…" : "Assign"}
-          </button>
-          <button
-            onClick={clearSelection}
-            className="rounded-lg text-sky-700 text-sm px-2 py-1.5 hover:bg-sky-100 inline-flex items-center gap-1"
-            title="Clear selection"
-          >
-            <X className="h-4 w-4" /> Clear
-          </button>
+        <div className="mb-3 rounded-xl bg-sky-50 ring-1 ring-sky-200 px-4 py-3 space-y-2">
+          <div className="flex flex-wrap items-center gap-3">
+            <UserPlus className="h-4 w-4 text-sky-700" />
+            <span className="text-sm font-medium text-sky-900">{selected.size} selected</span>
+            <UserPicker
+              value={assignee || null}
+              onChange={(v) => setAssignee(v || "")}
+              placeholder="Assign to…"
+              size="sm"
+              className="flex-1 min-w-[220px]"
+            />
+            <button
+              onClick={bulkAssign}
+              disabled={bulkBusy || !assignee.trim()}
+              className="rounded-lg bg-sky-600 text-white text-sm px-3 py-1.5 hover:bg-sky-700 disabled:opacity-50"
+            >
+              {bulkBusy ? "Assigning…" : "Assign"}
+            </button>
+            <button
+              onClick={clearSelection}
+              className="rounded-lg text-sky-700 text-sm px-2 py-1.5 hover:bg-sky-100 inline-flex items-center gap-1"
+              title="Clear selection"
+            >
+              <X className="h-4 w-4" /> Clear
+            </button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-sky-100">
+            <span className="text-xs uppercase tracking-wide text-sky-700/80 font-semibold">Bulk status:</span>
+            <button
+              onClick={() => bulkSetStatus("in_progress")}
+              disabled={bulkBusy}
+              className="rounded-lg bg-white ring-1 ring-sky-200 text-sky-800 text-sm px-3 py-1.5 hover:bg-sky-100 disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              <Play className="h-3.5 w-3.5" /> Start
+            </button>
+            <button
+              onClick={() => bulkSetStatus("done")}
+              disabled={bulkBusy}
+              className="rounded-lg bg-white ring-1 ring-emerald-200 text-emerald-800 text-sm px-3 py-1.5 hover:bg-emerald-50 disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              <CheckCircle2 className="h-3.5 w-3.5" /> Mark done
+            </button>
+            <button
+              onClick={() => bulkSetStatus("blocked")}
+              disabled={bulkBusy}
+              className="rounded-lg bg-white ring-1 ring-amber-200 text-amber-800 text-sm px-3 py-1.5 hover:bg-amber-50 disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              <Ban className="h-3.5 w-3.5" /> Block
+            </button>
+            <button
+              onClick={() => bulkSetStatus("open")}
+              disabled={bulkBusy}
+              className="rounded-lg bg-white ring-1 ring-slate-200 text-slate-700 text-sm px-3 py-1.5 hover:bg-slate-50 disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              <Circle className="h-3.5 w-3.5" /> Reopen
+            </button>
+          </div>
         </div>
       ) : null}
 

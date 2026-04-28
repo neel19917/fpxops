@@ -7,6 +7,7 @@ import { ActionBadge } from "../components/Badge";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
 import { ColumnSelector } from "../components/ColumnSelector";
+import { UserPicker } from "../components/UserPicker";
 import {
   SHIPMENT_COLUMNS,
   loadColumnPrefs,
@@ -672,10 +673,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 </div>
                 <div>
                   <label className="text-xs text-slate-500 block mb-1">Assignee (override)</label>
-                  <input
-                    value={bulkAssignee}
-                    onChange={(e) => setBulkAssignee(e.target.value)}
-                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  <UserPicker
+                    value={bulkAssignee || null}
+                    onChange={(v) => setBulkAssignee(v || "")}
                     placeholder="(blank = runner)"
                   />
                 </div>

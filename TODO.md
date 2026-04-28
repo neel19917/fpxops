@@ -98,6 +98,45 @@ land or scope shifts.
 
 ---
 
+## Done (2026-04-28 batch — Tasks polish + DB-backed assignees)
+
+### Database-backed user picker
+- [x] New shared `dashboard/src/components/UserPicker.tsx` — typeahead +
+  dropdown driven by `api.users.list()` with module-level cache so the
+  list loads once per session. Falls through to free-text for
+  back-compat with legacy assignees (e.g. "Shaun" not in the user table).
+- [x] Wired into the **Shipments bulk-create-task** modal's "Assignee"
+  field (`pages/Shipments.tsx`)
+- [x] Wired into the **Tasks** page bulk toolbar's assignee field
+- [x] Wired into the **Tasks** page per-row inline-edit assignee
+  (replaces the old free-text input; `e` shortcut still opens it)
+
+### "Start all" + bulk status changes on Tasks
+- [x] Header **"Start all open (N)"** button — one click marks every
+  currently-visible open task as `in_progress` (with confirm). Disabled
+  when N=0 or while a bulk op is in flight.
+- [x] **Status KPI strip** at the top — All / Open / In Progress /
+  Blocked / Done. Click a card to filter; selected card is ring-highlighted.
+- [x] Bulk toolbar got a **Status row**: Start / Mark done / Block /
+  Reopen buttons that fire `tasks.bulkUpdate` with the selected ids.
+- [x] Bulk operations now `await load()` after returning so rows that no
+  longer match the active filter don't linger optimistically on screen.
+
+### Test coverage (+56 cases)
+- [x] `tests/scrapeHistory.test.js` — `computeMaterialDiff`,
+  `MATERIAL_FIELDS` catalog (12 cases)
+- [x] `tests/auth.test.js` — `generateApiKey` entropy / format,
+  `hashApiKey` determinism + avalanche (11 cases)
+- [x] `tests/httpCache.test.js` — `sendCachedJson` header shape (8 cases)
+- [x] `tests/shipments.extra.test.js` — name-fallback ladder, runner
+  attribution, bulk-mapper edges (16 cases)
+- [x] `tests/pendingApiKey.extra.test.js` — boundary parses, deeply
+  expired stashes, junk row shapes (8 cases)
+- [x] `server/package.json` `npm test` script registers all five new
+  files. **117/117 pass.**
+
+---
+
 ## Done (latest)
 
 ### Extension is scrape-only; analysis lives in the dashboard
