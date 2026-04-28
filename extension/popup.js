@@ -29,6 +29,7 @@ const els = {
   msSignedInRow:  $("msSignedInRow"),
   msSignedInEmail:$("msSignedInEmail"),
   msSignOutLink:  $("msSignOutLink"),
+  msRecheckLink:  $("msRecheckLink"),
 };
 
 // Parse a credentials file the admin downloaded from the dashboard. Handles
@@ -287,6 +288,34 @@ els.msSignOutLink?.addEventListener("click", (e) => {
     els.keyMsg.className = "save-msg";
     refreshKeyState();
   });
+});
+
+// "Recheck approval" — re-pings /api/me without a fresh sign-in so the rep
+// doesn't have to close + reopen the popup after the admin enables them.
+els.msRecheckLink?.addEventListener("click", (e) => {
+  e.preventDefault();
+  if (!els.msRecheckLink) return;
+  const wasApproved = signedInApproved;
+  els.msRecheckLink.textContent = "Checking…";
+  els.msRecheckLink.style.pointerEvents = "none";
+  chrome.runtime.sendMessage({ type: "checkApiKey" }, (res) => {
+    els.msRecheckLink.style.pointerEvents = "";
+    els.msRecheckLink.textContent = "Recheck approval";
+    if (chrome.runtime.lastError) return;
+    const nowApproved = !!(res && res.approved);
+    isConfigured = !!(res && res.configured);
+    renderSignedIn(res && res.signedInAs, nowApproved, res && res.fullName);
+    setStatus(isConfigured, savedName);
+    if (!wasApproved && nowApproved) {
+      els.keyMsg.textContent = "Approved. You're all set.";
+      els.keyMsg.className = "save-msg ok";
+      setTimeout(hideSetup, 700);
+    } else if (!nowApproved) {
+      els.keyMsg.textContent = "Still awaiting admin approval.";
+      els.keyMsg.className = "save-msg";
+    }
+  });
+  refreshServerState();
 });
 
 // "Import config file" — open the picker, parse the file, fill the inputs.
