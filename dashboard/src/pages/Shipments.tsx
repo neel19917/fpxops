@@ -9,6 +9,7 @@ import { ShareButton } from "../components/ShareButton";
 import { ColumnSelector } from "../components/ColumnSelector";
 import { UserPicker } from "../components/UserPicker";
 import { useAuth } from "../lib/auth";
+import { showFrame, hideFrame } from "../lib/freightpopFrame";
 import {
   SHIPMENT_COLUMNS,
   loadColumnPrefs,
@@ -182,6 +183,35 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   useEffect(() => {
     try { localStorage.setItem("fpx.shipments.splitView", splitView ? "1" : "0"); } catch {}
   }, [splitView]);
+
+  // Drive the singleton FreightPOP overlay. Mounting the iframe at App
+  // scope means its login session survives every route change; pages
+  // (this one) only push visibility + context updates. We keep the URL
+  // stable when the template has no per-shipment placeholders so the
+  // iframe never reloads on prev/next walks.
+  useEffect(() => {
+    if (!embedCfg?.enabled || !splitView || !drawerId) {
+      hideFrame();
+      return;
+    }
+    if (!drawerData) return;
+    const ship = drawerData.shipment;
+    const url = (embedCfg.url_template || "")
+      .replace(/\{tracking_number\}/g, encodeURIComponent(ship.tracking_number || ""))
+      .replace(/\{shipment_id\}/g, encodeURIComponent(ship.shipment_id || ship.id))
+      .replace(/\{order_number\}/g, encodeURIComponent(ship.order_number || ""));
+    showFrame({
+      url,
+      shipmentId: ship.id,
+      trackingNumber: ship.tracking_number || null,
+    });
+  }, [embedCfg?.enabled, embedCfg?.url_template, splitView, drawerId, drawerData]);
+
+  // Closing the page (unmount) clears the frame so it doesn't linger
+  // on top of other routes.
+  useEffect(() => {
+    return () => { hideFrame(); };
+  }, []);
 
   // "Export all" pulls every shipment fresh (ignores filters / pill / search)
   // so the workbook reflects the database, not the current view.
@@ -796,14 +826,10 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         onClose={() => setDrawerId(null)}
         title={drawerData?.shipment.tracking_number || "Shipment"}
         subtitle={drawerData?.shipment.customer_name || undefined}
-        leftSlot={
-          embedCfg?.enabled && splitView && drawerData ? (
-            <FreightPopSidebar
-              template={embedCfg.url_template}
-              shipment={drawerData.shipment}
-            />
-          ) : null
-        }
+        // Suppress the dimmed backdrop when the FreightPOP overlay is
+        // visible — the overlay (mounted at App scope) takes over the
+        // gray space.
+        suppressBackdrop={!!(embedCfg?.enabled && splitView && drawerId)}
       >
         {drawerData ? (
           <>
@@ -1625,77 +1651,7 @@ const EMBED_ALLOW = [
   "fullscreen *",
 ].join("; ");
 
-// =====================================================================
-// FreightPopSidebar — full-height variant of the embed for split view.
-// Renders into the Drawer's leftSlot when embed is enabled and the
-// user has split-view turned on. Same iframe permissions as the in-tab
-// embed; the layout chrome is just adapted to fill the gray area
-// (no Section wrapper, header bar pinned to top).
-// =====================================================================
-function FreightPopSidebar({ template, shipment }: { template: string; shipment: Shipment }) {
-  const hasPlaceholder = EMBED_PLACEHOLDERS.test(template || "");
-  const url = useMemo(() => {
-    if (!template) return "";
-    try { return buildEmbedUrl(template, shipment); }
-    catch { return ""; }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, hasPlaceholder ? [template, shipment] : [template]);
-  const [copied, setCopied] = useState(false);
-  const tracking = shipment.tracking_number || "";
-
-  async function copyTracking() {
-    if (!tracking) return;
-    try {
-      await navigator.clipboard.writeText(tracking);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch { /* no-op */ }
-  }
-
-  if (!url) {
-    return (
-      <div className="h-full flex items-center justify-center p-6 text-sm text-slate-500">
-        FreightPOP embed URL not configured. Set <span className="font-mono mx-1">embed.freightpop.url_template</span> in Settings.
-      </div>
-    );
-  }
-  return (
-    <div className="h-full flex flex-col bg-slate-100">
-      <div className="flex items-center gap-3 px-3 py-2 bg-white border-b border-slate-200 shadow-sm">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 shrink-0">FreightPOP · Tracking #</span>
-          <span className="font-mono text-sm text-slate-900 truncate">{tracking || "—"}</span>
-          {tracking ? (
-            <button
-              onClick={copyTracking}
-              className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50"
-              title="Copy tracking number"
-            >
-              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-              {copied ? "Copied" : "Copy"}
-            </button>
-          ) : null}
-        </div>
-        <div className="ml-auto flex items-center gap-2">
-          <a
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-sky-700 hover:text-sky-900 underline inline-flex items-center gap-1"
-          >
-            <ExternalLink className="h-3.5 w-3.5" /> New tab
-          </a>
-        </div>
-      </div>
-      <div className="flex-1 bg-white">
-        <iframe
-          src={url}
-          className="w-full h-full block"
-          title="FreightPOP"
-          allow={EMBED_ALLOW}
-          referrerPolicy="no-referrer-when-downgrade"
-        />
-      </div>
-    </div>
-  );
-}
+// FreightPopSidebar was the previous in-page split-view iframe. It was
+// replaced by the singleton FreightPopOverlay (mounted at App scope) so
+// the iframe survives route changes and keeps the user logged into
+// FreightPOP across every prev/next walk.

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./lib/api";
 import type { ShipmentTask } from "./lib/types";
+import { FreightPopOverlay } from "./components/FreightPopOverlay";
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams, Outlet } from "react-router-dom";
 import { Layout, type TabId } from "./components/Layout";
 import { AuthProvider, useAuth } from "./lib/auth";
@@ -112,6 +113,10 @@ function AuthedApp() {
 
   return (
     <NavCtx.Provider value={nav}>
+      {/* Singleton FreightPOP iframe — mounted ONCE here so the user's
+          login session survives every route change. Pages drive its
+          visibility/context via the freightpopFrame pub/sub store. */}
+      <FreightPopOverlay />
       <Layout
         tab={tab}
         onTab={(t) => navigate(TAB_PATH[t])}

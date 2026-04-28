@@ -7,24 +7,17 @@ interface Props {
   title: string;
   subtitle?: string;
   children: ReactNode;
-  // Optional content to render in the left "gray screen" area while the
-  // drawer is open. Used for the FreightPOP iframe sidebar so the rep can
-  // see the live grid and the shipment details side-by-side. When provided,
-  // the dimmed backdrop is suppressed and click-outside-to-close is too —
-  // the leftSlot becomes interactive content, not a dismiss target.
-  leftSlot?: ReactNode;
+  // Hide the dimmed backdrop + click-outside-to-close. Used when something
+  // else (e.g. the singleton FreightPOP overlay mounted at App scope) is
+  // already filling the area to the left of the drawer; rendering a backdrop
+  // on top of it would dim the iframe.
+  suppressBackdrop?: boolean;
 }
 
-export function Drawer({ open, onClose, title, subtitle, children, leftSlot }: Props) {
+export function Drawer({ open, onClose, title, subtitle, children, suppressBackdrop }: Props) {
   return (
     <>
-      {leftSlot && open ? (
-        // Split-view: the previously-dimmed backdrop becomes the leftSlot.
-        // No click-to-close — the user dismisses via the X / Esc / sign-out.
-        <div className="fixed top-0 left-0 right-0 sm:right-[560px] bottom-0 z-20 bg-slate-100">
-          {leftSlot}
-        </div>
-      ) : (
+      {suppressBackdrop ? null : (
         <div
           onClick={onClose}
           className={`fixed inset-0 z-20 bg-slate-900/30 backdrop-blur-sm transition-opacity ${open ? "opacity-100" : "opacity-0 pointer-events-none"}`}

@@ -34,7 +34,7 @@ const FALLBACKS = {
   // Placeholder substitution still works ({tracking_number}, {shipment_id},
   // {order_number}) for tenants with custom URL routes.
   "embed.freightpop.enabled": true,
-  "embed.freightpop.url_template": "https://app.freightpop.com/",
+  "embed.freightpop.url_template": "https://app.freightpop.com/dashboard",
 };
 
 const TTL_MS = 30_000;

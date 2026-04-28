@@ -15,15 +15,16 @@ describe("FreightPOP embed defaults", () => {
     assert.equal(getFallback("embed.freightpop.enabled"), true);
   });
 
-  it("default url_template is the bare base URL — no /tracking/{...} path", () => {
+  it("default url_template lands on the FreightPOP /dashboard, not /tracking/{...}", () => {
     // FreightPOP has no public deep-link route for an individual shipment,
-    // so the previous /tracking/{tracking_number} default landed on a
-    // generic page. We mirror the Chrome extension's flow now: load the
-    // grid, paste the tracking number into search.
+    // so the old /tracking/{tracking_number} default landed on a generic
+    // page (or a Generate History Report modal). The /dashboard route is
+    // the actual landing page reps see when they sign in. The walk-through
+    // flow then mirrors the Chrome extension: paste the tracking number
+    // into FreightPOP's search to jump to a specific shipment.
     const tpl = getFallback("embed.freightpop.url_template");
     assert.equal(typeof tpl, "string");
-    assert.equal(tpl, "https://app.freightpop.com/");
-    assert.ok(!tpl.includes("/tracking/"), "must not include /tracking/ path");
+    assert.equal(tpl, "https://app.freightpop.com/dashboard");
     assert.ok(!tpl.includes("{tracking_number}"), "must not have placeholder");
   });
 
