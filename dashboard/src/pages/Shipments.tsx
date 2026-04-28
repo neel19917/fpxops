@@ -70,11 +70,15 @@ interface ShipmentsPageProps {
   // server-side. onWalk navigates to the sibling /tasks/:id route.
   taskWalk?: {
     taskId: string;
+    task: ShipmentTask | null;
     prevTaskId: string | null;
     nextTaskId: string | null;
     index: number;
     total: number;
     onWalk: (taskId: string) => void;
+    // Called after the task's status changes so the route can refresh the
+    // sibling lookup (a Done task may drop out of the active scope, etc.).
+    onTaskStatusChanged?: (status: TaskStatus) => void;
   } | null;
 }
 
@@ -154,6 +158,14 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   // Re-analyze button state — busy flag prevents double-click during a Claude
   // round-trip (typically 2-3s).
   const [reanalyzing, setReanalyzing] = useState(false);
+
+  // Task-walk: tracks whether the focused task's status update is in flight,
+  // and whether the user has opted in to inline action overrides on the
+  // shipment. Default off — clicking the checkbox reveals YES / NO / Resolved
+  // quick buttons next to the existing "Override" link.
+  const [taskBusy, setTaskBusy] = useState(false);
+  const [actionEditOptIn, setActionEditOptIn] = useState(false);
+  const [actionEditBusy, setActionEditBusy] = useState(false);
 
   // "Export all" pulls every shipment fresh (ignores filters / pill / search)
   // so the workbook reflects the database, not the current view.
@@ -845,6 +857,22 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               ))}
             </div>
 
+            {taskWalk?.task ? (
+              <TaskBanner
+                task={taskWalk.task}
+                busy={taskBusy}
+                onSetStatus={async (status) => {
+                  if (!taskWalk?.task) return;
+                  setTaskBusy(true);
+                  try {
+                    await api.tasks.update(taskWalk.task.id, { status });
+                    taskWalk.onTaskStatusChanged?.(status);
+                  } catch (e) { setErr((e as Error).message); }
+                  finally { setTaskBusy(false); }
+                }}
+              />
+            ) : null}
+
             {drawerTab === "overview" && (
               <>
                 <Section title="Shipment">
@@ -872,7 +900,70 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                           onClick={() => setOverrideModal({ value: drawerData.shipment.action_required === "YES" ? "NO" : "YES", reason: "", busy: false })}
                           className="text-[11px] text-sky-700 hover:text-sky-900 underline"
                         >Override</button>
+                        {/* Opt-in to inline modify — keeps accidental clicks
+                            from flipping the action. Once ticked, three
+                            single-click quick actions appear below. */}
+                        <label className="inline-flex items-center gap-1 text-[11px] text-slate-500 cursor-pointer select-none ml-1">
+                          <input
+                            type="checkbox"
+                            checked={actionEditOptIn}
+                            onChange={(e) => setActionEditOptIn(e.target.checked)}
+                            className="h-3 w-3 rounded border-slate-300"
+                          />
+                          Modify
+                        </label>
                       </div>
+                      {actionEditOptIn ? (
+                        <div className="mt-1.5 inline-flex items-center gap-1.5 flex-wrap">
+                          {(["YES", "NO", "RESOLVED"] as const).map((v) => {
+                            const active = drawerData.shipment.action_required === v;
+                            const tone = v === "YES"
+                              ? "bg-rose-50 text-rose-700 ring-rose-200 hover:bg-rose-100"
+                              : v === "NO"
+                              ? "bg-emerald-50 text-emerald-700 ring-emerald-200 hover:bg-emerald-100"
+                              : "bg-violet-50 text-violet-700 ring-violet-200 hover:bg-violet-100";
+                            return (
+                              <button
+                                key={v}
+                                disabled={actionEditBusy || active}
+                                onClick={async () => {
+                                  if (!drawerId) return;
+                                  setActionEditBusy(true);
+                                  try {
+                                    await api.shipments.overrideAction(drawerId, { action_required: v });
+                                    const r = await api.shipments.get(drawerId);
+                                    setDrawerData(r);
+                                    setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                                  } catch (e) { setErr((e as Error).message); }
+                                  finally { setActionEditBusy(false); }
+                                }}
+                                className={`text-[11px] font-semibold rounded-md px-2 py-0.5 ring-1 transition ${tone} disabled:opacity-50 disabled:cursor-not-allowed`}
+                                title={active ? "Already set" : `Set action to ${v}`}
+                              >
+                                {v === "RESOLVED" ? "Resolved" : v}
+                              </button>
+                            );
+                          })}
+                          <button
+                            disabled={actionEditBusy || drawerData.shipment.action_source !== "manual"}
+                            onClick={async () => {
+                              if (!drawerId) return;
+                              setActionEditBusy(true);
+                              try {
+                                await api.shipments.overrideAction(drawerId, { action_required: null });
+                                const r = await api.shipments.get(drawerId);
+                                setDrawerData(r);
+                                setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                              } catch (e) { setErr((e as Error).message); }
+                              finally { setActionEditBusy(false); }
+                            }}
+                            className="text-[11px] text-slate-600 hover:text-slate-900 underline disabled:opacity-40 disabled:no-underline"
+                            title="Clear override and let the AI value stand"
+                          >
+                            Revert to AI
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
                     <Field label="Pickup">{fmtDateTime(drawerData.shipment.pickup_date)}</Field>
                     <Field label="ETA">{fmtDateTime(drawerData.shipment.updated_eta)}</Field>
@@ -1275,6 +1366,92 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           </div>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+// =====================================================================
+// Task banner — surfaces the focused task in the drawer when entered via
+// /tasks/:taskId. Title, priority/status chips, and the same Start /
+// Complete / Reopen / Block actions the Tasks page exposes, so the rep
+// can finish a task without leaving the drawer.
+// =====================================================================
+const TASK_PRIORITY_COLOR: Record<string, string> = {
+  low: "bg-slate-100 text-slate-700 ring-slate-200",
+  normal: "bg-sky-100 text-sky-800 ring-sky-200",
+  high: "bg-amber-100 text-amber-800 ring-amber-200",
+  urgent: "bg-rose-100 text-rose-800 ring-rose-200",
+};
+const TASK_STATUS_TONE: Record<string, string> = {
+  open: "bg-sky-50 text-sky-800 ring-sky-200",
+  in_progress: "bg-indigo-50 text-indigo-800 ring-indigo-200",
+  blocked: "bg-amber-50 text-amber-800 ring-amber-200",
+  done: "bg-emerald-50 text-emerald-800 ring-emerald-200",
+  cancelled: "bg-slate-50 text-slate-600 ring-slate-200",
+};
+const TASK_STATUS_LABEL: Record<string, string> = {
+  open: "Open", in_progress: "In Progress", blocked: "Blocked", done: "Done", cancelled: "Cancelled",
+};
+
+function TaskBanner({ task, busy, onSetStatus }: {
+  task: ShipmentTask;
+  busy: boolean;
+  onSetStatus: (status: TaskStatus) => Promise<void> | void;
+}) {
+  // Build the action set per current status so the banner only shows
+  // moves that make sense (matches the per-row status button on Tasks).
+  const actions: { label: string; status: TaskStatus; tone: string }[] = (() => {
+    if (task.status === "open") return [
+      { label: "Start", status: "in_progress", tone: "bg-indigo-600 text-white hover:bg-indigo-700" },
+    ];
+    if (task.status === "in_progress") return [
+      { label: "Mark done", status: "done",    tone: "bg-emerald-600 text-white hover:bg-emerald-700" },
+      { label: "Block",     status: "blocked", tone: "bg-white text-amber-700 ring-1 ring-amber-200 hover:bg-amber-50" },
+    ];
+    if (task.status === "blocked") return [
+      { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" },
+    ];
+    if (task.status === "done") return [
+      { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" },
+    ];
+    return [];
+  })();
+
+  return (
+    <div className="mb-4 rounded-xl bg-violet-50 ring-1 ring-violet-200 px-4 py-3">
+      <div className="flex items-center justify-between gap-3 mb-1">
+        <div className="text-[10px] font-bold uppercase tracking-wider text-violet-700">Task</div>
+        <div className="flex items-center gap-1.5">
+          <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ring-1 ${TASK_PRIORITY_COLOR[task.priority] || TASK_PRIORITY_COLOR.normal}`}>
+            {task.priority}
+          </span>
+          <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ring-1 ${TASK_STATUS_TONE[task.status] || TASK_STATUS_TONE.open}`}>
+            {TASK_STATUS_LABEL[task.status] || task.status}
+          </span>
+        </div>
+      </div>
+      <div className="text-sm font-medium text-slate-900 leading-snug">{task.title}</div>
+      {task.description ? (
+        <div className="text-xs text-slate-600 mt-1 leading-snug whitespace-pre-wrap">{task.description}</div>
+      ) : null}
+      <div className="flex items-center justify-between gap-2 mt-2.5 flex-wrap">
+        <div className="text-[11px] text-slate-500">
+          {task.assigned_to ? <span className="mr-2">{task.assigned_to}</span> : null}
+          <span>created {new Date(task.created_at).toLocaleDateString()}</span>
+        </div>
+        <div className="inline-flex items-center gap-1.5 flex-wrap">
+          {actions.map((a) => (
+            <button
+              key={a.label}
+              disabled={busy}
+              onClick={() => onSetStatus(a.status)}
+              className={`text-xs font-semibold rounded-md px-2.5 py-1 ${a.tone} disabled:opacity-50`}
+            >
+              {busy ? "…" : a.label}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

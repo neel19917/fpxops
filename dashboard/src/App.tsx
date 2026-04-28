@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./lib/api";
+import type { ShipmentTask } from "./lib/types";
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams, Outlet } from "react-router-dom";
 import { Layout, type TabId } from "./components/Layout";
 import { AuthProvider, useAuth } from "./lib/auth";
@@ -176,6 +177,7 @@ function TaskWalkRoute() {
   const { taskId, section } = useParams<{ taskId: string; section?: string }>();
   const navigate = useNavigate();
   const [resolved, setResolved] = useState<{
+    task: ShipmentTask;
     shipmentId: string;
     prevTaskId: string | null;
     nextTaskId: string | null;
@@ -183,6 +185,10 @@ function TaskWalkRoute() {
     total: number;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Bumped when the drawer reports a task status change so we refetch the
+  // sibling lookup (an in_progress→done transition can pop the task out of
+  // the active scope and shift the prev/next pointers).
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     if (!taskId) return;
@@ -196,6 +202,7 @@ function TaskWalkRoute() {
           return;
         }
         setResolved({
+          task: r.task,
           shipmentId: r.task.shipment_id,
           prevTaskId: r.walk?.prev_id || null,
           nextTaskId: r.walk?.next_id || null,
@@ -205,7 +212,7 @@ function TaskWalkRoute() {
       })
       .catch((e: Error) => { if (!cancelled) setError(e.message); });
     return () => { cancelled = true; };
-  }, [taskId]);
+  }, [taskId, reloadKey]);
 
   if (error) {
     return (
@@ -242,11 +249,13 @@ function TaskWalkRoute() {
       }}
       taskWalk={{
         taskId,
+        task: resolved.task,
         prevTaskId: resolved.prevTaskId,
         nextTaskId: resolved.nextTaskId,
         index: resolved.index,
         total: resolved.total,
         onWalk: (nextTaskId) => navigate(section ? `/tasks/${nextTaskId}/${section}` : `/tasks/${nextTaskId}`),
+        onTaskStatusChanged: () => setReloadKey((k) => k + 1),
       }}
     />
   );
