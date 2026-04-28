@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -123,6 +123,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [notesDraft, setNotesDraft] = useState("");
   const [notesBusy, setNotesBusy] = useState(false);
   const [notesSaved, setNotesSaved] = useState(false);
+
+  // CRM-style drawer keyboard navigation.
+  const [drawerHelpOpen, setDrawerHelpOpen] = useState(false);
 
   // Email draft modal.
   const [emailModal, setEmailModal] = useState<{
@@ -339,6 +342,105 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       return true;
     });
   }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter]);
+
+  // Drawer position within the filtered list, used for "X of Y" + prev/next.
+  const drawerIndex = useMemo(() => {
+    if (!drawerId) return -1;
+    return filtered.findIndex((r) => r.id === drawerId);
+  }, [filtered, drawerId]);
+  const drawerPrev = drawerIndex > 0 ? filtered[drawerIndex - 1] : null;
+  const drawerNext = drawerIndex >= 0 && drawerIndex < filtered.length - 1 ? filtered[drawerIndex + 1] : null;
+  function openShipmentSibling(target: Shipment | null) {
+    if (!target) return;
+    setDrawerId(target.id);
+  }
+
+  // Keyboard shortcuts that fire only while the drawer is open. CRM-style:
+  // step through the filtered list, jump to a tab, run the common drawer
+  // actions (re-analyze, override, share), close. Pause whenever the user
+  // is typing in any input/textarea so notes editing isn't disrupted.
+  useEffect(() => {
+    if (!drawerId) return;
+    function isTypingInField(target: EventTarget | null): boolean {
+      const el = target as HTMLElement | null;
+      if (!el) return false;
+      const tag = (el.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return true;
+      if (el.isContentEditable) return true;
+      return false;
+    }
+    function onKey(e: KeyboardEvent) {
+      if (drawerHelpOpen) {
+        if (e.key === "Escape") { e.preventDefault(); setDrawerHelpOpen(false); }
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (isTypingInField(e.target)) return;
+
+      if (e.key === "?" || (e.key === "/" && e.shiftKey)) {
+        e.preventDefault();
+        setDrawerHelpOpen(true);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setDrawerId(null);
+        return;
+      }
+      if (e.key === "j" || e.key === "ArrowDown" || e.key === "n" || e.key === "ArrowRight") {
+        e.preventDefault();
+        openShipmentSibling(drawerNext);
+        return;
+      }
+      if (e.key === "k" || e.key === "ArrowUp" || e.key === "p" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        openShipmentSibling(drawerPrev);
+        return;
+      }
+      // Tab shortcuts — match the order in the drawer's tab bar.
+      const tabMap: Record<string, DrawerTabId> = {
+        "1": "overview",
+        "2": "tasks",
+        "3": "email",
+        "4": "drafts",
+        "5": "history",
+        "6": "raw",
+      };
+      if (tabMap[e.key]) {
+        e.preventDefault();
+        setDrawerTab(tabMap[e.key]);
+        return;
+      }
+      // Quick actions on the focused shipment.
+      if (e.key === "o") {
+        e.preventDefault();
+        if (drawerData) {
+          setOverrideModal({
+            value: drawerData.shipment.action_required === "YES" ? "NO" : "YES",
+            reason: "",
+            busy: false,
+          });
+        }
+        return;
+      }
+      if (e.key === "r") {
+        e.preventDefault();
+        if (!drawerId || reanalyzing) return;
+        setReanalyzing(true);
+        api.shipments.reanalyze(drawerId)
+          .then((r) => {
+            setDrawerData((p) => p ? { ...p, shipment: r.shipment } : p);
+            setRows((prev) => prev.map((row) => row.id === r.shipment.id ? r.shipment : row));
+          })
+          .catch((err) => setErr((err as Error).message))
+          .finally(() => setReanalyzing(false));
+        return;
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawerId, drawerHelpOpen, drawerPrev, drawerNext, drawerData, reanalyzing]);
 
   const allFilteredSelected = filtered.length > 0 && filtered.every((r) => selectedIds.has(r.id));
   function toggleRow(id: string) {
@@ -643,12 +745,45 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       >
         {drawerData ? (
           <>
-            <div className="flex justify-end mb-3">
-              <ShareButton
-                resourceType="shipment"
-                resourceId={drawerData.shipment.id}
-                defaultLabel={`Shipment ${drawerData.shipment.tracking_number || ""}`.trim()}
-              />
+            <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+              <div className="inline-flex items-center rounded-lg ring-1 ring-slate-200 bg-white">
+                <button
+                  type="button"
+                  onClick={() => openShipmentSibling(drawerPrev)}
+                  disabled={!drawerPrev}
+                  title={drawerPrev ? `Previous: ${drawerPrev.tracking_number || ""} (k / ←)` : "No previous shipment"}
+                  className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-l-lg"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <div className="px-2 text-xs text-slate-600 tabular-nums whitespace-nowrap select-none border-x border-slate-200 self-stretch flex items-center">
+                  {drawerIndex >= 0 ? `${drawerIndex + 1} of ${filtered.length}` : "—"}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => openShipmentSibling(drawerNext)}
+                  disabled={!drawerNext}
+                  title={drawerNext ? `Next: ${drawerNext.tracking_number || ""} (j / →)` : "No next shipment"}
+                  className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-r-lg"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setDrawerHelpOpen(true)}
+                  className="text-xs px-2.5 py-1.5 rounded-md bg-white ring-1 ring-slate-200 text-slate-600 hover:bg-slate-50 inline-flex items-center gap-1.5"
+                  title="Keyboard shortcuts (?)"
+                >
+                  <Keyboard className="h-3.5 w-3.5" /> Shortcuts
+                </button>
+                <ShareButton
+                  resourceType="shipment"
+                  resourceId={drawerData.shipment.id}
+                  defaultLabel={`Shipment ${drawerData.shipment.tracking_number || ""}`.trim()}
+                />
+              </div>
             </div>
             <div className="flex gap-1 border-b border-slate-200 mb-5 -mx-1 px-1 overflow-x-auto">
               {([
@@ -941,6 +1076,58 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           </>
         ) : <div className="text-sm text-slate-500">Loading…</div>}
       </Drawer>
+
+      {drawerHelpOpen ? (
+        <div
+          className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setDrawerHelpOpen(false)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100">
+              <h3 className="text-base font-semibold flex items-center gap-2">
+                <Keyboard className="h-5 w-5 text-slate-700" /> Drawer shortcuts
+              </h3>
+              <button
+                onClick={() => setDrawerHelpOpen(false)}
+                className="p-1.5 rounded text-slate-500 hover:text-slate-900 hover:bg-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <ul className="px-5 py-4 space-y-2">
+              {([
+                { keys: ["j", "↓", "n", "→"], label: "Next shipment" },
+                { keys: ["k", "↑", "p", "←"], label: "Previous shipment" },
+                { keys: ["1"], label: "Overview tab" },
+                { keys: ["2"], label: "Tasks tab" },
+                { keys: ["3"], label: "Email tab" },
+                { keys: ["4"], label: "Drafts tab" },
+                { keys: ["5"], label: "Analysis tab" },
+                { keys: ["6"], label: "Raw tab" },
+                { keys: ["o"], label: "Open override modal" },
+                { keys: ["r"], label: "Re-analyze" },
+                { keys: ["esc"], label: "Close drawer" },
+                { keys: ["?"], label: "Show this help" },
+              ] as const).map((s) => (
+                <li key={s.label} className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-700">{s.label}</span>
+                  <span className="flex gap-1 shrink-0">
+                    {s.keys.map((k) => (
+                      <kbd key={k} className="px-1.5 py-0.5 rounded bg-slate-100 ring-1 ring-slate-200 font-mono text-[11px] text-slate-700">{k}</kbd>
+                    ))}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <div className="px-5 py-3 border-t border-slate-100 text-[11px] text-slate-500">
+              Shortcuts pause while you're typing in a field (notes, override reason, task title, etc.).
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {overrideModal && drawerData ? (
         <div
