@@ -1,12 +1,21 @@
+// Default API URL — production Railway. config.js (if present) and the popup's
+// Advanced URL field both override this; storage > config.js > default.
+const DEFAULT_FPX_API_URL = "https://fpxtrackingchromeextension-production.up.railway.app";
+
 // Optional baked-in defaults. Most users set API URL + key from the popup
 // (saved in chrome.storage.local), which always wins. Drop a config.js next
-// to background.js if you want a pre-configured zip; otherwise this is a
-// no-op and the popup is the source of truth.
+// to background.js if you want a pre-configured zip; otherwise the
+// production default below is used.
 try {
   importScripts("config.js");
 } catch {
-  self.FPX_API_URL = "";
+  self.FPX_API_URL = DEFAULT_FPX_API_URL;
   self.FPX_API_KEY = "";
+}
+// If config.js was loaded but left FPX_API_URL blank, fall back to the
+// production default so the extension still works.
+if (!self.FPX_API_URL || typeof self.FPX_API_URL !== "string") {
+  self.FPX_API_URL = DEFAULT_FPX_API_URL;
 }
 
 // ---------- API key & URL resolution ----------
