@@ -280,7 +280,10 @@ export function TasksPage() {
       // Starting a task means starting work on the shipment — pop the drawer
       // open so the user lands directly in context. Other transitions
       // (Complete / Reopen) stay where they are.
-      if (opts.openDrawer && t.shipment_id) nav.openShipment(t.shipment_id);
+      // openDrawer means "begin work on this task" — route through task-walk
+      // so the drawer's prev/next chevrons step through tasks instead of
+      // shipments.
+      if (opts.openDrawer && t.shipment_id) nav.openTask(t.id);
     } catch (e) { setError((e as Error).message); }
   }
   async function updateAssignee(t: ShipmentTask, assigned_to: string | null) {
@@ -400,21 +403,20 @@ export function TasksPage() {
         return;
       }
       if (e.key === "Enter") {
-        if (t.shipment_id) { e.preventDefault(); nav.openShipment(t.shipment_id); }
+        if (t.shipment_id) { e.preventDefault(); nav.openTask(t.id); }
         return;
       }
       // Walk-through: n / p step through the visible task list and open
-      // each task's shipment in the drawer.
+      // each task in task-walk mode.
       if (e.key === "n" || e.key === "p") {
         e.preventDefault();
         const dir = e.key === "n" ? 1 : -1;
         const start = idx < 0 ? 0 : idx + dir;
-        // Find the next task that has a shipment; skip orphans rather than
-        // opening nothing.
+        // Find the next task that has a shipment; skip orphans.
         for (let i = start; i >= 0 && i < visibleTasks.length; i += dir) {
           const cand = visibleTasks[i];
           setFocusedId(cand.id);
-          if (cand.shipment_id) { nav.openShipment(cand.shipment_id); break; }
+          if (cand.shipment_id) { nav.openTask(cand.id); break; }
         }
         return;
       }
@@ -503,7 +505,7 @@ export function TasksPage() {
               const first = visibleTasks.find((t) => t.shipment_id);
               if (!first) { setError("No task with a shipment to walk through."); return; }
               setFocusedId(first.id);
-              if (first.shipment_id) nav.openShipment(first.shipment_id);
+              nav.openTask(first.id);
             }}
             disabled={visibleTasks.length === 0}
             className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -629,7 +631,7 @@ export function TasksPage() {
           focusedId={focusedId}
           onFocus={setFocusedId}
           onSetStatus={(t, s) => setStatus(t, s, { openDrawer: s === "in_progress" && t.status === "open" })}
-          onOpenShipment={(id) => nav.openShipment(id)}
+          onOpenTask={(taskId) => nav.openTask(taskId)}
         />
       ) : (
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -726,9 +728,9 @@ export function TasksPage() {
                 <td className="px-4 py-3">
                   {t.shipment_id ? (
                     <button
-                      onClick={(e) => { e.stopPropagation(); nav.openShipment(t.shipment_id); }}
+                      onClick={(e) => { e.stopPropagation(); nav.openTask(t.id); }}
                       className={"text-left w-full hover:text-sky-700 " + (t.status === "done" ? "line-through text-slate-400" : "text-slate-900 font-medium")}
-                      title="Open shipment drawer"
+                      title="Open in task-walk mode"
                     >
                       {t.title}
                     </button>
@@ -743,7 +745,7 @@ export function TasksPage() {
                 <td className="px-4 py-3 font-mono text-xs">
                   {t.shipment_id ? (
                     <button
-                      onClick={(e) => { e.stopPropagation(); nav.openShipment(t.shipment_id); }}
+                      onClick={(e) => { e.stopPropagation(); nav.openTask(t.id); }}
                       className="text-sky-700 hover:text-sky-900 hover:underline font-medium"
                     >
                       {t.tracking_number || "(no tracking #)"}
@@ -764,9 +766,9 @@ export function TasksPage() {
                 <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
                   {t.shipment_id ? (
                     <button
-                      onClick={() => nav.openShipment(t.shipment_id)}
+                      onClick={() => nav.openTask(t.id)}
                       className="p-1.5 text-slate-400 hover:text-sky-700 hover:bg-sky-50 rounded-md mr-1"
-                      title="Open shipment drawer"
+                      title="Open in task-walk mode"
                     >
                       <ExternalLink className="h-4 w-4" />
                     </button>
@@ -840,10 +842,11 @@ interface KanbanBoardProps {
   focusedId: string | null;
   onFocus: (id: string) => void;
   onSetStatus: (t: ShipmentTask, status: TaskStatus) => void;
-  onOpenShipment: (id: string) => void;
+  // Routes through /tasks/:taskId so the drawer enters task-walk mode.
+  onOpenTask: (taskId: string) => void;
 }
 
-function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenShipment }: KanbanBoardProps) {
+function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenTask }: KanbanBoardProps) {
   const grouped = useMemo(() => {
     const m: Record<TaskStatus, ShipmentTask[]> = {
       open: [], in_progress: [], blocked: [], done: [], cancelled: [],
@@ -874,7 +877,7 @@ function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenShipment }:
                   focused={focusedId === t.id}
                   onFocus={onFocus}
                   onSetStatus={onSetStatus}
-                  onOpenShipment={onOpenShipment}
+                  onOpenTask={onOpenTask}
                 />
               ))}
             </div>
@@ -890,10 +893,10 @@ interface KanbanCardProps {
   focused: boolean;
   onFocus: (id: string) => void;
   onSetStatus: (t: ShipmentTask, s: TaskStatus) => void;
-  onOpenShipment: (id: string) => void;
+  onOpenTask: (taskId: string) => void;
 }
 
-function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenShipment }: KanbanCardProps) {
+function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask }: KanbanCardProps) {
   // Action choices per column. Open → Start. In Progress → Done | Block.
   // Blocked → Reopen. Done → Reopen. Keeps the card terse — at most two
   // buttons.
@@ -931,9 +934,9 @@ function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenShipment }: Kan
         </span>
         {task.tracking_number && task.shipment_id ? (
           <button
-            onClick={(e) => { e.stopPropagation(); onOpenShipment(task.shipment_id!); }}
+            onClick={(e) => { e.stopPropagation(); onOpenTask(task.id); }}
             className="text-[11px] font-mono text-sky-700 hover:text-sky-900 hover:underline truncate"
-            title="Open shipment drawer"
+            title="Open shipment drawer (task-walk mode)"
           >
             {task.tracking_number}
           </button>

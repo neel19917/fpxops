@@ -1,4 +1,5 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { api } from "./lib/api";
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams, Outlet } from "react-router-dom";
 import { Layout, type TabId } from "./components/Layout";
 import { AuthProvider, useAuth } from "./lib/auth";
@@ -87,6 +88,7 @@ function AuthedApp() {
       if (path) navigate(path);
     },
     openShipment: (id: string) => navigate(`/tracking/${id}`),
+    openTask: (taskId: string) => navigate(`/tasks/${taskId}`),
   }), [navigate]);
 
   if (loading) {
@@ -119,6 +121,8 @@ function AuthedApp() {
           <Route path="/tracking/:id" element={<ShipmentsRoute />} />
           <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
           <Route path="/tasks" element={<TasksPage />} />
+          <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
+          <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
           <Route path="/analyses" element={<AnalysesPage />} />
           <Route path="/audits/gp" element={<GpAuditsPage />} />
           <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
@@ -158,6 +162,91 @@ function ShipmentsRoute() {
         } else {
           navigate(`/tracking/${nextId}`);
         }
+      }}
+    />
+  );
+}
+
+// /tasks/:taskId — task-walk-through entry point. Hits the database route
+// lookup (GET /api/tasks/:id?walk=active) to resolve the focused task to a
+// shipment and to get its prev/next sibling task ids for the drawer's
+// chevrons. While the lookup is in flight we render a small placeholder.
+// On not-found / no-shipment we fall back to /tasks so the URL doesn't dead-end.
+function TaskWalkRoute() {
+  const { taskId, section } = useParams<{ taskId: string; section?: string }>();
+  const navigate = useNavigate();
+  const [resolved, setResolved] = useState<{
+    shipmentId: string;
+    prevTaskId: string | null;
+    nextTaskId: string | null;
+    index: number;
+    total: number;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!taskId) return;
+    let cancelled = false;
+    setResolved(null); setError(null);
+    api.tasks.get(taskId, { walk: "active" })
+      .then((r) => {
+        if (cancelled) return;
+        if (!r.task.shipment_id) {
+          setError("This task isn't linked to a shipment.");
+          return;
+        }
+        setResolved({
+          shipmentId: r.task.shipment_id,
+          prevTaskId: r.walk?.prev_id || null,
+          nextTaskId: r.walk?.next_id || null,
+          index: r.walk?.index ?? 0,
+          total: r.walk?.total ?? 1,
+        });
+      })
+      .catch((e: Error) => { if (!cancelled) setError(e.message); });
+    return () => { cancelled = true; };
+  }, [taskId]);
+
+  if (error) {
+    return (
+      <div className="p-6 max-w-md mx-auto text-sm text-slate-600">
+        <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-4 py-3 text-rose-800">{error}</div>
+        <button
+          onClick={() => navigate("/tasks")}
+          className="mt-3 text-sky-700 hover:text-sky-900 hover:underline"
+        >← Back to Tasks</button>
+      </div>
+    );
+  }
+  if (!resolved || !taskId) {
+    return <div className="p-6 text-sm text-slate-400">Loading task…</div>;
+  }
+
+  return (
+    <ShipmentsPage
+      initialShipmentId={resolved.shipmentId}
+      drawerSection={section || null}
+      onShipmentConsumed={() => { /* URL already has the task id */ }}
+      onDrawerChange={(nextId, nextSection) => {
+        // Closing the drawer in task-walk mode pops back to the Tasks page.
+        if (!nextId) { navigate("/tasks"); return; }
+        // Drawer changing the *shipment* id while in task-walk mode would
+        // sever the task↔shipment link, so push to /tracking instead.
+        if (nextId !== resolved.shipmentId) {
+          navigate(nextSection ? `/tracking/${nextId}/${nextSection}` : `/tracking/${nextId}`);
+          return;
+        }
+        // Same shipment — only the section changed.
+        if (nextSection) navigate(`/tasks/${taskId}/${nextSection}`);
+        else navigate(`/tasks/${taskId}`);
+      }}
+      taskWalk={{
+        taskId,
+        prevTaskId: resolved.prevTaskId,
+        nextTaskId: resolved.nextTaskId,
+        index: resolved.index,
+        total: resolved.total,
+        onWalk: (nextTaskId) => navigate(section ? `/tasks/${nextTaskId}/${section}` : `/tasks/${nextTaskId}`),
       }}
     />
   );

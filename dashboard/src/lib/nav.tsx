@@ -6,6 +6,10 @@ import { createContext, useContext } from "react";
 export interface NavApi {
   setTab: (t: string) => void;
   openShipment: (shipmentId: string) => void;
+  // Task-walk entry: opens the drawer in task-walk mode at /tasks/:taskId.
+  // The drawer's prev/next chevrons step through the task list (resolved
+  // server-side via /api/tasks/:id?walk=active).
+  openTask: (taskId: string) => void;
 }
 
 export const NavCtx = createContext<NavApi | null>(null);

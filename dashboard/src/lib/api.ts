@@ -184,6 +184,23 @@ export const api = {
   tasks: {
     list: (params?: { status?: string; assigned_to?: string; priority?: string; limit?: number }) =>
       request<{ data: ShipmentTask[] }>("/api/tasks", { params }),
+    // Single-task lookup with optional walk-through siblings. The server
+    // resolves the prev / next task ids (and their shipment ids) within the
+    // selected scope, so a /tasks/:id URL is self-contained.
+    get: (id: string, params?: { walk?: "active" | "open" | "in_progress" | "blocked" | "done" | "all" | "off" }) =>
+      request<{
+        task: ShipmentTask;
+        walk: null | {
+          mode: string;
+          index: number;
+          total: number;
+          prev_id: string | null;
+          next_id: string | null;
+          prev_shipment_id: string | null;
+          next_shipment_id: string | null;
+          ids: string[];
+        };
+      }>(`/api/tasks/${id}`, { params }),
     listForShipment: (shipmentId: string) =>
       request<{ data: ShipmentTask[] }>(`/api/shipments/${shipmentId}/tasks`),
     create: (shipmentId: string, body: { title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string }) =>

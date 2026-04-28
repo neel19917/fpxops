@@ -64,6 +64,18 @@ interface ShipmentsPageProps {
   drawerSection?: string | null;
   onShipmentConsumed?: () => void;
   onDrawerChange?: (id: string | null, section: string | null) => void;
+  // When the drawer was entered via a /tasks/:taskId URL, the task-walk
+  // context drives prev/next instead of the local `filtered` shipments list.
+  // taskId is the focused task; prev / next are sibling task ids resolved
+  // server-side. onWalk navigates to the sibling /tasks/:id route.
+  taskWalk?: {
+    taskId: string;
+    prevTaskId: string | null;
+    nextTaskId: string | null;
+    index: number;
+    total: number;
+    onWalk: (taskId: string) => void;
+  } | null;
 }
 
 const DRAWER_TABS = ["overview", "tasks", "email", "drafts", "history", "raw"] as const;
@@ -72,7 +84,7 @@ function asDrawerTab(s: string | null | undefined): DrawerTabId {
   return DRAWER_TABS.includes(s as DrawerTabId) ? (s as DrawerTabId) : "overview";
 }
 
-export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange }: ShipmentsPageProps = {}) {
+export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk }: ShipmentsPageProps = {}) {
   const [rows, setRows] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -348,12 +360,27 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter]);
 
   // Drawer position within the filtered list, used for "X of Y" + prev/next.
+  // When taskWalk is active the position comes from the task list instead.
   const drawerIndex = useMemo(() => {
+    if (taskWalk) return taskWalk.index;
     if (!drawerId) return -1;
     return filtered.findIndex((r) => r.id === drawerId);
-  }, [filtered, drawerId]);
-  const drawerPrev = drawerIndex > 0 ? filtered[drawerIndex - 1] : null;
-  const drawerNext = drawerIndex >= 0 && drawerIndex < filtered.length - 1 ? filtered[drawerIndex + 1] : null;
+  }, [filtered, drawerId, taskWalk]);
+  // In task-walk mode prev/next is a thin shim — clicking the chevron just
+  // navigates to the sibling /tasks/:id; the route loader does the resolution.
+  const drawerHasPrev = taskWalk ? !!taskWalk.prevTaskId : drawerIndex > 0;
+  const drawerHasNext = taskWalk ? !!taskWalk.nextTaskId : (drawerIndex >= 0 && drawerIndex < filtered.length - 1);
+  const drawerTotal = taskWalk ? taskWalk.total : filtered.length;
+  const drawerPrev = !taskWalk && drawerIndex > 0 ? filtered[drawerIndex - 1] : null;
+  const drawerNext = !taskWalk && drawerIndex >= 0 && drawerIndex < filtered.length - 1 ? filtered[drawerIndex + 1] : null;
+  function walkPrev() {
+    if (taskWalk?.prevTaskId) { taskWalk.onWalk(taskWalk.prevTaskId); return; }
+    if (drawerPrev) setDrawerId(drawerPrev.id);
+  }
+  function walkNext() {
+    if (taskWalk?.nextTaskId) { taskWalk.onWalk(taskWalk.nextTaskId); return; }
+    if (drawerNext) setDrawerId(drawerNext.id);
+  }
   function openShipmentSibling(target: Shipment | null) {
     if (!target) return;
     setDrawerId(target.id);
@@ -393,12 +420,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       }
       if (e.key === "j" || e.key === "ArrowDown" || e.key === "n" || e.key === "ArrowRight") {
         e.preventDefault();
-        openShipmentSibling(drawerNext);
+        walkNext();
         return;
       }
       if (e.key === "k" || e.key === "ArrowUp" || e.key === "p" || e.key === "ArrowLeft") {
         e.preventDefault();
-        openShipmentSibling(drawerPrev);
+        walkPrev();
         return;
       }
       // Tab shortcuts — match the order in the drawer's tab bar.
@@ -444,7 +471,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawerId, drawerHelpOpen, drawerPrev, drawerNext, drawerData, reanalyzing]);
+  }, [drawerId, drawerHelpOpen, drawerPrev, drawerNext, drawerData, reanalyzing, taskWalk]);
 
   const allFilteredSelected = filtered.length > 0 && filtered.every((r) => selectedIds.has(r.id));
   function toggleRow(id: string) {
@@ -752,21 +779,28 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               <div className="inline-flex items-center rounded-lg ring-1 ring-slate-200 bg-white">
                 <button
                   type="button"
-                  onClick={() => openShipmentSibling(drawerPrev)}
-                  disabled={!drawerPrev}
-                  title={drawerPrev ? `Previous: ${drawerPrev.tracking_number || ""} (k / ←)` : "No previous shipment"}
+                  onClick={walkPrev}
+                  disabled={!drawerHasPrev}
+                  title={drawerHasPrev ? (taskWalk ? "Previous task (k / ←)" : `Previous: ${drawerPrev?.tracking_number || ""} (k / ←)`) : "No previous"}
                   className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-l-lg"
                 >
                   <ChevronLeft className="h-4 w-4" />
                 </button>
                 <div className="px-2 text-xs text-slate-600 tabular-nums whitespace-nowrap select-none border-x border-slate-200 self-stretch flex items-center">
-                  {drawerIndex >= 0 ? `${drawerIndex + 1} of ${filtered.length}` : "—"}
+                  {taskWalk ? (
+                    <span className="inline-flex items-center gap-1">
+                      <span className="text-violet-700 font-semibold">Task</span>
+                      <span>{drawerIndex + 1} of {drawerTotal}</span>
+                    </span>
+                  ) : (
+                    drawerIndex >= 0 ? `${drawerIndex + 1} of ${drawerTotal}` : "—"
+                  )}
                 </div>
                 <button
                   type="button"
-                  onClick={() => openShipmentSibling(drawerNext)}
-                  disabled={!drawerNext}
-                  title={drawerNext ? `Next: ${drawerNext.tracking_number || ""} (j / →)` : "No next shipment"}
+                  onClick={walkNext}
+                  disabled={!drawerHasNext}
+                  title={drawerHasNext ? (taskWalk ? "Next task (j / →)" : `Next: ${drawerNext?.tracking_number || ""} (j / →)`) : "No next"}
                   className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-r-lg"
                 >
                   <ChevronRight className="h-4 w-4" />

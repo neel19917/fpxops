@@ -17,6 +17,51 @@ tasksRouter.get("/", async (req, res) => {
   res.json({ data: data || [] });
 });
 
+// GET /tasks/:id  — task lookup by id, with optional walk-through context.
+// When ?walk=active is set, returns prev_task_id / next_task_id keyed against
+// the active (open + in_progress) task set so the drawer can step through.
+// `walk` accepts: "active" (default), "open", "in_progress", "all".
+// This is the single "database route lookup" the drawer relies on so URL
+// state alone (/tasks/:id) is enough to render — no fragile passing of
+// in-memory task lists across page transitions.
+tasksRouter.get("/:id", async (req, res) => {
+  const { data: task, error } = await supabase
+    .from("fpx_shipment_tasks").select("*").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!task) return res.status(404).json({ error: "Task not found" });
+
+  const walkParam = String(req.query.walk || "active").toLowerCase();
+  let walk = null;
+  if (walkParam !== "off") {
+    let q = supabase.from("fpx_shipment_tasks")
+      .select("id, shipment_id, tracking_number, title, status")
+      .order("created_at", { ascending: false });
+    if (walkParam === "active") q = q.in("status", ["open", "in_progress"]);
+    else if (walkParam === "open" || walkParam === "in_progress" || walkParam === "blocked" || walkParam === "done")
+      q = q.eq("status", walkParam);
+    // "all" → no status filter.
+    const { data: list, error: listErr } = await q;
+    if (!listErr && list) {
+      // Always include the focused task even if it falls out of the filter
+      // (e.g. you walked into a blocked task while filtered to active).
+      const idx = list.findIndex((t) => t.id === task.id);
+      const safeList = idx >= 0 ? list : [task, ...list];
+      const safeIdx = idx >= 0 ? idx : 0;
+      walk = {
+        mode: walkParam,
+        index: safeIdx,
+        total: safeList.length,
+        prev_id: safeIdx > 0 ? safeList[safeIdx - 1].id : null,
+        next_id: safeIdx < safeList.length - 1 ? safeList[safeIdx + 1].id : null,
+        prev_shipment_id: safeIdx > 0 ? safeList[safeIdx - 1].shipment_id : null,
+        next_shipment_id: safeIdx < safeList.length - 1 ? safeList[safeIdx + 1].shipment_id : null,
+        ids: safeList.map((t) => t.id),
+      };
+    }
+  }
+  res.json({ task, walk });
+});
+
 // POST /tasks/bulk  { shipment_ids: string[], title, description?, priority?, assigned_to? }
 // Creates one task per shipment. assigned_to defaults to that shipment's
 // created_by (the runner who scraped it). Skips already-completed shipments? No —
