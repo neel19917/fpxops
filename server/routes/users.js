@@ -18,12 +18,16 @@ usersRouter.get("/", async (req, res) => {
   sendCachedJson(req, res, { data: data || [] });
 });
 
-// PATCH /api/users/:id  { enabled?, role? }
+// PATCH /api/users/:id  { enabled?, role?, full_name? }
 usersRouter.patch("/:id", async (req, res) => {
   const updates = {};
   if (typeof req.body?.enabled === "boolean") updates.enabled = req.body.enabled;
   if (typeof req.body?.role === "string" && ["viewer","member","admin"].includes(req.body.role)) {
     updates.role = req.body.role;
+  }
+  if (typeof req.body?.full_name === "string") {
+    const trimmed = req.body.full_name.trim();
+    updates.full_name = trimmed === "" ? null : trimmed.slice(0, 200);
   }
   if (Object.keys(updates).length === 0) return res.status(400).json({ error: "No valid fields to update" });
   const { data, error } = await supabase

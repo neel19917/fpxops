@@ -1,8 +1,57 @@
 import { useEffect, useMemo, useState } from "react";
-import { ListChecks, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X } from "lucide-react";
+import { ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X } from "lucide-react";
 import { api } from "../lib/api";
 import type { ShipmentTask, TaskStatus } from "../lib/types";
 import { useNav } from "../lib/nav";
+
+interface InlineAssigneeProps {
+  value: string | null;
+  onSave: (next: string | null) => Promise<void>;
+}
+function InlineAssignee({ value, onSave }: InlineAssigneeProps) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value || "");
+  const [busy, setBusy] = useState(false);
+  async function commit() {
+    const next = draft.trim();
+    if (next === (value || "").trim()) { setEditing(false); return; }
+    setBusy(true);
+    try {
+      await onSave(next === "" ? null : next);
+      setEditing(false);
+    } catch (e) { alert((e as Error).message); }
+    finally { setBusy(false); }
+  }
+  if (!editing) {
+    return (
+      <button
+        onClick={(e) => { e.stopPropagation(); setDraft(value || ""); setEditing(true); }}
+        className="group inline-flex items-center gap-1.5 text-left text-slate-600 hover:text-sky-700"
+        title="Edit assignee"
+      >
+        <span>{value || <span className="text-slate-400">—</span>}</span>
+        <Pencil className="h-3 w-3 opacity-0 group-hover:opacity-60" />
+      </button>
+    );
+  }
+  return (
+    <input
+      autoFocus
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") { setDraft(value || ""); setEditing(false); }
+      }}
+      disabled={busy}
+      placeholder="email or name"
+      className="text-sm px-2 py-1 rounded-md border border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-300 min-w-[180px]"
+    />
+  );
+}
 
 const STATUS_LABEL: Record<TaskStatus, string> = {
   open: "Open",
@@ -98,6 +147,10 @@ export function TasksPage() {
       const { task } = await api.tasks.update(t.id, { status });
       setTasks((prev) => prev.map((p) => (p.id === task.id ? task : p)));
     } catch (e) { setError((e as Error).message); }
+  }
+  async function updateAssignee(t: ShipmentTask, assigned_to: string | null) {
+    const { task } = await api.tasks.update(t.id, { assigned_to });
+    setTasks((prev) => prev.map((p) => (p.id === task.id ? task : p)));
   }
 
   async function remove(t: ShipmentTask) {
@@ -234,7 +287,12 @@ export function TasksPage() {
                     </span>
                   ) : (t.tracking_number || "—")}
                 </td>
-                <td className="px-4 py-3 text-slate-600">{t.assigned_to || "—"}</td>
+                <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                  <InlineAssignee
+                    value={t.assigned_to}
+                    onSave={(next) => updateAssignee(t, next)}
+                  />
+                </td>
                 <td className="px-4 py-3 text-slate-500 text-xs">{new Date(t.created_at).toLocaleString()}</td>
                 <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
                   {t.shipment_id ? (

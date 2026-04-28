@@ -1,9 +1,57 @@
 import { useEffect, useState } from "react";
-import { Shield, ShieldAlert, UserCheck, UserX, Users as UsersIcon } from "lucide-react";
+import { Pencil, Shield, ShieldAlert, UserCheck, UserX, Users as UsersIcon } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
 import type { UserProfileRow } from "../lib/types";
 import { useAuth } from "../lib/auth";
+
+interface InlineNameProps {
+  value: string | null;
+  fallback: string;
+  onSave: (next: string | null) => Promise<void>;
+}
+function InlineName({ value, fallback, onSave }: InlineNameProps) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value || "");
+  const [busy, setBusy] = useState(false);
+  async function commit() {
+    const next = draft.trim();
+    if (next === (value || "").trim()) { setEditing(false); return; }
+    setBusy(true);
+    try {
+      await onSave(next === "" ? null : next);
+      setEditing(false);
+    } catch (e) { alert((e as Error).message); }
+    finally { setBusy(false); }
+  }
+  if (!editing) {
+    return (
+      <button
+        onClick={() => { setDraft(value || ""); setEditing(true); }}
+        className="group inline-flex items-center gap-1.5 text-left font-medium hover:text-sky-700"
+        title="Edit name"
+      >
+        <span>{value || fallback}</span>
+        <Pencil className="h-3 w-3 opacity-0 group-hover:opacity-60" />
+      </button>
+    );
+  }
+  return (
+    <input
+      autoFocus
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") { setDraft(value || ""); setEditing(false); }
+      }}
+      disabled={busy}
+      maxLength={200}
+      className="text-sm font-medium px-2 py-1 rounded-md border border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-300 min-w-[180px]"
+    />
+  );
+}
 
 export function UsersPage() {
   const { profile } = useAuth();
@@ -26,6 +74,10 @@ export function UsersPage() {
   async function setRole(u: UserProfileRow, role: string) {
     try { await api.users.update(u.id, { role }); load(); }
     catch (e) { alert((e as Error).message); }
+  }
+  async function setName(u: UserProfileRow, full_name: string | null) {
+    const r = await api.users.update(u.id, { full_name });
+    setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
   }
 
   return (
@@ -65,7 +117,11 @@ export function UsersPage() {
                       {(u.full_name || u.email).slice(0, 2).toUpperCase()}
                     </div>
                   )}
-                  <span className="font-medium">{u.full_name || u.email.split("@")[0]}</span>
+                  <InlineName
+                    value={u.full_name}
+                    fallback={u.email.split("@")[0]}
+                    onSave={(next) => setName(u, next)}
+                  />
                   {isMe ? <span className="text-xs text-slate-400">(you)</span> : null}
                 </td>
                 <td className="px-5 py-3 text-slate-600">{u.email}</td>

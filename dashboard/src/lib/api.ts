@@ -125,7 +125,7 @@ export const api = {
   },
   users: {
     list: () => request<{ data: UserProfileRow[] }>("/api/users"),
-    update: (id: string, body: { enabled?: boolean; role?: string }) =>
+    update: (id: string, body: { enabled?: boolean; role?: string; full_name?: string | null }) =>
       request<{ user: UserProfileRow }>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   },
   shareLinks: {
