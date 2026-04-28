@@ -6,6 +6,7 @@ import * as DEFAULTS from "../prompts.js";
 const FALLBACKS = {
   "prompt.system": DEFAULTS.SYSTEM_PROMPT,
   "prompt.per_shipment": DEFAULTS.PER_SHIPMENT_PROMPT,
+  "prompt.per_shipment_logic": DEFAULTS.PER_SHIPMENT_LOGIC,
   "prompt.priority": DEFAULTS.PRIORITY_PROMPT,
   "prompt.summary": DEFAULTS.SUMMARY_PROMPT,
   "prompt.email_draft.system_base":

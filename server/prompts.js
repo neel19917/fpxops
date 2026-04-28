@@ -19,6 +19,9 @@ Rules:
 - "actionConfidence" is your probability (0.0–1.0) that this shipment requires action right now.
 - "actionTarget" must be one of: "customer", "carrier", "none". Use "none" only when no action is needed.
 
+Logic handling (apply BEFORE deciding actionConfidence):
+{{logic}}
+
 Respond in this exact JSON format:
 {
   "actionConfidence": 0.0,
@@ -29,6 +32,14 @@ Respond in this exact JSON format:
 
 Shipment data:
 {{data}}`;
+
+// Editable rule list injected into PER_SHIPMENT_PROMPT at {{logic}}. Edit
+// this block in the dashboard's Settings tab (key: prompt.per_shipment_logic)
+// to adjust how the AI decides whether to flag a shipment.
+export const PER_SHIPMENT_LOGIC = `- If delivery_date is BEFORE the estimated delivery (updated_eta, falling back to original_eta), DO NOT flag. Note in "issue" that the shipment delivered early; set actionConfidence low and actionTarget to "none".
+- If delivery_date is AFTER the estimated delivery (updated_eta, falling back to original_eta), DO flag. Identify it as a late delivery, set actionTarget to "carrier" unless the data clearly points to the customer.
+- If the shipment has not yet been picked up (no actual_departure / no real pickup_date — pickup is only scheduled or pickup_response indicates "Pickup Request" / "Tendered" / "Confirmed" without a hauled status) AND the ETA has already passed, DO NOT flag the late ETA — pickup hasn't happened yet, so the ETA is moot. If pickup itself is overdue, that's the real issue: flag it as a pickup problem with actionTarget "carrier".
+- These rules override generic "status looks bad" heuristics. If a rule above applies, follow it.`;
 
 export const PRIORITY_PROMPT = `URGENT SHIPMENT REVIEW — This shipment has been flagged as critical.
 

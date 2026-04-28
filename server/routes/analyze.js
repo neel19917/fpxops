@@ -6,6 +6,20 @@ import { getSettings } from "../lib/settings.js";
 
 export const analyzeRouter = Router();
 
+// Compose a per-shipment user message from the editable template +
+// editable logic block + the row JSON. If the template still contains
+// `{{logic}}` we substitute in place; otherwise we append the logic at
+// the end so removing the placeholder by hand never silently drops the
+// rules. {{data}} is substituted last.
+function buildPerShipmentUserMessage(template, logic, dataJson) {
+  const tpl = String(template || "");
+  const logicBlock = String(logic || "").trim();
+  const withLogic = tpl.includes("{{logic}}")
+    ? tpl.replace("{{logic}}", logicBlock)
+    : (logicBlock ? `${tpl.trimEnd()}\n\nLogic handling:\n${logicBlock}\n` : tpl);
+  return withLogic.replace("{{data}}", dataJson);
+}
+
 // Run per-shipment AI on a row that's already in fpx_shipments. Used by:
 // (1) the auto-analyze path after POST /api/shipments upserts, and
 // (2) the dashboard's "Re-analyze" button.
@@ -13,10 +27,11 @@ export const analyzeRouter = Router();
 // reached or returned no parseable result).
 export async function analyzeExistingShipment(row, { reqContext } = {}) {
   if (!row?.id) return null;
-  const settings = await getSettings("prompt.system", "prompt.per_shipment");
-  const userMsg = (settings["prompt.per_shipment"] || "").replace(
-    "{{data}}",
-    JSON.stringify(slimShipment(row.raw_data || row))
+  const settings = await getSettings("prompt.system", "prompt.per_shipment", "prompt.per_shipment_logic");
+  const userMsg = buildPerShipmentUserMessage(
+    settings["prompt.per_shipment"],
+    settings["prompt.per_shipment_logic"],
+    JSON.stringify(slimShipment(row.raw_data || row)),
   );
   const result = await callClaude({
     systemPrompt: settings["prompt.system"],
@@ -74,10 +89,11 @@ analyzeRouter.post("/shipment", async (req, res) => {
     shipmentUuid = data?.id || null;
   }
 
-  const settings = await getSettings("prompt.system", "prompt.per_shipment");
+  const settings = await getSettings("prompt.system", "prompt.per_shipment", "prompt.per_shipment_logic");
   const system = req.body.system || settings["prompt.system"];
   const template = req.body.template || settings["prompt.per_shipment"];
-  const userMsg = template.replace("{{data}}", JSON.stringify(slimShipment(raw)));
+  const logic = req.body.logic ?? settings["prompt.per_shipment_logic"];
+  const userMsg = buildPerShipmentUserMessage(template, logic, JSON.stringify(slimShipment(raw)));
 
   const result = await callClaude({
     systemPrompt: system,
