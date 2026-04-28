@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ListChecks, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ListChecks, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X } from "lucide-react";
 import { api } from "../lib/api";
 import type { ShipmentTask, TaskStatus } from "../lib/types";
 import { useNav } from "../lib/nav";
@@ -25,6 +25,56 @@ export function TasksPage() {
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+
+  // Bulk selection + assign state.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [assignee, setAssignee] = useState<string>("");
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const visibleIds = useMemo(() => tasks.map((t) => t.id), [tasks]);
+  const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
+  function toggle(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+  function toggleAll() {
+    setSelected((prev) => {
+      if (visibleIds.every((id) => prev.has(id))) {
+        const next = new Set(prev);
+        for (const id of visibleIds) next.delete(id);
+        return next;
+      }
+      const next = new Set(prev);
+      for (const id of visibleIds) next.add(id);
+      return next;
+    });
+  }
+  function clearSelection() { setSelected(new Set()); }
+
+  async function bulkAssign() {
+    if (!selected.size || bulkBusy) return;
+    const target = assignee.trim();
+    if (!target) { setError("Enter an assignee email or name."); return; }
+    setBulkBusy(true);
+    setError(null);
+    try {
+      const ids = Array.from(selected);
+      const r = await api.tasks.bulkUpdate({ ids, assigned_to: target });
+      // Optimistic local patch — server route returns just a count.
+      setTasks((prev) => prev.map((t) => selected.has(t.id) ? { ...t, assigned_to: target } : t));
+      clearSelection();
+      setAssignee("");
+      if (r.updated !== ids.length) {
+        setError(`Assigned ${r.updated} of ${ids.length} tasks.`);
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
 
   async function load() {
     setLoading(true);
@@ -89,10 +139,46 @@ export function TasksPage() {
 
       {error ? <div className="mb-4 rounded-lg bg-red-50 text-red-700 px-4 py-2 text-sm">{error}</div> : null}
 
+      {selected.size > 0 ? (
+        <div className="mb-3 rounded-xl bg-sky-50 ring-1 ring-sky-200 px-4 py-3 flex flex-wrap items-center gap-3">
+          <UserPlus className="h-4 w-4 text-sky-700" />
+          <span className="text-sm font-medium text-sky-900">{selected.size} selected</span>
+          <input
+            value={assignee}
+            onChange={(e) => setAssignee(e.target.value)}
+            placeholder="Assign to (email or name)…"
+            className="flex-1 min-w-[220px] rounded-lg border border-sky-200 bg-white px-3 py-1.5 text-sm focus:ring-2 focus:ring-sky-400 focus:border-sky-400"
+          />
+          <button
+            onClick={bulkAssign}
+            disabled={bulkBusy || !assignee.trim()}
+            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-1.5 hover:bg-sky-700 disabled:opacity-50"
+          >
+            {bulkBusy ? "Assigning…" : "Assign"}
+          </button>
+          <button
+            onClick={clearSelection}
+            className="rounded-lg text-sky-700 text-sm px-2 py-1.5 hover:bg-sky-100 inline-flex items-center gap-1"
+            title="Clear selection"
+          >
+            <X className="h-4 w-4" /> Clear
+          </button>
+        </div>
+      ) : null}
+
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-xs uppercase text-slate-500">
             <tr>
+              <th className="px-4 py-3 w-10">
+                <input
+                  type="checkbox"
+                  checked={allChecked}
+                  onChange={toggleAll}
+                  aria-label="Select all"
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+              </th>
               <th className="text-left px-4 py-3">Status</th>
               <th className="text-left px-4 py-3">Title</th>
               <th className="text-left px-4 py-3">Priority</th>
@@ -104,16 +190,25 @@ export function TasksPage() {
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={7} className="text-center text-slate-400 py-8">Loading…</td></tr>
+              <tr><td colSpan={8} className="text-center text-slate-400 py-8">Loading…</td></tr>
             ) : tasks.length === 0 ? (
-              <tr><td colSpan={7} className="text-center text-slate-400 py-8">No tasks yet. Open a shipment and add one.</td></tr>
+              <tr><td colSpan={8} className="text-center text-slate-400 py-8">No tasks yet. Open a shipment and add one.</td></tr>
             ) : tasks.map((t) => (
               <tr
                 key={t.id}
                 onClick={() => t.shipment_id && nav.openShipment(t.shipment_id)}
-                className={"border-t border-slate-100 hover:bg-sky-50/50 " + (t.shipment_id ? "cursor-pointer" : "")}
+                className={"border-t border-slate-100 hover:bg-sky-50/50 " + (t.shipment_id ? "cursor-pointer" : "") + (selected.has(t.id) ? " bg-sky-50/40" : "")}
                 title={t.shipment_id ? "Open shipment drawer" : undefined}
               >
+                <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={selected.has(t.id)}
+                    onChange={() => toggle(t.id)}
+                    aria-label={`Select task ${t.title}`}
+                    className="h-4 w-4 rounded border-slate-300"
+                  />
+                </td>
                 <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                   <button
                     onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
