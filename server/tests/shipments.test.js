@@ -78,6 +78,17 @@ describe("mapShipment — basic mapping", () => {
     });
     assert.equal(out.customer_name, "Real Customer");
   });
+
+  it("Company Name beats the address guess when Customer Name is missing", () => {
+    const out = mapShipment({
+      _trackingNumber: "TRK-4",
+      "Company Name": "Proline Range Hoods",
+      // FreightPOP origin blob would otherwise produce "SPARTANBURGSC29301".
+      "Ship From": "SPARTANBURGSC29301",
+    });
+    assert.equal(out.customer_name, "Proline Range Hoods");
+    assert.equal(out.company_name, "Proline Range Hoods");
+  });
 });
 
 describe("mapShipment — cleanField / blob detection", () => {

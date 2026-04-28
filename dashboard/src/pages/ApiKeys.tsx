@@ -1,8 +1,40 @@
 import { useEffect, useState } from "react";
-import { KeyRound, Plus, Trash2, Copy, Shield, ShieldAlert } from "lucide-react";
-import { api } from "../lib/api";
+import { KeyRound, Plus, Trash2, Copy, Download, Shield, ShieldAlert } from "lucide-react";
+import { api, apiUrl } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
 import type { ApiKey } from "../lib/types";
+
+// Build a config.js the teammate can drop straight into extension/config.js,
+// matching the shape extension/config.example.js expects.
+function buildExtensionConfig(name: string, plaintext: string): string {
+  const generated = new Date().toISOString();
+  return [
+    "// FPXpress extension config — drop this file into extension/config.js",
+    `// Generated ${generated} for "${name}"`,
+    "// Treat this file like a password — it grants API access.",
+    "",
+    `const FPX_API_URL = ${JSON.stringify(apiUrl)};`,
+    `const FPX_API_KEY = ${JSON.stringify(plaintext)};`,
+    "",
+  ].join("\n");
+}
+
+function downloadFile(filename: string, content: string, mime = "text/plain") {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function safeFilename(name: string, ext: string): string {
+  const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "fpxpress";
+  return `${base}.${ext}`;
+}
 
 export function ApiKeysPage() {
   const [rows, setRows] = useState<ApiKey[]>([]);
@@ -188,6 +220,7 @@ export function ApiKeysPage() {
             <h2 className="text-lg font-semibold">Save this key now</h2>
             <p className="text-sm text-slate-500 mt-1">
               This is the only time <b>{justCreated.name}</b>'s plaintext key will be shown.
+              Download a config file for the teammate's extension, or copy and paste it manually.
             </p>
             <div className="mt-4 flex gap-2">
               <code className="flex-1 bg-slate-900 text-slate-100 font-mono text-sm p-3 rounded-lg break-all">{justCreated.plaintext}</code>
@@ -198,6 +231,47 @@ export function ApiKeysPage() {
               >
                 <Copy className="h-4 w-4" />
               </button>
+            </div>
+            <div className="mt-4 rounded-xl bg-sky-50 ring-1 ring-sky-200 p-4">
+              <div className="flex items-start gap-3">
+                <Download className="h-5 w-5 text-sky-700 mt-0.5 shrink-0" />
+                <div className="flex-1">
+                  <div className="text-sm font-semibold text-sky-900">Download credentials file</div>
+                  <p className="text-xs text-sky-800 mt-0.5">
+                    Drops straight into <code className="font-mono bg-white/60 px-1 rounded">extension/config.js</code> — the teammate just replaces the file and reloads the extension.
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => downloadFile(
+                        safeFilename(justCreated.name, "config.js"),
+                        buildExtensionConfig(justCreated.name, justCreated.plaintext),
+                        "application/javascript",
+                      )}
+                      className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md bg-sky-600 text-white hover:bg-sky-700"
+                    >
+                      <Download className="h-3.5 w-3.5" /> config.js
+                    </button>
+                    <button
+                      onClick={() => downloadFile(
+                        safeFilename(justCreated.name, "credentials.txt"),
+                        [
+                          "FPXpress API credentials",
+                          `Generated ${new Date().toISOString()} for "${justCreated.name}"`,
+                          "Treat this file like a password.",
+                          "",
+                          `API URL:  ${apiUrl}`,
+                          `API Key:  ${justCreated.plaintext}`,
+                          "",
+                          "To use: open the FPXpress extension popup → Settings → paste both values.",
+                        ].join("\n"),
+                      )}
+                      className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md bg-white ring-1 ring-sky-200 text-sky-700 hover:bg-sky-100"
+                    >
+                      <Download className="h-3.5 w-3.5" /> credentials.txt
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
             <div className="mt-5 flex justify-end">
               <button

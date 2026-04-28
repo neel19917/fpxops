@@ -73,9 +73,13 @@ export function guessCustomerNameFromAddress(addr) {
 export function mapShipment(raw, runnerName) {
   if (!raw || typeof raw !== "object") return null;
   const explicitCustomer = pick(raw, ["Customer Name", "CUSTOMER NAME", "Customer"]);
+  const companyName = pick(raw, ["Company Name", "Company", "COMPANY NAME", "CompanyName"]);
   const origin = pick(raw, ["Ship From", "Origin"]);
   const destination = pick(raw, ["Ship To", "Destination"]);
-  const guessedCustomer = explicitCustomer || guessCustomerNameFromAddress(origin);
+  // Prefer the FreightPOP grid's "Company Name" column over guessing from the
+  // origin address. Address-guessing was producing "SPARTANBURGSC29301" /
+  // "FT WORTHTX76104" style fragments when origin was a single ALL-CAPS blob.
+  const guessedCustomer = explicitCustomer || companyName || guessCustomerNameFromAddress(origin);
   return {
     created_by: runnerName || null,
     tracking_number: pick(raw, ["_trackingNumber", "Tracking Number", "TRACKING"]),
@@ -118,7 +122,7 @@ export function mapShipment(raw, runnerName) {
     total_packages: toNum(pick(raw, ["Total Packages", "TOTAL PACKAGES", "Number of Pieces"])),
     // FreightPOP grid column parity — kendo column titles vary in case/spacing,
     // so accept the common variants. All optional; fall through to null when absent.
-    company_name: pick(raw, ["Company Name", "Company", "COMPANY NAME", "CompanyName"]),
+    company_name: companyName,
     shipment_date: toIso(pick(raw, ["Shipment Date", "Ship Date", "Shipped Date", "SHIPMENT DATE", "ShipmentDate"])),
     tracking_comments: cleanField(pick(raw, ["Tracking Comments", "TRACKING COMMENTS", "TrackingComments"]), { maxLen: 500 }),
     shipper_spot_quote: pick(raw, ["Shipper Spot Quote", "Spot Quote", "SHIPPER SPOT QUOTE", "SpotQuote"]),
