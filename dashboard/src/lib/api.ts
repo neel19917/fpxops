@@ -3,6 +3,7 @@ import type {
   InvoiceAudit, InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentTask, UserProfileRow,
 } from "./types";
 import { sb } from "./supabase";
+import { impersonateHeaders } from "./impersonate";
 
 const API_URL = (import.meta.env.VITE_FPX_API_URL || "http://localhost:3210").replace(/\/$/, "");
 
@@ -43,6 +44,7 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
+      ...impersonateHeaders(),
       ...(init?.headers || {}),
     },
   });

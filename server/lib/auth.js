@@ -51,6 +51,34 @@ async function resolveJwt(token) {
 }
 
 // ============================================================
+// Impersonation ("view as another user")
+//   x-fpx-impersonate:        target user id  → swap req.user to target
+//   x-fpx-impersonate-write:  '1'             → also allow mutations
+//
+// Only honored when the real caller is an admin via JWT. API-key auth ignores
+// these headers (impersonation is a UI debug aid, not a service-to-service tool).
+// `req.realUser` always carries the actual admin so audit logs stay accurate
+// even when `req.user` reflects the impersonated target.
+// ============================================================
+async function resolveImpersonationTarget(targetId) {
+  if (!targetId || typeof targetId !== "string") return null;
+  const { data, error } = await supabase
+    .from("fpx_user_profiles")
+    .select("id, email, full_name, role, enabled, avatar_url")
+    .eq("id", targetId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return {
+    id: data.id,
+    email: data.email,
+    fullName: data.full_name,
+    avatarUrl: data.avatar_url,
+    role: data.role,
+    enabled: data.enabled,
+  };
+}
+
+// ============================================================
 // Unified middleware
 //   options.scope   -> required API-key scope (e.g. 'admin')
 //   options.role    -> required JWT role (e.g. 'admin')
@@ -81,14 +109,41 @@ export function requireAuth(options = {}) {
     if (bearer) {
       const v = await resolveJwt(bearer);
       if (!v) return res.status(401).json({ error: "Invalid session" });
-      if (requireEnabled && !v.user.enabled) {
+      // Real admin must always be enabled before we even look at impersonation.
+      if (!v.user.enabled) {
         return res.status(403).json({ error: "Your account is not yet enabled. An admin needs to activate it." });
       }
-      if (options.role && v.user.role !== options.role && v.user.role !== "admin") {
+
+      // Impersonation handshake (admin-only, JWT-only).
+      const impersonateId = req.header("x-fpx-impersonate");
+      const writeOptIn = req.header("x-fpx-impersonate-write") === "1";
+      if (impersonateId && v.user.role === "admin" && impersonateId !== v.user.id) {
+        const target = await resolveImpersonationTarget(impersonateId);
+        if (!target) return res.status(404).json({ error: "Impersonation target not found" });
+        const isMutation = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+        if (isMutation && !writeOptIn) {
+          return res.status(403).json({
+            error: "Impersonation is read-only. Enable write impersonation to perform this action.",
+          });
+        }
+        req.realUser = v.user;
+        req.user = target;
+        req.impersonating = { mode: writeOptIn ? "write" : "read", target };
+      } else {
+        req.user = v.user;
+        req.realUser = v.user;
+      }
+
+      // Now enforce the route's enabled requirement against whoever req.user
+      // ends up being. For impersonated requests this gives an honest
+      // "what would this user see" — including a 403 if they're disabled.
+      if (requireEnabled && !req.user.enabled) {
+        return res.status(403).json({ error: "Your account is not yet enabled. An admin needs to activate it." });
+      }
+      if (options.role && req.user.role !== options.role && req.user.role !== "admin") {
         // 'admin' is a superset — always allowed.
         return res.status(403).json({ error: `Requires '${options.role}' role` });
       }
-      req.user = v.user;
       return next();
     }
 

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { sb } from "./supabase";
 import type { Session } from "@supabase/supabase-js";
+import { getImpersonate, setImpersonate, subscribeImpersonate, type ImpersonateState } from "./impersonate";
 
 export interface UserProfile {
   id: string;
@@ -16,6 +17,12 @@ interface AuthState {
   profile: UserProfile | null;
   loading: boolean;
   error: string | null;
+  // Real (non-impersonated) admin profile. Equal to `profile` when not
+  // impersonating; lets the layout decide whether to show the View-as control.
+  realProfile: UserProfile | null;
+  impersonate: ImpersonateState | null;
+  startImpersonate: (s: ImpersonateState) => void;
+  stopImpersonate: () => void;
   signInWithMicrosoft: () => Promise<void>;
   signOut: () => Promise<void>;
   refreshProfile: () => Promise<void>;
@@ -28,6 +35,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [impersonate, setImpersonateState] = useState<ImpersonateState | null>(() => getImpersonate());
+
+  useEffect(() => subscribeImpersonate(setImpersonateState), []);
 
   async function loadProfile(sess: Session | null) {
     if (!sess?.user) { setProfile(null); return; }
@@ -95,6 +105,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   async function signOut() {
+    setImpersonate(null);
     await sb.auth.signOut();
     setSession(null);
     setProfile(null);
@@ -104,7 +115,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await loadProfile(session);
   }
 
-  const value: AuthState = { session, profile, loading, error, signInWithMicrosoft, signOut, refreshProfile };
+  // The "effective" profile for the rest of the app — when impersonating,
+  // role / enabled reflect the target so admin-only nav hides as you'd expect.
+  const effectiveProfile: UserProfile | null = impersonate && profile ? {
+    id: impersonate.target.id,
+    email: impersonate.target.email,
+    fullName: impersonate.target.full_name,
+    avatarUrl: impersonate.target.avatar_url,
+    role: impersonate.target.role,
+    enabled: impersonate.target.enabled,
+  } : profile;
+
+  function startImpersonate(s: ImpersonateState) { setImpersonate(s); }
+  function stopImpersonate() { setImpersonate(null); }
+
+  const value: AuthState = {
+    session,
+    profile: effectiveProfile,
+    realProfile: profile,
+    impersonate,
+    startImpersonate,
+    stopImpersonate,
+    loading,
+    error,
+    signInWithMicrosoft,
+    signOut,
+    refreshProfile,
+  };
   return <AuthCtx.Provider value={value}>{children}</AuthCtx.Provider>;
 }
 
