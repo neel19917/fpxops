@@ -541,21 +541,31 @@ export function TasksPage() {
               <tr><td colSpan={8} className="text-center text-slate-400 py-8">Loading…</td></tr>
             ) : tasks.length === 0 ? (
               <tr><td colSpan={8} className="text-center text-slate-400 py-8">No tasks yet. Open a shipment and add one.</td></tr>
-            ) : tasks.map((t) => (
+            ) : tasks.map((t) => {
+              // Status circle is the primary per-row action button:
+              //   open → in_progress (Start)
+              //   in_progress → done   (Complete)
+              //   done → open          (Reopen)
+              //   blocked / cancelled → open (Reopen)
+              const nextStatus: TaskStatus =
+                t.status === "open" ? "in_progress"
+                : t.status === "in_progress" ? "done"
+                : "open";
+              const statusLabel =
+                t.status === "open" ? "Start"
+                : t.status === "in_progress" ? "Complete"
+                : t.status === "done" ? "Reopen"
+                : "Reopen";
+              return (
               <tr
                 key={t.id}
                 data-task-id={t.id}
-                onClick={() => {
-                  setFocusedId(t.id);
-                  if (t.shipment_id) nav.openShipment(t.shipment_id);
-                }}
+                onClick={() => setFocusedId(t.id)}
                 className={
                   "border-t border-slate-100 hover:bg-sky-50/50 " +
-                  (t.shipment_id ? "cursor-pointer " : "") +
                   (selected.has(t.id) ? "bg-sky-50/40 " : "") +
                   (focusedId === t.id ? "ring-2 ring-inset ring-sky-400 bg-sky-50/30" : "")
                 }
-                title={t.shipment_id ? "Open shipment drawer" : undefined}
               >
                 <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                   <input
@@ -568,17 +578,41 @@ export function TasksPage() {
                 </td>
                 <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                   <button
-                    onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
-                    title={STATUS_LABEL[t.status]}
-                    className="text-slate-500 hover:text-slate-900"
+                    onClick={() => setStatus(t, nextStatus)}
+                    title={`${statusLabel} (currently ${STATUS_LABEL[t.status]})`}
+                    className={
+                      "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 ring-1 transition " +
+                      (t.status === "done"
+                        ? "text-emerald-700 ring-emerald-200 bg-emerald-50 hover:bg-emerald-100"
+                        : t.status === "in_progress"
+                        ? "text-indigo-700 ring-indigo-200 bg-indigo-50 hover:bg-indigo-100"
+                        : t.status === "blocked"
+                        ? "text-amber-700 ring-amber-200 bg-amber-50 hover:bg-amber-100"
+                        : "text-sky-700 ring-sky-200 bg-sky-50 hover:bg-sky-100")
+                    }
                   >
                     {t.status === "done"
-                      ? <CheckCircle2 className="h-5 w-5 text-emerald-600" />
-                      : <Circle className="h-5 w-5" />}
+                      ? <CheckCircle2 className="h-4 w-4" />
+                      : t.status === "in_progress"
+                      ? <Play className="h-4 w-4" />
+                      : t.status === "blocked"
+                      ? <Ban className="h-4 w-4" />
+                      : <Circle className="h-4 w-4" />}
+                    <span className="text-[11px] font-semibold">{statusLabel}</span>
                   </button>
                 </td>
                 <td className="px-4 py-3">
-                  <div className={t.status === "done" ? "line-through text-slate-400" : "text-slate-900 font-medium"}>{t.title}</div>
+                  {t.shipment_id ? (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); nav.openShipment(t.shipment_id); }}
+                      className={"text-left w-full hover:text-sky-700 " + (t.status === "done" ? "line-through text-slate-400" : "text-slate-900 font-medium")}
+                      title="Open shipment drawer"
+                    >
+                      {t.title}
+                    </button>
+                  ) : (
+                    <div className={t.status === "done" ? "line-through text-slate-400" : "text-slate-900 font-medium"}>{t.title}</div>
+                  )}
                   {t.description ? <div className="text-xs text-slate-500 mt-0.5 line-clamp-2">{t.description}</div> : null}
                 </td>
                 <td className="px-4 py-3">
@@ -586,9 +620,12 @@ export function TasksPage() {
                 </td>
                 <td className="px-4 py-3 font-mono text-xs">
                   {t.shipment_id ? (
-                    <span className="text-sky-700 group-hover:text-sky-900 hover:underline font-medium">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); nav.openShipment(t.shipment_id); }}
+                      className="text-sky-700 hover:text-sky-900 hover:underline font-medium"
+                    >
                       {t.tracking_number || "(no tracking #)"}
-                    </span>
+                    </button>
                   ) : (t.tracking_number || "—")}
                 </td>
                 <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
@@ -617,7 +654,8 @@ export function TasksPage() {
                   </button>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
