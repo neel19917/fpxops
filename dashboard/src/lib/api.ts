@@ -87,6 +87,11 @@ export const api = {
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/reanalyze`, { method: "POST" }),
+    updateNotes: (id: string, notes: string | null) =>
+      request<{ shipment: Shipment }>(`/api/shipments/${id}/notes`, {
+        method: "PATCH",
+        body: JSON.stringify({ notes }),
+      }),
     bulkDelete: (ids: string[]) =>
       request<{ deleted: number }>(`/api/shipments/bulk-delete`, {
         method: "POST",

@@ -478,6 +478,29 @@ shipmentsRouter.patch("/:id/action", async (req, res) => {
   res.json({ shipment: data });
 });
 
+// PATCH /shipments/:id/notes  { notes }
+// Free-form operator notes shown in the dashboard drawer. Pass empty string
+// or null to clear.
+shipmentsRouter.patch("/:id/notes", async (req, res) => {
+  const raw = req.body?.notes;
+  const notes = raw == null || raw === "" ? null : String(raw).slice(0, 5000);
+  const { data: before } = await supabase
+    .from("fpx_shipments").select("id, tracking_number, notes").eq("id", req.params.id).maybeSingle();
+  if (!before) return res.status(404).json({ error: "Shipment not found" });
+  const { data, error } = await supabase
+    .from("fpx_shipments").update({ notes }).eq("id", req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "update_notes",
+    entity_type: "shipment",
+    entity_id: data.id,
+    summary: `Updated notes on ${data.tracking_number || data.id}`,
+    before: { notes: before.notes },
+    after: { notes: data.notes },
+  });
+  res.json({ shipment: data });
+});
+
 // ----- Tasks scoped to a shipment -----
 
 // GET /shipments/:id/tasks — list tasks for a shipment (newest first).

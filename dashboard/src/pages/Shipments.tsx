@@ -17,11 +17,13 @@ import { exportShipmentsXlsx } from "../lib/exportShipments";
 
 // FreightPOP-style stat pills. Pills are mutually exclusive click-to-filter.
 // Status matchers run against shipment_status; ISSUES uses action_required.
-type PillId = "all" | "booked" | "in_transit" | "issues" | "out_for_delivery";
+type PillId = "all" | "booked" | "in_transit" | "issues" | "out_for_delivery" | "delivered";
 const STATUS_MATCHERS: Record<Exclude<PillId, "all" | "issues">, (s: string) => boolean> = {
   booked: (s) => /\bbooked\b|\btendered\b|pickup\s*scheduled|\bnew\b/i.test(s),
   in_transit: (s) => /in\s*transit|picked\s*up|en\s*route|departed|\btransit\b/i.test(s),
-  out_for_delivery: (s) => /out\s+for\s+delivery|\bofd\b|\bdelivered\b/i.test(s),
+  out_for_delivery: (s) => /out\s+for\s+delivery|\bofd\b/i.test(s),
+  // "Delivered" excludes "Out for Delivery" so the two pills don't double-count.
+  delivered: (s) => /\bdelivered\b/i.test(s) && !/out\s+for\s+delivery/i.test(s),
 };
 function shipmentMatchesPill(r: Shipment, pill: PillId): boolean {
   if (pill === "all") return true;
@@ -34,7 +36,7 @@ interface StatPillProps {
   label: string;
   count: number;
   active: boolean;
-  tone: "gray" | "blue" | "green";
+  tone: "gray" | "blue" | "green" | "teal";
   onClick: () => void;
 }
 function StatPill({ label, count, active, tone, onClick }: StatPillProps) {
@@ -42,6 +44,7 @@ function StatPill({ label, count, active, tone, onClick }: StatPillProps) {
     gray: { active: "bg-slate-900 text-white ring-slate-900", idle: "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50" },
     blue: { active: "bg-sky-600 text-white ring-sky-600", idle: "bg-white text-sky-700 ring-sky-200 hover:bg-sky-50" },
     green: { active: "bg-emerald-600 text-white ring-emerald-600", idle: "bg-white text-emerald-700 ring-emerald-200 hover:bg-emerald-50" },
+    teal: { active: "bg-teal-600 text-white ring-teal-600", idle: "bg-white text-teal-700 ring-teal-200 hover:bg-teal-50" },
   } as const;
   const cls = active ? TONES[tone].active : TONES[tone].idle;
   return (
@@ -116,6 +119,11 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskBusy, setNewTaskBusy] = useState(false);
 
+  // Drawer notes — local draft, saved on demand.
+  const [notesDraft, setNotesDraft] = useState("");
+  const [notesBusy, setNotesBusy] = useState(false);
+  const [notesSaved, setNotesSaved] = useState(false);
+
   // Email draft modal.
   const [emailModal, setEmailModal] = useState<{
     audience: "carrier" | "customer";
@@ -125,7 +133,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   } | null>(null);
 
   // Action override modal (manual YES/NO/clear).
-  const [overrideModal, setOverrideModal] = useState<null | { value: "YES" | "NO" | null; reason: string; busy: boolean }>(null);
+  const [overrideModal, setOverrideModal] = useState<null | { value: "YES" | "NO" | "RESOLVED" | null; reason: string; busy: boolean }>(null);
 
   // Re-analyze button state — busy flag prevents double-click during a Claude
   // round-trip (typically 2-3s).
@@ -188,12 +196,33 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       setDrawerTabState("overview");
       setEmailModal(null);
       setNewTaskTitle("");
+      setNotesDraft("");
+      setNotesSaved(false);
       return;
     }
     api.shipments.get(drawerId)
-      .then((d) => { setDrawerData(d); setDrawerTasks(d.tasks || []); })
+      .then((d) => {
+        setDrawerData(d);
+        setDrawerTasks(d.tasks || []);
+        setNotesDraft(d.shipment.notes || "");
+        setNotesSaved(false);
+      })
       .catch(() => { setDrawerData(null); setDrawerTasks([]); });
   }, [drawerId]);
+
+  async function saveNotes() {
+    if (!drawerId || notesBusy) return;
+    setNotesBusy(true);
+    setNotesSaved(false);
+    try {
+      const r = await api.shipments.updateNotes(drawerId, notesDraft.trim() ? notesDraft : null);
+      setDrawerData((p) => p ? { ...p, shipment: r.shipment } : p);
+      setRows((prev) => prev.map((row) => row.id === r.shipment.id ? { ...row, notes: r.shipment.notes } : row));
+      setNotesSaved(true);
+      setTimeout(() => setNotesSaved(false), 1800);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setNotesBusy(false); }
+  }
 
   async function addDrawerTask() {
     if (!drawerId || !newTaskTitle.trim()) return;
@@ -356,6 +385,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     in_transit: rows.filter((r) => shipmentMatchesPill(r, "in_transit")).length,
     issues: rows.filter((r) => shipmentMatchesPill(r, "issues")).length,
     out_for_delivery: rows.filter((r) => shipmentMatchesPill(r, "out_for_delivery")).length,
+    delivered: rows.filter((r) => shipmentMatchesPill(r, "delivered")).length,
   }), [rows]);
 
   return (
@@ -366,6 +396,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         <StatPill label="In Transit"       count={pillCounts.in_transit}       tone="blue"  active={pillFilter === "in_transit"}       onClick={() => setPillFilter(pillFilter === "in_transit" ? "all" : "in_transit")} />
         <StatPill label="Issues"           count={pillCounts.issues}           tone="blue"  active={pillFilter === "issues"}           onClick={() => setPillFilter(pillFilter === "issues" ? "all" : "issues")} />
         <StatPill label="Out for Delivery" count={pillCounts.out_for_delivery} tone="green" active={pillFilter === "out_for_delivery"} onClick={() => setPillFilter(pillFilter === "out_for_delivery" ? "all" : "out_for_delivery")} />
+        <StatPill label="Delivered"        count={pillCounts.delivered}        tone="teal"  active={pillFilter === "delivered"}        onClick={() => setPillFilter(pillFilter === "delivered" ? "all" : "delivered")} />
       </div>
 
       <div className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm">
@@ -710,6 +741,26 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   <div className="h-3" />
                   <Field label="Recommendation">{drawerData.shipment.ai_recommendation}</Field>
                 </Section>
+                <Section title="Notes">
+                  <textarea
+                    value={notesDraft}
+                    onChange={(e) => { setNotesDraft(e.target.value); setNotesSaved(false); }}
+                    placeholder="Add operator notes for this shipment…"
+                    rows={4}
+                    maxLength={5000}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:ring-2 focus:ring-sky-400 focus:border-sky-400"
+                  />
+                  <div className="mt-2 flex items-center justify-end gap-3">
+                    {notesSaved ? <span className="text-xs text-emerald-600">Saved</span> : null}
+                    <button
+                      onClick={saveNotes}
+                      disabled={notesBusy || (notesDraft || "") === (drawerData.shipment.notes || "")}
+                      className="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {notesBusy ? "Saving…" : "Save notes"}
+                    </button>
+                  </div>
+                </Section>
               </>
             )}
 
@@ -899,25 +950,30 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-lg font-semibold mb-1">Override action</h2>
             <p className="text-sm text-slate-500 mb-4">Manually set this shipment's action. The AI's classification will be ignored on subsequent scrapes until you clear the override.</p>
-            <div className="flex gap-2 mb-4">
-              {(["YES", "NO"] as const).map((v) => (
-                <button
-                  key={v}
-                  onClick={() => setOverrideModal({ ...overrideModal, value: v })}
-                  className={
-                    "flex-1 py-2.5 rounded-xl text-sm font-semibold ring-1 transition " +
-                    (overrideModal.value === v
-                      ? (v === "YES" ? "bg-rose-600 text-white ring-rose-700" : "bg-emerald-600 text-white ring-emerald-700")
-                      : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")
-                  }
-                >
-                  {v === "YES" ? "Action needed" : "On track"}
-                </button>
-              ))}
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              {(["YES", "NO", "RESOLVED"] as const).map((v) => {
+                const selected = overrideModal.value === v;
+                const selectedCls =
+                  v === "YES" ? "bg-rose-600 text-white ring-rose-700"
+                  : v === "NO" ? "bg-emerald-600 text-white ring-emerald-700"
+                  : "bg-violet-600 text-white ring-violet-700";
+                return (
+                  <button
+                    key={v}
+                    onClick={() => setOverrideModal({ ...overrideModal, value: v })}
+                    className={
+                      "py-2.5 rounded-xl text-sm font-semibold ring-1 transition " +
+                      (selected ? selectedCls : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")
+                    }
+                  >
+                    {v === "YES" ? "Action needed" : v === "NO" ? "On track" : "Manually resolved"}
+                  </button>
+                );
+              })}
               <button
                 onClick={() => setOverrideModal({ ...overrideModal, value: null })}
                 className={
-                  "flex-1 py-2.5 rounded-xl text-sm font-semibold ring-1 transition " +
+                  "py-2.5 rounded-xl text-sm font-semibold ring-1 transition " +
                   (overrideModal.value === null
                     ? "bg-slate-700 text-white ring-slate-800"
                     : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")

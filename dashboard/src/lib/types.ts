@@ -63,6 +63,8 @@ export interface Shipment {
   appointment_date: string | null;
   required_arrival_date: string | null;
   spot_quote_fulfilled_by: string | null;
+  // Free-form operator notes (drawer-only).
+  notes: string | null;
   // Pre-existing optional fields used by some columns
   service: string | null;
   pickup_request_number: string | null;
