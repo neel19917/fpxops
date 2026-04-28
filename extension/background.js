@@ -110,9 +110,15 @@ async function processOauthResponse(responseUrl) {
 // the URL and close the window before the failed navigation matters).
 async function signInWithMicrosoft() {
   const redirectUrl = chrome.identity.getRedirectURL();
+  // Request email + profile scopes so Microsoft returns the email claim;
+  // without these Supabase fails with "Error getting user email from
+  // external provider" because Azure won't include the user's email by
+  // default. The dashboard's auth call uses the same scope list.
+  const scopes = encodeURIComponent("openid email profile");
   const authUrl =
     `${SUPABASE_URL}/auth/v1/authorize` +
-    `?provider=azure&redirect_to=${encodeURIComponent(redirectUrl)}`;
+    `?provider=azure&scopes=${scopes}` +
+    `&redirect_to=${encodeURIComponent(redirectUrl)}`;
 
   return new Promise((resolve) => {
     let resolved = false;
