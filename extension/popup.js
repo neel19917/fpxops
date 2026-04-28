@@ -22,7 +22,31 @@ const els = {
   keyMsg:         $("keyMsg"),
   serverState:    $("serverState"),
   serverLabel:    $("serverLabel"),
+  importFileBtn:  $("importFileBtn"),
+  importFileInput:$("importFileInput"),
 };
+
+// Parse a credentials file the admin downloaded from the dashboard. Handles
+// both formats:
+//   config.js      → `const FPX_API_URL = "..."` / `const FPX_API_KEY = "..."`
+//   credentials.txt → `API URL: ...` / `API Key: ...`
+// Returns { url, key } with whichever fields were found.
+function parseCredentialsFile(text) {
+  const out = { url: "", key: "" };
+  const url1 = text.match(/FPX_API_URL\s*=\s*["']([^"']+)["']/);
+  const key1 = text.match(/FPX_API_KEY\s*=\s*["']([^"']+)["']/);
+  if (url1) out.url = url1[1].trim();
+  if (key1) out.key = key1[1].trim();
+  if (!out.url) {
+    const url2 = text.match(/(?:^|\n)\s*API\s*URL\s*[:=]\s*(\S+)/i);
+    if (url2) out.url = url2[1].trim();
+  }
+  if (!out.key) {
+    const key2 = text.match(/(?:^|\n)\s*API\s*Key\s*[:=]\s*(\S+)/i);
+    if (key2) out.key = key2[1].trim();
+  }
+  return out;
+}
 
 // Track configured-ness so the status pill, primary CTA, and setup form
 // can re-render without round-tripping to the background again.
@@ -177,6 +201,44 @@ for (const inp of [els.nameInput, els.keyInput, els.urlInput]) {
     if (e.key === "Escape") { e.preventDefault(); hideSetup(); }
   });
 }
+
+// "Import config file" — open the picker, parse the file, fill the inputs.
+els.importFileBtn.addEventListener("click", () => els.importFileInput.click());
+els.importFileInput.addEventListener("change", () => {
+  const file = els.importFileInput.files && els.importFileInput.files[0];
+  if (!file) return;
+  if (file.size > 64 * 1024) {
+    els.keyMsg.textContent = "That file is too big to be a credentials file.";
+    els.keyMsg.className = "save-msg err";
+    els.importFileInput.value = "";
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const { url, key } = parseCredentialsFile(String(reader.result || ""));
+    if (!key) {
+      els.keyMsg.textContent = "Couldn't find an API key in that file.";
+      els.keyMsg.className = "save-msg err";
+      els.importFileInput.value = "";
+      return;
+    }
+    if (url) els.urlInput.value = url;
+    els.keyInput.value = key;
+    // Reveal the advanced block when the file pre-fills a custom URL so the
+    // user can see what was imported before saving.
+    if (url) els.advBlock.classList.add("visible");
+    els.keyMsg.textContent = `Imported from ${file.name}. Review and click Save.`;
+    els.keyMsg.className = "save-msg ok";
+    els.importFileInput.value = "";
+    if (!els.nameInput.value.trim()) els.nameInput.focus();
+  };
+  reader.onerror = () => {
+    els.keyMsg.textContent = "Couldn't read that file.";
+    els.keyMsg.className = "save-msg err";
+    els.importFileInput.value = "";
+  };
+  reader.readAsText(file);
+});
 
 refreshKeyState();
 refreshServerState();
