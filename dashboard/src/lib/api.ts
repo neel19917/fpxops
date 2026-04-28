@@ -160,6 +160,14 @@ export const api = {
     list: () => request<{ data: UserProfileRow[] }>("/api/users"),
     update: (id: string, body: { enabled?: boolean; role?: string; full_name?: string | null }) =>
       request<{ user: UserProfileRow }>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    issueKey: (id: string) =>
+      request<{
+        key: { id: string; name: string; key_prefix: string; scopes: string[]; created_at: string };
+        plaintext: string;
+        user_id: string;
+        expires_at: string;
+        revoked_count: number;
+      }>(`/api/users/${id}/issue-key`, { method: "POST" }),
   },
   shareLinks: {
     list: () => request<{ data: ShareLink[] }>("/api/share-links"),

@@ -2,13 +2,40 @@ import { Router } from "express";
 import { requireAuth } from "../lib/auth.js";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
+import { decidePendingApiKey } from "../lib/pendingApiKey.js";
 
 export const meRouter = Router();
 
 // GET /api/me — who am I? Lets the dashboard check enabled-status + role.
 // Surfaces impersonation state so the dashboard can render the banner.
-meRouter.get("/", requireAuth({ requireEnabled: false }), (req, res) => {
+//
+// Doubles as the extension's API-key delivery channel: when the admin issues
+// a key for this user via POST /api/users/:id/issue-key, the plaintext is
+// stashed on fpx_user_profiles.pending_api_key. The first /api/me call from
+// that user's session pulls it back, returns it in `pending_api_key`, and
+// clears it — so it's a one-shot handover. Impersonated callers don't get
+// to read or clear someone else's stash; only the genuine user does.
+meRouter.get("/", requireAuth({ requireEnabled: false }), async (req, res) => {
   if (req.user) {
+    let pending_api_key = null;
+    // Only the genuine user reads + clears their own stash. An admin
+    // impersonating someone shouldn't grab the plaintext that's meant for
+    // the rep's extension.
+    if (!req.impersonating) {
+      const { data: row } = await supabase
+        .from("fpx_user_profiles")
+        .select("pending_api_key, pending_api_key_expires_at")
+        .eq("id", req.user.id)
+        .maybeSingle();
+      const verdict = decidePendingApiKey(row);
+      pending_api_key = verdict.plaintext;
+      if (verdict.shouldClear) {
+        await supabase
+          .from("fpx_user_profiles")
+          .update({ pending_api_key: null, pending_api_key_expires_at: null })
+          .eq("id", req.user.id);
+      }
+    }
     return res.json({
       kind: "user",
       user: req.user,
@@ -16,6 +43,7 @@ meRouter.get("/", requireAuth({ requireEnabled: false }), (req, res) => {
       impersonating: req.impersonating
         ? { mode: req.impersonating.mode, target: req.impersonating.target }
         : null,
+      pending_api_key,
     });
   }
   if (req.apiKey) {

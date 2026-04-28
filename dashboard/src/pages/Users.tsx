@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pencil, Shield, ShieldAlert, UserCheck, UserX, Users as UsersIcon } from "lucide-react";
+import { KeyRound, Pencil, Shield, ShieldAlert, UserCheck, UserX, Users as UsersIcon } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
 import type { UserProfileRow } from "../lib/types";
@@ -58,6 +58,9 @@ export function UsersPage() {
   const [rows, setRows] = useState<UserProfileRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [issuingId, setIssuingId] = useState<string | null>(null);
+  const [issueErr, setIssueErr] = useState<string | null>(null);
+  const [issueResult, setIssueResult] = useState<null | { email: string; plaintext: string; keyName: string; revokedCount: number }>(null);
 
   async function load() {
     setLoading(true); setErr(null);
@@ -79,6 +82,30 @@ export function UsersPage() {
     const r = await api.users.update(u.id, { full_name });
     setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
   }
+  async function issueKey(u: UserProfileRow) {
+    const confirmMsg = `Approve API access for ${u.email} and auto-issue a new API key?` +
+      `\n\nAny existing key for this user will be revoked.` +
+      `\nThe plaintext will be sent to their extension on the next sign-in / Recheck.`;
+    if (!confirm(confirmMsg)) return;
+    setIssuingId(u.id);
+    setIssueErr(null);
+    setIssueResult(null);
+    try {
+      const r = await api.users.issueKey(u.id);
+      setIssueResult({
+        email: u.email,
+        plaintext: r.plaintext,
+        keyName: r.key.name,
+        revokedCount: r.revoked_count,
+      });
+      // The user is now enabled server-side too — refresh.
+      load();
+    } catch (e) {
+      setIssueErr((e as Error).message);
+    } finally {
+      setIssuingId(null);
+    }
+  }
 
   return (
     <div className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm">
@@ -91,6 +118,40 @@ export function UsersPage() {
         </p>
       </div>
       {err ? <div className="mx-5 mt-4 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-sm px-3 py-2">{err}</div> : null}
+      {issueErr ? <div className="mx-5 mt-4 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-sm px-3 py-2">Issue failed: {issueErr}</div> : null}
+      {issueResult ? (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full p-6">
+            <h3 className="text-lg font-semibold flex items-center gap-2">
+              <KeyRound className="h-5 w-5 text-sky-600" /> API key issued
+            </h3>
+            <p className="text-sm text-slate-600 mt-2">
+              <b>{issueResult.email}</b> is enabled and a fresh API key (<code className="font-mono text-xs bg-slate-100 px-1 rounded">{issueResult.keyName}</code>) was generated.
+              {issueResult.revokedCount > 0 ? <> The previous {issueResult.revokedCount} active key(s) were revoked.</> : null}
+            </p>
+            <p className="text-sm text-slate-600 mt-2">
+              The plaintext is stashed for the rep's extension — they'll pick it up automatically on their next <b>Recheck approval</b> click or the next time they reopen the popup. No need to copy this anywhere.
+            </p>
+            <details className="mt-4">
+              <summary className="text-xs text-slate-500 cursor-pointer">Need to send manually instead?</summary>
+              <div className="mt-2 flex gap-2">
+                <code className="flex-1 bg-slate-900 text-slate-100 font-mono text-xs p-3 rounded-lg break-all">{issueResult.plaintext}</code>
+                <button
+                  onClick={() => navigator.clipboard.writeText(issueResult.plaintext)}
+                  className="px-3 py-3 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs"
+                >Copy</button>
+              </div>
+              <p className="text-[11px] text-slate-500 mt-1">Treat this like a password.</p>
+            </details>
+            <div className="mt-5 flex justify-end">
+              <button
+                onClick={() => setIssueResult(null)}
+                className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800"
+              >Done</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <table className="w-full text-sm">
         <thead className="bg-slate-50">
           <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500">
@@ -141,7 +202,16 @@ export function UsersPage() {
                 </td>
                 <td className="px-5 py-3 text-slate-500">{fmtRelative(u.last_login_at)}</td>
                 <td className="px-5 py-3 text-slate-500">{fmtDateTime(u.created_at)}</td>
-                <td className="px-5 py-3 text-right">
+                <td className="px-5 py-3 text-right whitespace-nowrap">
+                  <button
+                    onClick={() => issueKey(u)}
+                    disabled={isMe || issuingId === u.id}
+                    title="Approve API access — generates a key and pushes it to their extension"
+                    className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg font-medium bg-sky-50 text-sky-700 hover:bg-sky-100 disabled:opacity-50 mr-2"
+                  >
+                    <KeyRound className="h-4 w-4" />
+                    {issuingId === u.id ? "Issuing…" : "Issue API key"}
+                  </button>
                   <button
                     onClick={() => toggleEnabled(u)}
                     disabled={isMe}

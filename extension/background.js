@@ -175,6 +175,11 @@ async function signInWithMicrosoft() {
 // Fetch /api/me using a specific session (used right after sign-in, before
 // the session is fully saved) and again on demand to surface approval state
 // in the popup without requiring a re-sign-in.
+//
+// Side effect: if the response carries a `pending_api_key`, the admin has
+// just auto-issued a key for this rep — stash it as fpxApiKey so subsequent
+// API calls work immediately, no manual paste. Plaintext is one-shot
+// (server clears the column on first read) so we only ever see it once.
 async function fetchProfileWithSession(session) {
   if (!session?.access_token) return null;
   const apiUrl = await getApiUrl();
@@ -185,6 +190,9 @@ async function fetchProfileWithSession(session) {
     });
     if (!resp.ok) return null;
     const body = await resp.json();
+    if (body?.pending_api_key && typeof body.pending_api_key === "string") {
+      try { await chrome.storage.local.set({ fpxApiKey: body.pending_api_key }); } catch {}
+    }
     return body?.user || null;
   } catch { return null; }
 }
