@@ -31,7 +31,7 @@ async function getAccessTokenOrWait(): Promise<string> {
   });
 }
 
-async function request<T>(path: string, init?: RequestInit & { params?: Record<string, string | number | undefined> }): Promise<T> {
+async function request<T>(path: string, init?: RequestInit & { params?: Record<string, string | number | undefined>; noImpersonate?: boolean }): Promise<T> {
   const accessToken = await getAccessTokenOrWait();
   const search = new URLSearchParams();
   for (const [k, v] of Object.entries(init?.params || {})) {
@@ -44,7 +44,9 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
-      ...impersonateHeaders(),
+      // Impersonation headers are skipped on meta-operations (start/stop/toggle)
+      // so the request is attributed to the real admin server-side.
+      ...(init?.noImpersonate ? {} : impersonateHeaders()),
       ...(init?.headers || {}),
     },
   });
@@ -80,6 +82,27 @@ export const apiUrl = API_URL;
 
 export const api = {
   health: () => fetch(`${API_URL}/health`).then((r) => r.json()),
+
+  impersonate: {
+    start: (target_id: string, writes: boolean) =>
+      request<{ ok: boolean }>("/api/me/impersonate-start", {
+        method: "POST",
+        body: JSON.stringify({ target_id, writes }),
+        noImpersonate: true,
+      }),
+    stop: (target_id: string | null, writes_were: boolean) =>
+      request<{ ok: boolean }>("/api/me/impersonate-stop", {
+        method: "POST",
+        body: JSON.stringify({ target_id, writes_were }),
+        noImpersonate: true,
+      }),
+    toggleWrites: (target_id: string, writes: boolean) =>
+      request<{ ok: boolean }>("/api/me/impersonate-toggle-writes", {
+        method: "POST",
+        body: JSON.stringify({ target_id, writes }),
+        noImpersonate: true,
+      }),
+  },
 
   shipments: {
     list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string }) =>

@@ -2,6 +2,7 @@ import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Li
 import { useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
+import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
 export type TabId = "tracking" | "tasks" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "audit" | "settings";
@@ -36,14 +37,26 @@ export function Layout({ tab, onTab, children }: Props) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [writePromptOpen, setWritePromptOpen] = useState(false);
 
-  function enableWrites() {
+  async function enableWrites() {
     if (!impersonate) return;
+    try { await api.impersonate.toggleWrites(impersonate.target.id, true); }
+    catch (e) { console.warn("[FPX] toggleWrites audit log failed:", (e as Error).message); }
     setImpersonate({ ...impersonate, writes: true });
     setWritePromptOpen(false);
   }
-  function disableWrites() {
+  async function disableWrites() {
     if (!impersonate) return;
+    try { await api.impersonate.toggleWrites(impersonate.target.id, false); }
+    catch (e) { console.warn("[FPX] toggleWrites audit log failed:", (e as Error).message); }
     setImpersonate({ ...impersonate, writes: false });
+  }
+  async function stopImpersonateWithLog() {
+    const snapshot = impersonate;
+    stopImpersonate(); // clear localStorage first so the audit call is attributed to the real admin
+    if (snapshot) {
+      try { await api.impersonate.stop(snapshot.target.id, snapshot.writes); }
+      catch (e) { console.warn("[FPX] impersonate-stop audit log failed:", (e as Error).message); }
+    }
   }
 
   return (
@@ -138,7 +151,7 @@ export function Layout({ tab, onTab, children }: Props) {
                 Enable writes…
               </button>
             )}
-            <button onClick={stopImpersonate} className="text-xs px-2.5 py-1 rounded-md bg-slate-900 text-white hover:bg-slate-800">
+            <button onClick={stopImpersonateWithLog} className="text-xs px-2.5 py-1 rounded-md bg-slate-900 text-white hover:bg-slate-800">
               Stop impersonating
             </button>
           </div>

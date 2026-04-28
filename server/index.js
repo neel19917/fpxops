@@ -52,7 +52,16 @@ app.use(cors({
     cb(ok ? null : new Error(`CORS blocked: ${origin}`), ok);
   },
   credentials: false,
-  allowedHeaders: ["Content-Type", "x-api-key", "Authorization"],
+  allowedHeaders: [
+    "Content-Type",
+    "x-api-key",
+    "Authorization",
+    // Admin "view as another user" handshake — without these in the allow-list
+    // the browser preflight strips them and the dashboard sees "Failed to fetch".
+    "x-fpx-impersonate",
+    "x-fpx-impersonate-write",
+    "x-fpx-user-name",
+  ],
 }));
 app.use(express.json({ limit: "20mb" }));
 

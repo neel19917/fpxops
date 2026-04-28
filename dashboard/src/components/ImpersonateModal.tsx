@@ -33,9 +33,16 @@ export function ImpersonateModal({ onClose }: Props) {
       .sort((a, b) => a.email.localeCompare(b.email));
   }, [users, q, realProfile?.id]);
 
-  function pick(target: UserProfileRow) {
+  async function pick(target: UserProfileRow) {
     // Stage 1: read-only impersonation. Stage 2 (writes) is opted in from the
     // banner via a confirmation modal.
+    try {
+      await api.impersonate.start(target.id, false);
+    } catch (e) {
+      // Don't block the user if audit logging fails — surface the error but
+      // let them proceed; the server-side console.log line still captures it.
+      console.warn("[FPX] impersonate-start audit log failed:", (e as Error).message);
+    }
     startImpersonate({ target, writes: false });
     onClose();
   }

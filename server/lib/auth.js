@@ -122,6 +122,8 @@ export function requireAuth(options = {}) {
         if (!target) return res.status(404).json({ error: "Impersonation target not found" });
         const isMutation = !["GET", "HEAD", "OPTIONS"].includes(req.method);
         if (isMutation && !writeOptIn) {
+          // Surface read-only-mode write attempts in the Railway log.
+          console.warn(`[FPX-IMPERSONATE] BLOCKED ${req.method} ${req.path} — admin=${v.user.email} target=${target.email} reason=read_only`);
           return res.status(403).json({
             error: "Impersonation is read-only. Enable write impersonation to perform this action.",
           });
@@ -129,6 +131,10 @@ export function requireAuth(options = {}) {
         req.realUser = v.user;
         req.user = target;
         req.impersonating = { mode: writeOptIn ? "write" : "read", target };
+        // Log every impersonated request so Railway logs reflect spoofing 1:1
+        // with real activity. The audit table only captures mutations + the
+        // explicit start/stop events; this catches reads too.
+        console.log(`[FPX-IMPERSONATE] ${req.impersonating.mode.toUpperCase()} ${req.method} ${req.path} — admin=${v.user.email} as=${target.email}`);
       } else {
         req.user = v.user;
         req.realUser = v.user;
