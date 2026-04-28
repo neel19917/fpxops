@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 import { sb } from "./supabase";
 import type { Session } from "@supabase/supabase-js";
 import { getImpersonate, setImpersonate, subscribeImpersonate, type ImpersonateState } from "./impersonate";
+import { api, type ClientConfig } from "./api";
 
 export interface UserProfile {
   id: string;
@@ -21,6 +22,10 @@ interface AuthState {
   // impersonating; lets the layout decide whether to show the View-as control.
   realProfile: UserProfile | null;
   impersonate: ImpersonateState | null;
+  // Server-supplied feature flags / config (e.g. FreightPOP iframe embed).
+  // Loaded from /api/me alongside the profile; null until the first fetch
+  // resolves.
+  clientConfig: ClientConfig | null;
   startImpersonate: (s: ImpersonateState) => void;
   stopImpersonate: () => void;
   signInWithMicrosoft: () => Promise<void>;
@@ -36,6 +41,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [impersonate, setImpersonateState] = useState<ImpersonateState | null>(() => getImpersonate());
+  const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
 
   useEffect(() => subscribeImpersonate(setImpersonateState), []);
 
@@ -74,6 +80,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       role: data.role as UserProfile["role"],
       enabled: data.enabled,
     });
+    // Fetch server-supplied feature flags (FreightPOP embed, etc.) once
+    // we know the user is enabled. Failure here is non-fatal — the rest
+    // of the app stays usable; embed-dependent UI just stays hidden.
+    if (data.enabled) {
+      api.me.get()
+        .then((r) => { if (r.client_config) setClientConfig(r.client_config); })
+        .catch(() => {});
+    }
   }
 
   useEffect(() => {
@@ -134,6 +148,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     profile: effectiveProfile,
     realProfile: profile,
     impersonate,
+    clientConfig,
     startImpersonate,
     stopImpersonate,
     loading,

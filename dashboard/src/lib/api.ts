@@ -7,15 +7,47 @@ import { impersonateHeaders } from "./impersonate";
 
 const API_URL = (import.meta.env.VITE_FPX_API_URL || "http://localhost:3210").replace(/\/$/, "");
 
-// Auth gate. Pages can mount before Supabase finishes hydrating the session
-// from localStorage / processing the OAuth hash, so the first request after a
-// hard refresh sometimes fires before `access_token` is available — that 401
-// surfaces as "loaded the page, no data, refresh fixes it." Wait briefly for
-// the session to appear via onAuthStateChange before giving up.
+// Auth gate. Three failure modes were causing a "load → blank → refresh fixes
+// it" loop on every page load:
+//   1. Page mounts before Supabase hydrates from localStorage / OAuth hash —
+//      first call to getSession() returns null until onAuthStateChange fires.
+//   2. Cached session in storage is *stale* (access token expired). getSession
+//      returns it anyway; the API server 401s; user refreshes; by then
+//      autoRefreshToken has rotated and the second load succeeds.
+//   3. (after #2) the same stale token gets sent on every subsequent request
+//      until something prompts a refresh.
+//
+// Fix: when getSession returns nothing or returns a token within 60s of
+// expiry, call refreshSession() before resolving. If neither yields a
+// usable token, wait briefly on onAuthStateChange. The 60s skew is generous
+// for clock drift between client + Supabase + Railway.
 const AUTH_GATE_TIMEOUT_MS = 2500;
+const REFRESH_SKEW_S = 60;
+
+function tokenStillFresh(s: { access_token?: string; expires_at?: number | null } | null): string | null {
+  if (!s?.access_token) return null;
+  const exp = s.expires_at;
+  if (exp && Date.now() / 1000 > exp - REFRESH_SKEW_S) return null; // expiring soon
+  return s.access_token;
+}
+
 async function getAccessTokenOrWait(): Promise<string> {
-  const { data } = await sb.auth.getSession();
-  if (data.session?.access_token) return data.session.access_token;
+  // 1. Cached session, if still fresh.
+  const cached = (await sb.auth.getSession()).data.session;
+  const fresh = tokenStillFresh(cached);
+  if (fresh) return fresh;
+
+  // 2. Cached but stale → ask the SDK to refresh. If we have a refresh
+  // token, this returns a brand-new access token without forcing a full
+  // sign-in round-trip.
+  if (cached?.refresh_token) {
+    try {
+      const { data, error } = await sb.auth.refreshSession();
+      if (!error && data.session?.access_token) return data.session.access_token;
+    } catch { /* fall through to the wait path */ }
+  }
+
+  // 3. Nothing usable yet — wait for onAuthStateChange to deliver one.
   return new Promise<string>((resolve, reject) => {
     const { data: sub } = sb.auth.onAuthStateChange((_event, s) => {
       if (s?.access_token) {
@@ -32,24 +64,41 @@ async function getAccessTokenOrWait(): Promise<string> {
 }
 
 async function request<T>(path: string, init?: RequestInit & { params?: Record<string, string | number | undefined>; noImpersonate?: boolean }): Promise<T> {
-  const accessToken = await getAccessTokenOrWait();
   const search = new URLSearchParams();
   for (const [k, v] of Object.entries(init?.params || {})) {
     if (v !== undefined && v !== "") search.set(k, String(v));
   }
   const q = search.toString();
   const full = `${API_URL}${path}${q ? `?${q}` : ""}`;
-  const resp = await fetch(full, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-      // Impersonation headers are skipped on meta-operations (start/stop/toggle)
-      // so the request is attributed to the real admin server-side.
-      ...(init?.noImpersonate ? {} : impersonateHeaders()),
-      ...(init?.headers || {}),
-    },
-  });
+
+  async function fire(token: string) {
+    return fetch(full, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        // Impersonation headers are skipped on meta-operations (start/stop/toggle)
+        // so the request is attributed to the real admin server-side.
+        ...(init?.noImpersonate ? {} : impersonateHeaders()),
+        ...(init?.headers || {}),
+      },
+    });
+  }
+
+  let accessToken = await getAccessTokenOrWait();
+  let resp = await fire(accessToken);
+  // Belt + suspenders for the stale-token race: a 401 means the access token
+  // the SDK handed us was no longer valid server-side. Force a refresh and
+  // retry exactly once before propagating the failure to the caller.
+  if (resp.status === 401) {
+    try {
+      const { data } = await sb.auth.refreshSession();
+      if (data.session?.access_token) {
+        accessToken = data.session.access_token;
+        resp = await fire(accessToken);
+      }
+    } catch { /* retry not possible — fall through with the original 401 */ }
+  }
   if (!resp.ok) {
     const text = await resp.text();
     try {
@@ -80,8 +129,26 @@ async function publicRequest<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const apiUrl = API_URL;
 
+// Client-visible configuration bundled into /api/me. Add new flags here in
+// lockstep with server/routes/me.js#loadClientConfig.
+export interface ClientConfig {
+  embed_freightpop: {
+    enabled: boolean;
+    url_template: string;
+  };
+}
+
 export const api = {
   health: () => fetch(`${API_URL}/health`).then((r) => r.json()),
+
+  me: {
+    get: () => request<{
+      kind: string;
+      user?: { id: string; email: string; role: string; enabled: boolean };
+      pending_api_key?: string | null;
+      client_config?: ClientConfig;
+    }>("/api/me"),
+  },
 
   impersonate: {
     start: (target_id: string, writes: boolean) =>

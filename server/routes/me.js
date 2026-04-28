@@ -3,8 +3,26 @@ import { requireAuth } from "../lib/auth.js";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { decidePendingApiKey } from "../lib/pendingApiKey.js";
+import { getSettings } from "../lib/settings.js";
 
 export const meRouter = Router();
+
+// Public client-config bundle returned in /api/me so every signed-in user
+// gets the same view of toggles like the FreightPOP iframe embed without
+// needing admin access to the settings table. Add any new client-visible
+// flags here; never include anything sensitive (prompts, API keys, etc.).
+async function loadClientConfig() {
+  const s = await getSettings(
+    "embed.freightpop.enabled",
+    "embed.freightpop.url_template",
+  );
+  return {
+    embed_freightpop: {
+      enabled: !!s["embed.freightpop.enabled"],
+      url_template: String(s["embed.freightpop.url_template"] || ""),
+    },
+  };
+}
 
 // GET /api/me — who am I? Lets the dashboard check enabled-status + role.
 // Surfaces impersonation state so the dashboard can render the banner.
@@ -36,6 +54,7 @@ meRouter.get("/", requireAuth({ requireEnabled: false }), async (req, res) => {
           .eq("id", req.user.id);
       }
     }
+
     return res.json({
       kind: "user",
       user: req.user,
@@ -44,6 +63,7 @@ meRouter.get("/", requireAuth({ requireEnabled: false }), async (req, res) => {
         ? { mode: req.impersonating.mode, target: req.impersonating.target }
         : null,
       pending_api_key,
+      client_config: await loadClientConfig(),
     });
   }
   if (req.apiKey) {

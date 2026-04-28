@@ -25,6 +25,12 @@ const FALLBACKS = {
   "action.auto_draft_enabled": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   "model.large": process.env.ANTHROPIC_MODEL_LARGE || "claude-sonnet-4-6",
+  // FreightPOP iframe embed in the shipment drawer. Off by default — many
+  // tenants block iframe embedding via X-Frame-Options / CSP and the only
+  // way to know is to flip this on. {tracking_number} and {shipment_id} are
+  // substituted into the URL when the drawer renders.
+  "embed.freightpop.enabled": false,
+  "embed.freightpop.url_template": "https://app.freightpop.com/tracking/{tracking_number}",
 };
 
 const TTL_MS = 30_000;

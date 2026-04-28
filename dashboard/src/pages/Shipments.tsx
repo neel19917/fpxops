@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -8,6 +8,7 @@ import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
 import { ColumnSelector } from "../components/ColumnSelector";
 import { UserPicker } from "../components/UserPicker";
+import { useAuth } from "../lib/auth";
 import {
   SHIPMENT_COLUMNS,
   loadColumnPrefs,
@@ -82,13 +83,15 @@ interface ShipmentsPageProps {
   } | null;
 }
 
-const DRAWER_TABS = ["overview", "tasks", "email", "drafts", "history", "raw"] as const;
+const DRAWER_TABS = ["overview", "tasks", "email", "drafts", "history", "freightpop", "raw"] as const;
 type DrawerTabId = typeof DRAWER_TABS[number];
 function asDrawerTab(s: string | null | undefined): DrawerTabId {
   return DRAWER_TABS.includes(s as DrawerTabId) ? (s as DrawerTabId) : "overview";
 }
 
 export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk }: ShipmentsPageProps = {}) {
+  const { clientConfig } = useAuth();
+  const embedCfg = clientConfig?.embed_freightpop;
   const [rows, setRows] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -837,8 +840,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 { id: "email", label: "Email", count: null },
                 { id: "drafts", label: "Drafts", count: drawerData.analyses.filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_")).length },
                 { id: "history", label: "Analysis", count: drawerData.analyses.filter((a) => a.kind === "per_shipment" || a.kind === "summary").length },
+                ...(embedCfg?.enabled ? [{ id: "freightpop" as const, label: "FreightPOP", count: null }] : []),
                 { id: "raw", label: "Raw", count: null },
-              ] as const).map((t) => (
+              ] as { id: typeof DRAWER_TABS[number]; label: string; count: number | null }[]).map((t) => (
                 <button
                   key={t.id}
                   onClick={() => setDrawerTab(t.id)}
@@ -1190,6 +1194,13 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               );
             })()}
 
+            {drawerTab === "freightpop" && embedCfg?.enabled && (
+              <FreightPopEmbed
+                template={embedCfg.url_template}
+                shipment={drawerData.shipment}
+              />
+            )}
+
             {drawerTab === "raw" && (
               <Section title="Raw scrape">
                 <pre className="text-[11px] bg-slate-900 text-slate-100 p-3 rounded-lg whitespace-pre-wrap max-h-[60vh] overflow-auto">
@@ -1453,5 +1464,67 @@ function TaskBanner({ task, busy, onSetStatus }: {
         </div>
       </div>
     </div>
+  );
+}
+
+// =====================================================================
+// FreightPOP iframe embed. Off by default; enabled via the
+// embed.freightpop.* settings. Many tenants block iframe embedding via
+// X-Frame-Options / CSP, so we always render an "Open in new tab" escape
+// hatch alongside the iframe.
+// =====================================================================
+function buildEmbedUrl(template: string, shipment: Shipment): string {
+  return template
+    .replace(/\{tracking_number\}/g, encodeURIComponent(shipment.tracking_number || ""))
+    .replace(/\{shipment_id\}/g, encodeURIComponent(shipment.shipment_id || shipment.id))
+    .replace(/\{order_number\}/g, encodeURIComponent(shipment.order_number || ""));
+}
+
+function FreightPopEmbed({ template, shipment }: { template: string; shipment: Shipment }) {
+  const url = useMemo(() => {
+    if (!template) return "";
+    try { return buildEmbedUrl(template, shipment); }
+    catch { return ""; }
+  }, [template, shipment]);
+
+  if (!url) {
+    return (
+      <Section title="FreightPOP">
+        <div className="text-sm text-slate-500">
+          The FreightPOP embed URL template hasn't been configured yet. Go to
+          <span className="font-mono mx-1">Settings → embed.freightpop.url_template</span>
+          to set it (placeholders: <span className="font-mono">{"{tracking_number}"}</span>, <span className="font-mono">{"{shipment_id}"}</span>).
+        </div>
+      </Section>
+    );
+  }
+  return (
+    <Section title="FreightPOP">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs text-slate-500 truncate font-mono">{url}</div>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-xs text-sky-700 hover:text-sky-900 underline inline-flex items-center gap-1 ml-3 shrink-0"
+        >
+          <ExternalLink className="h-3.5 w-3.5" /> Open in new tab
+        </a>
+      </div>
+      <div className="rounded-lg ring-1 ring-slate-200 overflow-hidden bg-white" style={{ height: "70vh" }}>
+        <iframe
+          src={url}
+          className="w-full h-full"
+          title="FreightPOP shipment view"
+          // Avoid implicit top-frame access; FreightPOP runs in its own origin.
+          sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+          referrerPolicy="no-referrer-when-downgrade"
+        />
+      </div>
+      <p className="text-[11px] text-slate-500 mt-2">
+        If the panel is blank, FreightPOP is blocking iframe embedding (X-Frame-Options / CSP).
+        Use the "Open in new tab" link above instead, or contact your FreightPOP admin to allow this origin.
+      </p>
+    </Section>
   );
 }
