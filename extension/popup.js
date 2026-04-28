@@ -58,20 +58,27 @@ function parseCredentialsFile(text) {
 let isConfigured = false;
 let savedName = "";
 let signedInAs = null;
+let signedInApproved = null;     // null when not signed in; true/false otherwise
+let signedInFullName = null;
 
 function setStatus(configured, name) {
   if (configured) {
     els.status.classList.remove("setup");
     els.status.classList.add("connected");
     if (signedInAs) {
-      els.statusLabel.textContent = `Signed in as ${signedInAs}`;
-      els.statusSub.textContent = name
-        ? `Your scrapes are stamped as ${name}.`
-        : "Your scrapes are tied to your Microsoft account.";
+      els.statusLabel.textContent = `Signed in as ${signedInFullName || signedInAs}`;
+      els.statusSub.textContent = "Approved · ready to scrape.";
     } else {
       els.statusLabel.textContent = name ? `Connected as ${name}` : "Connected";
       els.statusSub.textContent = "Your scrapes are stamped with your name.";
     }
+  } else if (signedInAs && signedInApproved === false) {
+    // Signed in but admin hasn't enabled them yet — distinct visual state so
+    // the rep knows what they're waiting on.
+    els.status.classList.remove("connected");
+    els.status.classList.add("setup");
+    els.statusLabel.textContent = `Awaiting admin approval`;
+    els.statusSub.textContent = `${signedInAs} is signed in. An admin needs to enable API access in the Users tab.`;
   } else {
     els.status.classList.remove("connected");
     els.status.classList.add("setup");
@@ -81,15 +88,27 @@ function setStatus(configured, name) {
   els.openBtn.disabled = !configured;
 }
 
-function renderSignedIn(email) {
+function renderSignedIn(email, approved, fullName) {
   signedInAs = email || null;
+  signedInApproved = email ? !!approved : null;
+  signedInFullName = email ? (fullName || null) : null;
   if (email) {
-    if (els.msSignedInEmail) els.msSignedInEmail.textContent = email;
+    if (els.msSignedInEmail) els.msSignedInEmail.textContent = fullName ? `${fullName} (${email})` : email;
     if (els.msSignedInRow) els.msSignedInRow.style.display = "";
     if (els.msSignInLabel) els.msSignInLabel.textContent = "Re-authenticate";
+    // Hide the API-key block when the rep is signed in — the Bearer JWT is
+    // doing the work. They can still expose it via Advanced if needed.
+    if (els.keyInput) {
+      const apiKeyStep = els.keyInput.closest(".setup-step");
+      if (apiKeyStep) apiKeyStep.style.display = "none";
+    }
   } else {
     if (els.msSignedInRow) els.msSignedInRow.style.display = "none";
     if (els.msSignInLabel) els.msSignInLabel.textContent = "Sign in with Microsoft";
+    if (els.keyInput) {
+      const apiKeyStep = els.keyInput.closest(".setup-step");
+      if (apiKeyStep) apiKeyStep.style.display = "";
+    }
   }
 }
 
@@ -124,15 +143,20 @@ function refreshKeyState() {
     if (chrome.runtime.lastError) return;
     const configured = !!(res && res.configured);
     isConfigured = configured;
-    renderSignedIn(res && res.signedInAs);
+    renderSignedIn(
+      res && res.signedInAs,
+      res && res.approved,
+      res && res.fullName,
+    );
     // Pull the saved name for the status sub-line.
     chrome.runtime.sendMessage({ type: "getApiKey" }, (nameRes) => {
       if (chrome.runtime.lastError) return;
       savedName = (nameRes && nameRes.name) || "";
       setStatus(configured, savedName);
       // First-time users see setup unfolded immediately; configured users
-      // get the setup hidden behind the Settings cog.
-      if (!configured) showSetup({ firstTime: true, prefill: true });
+      // get the setup hidden behind the Settings cog. Pending-approval users
+      // also see the setup so they understand the state.
+      if (!configured) showSetup({ firstTime: !signedInAs, prefill: true });
       else hideSetup();
     });
   });

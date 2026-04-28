@@ -99,9 +99,46 @@ async function signInWithMicrosoft() {
         provider: "azure",
       };
       await saveSupabaseSession(session);
-      resolve({ ok: true, email: session.email });
+      // Auto-stamp the user's name from their profile so the rep doesn't have
+      // to type it. Surfaces approval state too — the popup uses it to render
+      // "Awaiting admin approval" when the user isn't enabled yet.
+      const profile = await fetchProfileWithSession(session);
+      if (profile?.fullName || profile?.email) {
+        const name = profile.fullName || profile.email.split("@")[0];
+        await chrome.storage.local.set({ fpxUserName: name });
+      }
+      resolve({
+        ok: true,
+        email: session.email,
+        approved: !!profile?.enabled,
+        role: profile?.role || null,
+        fullName: profile?.fullName || null,
+      });
     });
   });
+}
+
+// Fetch /api/me using a specific session (used right after sign-in, before
+// the session is fully saved) and again on demand to surface approval state
+// in the popup without requiring a re-sign-in.
+async function fetchProfileWithSession(session) {
+  if (!session?.access_token) return null;
+  const apiUrl = await getApiUrl();
+  if (!apiUrl) return null;
+  try {
+    const resp = await fetch(`${apiUrl}/api/me`, {
+      headers: { "Authorization": `Bearer ${session.access_token}` },
+    });
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    return body?.user || null;
+  } catch { return null; }
+}
+
+async function fetchOwnProfile() {
+  const session = await getSupabaseSession();
+  if (!isSessionLive(session)) return null;
+  return fetchProfileWithSession(session);
 }
 
 async function getApiUrl() {
@@ -328,11 +365,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const k = await getApiKey();
       const session = await getSupabaseSession();
       const sessionLive = isSessionLive(session);
-      // Configured = either auth path is present.
+      // When signed in via Microsoft, ping /api/me so the popup knows whether
+      // the admin has enabled this user yet (= API access approved). Skip the
+      // ping if no session — we don't need it for the API-key path.
+      let approved = null;
+      let signedInAs = null;
+      let fullName = null;
+      if (sessionLive) {
+        signedInAs = session.email || null;
+        const profile = await fetchProfileWithSession(session);
+        approved = profile?.enabled ?? false;
+        fullName = profile?.fullName || null;
+      }
+      // "Configured" = the user has an auth path AND, if signed in, the
+      // admin has approved them. API-key path doesn't need a separate
+      // approval — the key being non-revoked IS the approval.
+      const configured = sessionLive ? !!approved : isValidKey(k);
       sendResponse({
-        configured: sessionLive || isValidKey(k),
+        configured,
         source: sessionLive ? "supabase" : await getKeySource(),
-        signedInAs: sessionLive ? (session.email || null) : null,
+        signedInAs,
+        approved,
+        fullName,
       });
     })();
     return true;

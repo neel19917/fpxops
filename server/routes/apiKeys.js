@@ -2,6 +2,7 @@ import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { requireAuth, hashApiKey, generateApiKey } from "../lib/auth.js";
 import { sendCachedJson } from "../lib/httpCache.js";
+import { logAudit } from "../lib/audit.js";
 
 export const apiKeysRouter = Router();
 
@@ -35,16 +36,46 @@ apiKeysRouter.post("/", async (req, res) => {
     .select("id, name, key_prefix, scopes, created_at")
     .single();
   if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "create",
+    entity_type: "api_key",
+    entity_id: data.id,
+    summary: `Created API key "${data.name}" (${key_prefix}…) with scopes: ${scopes.join(", ")}`,
+    after: { name: data.name, key_prefix, scopes },
+    metadata: { name: data.name, key_prefix, scopes },
+  });
   res.json({ key: data, plaintext, warning: "Save this key now — it will not be shown again." });
 });
 
 // DELETE /api-keys/:id — soft-revoke (sets revoked_at).
 apiKeysRouter.delete("/:id", async (req, res) => {
-  const { error } = await supabase
+  // Snapshot for the audit `before` so the log shows what got revoked even
+  // after the row's revoked_at timestamp moves.
+  const { data: before } = await supabase
+    .from("fpx_api_keys")
+    .select("id, name, key_prefix, scopes, revoked_at")
+    .eq("id", req.params.id).maybeSingle();
+  if (!before) return res.status(404).json({ error: "API key not found" });
+  if (before.revoked_at) return res.status(409).json({ error: "API key already revoked" });
+
+  const { error, data } = await supabase
     .from("fpx_api_keys")
     .update({ revoked_at: new Date().toISOString() })
     .eq("id", req.params.id)
-    .is("revoked_at", null);
+    .is("revoked_at", null)
+    .select("id, name, key_prefix, scopes, revoked_at")
+    .maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(409).json({ error: "API key already revoked" });
+
+  logAudit(req, {
+    action: "revoke",
+    entity_type: "api_key",
+    entity_id: data.id,
+    summary: `Revoked API key "${data.name}" (${data.key_prefix}…)`,
+    before: { name: before.name, key_prefix: before.key_prefix, scopes: before.scopes, revoked_at: before.revoked_at },
+    after:  { name: data.name,   key_prefix: data.key_prefix,   scopes: data.scopes,   revoked_at: data.revoked_at },
+    metadata: { name: data.name, key_prefix: data.key_prefix, scopes: data.scopes },
+  });
   res.json({ ok: true });
 });

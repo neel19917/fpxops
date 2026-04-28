@@ -109,20 +109,23 @@ export function requireAuth(options = {}) {
     if (bearer) {
       const v = await resolveJwt(bearer);
       if (!v) return res.status(401).json({ error: "Invalid session" });
-      // Real admin must always be enabled before we even look at impersonation.
-      if (!v.user.enabled) {
-        return res.status(403).json({ error: "Your account is not yet enabled. An admin needs to activate it." });
-      }
 
-      // Impersonation handshake (admin-only, JWT-only).
+      // Impersonation handshake (admin-only, JWT-only). The real admin must
+      // be enabled + admin-role to impersonate; the target's enabled flag is
+      // checked afterward via the route's requireEnabled.
       const impersonateId = req.header("x-fpx-impersonate");
       const writeOptIn = req.header("x-fpx-impersonate-write") === "1";
-      if (impersonateId && v.user.role === "admin" && impersonateId !== v.user.id) {
+      if (impersonateId && impersonateId !== v.user.id) {
+        if (!v.user.enabled) {
+          return res.status(403).json({ error: "Your account is not yet enabled. An admin needs to activate it." });
+        }
+        if (v.user.role !== "admin") {
+          return res.status(403).json({ error: "Impersonation requires admin role." });
+        }
         const target = await resolveImpersonationTarget(impersonateId);
         if (!target) return res.status(404).json({ error: "Impersonation target not found" });
         const isMutation = !["GET", "HEAD", "OPTIONS"].includes(req.method);
         if (isMutation && !writeOptIn) {
-          // Surface read-only-mode write attempts in the Railway log.
           console.warn(`[FPX-IMPERSONATE] BLOCKED ${req.method} ${req.path} — admin=${v.user.email} target=${target.email} reason=read_only`);
           return res.status(403).json({
             error: "Impersonation is read-only. Enable write impersonation to perform this action.",
@@ -131,18 +134,15 @@ export function requireAuth(options = {}) {
         req.realUser = v.user;
         req.user = target;
         req.impersonating = { mode: writeOptIn ? "write" : "read", target };
-        // Log every impersonated request so Railway logs reflect spoofing 1:1
-        // with real activity. The audit table only captures mutations + the
-        // explicit start/stop events; this catches reads too.
         console.log(`[FPX-IMPERSONATE] ${req.impersonating.mode.toUpperCase()} ${req.method} ${req.path} — admin=${v.user.email} as=${target.email}`);
       } else {
         req.user = v.user;
         req.realUser = v.user;
       }
 
-      // Now enforce the route's enabled requirement against whoever req.user
-      // ends up being. For impersonated requests this gives an honest
-      // "what would this user see" — including a 403 if they're disabled.
+      // Now enforce the route's enabled requirement. /api/me deliberately
+      // passes requireEnabled:false so a pending-approval user can still
+      // read their own profile to find out *why* they're locked out.
       if (requireEnabled && !req.user.enabled) {
         return res.status(403).json({ error: "Your account is not yet enabled. An admin needs to activate it." });
       }
