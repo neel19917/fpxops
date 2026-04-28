@@ -1468,11 +1468,16 @@ function TaskBanner({ task, busy, onSetStatus }: {
 }
 
 // =====================================================================
-// FreightPOP iframe embed. Off by default; enabled via the
-// embed.freightpop.* settings. Many tenants block iframe embedding via
-// X-Frame-Options / CSP, so we always render an "Open in new tab" escape
-// hatch alongside the iframe.
+// FreightPOP iframe embed. Toggled by embed.freightpop.* settings. The
+// default template is the base FreightPOP URL with no placeholders —
+// FreightPOP has no public deep-link route for an individual shipment,
+// so we mirror the Chrome extension's flow: load the live grid inside
+// the iframe and let the user paste the tracking number into search.
+// (If a tenant DOES have a per-shipment URL, placeholder substitution
+// still works: {tracking_number}, {shipment_id}, {order_number}.)
 // =====================================================================
+const EMBED_PLACEHOLDERS = /\{(tracking_number|shipment_id|order_number)\}/;
+
 function buildEmbedUrl(template: string, shipment: Shipment): string {
   return template
     .replace(/\{tracking_number\}/g, encodeURIComponent(shipment.tracking_number || ""))
@@ -1481,34 +1486,64 @@ function buildEmbedUrl(template: string, shipment: Shipment): string {
 }
 
 function FreightPopEmbed({ template, shipment }: { template: string; shipment: Shipment }) {
+  // When the template has no placeholders, the iframe URL doesn't change
+  // when the user navigates between shipments — keep `shipment` out of the
+  // memo deps so the iframe doesn't reload (and the user doesn't lose
+  // their FreightPOP session/scroll) on every walk step.
+  const hasPlaceholder = EMBED_PLACEHOLDERS.test(template || "");
   const url = useMemo(() => {
     if (!template) return "";
     try { return buildEmbedUrl(template, shipment); }
     catch { return ""; }
-  }, [template, shipment]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, hasPlaceholder ? [template, shipment] : [template]);
+  const [copied, setCopied] = useState(false);
+  const tracking = shipment.tracking_number || "";
+
+  async function copyTracking() {
+    if (!tracking) return;
+    try {
+      await navigator.clipboard.writeText(tracking);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked — no-op */ }
+  }
 
   if (!url) {
     return (
       <Section title="FreightPOP">
         <div className="text-sm text-slate-500">
-          The FreightPOP embed URL template hasn't been configured yet. Go to
+          The FreightPOP embed URL hasn't been configured yet. Go to
           <span className="font-mono mx-1">Settings → embed.freightpop.url_template</span>
-          to set it (placeholders: <span className="font-mono">{"{tracking_number}"}</span>, <span className="font-mono">{"{shipment_id}"}</span>).
+          to set it.
         </div>
       </Section>
     );
   }
   return (
     <Section title="FreightPOP">
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-xs text-slate-500 truncate font-mono">{url}</div>
+      <div className="rounded-lg bg-slate-50 ring-1 ring-slate-200 px-3 py-2 mb-2 flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-500 shrink-0">Tracking #</span>
+          <span className="font-mono text-sm text-slate-900 truncate">{tracking || "—"}</span>
+          {tracking ? (
+            <button
+              onClick={copyTracking}
+              className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50"
+              title="Copy tracking number"
+            >
+              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              {copied ? "Copied" : "Copy"}
+            </button>
+          ) : null}
+        </div>
         <a
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-xs text-sky-700 hover:text-sky-900 underline inline-flex items-center gap-1 ml-3 shrink-0"
+          className="text-xs text-sky-700 hover:text-sky-900 underline inline-flex items-center gap-1 shrink-0"
         >
-          <ExternalLink className="h-3.5 w-3.5" /> Open in new tab
+          <ExternalLink className="h-3.5 w-3.5" /> Open FreightPOP in new tab
         </a>
       </div>
       <div className="rounded-lg ring-1 ring-slate-200 overflow-hidden bg-white" style={{ height: "70vh" }}>
@@ -1516,14 +1551,15 @@ function FreightPopEmbed({ template, shipment }: { template: string; shipment: S
           src={url}
           className="w-full h-full"
           title="FreightPOP shipment view"
-          // Avoid implicit top-frame access; FreightPOP runs in its own origin.
           sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"
           referrerPolicy="no-referrer-when-downgrade"
         />
       </div>
       <p className="text-[11px] text-slate-500 mt-2">
-        If the panel is blank, FreightPOP is blocking iframe embedding (X-Frame-Options / CSP).
-        Use the "Open in new tab" link above instead, or contact your FreightPOP admin to allow this origin.
+        Paste the tracking number above into FreightPOP's search to jump to this shipment —
+        FreightPOP doesn't expose a deep-link URL, so we mirror what the Chrome extension does
+        (navigate the live grid). If the panel is blank, FreightPOP is blocking iframe embedding
+        for this origin (X-Frame-Options / CSP); use the "Open in new tab" link instead.
       </p>
     </Section>
   );

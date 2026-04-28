@@ -25,12 +25,16 @@ const FALLBACKS = {
   "action.auto_draft_enabled": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   "model.large": process.env.ANTHROPIC_MODEL_LARGE || "claude-sonnet-4-6",
-  // FreightPOP iframe embed in the shipment drawer. Off by default — many
-  // tenants block iframe embedding via X-Frame-Options / CSP and the only
-  // way to know is to flip this on. {tracking_number} and {shipment_id} are
-  // substituted into the URL when the drawer renders.
-  "embed.freightpop.enabled": false,
-  "embed.freightpop.url_template": "https://app.freightpop.com/tracking/{tracking_number}",
+  // FreightPOP iframe embed in the shipment drawer. On by default; admins
+  // can flip off in /admin/settings if iframe embedding is blocked for
+  // their tenant. The url_template is normally the base FreightPOP URL —
+  // FreightPOP has no deep-link route for an individual shipment, so the
+  // drawer surfaces the tracking number next to the iframe for paste-into-
+  // search (mirrors how the Chrome extension navigates the live grid).
+  // Placeholder substitution still works ({tracking_number}, {shipment_id},
+  // {order_number}) for tenants with custom URL routes.
+  "embed.freightpop.enabled": true,
+  "embed.freightpop.url_template": "https://app.freightpop.com/",
 };
 
 const TTL_MS = 30_000;
