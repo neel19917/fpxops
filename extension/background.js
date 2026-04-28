@@ -63,57 +63,105 @@ function decodeJwtPayload(jwt) {
   } catch { return null; }
 }
 
+// Persist the response-url-handling logic outside the flow so both
+// launchWebAuthFlow and the chrome.windows.create variant can share it.
+async function processOauthResponse(responseUrl) {
+  // Supabase OAuth implicit flow returns tokens in the URL hash:
+  //   <redirect>#access_token=...&refresh_token=...&expires_in=...&token_type=bearer
+  const hashIdx = responseUrl.indexOf("#");
+  if (hashIdx === -1) return { ok: false, error: "No token in OAuth response" };
+  const params = new URLSearchParams(responseUrl.slice(hashIdx + 1));
+  const access_token = params.get("access_token");
+  const refresh_token = params.get("refresh_token") || null;
+  const expires_in = Number(params.get("expires_in") || 3600);
+  if (!access_token) {
+    const err = params.get("error_description") || params.get("error") || "Missing access_token";
+    return { ok: false, error: err };
+  }
+  const claims = decodeJwtPayload(access_token) || {};
+  const session = {
+    access_token,
+    refresh_token,
+    expires_at: Math.floor(Date.now() / 1000) + expires_in,
+    email: claims.email || null,
+    provider: "azure",
+  };
+  await saveSupabaseSession(session);
+  // Auto-stamp the user's name from their profile so the rep doesn't have
+  // to type it. Surfaces approval state too — the popup uses it to render
+  // "Awaiting admin approval" when the user isn't enabled yet.
+  const profile = await fetchProfileWithSession(session);
+  if (profile?.fullName || profile?.email) {
+    const name = profile.fullName || profile.email.split("@")[0];
+    await chrome.storage.local.set({ fpxUserName: name });
+  }
+  return {
+    ok: true,
+    email: session.email,
+    approved: !!profile?.enabled,
+    role: profile?.role || null,
+    fullName: profile?.fullName || null,
+  };
+}
+
+// Open the OAuth flow in a small Chrome popup window instead of a full tab.
+// Uses chrome.windows.create + chrome.tabs.onUpdated to detect when Supabase
+// redirects to chromiumapp.org (which doesn't actually resolve — we capture
+// the URL and close the window before the failed navigation matters).
 async function signInWithMicrosoft() {
   const redirectUrl = chrome.identity.getRedirectURL();
   const authUrl =
     `${SUPABASE_URL}/auth/v1/authorize` +
     `?provider=azure&redirect_to=${encodeURIComponent(redirectUrl)}`;
+
   return new Promise((resolve) => {
-    chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, async (responseUrl) => {
-      if (chrome.runtime.lastError || !responseUrl) {
-        resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "Sign-in cancelled" });
+    let resolved = false;
+    let createdWindowId = null;
+    let createdTabId = null;
+
+    function finish(result) {
+      if (resolved) return;
+      resolved = true;
+      try { chrome.tabs.onUpdated.removeListener(navListener); } catch {}
+      try { chrome.windows.onRemoved.removeListener(closeListener); } catch {}
+      if (createdWindowId != null) {
+        chrome.windows.remove(createdWindowId).catch(() => {});
+      }
+      resolve(result);
+    }
+
+    async function navListener(tabId, changeInfo, tab) {
+      if (tabId !== createdTabId) return;
+      const url = changeInfo.url || tab?.url || "";
+      if (!url || !url.startsWith(redirectUrl)) return;
+      const result = await processOauthResponse(url);
+      finish(result);
+    }
+
+    function closeListener(windowId) {
+      if (windowId === createdWindowId && !resolved) {
+        finish({ ok: false, error: "Sign-in cancelled" });
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(navListener);
+    chrome.windows.onRemoved.addListener(closeListener);
+
+    // Center the popup on the current display. Fall back to default placement
+    // if we can't read the screen size from the service worker.
+    chrome.windows.create({
+      url: authUrl,
+      type: "popup",
+      width: 500,
+      height: 680,
+      focused: true,
+    }, (win) => {
+      if (chrome.runtime.lastError || !win) {
+        finish({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "Couldn't open auth window" });
         return;
       }
-      // Supabase OAuth implicit flow returns tokens in the URL hash:
-      //   <redirect>#access_token=...&refresh_token=...&expires_in=...&token_type=bearer
-      const hashIdx = responseUrl.indexOf("#");
-      if (hashIdx === -1) {
-        resolve({ ok: false, error: "No token in OAuth response" });
-        return;
-      }
-      const params = new URLSearchParams(responseUrl.slice(hashIdx + 1));
-      const access_token = params.get("access_token");
-      const refresh_token = params.get("refresh_token") || null;
-      const expires_in = Number(params.get("expires_in") || 3600);
-      if (!access_token) {
-        const err = params.get("error_description") || params.get("error") || "Missing access_token";
-        resolve({ ok: false, error: err });
-        return;
-      }
-      const claims = decodeJwtPayload(access_token) || {};
-      const session = {
-        access_token,
-        refresh_token,
-        expires_at: Math.floor(Date.now() / 1000) + expires_in,
-        email: claims.email || null,
-        provider: "azure",
-      };
-      await saveSupabaseSession(session);
-      // Auto-stamp the user's name from their profile so the rep doesn't have
-      // to type it. Surfaces approval state too — the popup uses it to render
-      // "Awaiting admin approval" when the user isn't enabled yet.
-      const profile = await fetchProfileWithSession(session);
-      if (profile?.fullName || profile?.email) {
-        const name = profile.fullName || profile.email.split("@")[0];
-        await chrome.storage.local.set({ fpxUserName: name });
-      }
-      resolve({
-        ok: true,
-        email: session.email,
-        approved: !!profile?.enabled,
-        role: profile?.role || null,
-        fullName: profile?.fullName || null,
-      });
+      createdWindowId = win.id;
+      createdTabId = win.tabs?.[0]?.id ?? null;
     });
   });
 }
