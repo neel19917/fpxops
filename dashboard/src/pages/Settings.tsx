@@ -73,10 +73,13 @@ export function SettingsPage() {
   }
 
   async function save(row: SettingRow) {
-    if (!(row.key in edits)) return;
     setSavingKey(row.key);
     try {
-      const v = edits[row.key];
+      // Prefer the in-flight edit if the user typed; otherwise persist the
+      // currently-displayed value (the resolved fallback for default rows).
+      // This lets admins promote a default to a real DB row in one click
+      // without having to type-and-retype the same value.
+      const v = row.key in edits ? edits[row.key] : row.value;
       await api.settings.update(row.key, v);
       await load();
     } catch (e) {
@@ -141,7 +144,14 @@ export function SettingsPage() {
             <ul className="divide-y divide-slate-100">
               {list.map((row) => {
                 const current = row.key in edits ? edits[row.key] : row.value;
-                const dirty = row.key in edits;
+                // Save is enabled if either (a) the user actually edited the
+                // field, OR (b) the row is still using the hard-coded default
+                // (no DB row yet) — saving in that case promotes the default
+                // to a persisted value so the admin can verify / lock it in.
+                // Without (b) the Save button is permanently grayed out for
+                // any setting an admin has never touched, which made the
+                // page feel broken.
+                const dirty = row.key in edits || row.isDefault;
                 const shape = valueShape(row.value);
                 const open = openKey === row.key;
                 const friendly = FRIENDLY_LABEL[row.key] || row.key;
