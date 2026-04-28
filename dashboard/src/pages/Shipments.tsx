@@ -170,6 +170,19 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [actionEditOptIn, setActionEditOptIn] = useState(false);
   const [actionEditBusy, setActionEditBusy] = useState(false);
 
+  // Split-view: render the FreightPOP iframe in the left "gray screen" area
+  // while the drawer is open, so reps see the live FreightPOP grid + the
+  // shipment details side-by-side. Default on when the embed is enabled;
+  // toggle persists in localStorage so users who can't get FreightPOP to
+  // load (CSP / X-Frame-Options) can collapse it permanently.
+  const [splitView, setSplitView] = useState<boolean>(() => {
+    try { return (localStorage.getItem("fpx.shipments.splitView") ?? "1") !== "0"; }
+    catch { return true; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fpx.shipments.splitView", splitView ? "1" : "0"); } catch {}
+  }, [splitView]);
+
   // "Export all" pulls every shipment fresh (ignores filters / pill / search)
   // so the workbook reflects the database, not the current view.
   const [exporting, setExporting] = useState(false);
@@ -783,6 +796,14 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         onClose={() => setDrawerId(null)}
         title={drawerData?.shipment.tracking_number || "Shipment"}
         subtitle={drawerData?.shipment.customer_name || undefined}
+        leftSlot={
+          embedCfg?.enabled && splitView && drawerData ? (
+            <FreightPopSidebar
+              template={embedCfg.url_template}
+              shipment={drawerData.shipment}
+            />
+          ) : null
+        }
       >
         {drawerData ? (
           <>
@@ -818,6 +839,19 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 </button>
               </div>
               <div className="flex items-center gap-2">
+                {embedCfg?.enabled ? (
+                  <button
+                    type="button"
+                    onClick={() => setSplitView((v) => !v)}
+                    className={"text-xs px-2.5 py-1.5 rounded-md ring-1 inline-flex items-center gap-1.5 " + (splitView
+                      ? "bg-violet-600 text-white ring-violet-600 hover:bg-violet-700"
+                      : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50")}
+                    title={splitView ? "Hide FreightPOP side panel" : "Show FreightPOP side panel"}
+                    aria-pressed={splitView}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" /> {splitView ? "FreightPOP on" : "FreightPOP"}
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => setDrawerHelpOpen(true)}
@@ -1551,7 +1585,14 @@ function FreightPopEmbed({ template, shipment }: { template: string; shipment: S
           src={url}
           className="w-full h-full"
           title="FreightPOP shipment view"
-          sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+          // No sandbox: a sandbox would block password-manager autofill,
+          // WebAuthn (passkeys / security keys), and bearer/access tokens
+          // stored in the iframe's localStorage. Same-origin within the
+          // iframe handles its own auth; we just don't get in the way.
+          // The `allow=` policy explicitly opts the iframe in to the
+          // permission-policy gates that browsers default-deny for
+          // cross-origin frames.
+          allow={EMBED_ALLOW}
           referrerPolicy="no-referrer-when-downgrade"
         />
       </div>
@@ -1562,5 +1603,99 @@ function FreightPopEmbed({ template, shipment }: { template: string; shipment: S
         for this origin (X-Frame-Options / CSP); use the "Open in new tab" link instead.
       </p>
     </Section>
+  );
+}
+
+// Permissions-policy bundle for FreightPOP iframes. Each entry corresponds
+// to a feature browsers default-deny for cross-origin frames; allowing them
+// here lets FreightPOP's login/session work the way it does in a normal tab:
+//   storage-access                        — Storage Access API (third-party
+//                                            cookies after user grants)
+//   publickey-credentials-{get,create}    — WebAuthn (passkeys, security keys)
+//   clipboard-read / clipboard-write      — paste + copy inside FreightPOP
+//   forms / autoplay / fullscreen         — generic UX features the app uses
+const EMBED_ALLOW = [
+  "storage-access *",
+  "publickey-credentials-get *",
+  "publickey-credentials-create *",
+  "clipboard-read *",
+  "clipboard-write *",
+  "forms *",
+  "autoplay *",
+  "fullscreen *",
+].join("; ");
+
+// =====================================================================
+// FreightPopSidebar — full-height variant of the embed for split view.
+// Renders into the Drawer's leftSlot when embed is enabled and the
+// user has split-view turned on. Same iframe permissions as the in-tab
+// embed; the layout chrome is just adapted to fill the gray area
+// (no Section wrapper, header bar pinned to top).
+// =====================================================================
+function FreightPopSidebar({ template, shipment }: { template: string; shipment: Shipment }) {
+  const hasPlaceholder = EMBED_PLACEHOLDERS.test(template || "");
+  const url = useMemo(() => {
+    if (!template) return "";
+    try { return buildEmbedUrl(template, shipment); }
+    catch { return ""; }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, hasPlaceholder ? [template, shipment] : [template]);
+  const [copied, setCopied] = useState(false);
+  const tracking = shipment.tracking_number || "";
+
+  async function copyTracking() {
+    if (!tracking) return;
+    try {
+      await navigator.clipboard.writeText(tracking);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* no-op */ }
+  }
+
+  if (!url) {
+    return (
+      <div className="h-full flex items-center justify-center p-6 text-sm text-slate-500">
+        FreightPOP embed URL not configured. Set <span className="font-mono mx-1">embed.freightpop.url_template</span> in Settings.
+      </div>
+    );
+  }
+  return (
+    <div className="h-full flex flex-col bg-slate-100">
+      <div className="flex items-center gap-3 px-3 py-2 bg-white border-b border-slate-200 shadow-sm">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 shrink-0">FreightPOP · Tracking #</span>
+          <span className="font-mono text-sm text-slate-900 truncate">{tracking || "—"}</span>
+          {tracking ? (
+            <button
+              onClick={copyTracking}
+              className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50"
+              title="Copy tracking number"
+            >
+              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              {copied ? "Copied" : "Copy"}
+            </button>
+          ) : null}
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-sky-700 hover:text-sky-900 underline inline-flex items-center gap-1"
+          >
+            <ExternalLink className="h-3.5 w-3.5" /> New tab
+          </a>
+        </div>
+      </div>
+      <div className="flex-1 bg-white">
+        <iframe
+          src={url}
+          className="w-full h-full block"
+          title="FreightPOP"
+          allow={EMBED_ALLOW}
+          referrerPolicy="no-referrer-when-downgrade"
+        />
+      </div>
+    </div>
   );
 }

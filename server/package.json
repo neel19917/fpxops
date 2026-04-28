@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node --test tests/graph.test.js tests/gp-audit.test.js tests/inv-audit.test.js tests/shipments.test.js tests/shipments.extra.test.js tests/pendingApiKey.test.js tests/pendingApiKey.extra.test.js tests/scrapeHistory.test.js tests/auth.test.js tests/httpCache.test.js",
+    "test": "node --test tests/graph.test.js tests/gp-audit.test.js tests/inv-audit.test.js tests/shipments.test.js tests/shipments.extra.test.js tests/pendingApiKey.test.js tests/pendingApiKey.extra.test.js tests/scrapeHistory.test.js tests/auth.test.js tests/httpCache.test.js tests/embedConfig.test.js",
     "create-key": "node scripts/create-api-key.js"
   },
   "dependencies": {
