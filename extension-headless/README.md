@@ -87,6 +87,29 @@ The XLSX is parsed in Node (same logic as `sidepanel.js`'s `parseInvoiceFile`)
 | `--chrome <path>` | Override Chrome binary |
 | `--timeout <minutes>` | Hard timeout for the run (default 30) |
 
+## Smoke-test the harness
+
+Verify the install + extension load + Railway connectivity + session
+state without running a real scrape (CI-friendly, no side effects):
+
+```bash
+FPX_API_URL=https://fpxtrackingchromeextension-production.up.railway.app \
+node run.js --smoke-test
+```
+
+Reports a checklist:
+
+- ✔ Chrome binary located
+- ✔ Chrome booted with extension
+- ✔ Extension service worker present (id + manifest version)
+- ✔ Railway /health reachable from extension
+- ✔ Supabase session (none / live for ... / expired)
+- ✔ Upload queue clean / N chunks pending
+
+Exits 0 on full pass, 1 on any failure with the offending row
+flagged. Run this after install, after every extension version
+bump, and from cron to alert when something drifts.
+
 ## Cron example
 
 ```cron

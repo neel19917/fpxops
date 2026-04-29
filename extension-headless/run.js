@@ -233,6 +233,136 @@ async function cmdSeedKey(argv) {
   }
 }
 
+// Smoke-test the harness without running a real scrape. Verifies:
+// 1. Chrome binary is locatable.
+// 2. Chrome boots with --load-extension=../extension.
+// 3. The extension's MV3 service worker shows up under
+//    browser.targets() within ~10s (the same path cmdRun uses).
+// 4. Optional Railway reachability check from inside the worker:
+//    fetches /health on whatever FPX_API_URL is configured.
+// 5. Optional Supabase session sniff: reports whether
+//    fpxSupabaseSession is present + un-expired in chrome.storage.
+//
+// Exits 0 on success, non-zero on first failure with a message
+// pointing at what to fix. CI-friendly: no network state is
+// changed, no scrape side effects.
+async function cmdSmokeTest(argv) {
+  const checks = [];
+  const fail = (label, err) => { checks.push({ label, ok: false, msg: err.message || String(err) }); };
+  const pass = (label, info) => { checks.push({ label, ok: true, msg: info || "" }); };
+
+  // 1. Chrome binary
+  let chromePath;
+  try {
+    chromePath = resolveChromeBinary(argv.chrome);
+    pass("Chrome binary located", chromePath);
+  } catch (e) {
+    fail("Chrome binary located", e);
+    printSmokeReport(checks);
+    process.exit(1);
+  }
+
+  // 2. Boot Chrome with the extension loaded
+  let browser;
+  try {
+    browser = await launchBrowser({ headed: !!argv.headed, chromePath });
+    pass("Chrome booted with extension", `profile=${PROFILE_DIR}`);
+  } catch (e) {
+    fail("Chrome booted with extension", e);
+    printSmokeReport(checks);
+    process.exit(1);
+  }
+
+  try {
+    // 3. Extension service worker reachable + manifest version
+    let worker; let extensionId; let manifestVersion = "?";
+    try {
+      const got = await getServiceWorker(browser);
+      worker = got.worker; extensionId = got.extensionId;
+      try {
+        manifestVersion = await worker.evaluate(() => chrome.runtime.getManifest().version);
+      } catch { /* informational only */ }
+      pass("Extension service worker present", `id=${extensionId}, manifest v${manifestVersion}`);
+    } catch (e) {
+      fail("Extension service worker present", e);
+      printSmokeReport(checks); process.exit(1);
+    }
+
+    // 4. Railway reachability — best-effort, only if FPX_API_URL is set
+    const apiUrl = argv.apiUrl || process.env.FPX_API_URL || "";
+    if (apiUrl) {
+      try {
+        const r = await worker.evaluate(async (url) => {
+          const resp = await fetch(`${url.replace(/\/$/, "")}/health`, { signal: AbortSignal.timeout(5000) });
+          if (!resp.ok) return { ok: false, status: resp.status };
+          const j = await resp.json();
+          return { ok: true, status: resp.status, body: j };
+        }, apiUrl);
+        if (r.ok) pass("Railway /health reachable from extension", `${r.body.version || "?"} db=${r.body.db ? "ok" : "missing"}`);
+        else fail("Railway /health reachable from extension", new Error(`HTTP ${r.status}`));
+      } catch (e) {
+        fail("Railway /health reachable from extension", e);
+      }
+    } else {
+      pass("Railway /health (skipped)", "set FPX_API_URL to include this check");
+    }
+
+    // 5. Supabase session sniff
+    try {
+      const sess = await worker.evaluate(async () => {
+        const r = await chrome.storage.local.get("fpxSupabaseSession");
+        return r.fpxSupabaseSession || null;
+      });
+      if (!sess) {
+        pass("Supabase session", "none — sign in via the popup or `--login` first");
+      } else {
+        const expSec = typeof sess.expires_at === "number" ? sess.expires_at : 0;
+        const live = expSec * 1000 > Date.now();
+        if (live) pass("Supabase session", `live for ${sess.email || "(unknown email)"} until ${new Date(expSec * 1000).toISOString()}`);
+        else fail("Supabase session", new Error(`expired at ${new Date(expSec * 1000).toISOString()}`));
+      }
+    } catch (e) {
+      fail("Supabase session", e);
+    }
+
+    // 6. Persistent upload queue sniff — surfaces stuck rows from a
+    //    prior session so the operator can flush before scraping more.
+    try {
+      const q = await worker.evaluate(async () => {
+        const r = await chrome.storage.local.get("pendingUploads");
+        const arr = Array.isArray(r.pendingUploads) ? r.pendingUploads : [];
+        return {
+          chunks: arr.length,
+          rows: arr.reduce((n, q) => n + (q.rows?.length || 0), 0),
+          dead: arr.filter((q) => (q.attempts || 0) >= 5).length,
+        };
+      });
+      if (q.chunks === 0) pass("Upload queue clean", "0 pending");
+      else pass("Upload queue", `${q.chunks} chunk(s), ${q.rows} row(s), ${q.dead} dead`);
+    } catch (e) {
+      fail("Upload queue sniff", e);
+    }
+  } finally {
+    await browser.close();
+  }
+
+  printSmokeReport(checks);
+  const anyFailed = checks.some((c) => !c.ok);
+  process.exit(anyFailed ? 1 : 0);
+}
+
+function printSmokeReport(checks) {
+  const w = Math.max(...checks.map((c) => c.label.length));
+  console.log("\nFPXpress headless smoke test\n" + "=".repeat(34));
+  for (const c of checks) {
+    const pad = " ".repeat(w - c.label.length);
+    console.log(`${c.ok ? "✔" : "✖"}  ${c.label}${pad}  ${c.msg}`);
+  }
+  const failedCount = checks.filter((c) => !c.ok).length;
+  if (failedCount === 0) console.log("\nAll checks passed. Harness is ready.");
+  else console.log(`\n${failedCount} failed — fix the above before running --mode.`);
+}
+
 async function cmdRun(argv) {
   const chromePath = resolveChromeBinary(argv.chrome);
   const mode = argv.mode;
@@ -337,6 +467,7 @@ await yargs(hideBin(process.argv))
       y
         .option("login", { type: "boolean", describe: "Open Chrome headed to log in to FreightPOP" })
         .option("seed-key", { type: "boolean", describe: "Write API credentials to chrome.storage.local and exit" })
+        .option("smoke-test", { type: "boolean", describe: "Verify the harness (boot, extension load, /health, session, queue) without running a scrape" })
         .option("mode", { type: "string", choices: ["refreshAll", "gpAudit", "invoiceAudit"] })
         .option("api-key", { type: "string", describe: "FPX API key (or env FPX_API_KEY)" })
         .option("api-url", { type: "string", describe: "FPX API URL  (or env FPX_API_URL)" })
@@ -354,8 +485,9 @@ await yargs(hideBin(process.argv))
     async (argv) => {
       if (argv.login) return cmdLogin(argv);
       if (argv.seedKey) return cmdSeedKey(argv);
+      if (argv.smokeTest) return cmdSmokeTest(argv);
       if (!argv.mode) {
-        console.error("Specify --mode <refreshAll|gpAudit|invoiceAudit>, or --login / --seed-key.");
+        console.error("Specify --mode <refreshAll|gpAudit|invoiceAudit>, or --login / --seed-key / --smoke-test.");
         process.exit(2);
       }
       return cmdRun(argv);
