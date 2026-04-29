@@ -251,19 +251,46 @@ if (serverToggleBtn) {
 }
 
 refreshServerCard();
-setInterval(checkServer, 15000);
+// Server health rarely changes mid-session; 30s keeps the indicator
+// fresh without hot-loading the side panel every 15s.
+setInterval(checkServer, 30000);
 
 // Persistent-upload queue indicator. Renders as a small chip next to
 // the server-status display so the rep sees pending/dead chunks at a
-// glance. We poll every 10 s — chrome.storage events would be more
-// elegant but the chip is unobtrusive enough that polling is fine.
+// glance.
+//
+// Polling cadence is adaptive:
+//   - When the queue is empty (the common case), we poll once a
+//     minute. The chip stays hidden, no DOM churn, minimal IPC.
+//   - When the queue has anything in it, we poll every 8s so the
+//     chip's count updates as the background drains chunks.
+// The previous unconditional 10s poll generated 6× the IPC traffic
+// it needed and kept the side panel's render loop hot for sessions
+// where the queue was always empty.
+let queuePollHandle = null;
+let queuePollEmpty = true;
+function scheduleQueuePoll(empty) {
+  if (queuePollHandle != null) clearTimeout(queuePollHandle);
+  const interval = empty ? 60_000 : 8_000;
+  queuePollHandle = setTimeout(refreshQueueStatus, interval);
+  queuePollEmpty = empty;
+}
 function refreshQueueStatus() {
   chrome.runtime.sendMessage({ type: "getQueueStatus" }, (res) => {
-    if (chrome.runtime.lastError || !res) return;
+    if (chrome.runtime.lastError || !res) {
+      // Schedule the next check at the slow cadence — error here
+      // usually means the SW was restarting; no point hammering.
+      scheduleQueuePoll(true);
+      return;
+    }
     const el = document.getElementById("fp-queue-status");
     if (!el) return;
     const total = (res.pending || 0) + (res.dead || 0);
-    if (total === 0) { el.hidden = true; return; }
+    if (total === 0) {
+      el.hidden = true;
+      scheduleQueuePoll(true);
+      return;
+    }
     el.hidden = false;
     const parts = [];
     if (res.pending) parts.push(`${res.pending} pending`);
@@ -272,6 +299,7 @@ function refreshQueueStatus() {
     el.title = res.last_errors && res.last_errors.length
       ? `Last errors:\n${res.last_errors.map((e) => `• ${e.error}`).join("\n")}\nClick to retry.`
       : "Click to retry the queue manually.";
+    scheduleQueuePoll(false);
   });
 }
 const queueStatusEl = document.getElementById("fp-queue-status");
@@ -282,7 +310,6 @@ if (queueStatusEl) {
   });
 }
 refreshQueueStatus();
-setInterval(refreshQueueStatus, 10000);
 
 // Re-evaluate when the popup saves a new URL/key.
 chrome.runtime.onMessage.addListener((msg) => {

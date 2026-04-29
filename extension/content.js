@@ -784,10 +784,11 @@ async function processPage() {
       // Extension is scrape-only — analysis runs server-side after upload.
       delete modalData["FULL MODAL TEXT"];
       logRows.push(modalData);
-
-      if (logRows.length % 25 === 0) {
-        try { chrome.storage.local.set({ _fpxCheckpoint: logRows }); } catch {}
-      }
+      // Legacy 25-row chrome.storage._fpxCheckpoint write was retired —
+      // the persistent upload queue (background.js / chrome.storage
+      // pendingUploads) covers crash recovery, and serializing
+      // logRows every 25 modals was the most expensive bookkeeping
+      // step on rep laptops.
 
       const actionTag = modalData._needsActionSheet ? " [ACTION NEEDED]" : "";
       sendStatus(`Done ${trackingNum}${actionTag} — closing modal...`);
@@ -838,34 +839,37 @@ async function run(filterCol, filterVal) {
   }
 
   let pageNum = 1;
-  // Index into logRows that's already been streamed to background.
-  // After each page completes we slice [uploadedSoFar..logRows.length)
-  // and ship those rows; the persistent queue in background.js
-  // handles concurrent pushes + survives a worker restart, so we
-  // can fire-and-forget without blocking the next page's scrape.
-  let uploadedSoFar = 0;
-  // How many rows we've actually CONFIRMED landed (server returned
-  // ok). Used in the final status line so the rep knows the true
-  // delivered count (vs queued-but-pending).
-  let confirmedRows = 0;
+  // We drop uploaded rows from logRows so the array doesn't grow
+  // unboundedly during long scrapes (a 50-page sweep with 50 rows/page
+  // and ~30 KB per modal = ~75 MB resident otherwise — tips reps with
+  // older laptops into memory pressure). Rows that DID upload land in
+  // counters we use for the final status; the rows themselves are
+  // gone-from-this-tab the moment Railway acks.
+  let pageRowCount = 0;        // rows scraped this page (reset each iteration)
+  let totalScraped = 0;        // total rows scraped this run, for the "Done" line
+  let confirmedRows = 0;       // rows the server has acked
 
-  // Helper: stream whatever's been added to logRows since the last
-  // call. Returns { count, ok }; non-blocking by design — caller
-  // fire-and-forgets via the .catch() at the call site.
-  function streamNewRowsToDashboard(label) {
-    const slice = logRows.slice(uploadedSoFar);
-    if (!slice.length) return Promise.resolve({ count: 0, ok: true });
-    uploadedSoFar = logRows.length;
+  // Helper: ship the current logRows buffer to background, then
+  // truncate logRows so memory stays bounded to ~one page at a time.
+  // Background's persistent queue handles concurrent pushes + worker
+  // restarts, so we can fire-and-forget without blocking the next
+  // page's scrape.
+  function flushAndDropLogRows(label) {
+    if (!logRows.length) return Promise.resolve({ count: 0, ok: true });
+    // Hand the buffer to background and immediately reset so the
+    // next page starts clean. structuredClone via postMessage means
+    // background gets its own copy — we don't have to wait for the
+    // round-trip to clear our reference.
+    const slice = logRows;
+    logRows = [];
     return new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: slice }, (r) => {
         if (r && r.ok) {
           confirmedRows += r.count || slice.length;
-          console.log(`[FPX] ${label}: streamed ${slice.length} row(s) to dashboard (${r.count} confirmed)`);
         } else if (r && r.error) {
           // Background queues the chunk on failure — it'll retry on
           // the next page's stream call AND on worker boot. We just
-          // log; the side-panel queue chip surfaces pending state.
-          console.warn(`[FPX] ${label}: upsert returned error (will retry from queue):`, r.error);
+          // surface the side-panel chip; no in-page logging.
         }
         resolve(r || { ok: false, error: "no response" });
       });
@@ -874,30 +878,31 @@ async function run(filterCol, filterVal) {
 
   while (true) {
     if (stopRequested) {
-      sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
+      await flushAndDropLogRows("stopped");
+      sendComplete(`Stopped by user. ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
       return;
     }
 
     sendStatus(`Processing page ${pageNum}...`);
+    // logRows was emptied by the previous page's flush, so its length
+    // after processPage is exactly this page's contribution.
     await processPage();
+    pageRowCount = logRows.length;
+    totalScraped += pageRowCount;
 
     if (stopRequested) {
-      // Even on stop, flush whatever was scraped on this page so the
-      // rep doesn't lose work. Awaited so the upload reaches the
-      // queue before the side panel disappears.
-      await streamNewRowsToDashboard(`page ${pageNum} (stopped)`);
-      sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
+      await flushAndDropLogRows("stopped");
+      sendComplete(`Stopped by user. ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
       return;
     }
 
     // Stream this page's rows to the dashboard. Don't await — the
     // upload runs in parallel with the next page's scrape so the
-    // dashboard fills in real time and total wall-clock time
-    // shrinks. The persistent queue absorbs partial failures.
-    sendStatus(`Page ${pageNum} done — uploading ${logRows.length - uploadedSoFar} row(s)…`);
-    streamNewRowsToDashboard(`page ${pageNum}`).catch((e) => {
-      console.warn(`[FPX] streamNewRowsToDashboard threw on page ${pageNum}:`, e.message);
-    });
+    // dashboard fills in real time and the next page can't pile up
+    // on top of an unsent batch. logRows is reset inside the helper
+    // so memory stays bounded to ~one page at a time.
+    sendStatus(`Page ${pageNum} done — uploading ${pageRowCount} row(s)…`);
+    flushAndDropLogRows(`page ${pageNum}`).catch(() => { /* surfaced via side-panel chip */ });
 
     sendStatus(`Page ${pageNum} done. Checking for next page...`);
     const advanced = goToNextPage();
@@ -907,20 +912,19 @@ async function run(filterCol, filterVal) {
     await waitForGridReady(3000);
   }
 
-  // Final flush — catches anything that landed in logRows after the
-  // last per-page stream call (e.g. the last page's rows if the
-  // streaming call was still in flight). Awaited so the "Done"
-  // status reflects the true confirmed count.
-  if (logRows.length > uploadedSoFar) {
-    sendStatus(`Finalizing upload of ${logRows.length - uploadedSoFar} remaining row(s)…`);
-    await streamNewRowsToDashboard("final flush");
+  // Final flush — catches anything still buffered (rare, since we
+  // flush after each page, but safe). Awaited so the "Done" status
+  // reflects the true confirmed count.
+  if (logRows.length > 0) {
+    sendStatus(`Finalizing upload of ${logRows.length} remaining row(s)…`);
+    await flushAndDropLogRows("final flush");
   }
 
+  // Background-side bookkeeping: drop the legacy checkpoint blob so
+  // chrome.storage doesn't carry stale data into the next session.
   try { chrome.storage.local.remove("_fpxCheckpoint"); } catch {}
-
-  // No AI summary in the extension anymore — clear any stale summary in the UI.
   try { chrome.runtime.sendMessage({ type: "aiSummary", text: "" }); } catch {}
-  const queuedButUnconfirmed = logRows.length - confirmedRows;
+  const queuedButUnconfirmed = totalScraped - confirmedRows;
   sendComplete(
     `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}. Open the dashboard to see analysis.`
   );

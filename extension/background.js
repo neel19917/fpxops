@@ -412,6 +412,13 @@ async function callApi(path, body, options = {}) {
 
 const BULK_CHUNK_SIZE = 250;
 const MAX_QUEUE_ATTEMPTS = 5;
+// Hard cap on dead chunks we keep around. Past this point the queue
+// is clearly not recovering on its own (Railway has been down for
+// hours, or the chunks are bad data) and continuing to grow it just
+// bloats chrome.storage and the side-panel chip. Old dead chunks
+// get evicted FIFO when we'd cross the cap, so the operator still
+// sees the most recent failures.
+const MAX_DEAD_CHUNKS = 20;
 const QUEUE_KEY = "pendingUploads";
 let _flushInFlight = false;
 
@@ -441,7 +448,22 @@ async function enqueueChunks(rows) {
       queuedAt,
     });
   }
-  await writeQueue([...queue, ...newEntries]);
+  // Evict old dead chunks (FIFO) if we'd cross the cap. Keeps
+  // chrome.storage bounded when Railway has been down for hours
+  // and a long scrape kept piling new chunks on top of dead ones.
+  let merged = [...queue, ...newEntries];
+  const dead = merged.filter((q) => (q.attempts || 0) >= MAX_QUEUE_ATTEMPTS);
+  if (dead.length > MAX_DEAD_CHUNKS) {
+    const evictCount = dead.length - MAX_DEAD_CHUNKS;
+    let evicted = 0;
+    merged = merged.filter((q) => {
+      if (evicted >= evictCount) return true;
+      if ((q.attempts || 0) >= MAX_QUEUE_ATTEMPTS) { evicted++; return false; }
+      return true;
+    });
+    console.warn(`[FPX] queue: evicted ${evictCount} dead chunk(s) past the ${MAX_DEAD_CHUNKS} cap`);
+  }
+  await writeQueue(merged);
   return newEntries;
 }
 
