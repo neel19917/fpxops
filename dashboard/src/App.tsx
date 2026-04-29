@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "./lib/api";
 import type { ShipmentTask } from "./lib/types";
 import { FreightPopOverlay } from "./components/FreightPopOverlay";
+import { requestAutoFilter } from "./lib/freightpopFrame";
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams, Outlet } from "react-router-dom";
 import { Layout, type TabId } from "./components/Layout";
 import { AuthProvider, useAuth } from "./lib/auth";
@@ -228,6 +229,11 @@ function TaskWalkRoute() {
           index: r.walk?.index ?? 0,
           total: r.walk?.total ?? 1,
         });
+        // Every task entry — direct URL, prev/next walk, drawer open from
+        // Tasks list — auto-requests a Kendo filter on the embedded
+        // FreightPOP grid. The overlay consumes the flag once both the
+        // bridge is ready and the tracking number arrives via showFrame.
+        requestAutoFilter();
       })
       .catch((e: Error) => { if (!cancelled) setError(e.message); })
       .finally(() => { if (!cancelled) setLoading(false); });

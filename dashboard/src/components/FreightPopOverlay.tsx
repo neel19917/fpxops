@@ -205,7 +205,7 @@ export function FreightPopOverlay() {
                 : "Install/enable the FPXpress Chrome extension to filter the embedded grid"}
             >
               <Filter className="h-3.5 w-3.5" />
-              {isFilteredToCurrent ? "Filtered" : "Filter to #"}
+              {isFilteredToCurrent ? "Loaded" : "Load shipment"}
             </button>
           ) : null}
           <button
