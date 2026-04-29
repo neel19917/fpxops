@@ -67,3 +67,81 @@ export async function generateEmailDraft({ ship, audience, notes, callMeta }) {
   }
   return { subject: parsed.subject, body: parsed.body };
 }
+
+// Slim per-shipment context for the carrier-group email. Mirrors
+// slimShipmentForEmail but keyed by tracking + shipment id since the
+// recipient is one carrier handling N shipments — those are the
+// reference points the reply will use.
+function slimShipmentForGroup(ship, taskTitle, taskDescription) {
+  return {
+    tracking_number: ship.tracking_number,
+    shipment_id: ship.shipment_id,
+    customer: ship.customer_name,
+    mode: ship.mode,
+    status: ship.shipment_status,
+    pickup_date: ship.pickup_date,
+    eta: ship.updated_eta || ship.estimated_arrival,
+    delivered: ship.delivery_date,
+    pickup_response: ship.pickup_response,
+    confirmation_number: ship.confirmation_number,
+    pickup_request_number: ship.pickup_request_number,
+    origin: ship.origin || ship.ship_from,
+    destination: ship.destination || ship.ship_to,
+    issue: ship.ai_issue,
+    recommendation: ship.ai_recommendation,
+    action_required: ship.action_required,
+    // Carry the operator's task notes through so the model knows what
+    // FPX is actually asking the carrier per shipment.
+    task_title: taskTitle || null,
+    task_description: taskDescription || null,
+  };
+}
+
+// Generate one consolidated carrier email covering N shipments at once.
+// Pulls the carrier_group prompt + model from settings so admins can
+// tune the wording and the model tier. Returns { subject, body } on
+// success, { error } on failure (matches generateEmailDraft contract).
+export async function generateCarrierGroupEmail({ carrier, items, notes, callMeta }) {
+  if (!Array.isArray(items) || items.length === 0) return { error: "No shipments supplied" };
+  const settings = await getSettings(
+    "prompt.email_draft.carrier_group.system_base",
+    "prompt.email_draft.carrier_group.audience",
+    "prompt.email_draft.carrier_group.model",
+  );
+  const audienceCopy = settings["prompt.email_draft.carrier_group.audience"];
+  const systemPrompt = String(settings["prompt.email_draft.carrier_group.system_base"] || "")
+    .replace("{{audienceCopy}}", audienceCopy);
+  const modelOverride = settings["prompt.email_draft.carrier_group.model"] || undefined;
+
+  const slim = items.map((it) => slimShipmentForGroup(it.shipment, it.task?.title, it.task?.description));
+  const userMessage = `Carrier: ${carrier || "(unknown)"}\n` +
+    `Shipments needing follow-up (count=${slim.length}):\n${JSON.stringify(slim, null, 2)}\n\n` +
+    (notes ? `Operator notes for this batch: ${notes}\n\n` : "") +
+    "Write the consolidated email now. JSON only, no preamble.";
+
+  // Generous token budget — multi-shipment bodies routinely run several
+  // hundred tokens; clipping mid-list would force the operator to ask
+  // for a regenerate. Fine to lean high on a one-off, on-demand call.
+  const result = await callClaude({
+    systemPrompt,
+    userMessage,
+    maxTokens: 2000,
+    modelOverride,
+    metadata: {
+      kind: "other",
+      ...(callMeta || {}),
+      metadata: { subkind: "email_draft_carrier_group", carrier, count: slim.length, ...((callMeta?.metadata) || {}) },
+    },
+  });
+  if (result.error) return { error: result.error };
+
+  let parsed = null;
+  try {
+    const m = result.text.match(/\{[\s\S]*\}/);
+    if (m) parsed = JSON.parse(m[0]);
+  } catch {}
+  if (!parsed?.subject || !parsed?.body) {
+    return { subject: "(draft)", body: result.text, raw: result.text };
+  }
+  return { subject: parsed.subject, body: parsed.body, model: result.model };
+}

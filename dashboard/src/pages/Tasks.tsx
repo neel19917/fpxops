@@ -1,10 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send } from "lucide-react";
 import { api } from "../lib/api";
-import type { ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
+import type { CarrierFollowupShipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { useNav } from "../lib/nav";
 import { UserPicker } from "../components/UserPicker";
 import { requestAutoFilter } from "../lib/freightpopFrame";
+
+// Convention-based detector: a task is a "Carrier Followup" when its
+// title contains both "carrier" and "follow" (case-insensitive). Mirrors
+// the server-side check in routes/tasks.js so the panel and the
+// /carrier-followups endpoint agree on which tasks belong here.
+function isCarrierFollowupTitle(title: string | null | undefined): boolean {
+  if (!title) return false;
+  const t = title.toLowerCase();
+  return t.includes("carrier") && t.includes("follow");
+}
 
 // Keyboard shortcut catalog — kept here so the help modal renders the same
 // thing the handler implements. Order matters; this is the help-modal order.
@@ -647,13 +657,16 @@ export function TasksPage() {
       ) : null}
 
       {viewMode === "kanban" ? (
-        <KanbanBoard
-          tasks={tasks}
-          focusedId={focusedId}
-          onFocus={setFocusedId}
-          onSetStatus={(t, s) => setStatus(t, s, { openDrawer: s === "in_progress" && t.status === "open" })}
-          onOpenTask={(taskId) => nav.openTask(taskId)}
-        />
+        <>
+          <CarrierFollowupsPanel onTaskClick={(taskId) => nav.openTask(taskId)} />
+          <KanbanBoard
+            tasks={tasks}
+            focusedId={focusedId}
+            onFocus={setFocusedId}
+            onSetStatus={(t, s) => setStatus(t, s, { openDrawer: s === "in_progress" && t.status === "open" })}
+            onOpenTask={(taskId) => nav.openTask(taskId)}
+          />
+        </>
       ) : (
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <table className="w-full text-sm">
@@ -1000,3 +1013,329 @@ function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask }: KanbanC
     </div>
   );
 }
+
+// ===========================================================================
+// Carrier Followups panel — surfaces tasks whose title flags them as
+// carrier follow-ups, grouped by carrier. Each carrier card lists its
+// shipments and exposes a "Group email" button that drafts ONE Claude
+// email covering every shipment for that carrier (Opus by default).
+// ===========================================================================
+
+interface CarrierFollowupItem { task: ShipmentTask; shipment: CarrierFollowupShipment; }
+interface CarrierFollowupGroup { carrier: string; items: CarrierFollowupItem[]; }
+
+function CarrierFollowupsPanel({ onTaskClick }: { onTaskClick: (taskId: string) => void }) {
+  const [groups, setGroups] = useState<CarrierFollowupGroup[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [emailFor, setEmailFor] = useState<CarrierFollowupGroup | null>(null);
+
+  async function load() {
+    setLoading(true); setErr(null);
+    try {
+      const r = await api.tasks.carrierFollowups();
+      setGroups(r.groups);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { load(); }, []);
+
+  // Empty state and loading state are intentionally compact — when no
+  // carrier-followup tasks exist, this panel should disappear into a
+  // single hint line so it doesn't crowd the regular Kanban below it.
+  if (loading) {
+    return (
+      <div className="mb-4 rounded-xl ring-1 ring-violet-200 bg-violet-50/40 px-4 py-3 text-sm text-violet-900">
+        Loading carrier follow-ups…
+      </div>
+    );
+  }
+  if (err) {
+    return (
+      <div className="mb-4 rounded-xl ring-1 ring-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+        Couldn't load carrier follow-ups: {err}
+      </div>
+    );
+  }
+  if (groups.length === 0) {
+    return (
+      <div className="mb-4 rounded-xl ring-1 ring-slate-200 bg-white px-4 py-2.5 text-[12px] text-slate-500">
+        <span className="font-semibold text-slate-700">Carrier Followups</span>
+        <span className="mx-1.5">·</span>
+        No active carrier-follow-up tasks. Tag a task title with “carrier followup” (e.g. <span className="font-mono text-[11px] bg-slate-100 px-1.5 py-0.5 rounded">Carrier followup: missing POD</span>) and it'll surface here grouped by carrier.
+      </div>
+    );
+  }
+  const total = groups.reduce((n, g) => n + g.items.length, 0);
+  return (
+    <div className="mb-4 rounded-xl ring-1 ring-violet-200 bg-violet-50/40">
+      <div className="px-4 py-2.5 flex items-center justify-between border-b border-violet-200/80">
+        <div className="flex items-center gap-2">
+          <Mail className="h-4 w-4 text-violet-700" />
+          <span className="text-sm font-semibold text-slate-800">Carrier Followups</span>
+          <span className="text-[11px] font-semibold px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-800">
+            {total} task{total === 1 ? "" : "s"} · {groups.length} carrier{groups.length === 1 ? "" : "s"}
+          </span>
+        </div>
+        <button
+          onClick={load}
+          className="text-[11px] text-violet-700 hover:text-violet-900 inline-flex items-center gap-1"
+          title="Refresh carrier followups"
+        >
+          <RefreshCw className="h-3 w-3" /> Refresh
+        </button>
+      </div>
+      <div className="p-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        {groups.map((g) => (
+          <CarrierGroupCard
+            key={g.carrier}
+            group={g}
+            onTaskClick={onTaskClick}
+            onEmail={() => setEmailFor(g)}
+          />
+        ))}
+      </div>
+
+      {emailFor ? (
+        <CarrierGroupEmailModal
+          group={emailFor}
+          onClose={() => setEmailFor(null)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function CarrierGroupCard({ group, onTaskClick, onEmail }: {
+  group: CarrierFollowupGroup;
+  onTaskClick: (taskId: string) => void;
+  onEmail: () => void;
+}) {
+  return (
+    <div className="rounded-lg bg-white ring-1 ring-violet-200 shadow-sm flex flex-col">
+      <div className="px-3 py-2 border-b border-violet-100 flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-[10px] uppercase tracking-wider font-bold text-violet-700">Carrier</div>
+          <div className="text-sm font-semibold text-slate-900 truncate" title={group.carrier}>
+            {group.carrier}
+          </div>
+        </div>
+        <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-violet-100 text-violet-800 shrink-0">
+          {group.items.length}
+        </span>
+      </div>
+      <ul className="px-3 py-2 space-y-1.5 max-h-44 overflow-y-auto">
+        {group.items.map((it) => (
+          <li key={it.task.id} className="text-xs">
+            <button
+              onClick={() => { requestAutoFilter(); onTaskClick(it.task.id); }}
+              className="w-full text-left rounded-md px-1.5 py-1 hover:bg-violet-50 group"
+              title={`Open ${it.shipment.tracking_number || it.task.title} in task-walk mode`}
+            >
+              <div className="flex items-center justify-between gap-2 min-w-0">
+                <span className="font-medium text-slate-900 truncate">
+                  {it.shipment.shipment_id || it.shipment.tracking_number || "(no id)"}
+                </span>
+                <span className="text-slate-500 shrink-0 font-mono text-[10px]">
+                  {it.shipment.tracking_number || ""}
+                </span>
+              </div>
+              <div className="text-[11px] text-slate-500 truncate">
+                {it.shipment.customer_name || "—"} · {it.task.title}
+              </div>
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div className="px-3 py-2 border-t border-violet-100 flex items-center gap-2">
+        <button
+          onClick={onEmail}
+          className="text-xs font-semibold rounded-md px-2.5 py-1.5 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1.5"
+          title={`Draft one consolidated email to ${group.carrier} covering all ${group.items.length} shipment(s)`}
+        >
+          <Send className="h-3.5 w-3.5" /> Group email
+        </button>
+        <span className="text-[11px] text-slate-500 leading-snug">
+          One email · all shipments · Opus model
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// Modal: previews the carrier's task list, fires the bulk email-draft
+// endpoint on demand, and renders the resulting subject/body with copy
+// + mailto helpers. We don't auto-generate on open — bulk Opus calls
+// cost money and the operator may just be browsing.
+function CarrierGroupEmailModal({ group, onClose }: {
+  group: CarrierFollowupGroup;
+  onClose: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState<{ subject: string; body: string; model: string | null } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [notes, setNotes] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  async function generate() {
+    setBusy(true); setErr(null); setDraft(null);
+    try {
+      const r = await api.tasks.carrierEmailDraft({
+        carrier: group.carrier,
+        task_ids: group.items.map((it) => it.task.id),
+        notes: notes.trim() || undefined,
+      });
+      setDraft({ subject: r.subject, body: r.body, model: r.model });
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally { setBusy(false); }
+  }
+
+  async function copy() {
+    if (!draft) return;
+    try {
+      await navigator.clipboard.writeText(`Subject: ${draft.subject}\n\n${draft.body}`);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked */ }
+  }
+
+  // esc-to-close, mirroring the per-shipment email modal in Shipments.tsx
+  // for keyboard parity.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <Mail className="h-5 w-5 text-violet-700" />
+              Group email · {group.carrier}
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {group.items.length} shipment{group.items.length === 1 ? "" : "s"} · one consolidated email · prompts editable in Settings
+            </p>
+          </div>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-900 p-2 rounded-lg hover:bg-slate-100">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="p-5 overflow-y-auto flex-1 space-y-4">
+          <div>
+            <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+              Shipments included
+            </div>
+            <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-44 overflow-y-auto">
+              <ul className="divide-y divide-slate-200">
+                {group.items.map((it) => (
+                  <li key={it.task.id} className="px-3 py-2 text-xs">
+                    <div className="flex items-center justify-between gap-2 min-w-0">
+                      <span className="font-medium text-slate-900 truncate">
+                        {it.shipment.shipment_id || "(no shipment id)"}
+                      </span>
+                      <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                        {it.shipment.tracking_number || ""}
+                      </span>
+                    </div>
+                    <div className="text-slate-500 truncate">
+                      {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
+                    </div>
+                    <div className="text-slate-700 mt-0.5">{it.task.title}</div>
+                    {it.task.description ? (
+                      <div className="text-slate-500 line-clamp-2">{it.task.description}</div>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          <div>
+            <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+              Operator notes (optional)
+            </label>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Anything the model should emphasize across the whole batch (e.g. 'all of these have been silent for 48h, ask for ETAs and POD where applicable')"
+              className="w-full text-sm px-3 py-2 rounded-lg ring-1 ring-slate-200 focus:ring-sky-400 focus:outline-none min-h-[60px]"
+            />
+          </div>
+
+          {err ? (
+            <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-3 py-2 text-sm text-rose-800">{err}</div>
+          ) : null}
+
+          {draft ? (
+            <div className="space-y-3">
+              <div>
+                <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Subject</div>
+                <div className="text-sm font-medium text-slate-900 px-3 py-2 rounded-lg bg-slate-50 ring-1 ring-slate-200">
+                  {draft.subject}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Body</div>
+                <pre className="text-sm whitespace-pre-wrap text-slate-800 px-3 py-3 rounded-lg bg-slate-50 ring-1 ring-slate-200 leading-relaxed">{draft.body}</pre>
+              </div>
+              {draft.model ? (
+                <div className="text-[11px] text-slate-500">Generated by <span className="font-mono">{draft.model}</span></div>
+              ) : null}
+            </div>
+          ) : !busy ? (
+            <div className="text-sm text-slate-500">
+              Click <span className="font-semibold">Generate</span> to draft one email covering every shipment above. The
+              system + audience prompts and the model are all editable in <span className="font-mono">Settings → prompt.email_draft.carrier_group.*</span>.
+            </div>
+          ) : null}
+        </div>
+
+        <div className="px-5 py-4 border-t border-slate-200 flex items-center justify-between gap-3">
+          <button
+            onClick={generate}
+            disabled={busy}
+            className="px-4 py-2 rounded-lg bg-violet-600 text-white text-sm font-semibold hover:bg-violet-700 disabled:opacity-50 inline-flex items-center gap-2"
+          >
+            {busy ? (
+              <><RefreshCw className="h-4 w-4 animate-spin" /> Drafting…</>
+            ) : draft ? (
+              <><RefreshCw className="h-4 w-4" /> Regenerate</>
+            ) : (
+              <><Send className="h-4 w-4" /> Generate</>
+            )}
+          </button>
+          {draft ? (
+            <div className="flex items-center gap-3">
+              <a
+                href={`mailto:?subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`}
+                className="text-sm text-sky-700 hover:text-sky-900 font-medium"
+              >Open in mail client →</a>
+              <button
+                onClick={copy}
+                className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 flex items-center gap-2"
+              >
+                {copied ? <><Check className="h-4 w-4" /> Copied</> : <><Copy className="h-4 w-4" /> Copy</>}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Re-export so future modules can build on the same predicate without
+// duplicating the rule.
+export { isCarrierFollowupTitle };

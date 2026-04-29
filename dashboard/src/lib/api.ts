@@ -1,5 +1,5 @@
 import type {
-  AiAnalysis, ApiKey, AuditLogEntry, EmailDraft, Feedback, GpAudit, GpAuditRow,
+  AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
   InvoiceAudit, InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentTask, UserProfileRow,
 } from "./types";
 import { sb } from "./supabase";
@@ -279,6 +279,22 @@ export const api = {
       request<{ created: number; missing: string[] }>("/api/tasks/bulk", { method: "POST", body: JSON.stringify(body) }),
     bulkUpdate: (body: { ids: string[]; status?: string; priority?: string; assigned_to?: string }) =>
       request<{ updated: number }>("/api/tasks/bulk-update", { method: "POST", body: JSON.stringify(body) }),
+    // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
+    // each task joined to its shipment so the Kanban panel can render
+    // carrier/customer/ETA without further round trips.
+    carrierFollowups: () =>
+      request<{
+        groups: { carrier: string; items: { task: ShipmentTask; shipment: CarrierFollowupShipment }[] }[];
+        total: number;
+      }>("/api/tasks/carrier-followups"),
+    // Generates ONE consolidated email covering every supplied task's
+    // shipment for a single carrier. The server pulls the larger model
+    // (Opus by default, configurable in Settings).
+    carrierEmailDraft: (body: { carrier: string; task_ids: string[]; notes?: string }) =>
+      request<{ subject: string; body: string; count: number; model: string | null }>(
+        "/api/tasks/carrier-email-draft",
+        { method: "POST", body: JSON.stringify(body) },
+      ),
   },
   feedback: {
     list: (params?: { status?: string; category?: string }) =>

@@ -21,6 +21,19 @@ const FALLBACKS = {
     "Write a concise, professional email FROM the FPX brokerage operations team TO the carrier handling this shipment. Ask for the specific information needed to resolve the issue or confirm status. Reference carrier-side identifiers (PRO, pickup number, carrier-issued tracking).",
   "prompt.email_draft.audience_customer":
     "Write a concise, professional email FROM the FPX brokerage account team TO the end customer (the shipper or consignee, not the carrier). Update them on shipment status in plain English; avoid carrier jargon. If action is required from the customer, state it clearly. Otherwise reassure them FPX is monitoring and following up directly with the carrier.",
+  // Bulk carrier-followup email: one email per carrier covering every
+  // followup-tagged task assigned to that carrier. Routed through the
+  // larger model by default so the model can synthesize across many
+  // shipments without losing detail.
+  "prompt.email_draft.carrier_group.system_base":
+    'You are a freight brokerage operations assistant at FPX. FPX is the freight broker — not the carrier and not the customer. You always write FROM FPX. {{audienceCopy}} You will be given a list of multiple shipments handled by ONE carrier that need follow-up. Synthesize them into a single email — one greeting, one closing, and a numbered or bulleted list of every shipment in between. Each shipment line must include the tracking number, FPX shipment id (if present), pickup/delivery cities, current status, and the specific question or action you need from the carrier (e.g. updated ETA, POD, pickup confirmation). Group multiple identical asks together where it improves readability. Output strict JSON: {"subject": "...", "body": "..."}. Body should be plain text with line breaks (\'\\n\') — no markdown. Sign as "[Your name]\\nFPX Operations" (do not invent a name).',
+  "prompt.email_draft.carrier_group.audience":
+    "Write ONE concise, professional email FROM the FPX brokerage operations team TO the carrier covering ALL of the carrier's open follow-up shipments at once. The goal is to consolidate what would otherwise be multiple per-shipment emails into a single round-up. Be direct about what FPX needs; the carrier should be able to reply once with the full set of answers.",
+  // Model used for the carrier-group email synthesis. Defaulting to Opus
+  // because this is a multi-shipment, multi-question task where the
+  // larger model produces noticeably tighter consolidations. Admins can
+  // dial back to Sonnet/Haiku in Settings if they want.
+  "prompt.email_draft.carrier_group.model": "claude-opus-4-7",
   "action.threshold": 0.7,
   "action.auto_draft_enabled": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",

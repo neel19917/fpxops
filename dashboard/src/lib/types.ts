@@ -234,6 +234,32 @@ export interface ShipmentTask {
   updated_at: string;
 }
 
+// Slim per-shipment shape returned by /api/tasks/carrier-followups. Curated
+// subset of Shipment that the carrier-followups panel + email modal need —
+// keeping it narrow keeps the JSON payload small for what is otherwise a
+// hot path on the Tasks page.
+export interface CarrierFollowupShipment {
+  id: string;
+  tracking_number: string | null;
+  shipment_id: string | null;
+  customer_name: string | null;
+  carrier: string | null;
+  carrier_name: string | null;
+  mode: string | null;
+  shipment_status: string | null;
+  pickup_date: string | null;
+  updated_eta: string | null;
+  estimated_arrival: string | null;
+  delivery_date: string | null;
+  origin: string | null;
+  destination: string | null;
+  ship_from: string | null;
+  ship_to: string | null;
+  ai_issue: string | null;
+  ai_recommendation: string | null;
+  action_required: ActionStatus;
+}
+
 export type FeedbackCategory = "bug" | "feature" | "support" | "other";
 export type FeedbackStatus = "open" | "triaged" | "in_progress" | "resolved" | "wont_fix";
 export type FeedbackSeverity = "low" | "normal" | "high" | "urgent";

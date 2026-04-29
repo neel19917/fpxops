@@ -2,8 +2,21 @@ import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { computeWalkContext } from "../lib/taskWalk.js";
+import { generateCarrierGroupEmail } from "../lib/emailDraft.js";
 
 export const tasksRouter = Router();
+
+// Convention-based detector: a task is a "carrier follow-up" when its
+// title contains both "carrier" and "follow" (case-insensitive). No
+// schema change needed — operators just type a recognizable title like
+// "Carrier followup: missing POD" and the dashboard surfaces it in the
+// dedicated panel. Kept in the route file (not a util) because both
+// /carrier-followups and /carrier-email-draft need the same definition.
+export function isCarrierFollowupTitle(title) {
+  if (typeof title !== "string") return false;
+  const t = title.toLowerCase();
+  return t.includes("carrier") && t.includes("follow");
+}
 
 // GET /tasks?status=open&assigned_to=...&limit=200
 // Cross-shipment task list; defaults to open tasks.
@@ -16,6 +29,99 @@ tasksRouter.get("/", async (req, res) => {
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json({ data: data || [] });
+});
+
+// GET /tasks/carrier-followups
+// Returns active (open + in_progress) carrier-followup tasks joined to
+// their shipments so the dashboard can group by carrier without N round
+// trips. The single-query approach also keeps the carrier and customer
+// in sync with the latest scrape — important when a carrier is
+// reassigned mid-shipment. Output shape:
+//   { groups: [{ carrier, items: [{ task, shipment }] }], total }
+// Sorted: groups by item count desc, items by oldest task first (FIFO
+// follow-up cadence). Sits before /tasks/:id so the static path wins.
+tasksRouter.get("/carrier-followups", async (req, res) => {
+  const { data: tasks, error } = await supabase
+    .from("fpx_shipment_tasks")
+    .select("*")
+    .in("status", ["open", "in_progress"])
+    .order("created_at", { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  const followups = (tasks || []).filter((t) => isCarrierFollowupTitle(t.title));
+  if (!followups.length) return res.json({ groups: [], total: 0 });
+
+  const shipIds = Array.from(new Set(followups.map((t) => t.shipment_id).filter(Boolean)));
+  const { data: ships, error: shipErr } = await supabase
+    .from("fpx_shipments")
+    .select("id, tracking_number, shipment_id, customer_name, carrier, carrier_name, mode, shipment_status, pickup_date, updated_eta, estimated_arrival, delivery_date, pickup_response, confirmation_number, pickup_request_number, origin, destination, ship_from, ship_to, ai_issue, ai_recommendation, action_required")
+    .in("id", shipIds);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  const byId = new Map((ships || []).map((s) => [s.id, s]));
+
+  // Group key prefers carrier_name (the human label scraped from the
+  // grid) and falls back to carrier (the code/short id). "(unassigned)"
+  // bucket catches shipments with neither populated — operators should
+  // see them surfaced rather than dropped.
+  const groupsMap = new Map();
+  for (const t of followups) {
+    const ship = byId.get(t.shipment_id);
+    if (!ship) continue;
+    const carrier = (ship.carrier_name || ship.carrier || "(unassigned)").trim() || "(unassigned)";
+    if (!groupsMap.has(carrier)) groupsMap.set(carrier, []);
+    groupsMap.get(carrier).push({ task: t, shipment: ship });
+  }
+  const groups = Array.from(groupsMap.entries())
+    .map(([carrier, items]) => ({ carrier, items }))
+    .sort((a, b) => b.items.length - a.items.length || a.carrier.localeCompare(b.carrier));
+  res.json({ groups, total: followups.length });
+});
+
+// POST /tasks/carrier-email-draft  { carrier, task_ids: string[], notes? }
+// Generates ONE consolidated email covering every supplied task's
+// shipment, addressed to the named carrier. Routed through the larger
+// model (configurable via prompt.email_draft.carrier_group.model in
+// Settings; defaults to Opus for the multi-shipment synthesis).
+tasksRouter.post("/carrier-email-draft", async (req, res) => {
+  const carrier = typeof req.body?.carrier === "string" ? req.body.carrier.trim() : "";
+  const taskIds = Array.isArray(req.body?.task_ids)
+    ? req.body.task_ids.filter((x) => typeof x === "string" && x)
+    : [];
+  if (!carrier) return res.status(400).json({ error: "carrier required" });
+  if (!taskIds.length) return res.status(400).json({ error: "task_ids required" });
+
+  const { data: tasks, error: taskErr } = await supabase
+    .from("fpx_shipment_tasks").select("*").in("id", taskIds);
+  if (taskErr) return res.status(500).json({ error: taskErr.message });
+  const followupTasks = (tasks || []).filter((t) => isCarrierFollowupTitle(t.title));
+  if (!followupTasks.length) {
+    return res.status(400).json({ error: "No carrier-followup tasks in supplied ids" });
+  }
+  const shipIds = Array.from(new Set(followupTasks.map((t) => t.shipment_id).filter(Boolean)));
+  if (!shipIds.length) return res.status(400).json({ error: "No shipments linked to supplied tasks" });
+
+  const { data: ships, error: shipErr } = await supabase
+    .from("fpx_shipments").select("*").in("id", shipIds);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  const shipById = new Map((ships || []).map((s) => [s.id, s]));
+
+  const items = followupTasks
+    .map((t) => ({ task: t, shipment: shipById.get(t.shipment_id) }))
+    .filter((it) => it.shipment);
+  if (!items.length) return res.status(404).json({ error: "Shipments not found" });
+
+  const result = await generateCarrierGroupEmail({
+    carrier,
+    items,
+    notes: req.body?.notes,
+    callMeta: { api_key_id: req.apiKey?.id, user_email: req.user?.email },
+  });
+  if (result.error) return res.status(500).json({ error: result.error });
+  logAudit(req, {
+    action: "create", entity_type: "email_draft",
+    summary: `Drafted carrier follow-up email to "${carrier}" covering ${items.length} shipment(s)`,
+    metadata: { carrier, task_ids: taskIds, count: items.length, model: result.model || null },
+  });
+  res.json({ subject: result.subject, body: result.body, count: items.length, model: result.model || null });
 });
 
 // GET /tasks/:id  — task lookup by id, with optional walk-through context.
