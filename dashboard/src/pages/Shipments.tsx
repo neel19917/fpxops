@@ -842,6 +842,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       >
         {drawerData ? (
           <>
+            {/* High-level summary card. Pinned above every drawer tab so
+                the operator always has the five identifiers / status they
+                need to talk about the shipment, no matter which tab they
+                navigate to. Mirrors what the user would scribble at the
+                top of a sticky note. */}
+            <ShipmentSummaryHeader shipment={drawerData.shipment} />
             <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
               <div className="inline-flex items-center rounded-lg ring-1 ring-slate-200 bg-white">
                 <button
@@ -1481,6 +1487,68 @@ const TASK_STATUS_TONE: Record<string, string> = {
 const TASK_STATUS_LABEL: Record<string, string> = {
   open: "Open", in_progress: "In Progress", blocked: "Blocked", done: "Done", cancelled: "Cancelled",
 };
+
+// =====================================================================
+// High-level shipment summary header. Renders the five identifiers
+// operators reference constantly — Shipment ID, Tracking Number,
+// Customer, Carrier, Status — as a labeled key/value grid pinned at
+// the top of the drawer body. We surface it on EVERY drawer tab (not
+// just Overview) because the rep often jumps to Email / Drafts /
+// Analysis and still needs these top-of-mind without scrolling back.
+// =====================================================================
+function ShipmentSummaryHeader({ shipment }: { shipment: Shipment }) {
+  const status = shipment.shipment_status || "—";
+  const carrier = shipment.carrier_name || shipment.carrier || "—";
+  // Tone the status pill based on common-case strings; default to slate.
+  // Best-effort match — FreightPOP's status vocabulary is open-ended and
+  // we don't want to invent a regex per phrase.
+  const s = status.toLowerCase();
+  const statusTone =
+    /deliver/.test(s) ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
+    : /transit|in.?route/.test(s) ? "bg-sky-100 text-sky-800 ring-sky-200"
+    : /pick|tender/.test(s) ? "bg-violet-100 text-violet-800 ring-violet-200"
+    : /delay|late|hold|except/.test(s) ? "bg-amber-100 text-amber-800 ring-amber-200"
+    : /cancel|fail/.test(s) ? "bg-rose-100 text-rose-800 ring-rose-200"
+    : "bg-slate-100 text-slate-700 ring-slate-200";
+  return (
+    <div className="mb-4 rounded-xl ring-1 ring-slate-200 bg-gradient-to-br from-white to-slate-50 px-4 py-3">
+      <div className="grid grid-cols-2 gap-x-5 gap-y-2.5">
+        <div className="col-span-2 sm:col-span-1">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Shipment ID</div>
+          <div className="text-base font-bold text-slate-900 truncate" title={shipment.shipment_id || ""}>
+            {shipment.shipment_id || "—"}
+          </div>
+        </div>
+        <div className="col-span-2 sm:col-span-1">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Tracking #</div>
+          <div className="text-sm font-mono font-semibold text-slate-900 truncate" title={shipment.tracking_number || ""}>
+            {shipment.tracking_number || "—"}
+          </div>
+        </div>
+        <div className="col-span-2 sm:col-span-1">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Customer</div>
+          <div className="text-sm font-medium text-slate-900 truncate" title={shipment.customer_name || ""}>
+            {shipment.customer_name || "—"}
+          </div>
+        </div>
+        <div className="col-span-2 sm:col-span-1">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Carrier</div>
+          <div className="text-sm font-medium text-slate-900 truncate" title={carrier}>
+            {carrier}
+          </div>
+        </div>
+        <div className="col-span-2">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Status</div>
+          <div className="mt-0.5">
+            <span className={`inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full ring-1 ${statusTone}`}>
+              {status}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function TaskBanner({ task, busy, onSetStatus }: {
   task: ShipmentTask;

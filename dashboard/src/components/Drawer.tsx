@@ -24,7 +24,7 @@ export function Drawer({ open, onClose, title, subtitle, children, suppressBackd
         />
       )}
       <aside
-        className={`fixed top-0 right-0 z-30 h-full w-full sm:w-[560px] bg-white shadow-2xl border-l border-slate-200 transform transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}
+        className={`fixed top-0 right-0 z-30 h-full w-full sm:w-[720px] bg-white shadow-2xl border-l border-slate-200 transform transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}
       >
         <div className="flex items-start justify-between px-6 pt-5 pb-4 border-b border-slate-200">
           <div className="min-w-0">

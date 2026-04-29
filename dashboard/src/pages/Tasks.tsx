@@ -656,17 +656,21 @@ export function TasksPage() {
         </div>
       ) : null}
 
+      {/* Carrier Followups panel sits above both views so it's always
+          findable, regardless of whether the user is in Kanban or
+          Table mode. The panel itself collapses to a one-liner when
+          there are no follow-up tasks, so this isn't visual noise on
+          quiet days. */}
+      <CarrierFollowupsPanel onTaskClick={(taskId) => nav.openTask(taskId)} />
+
       {viewMode === "kanban" ? (
-        <>
-          <CarrierFollowupsPanel onTaskClick={(taskId) => nav.openTask(taskId)} />
-          <KanbanBoard
-            tasks={tasks}
-            focusedId={focusedId}
-            onFocus={setFocusedId}
-            onSetStatus={(t, s) => setStatus(t, s, { openDrawer: s === "in_progress" && t.status === "open" })}
-            onOpenTask={(taskId) => nav.openTask(taskId)}
-          />
-        </>
+        <KanbanBoard
+          tasks={tasks}
+          focusedId={focusedId}
+          onFocus={setFocusedId}
+          onSetStatus={(t, s) => setStatus(t, s, { openDrawer: s === "in_progress" && t.status === "open" })}
+          onOpenTask={(taskId) => nav.openTask(taskId)}
+        />
       ) : (
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <table className="w-full text-sm">
@@ -1085,7 +1089,7 @@ function CarrierFollowupsPanel({ onTaskClick }: { onTaskClick: (taskId: string) 
           <RefreshCw className="h-3 w-3" /> Refresh
         </button>
       </div>
-      <div className="p-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+      <div className="p-3 grid grid-cols-1 lg:grid-cols-2 gap-3">
         {groups.map((g) => (
           <CarrierGroupCard
             key={g.carrier}
@@ -1124,24 +1128,27 @@ function CarrierGroupCard({ group, onTaskClick, onEmail }: {
           {group.items.length}
         </span>
       </div>
-      <ul className="px-3 py-2 space-y-1.5 max-h-44 overflow-y-auto">
+      <ul className="px-3 py-2 space-y-1.5 max-h-80 overflow-y-auto">
         {group.items.map((it) => (
           <li key={it.task.id} className="text-xs">
             <button
               onClick={() => { requestAutoFilter(); onTaskClick(it.task.id); }}
-              className="w-full text-left rounded-md px-1.5 py-1 hover:bg-violet-50 group"
+              className="w-full text-left rounded-md px-2 py-1.5 hover:bg-violet-50 group ring-1 ring-transparent hover:ring-violet-200"
               title={`Open ${it.shipment.tracking_number || it.task.title} in task-walk mode`}
             >
               <div className="flex items-center justify-between gap-2 min-w-0">
-                <span className="font-medium text-slate-900 truncate">
-                  {it.shipment.shipment_id || it.shipment.tracking_number || "(no id)"}
+                <span className="font-semibold text-slate-900 truncate text-sm">
+                  {it.shipment.shipment_id || "(no shipment id)"}
                 </span>
-                <span className="text-slate-500 shrink-0 font-mono text-[10px]">
+                <span className="text-slate-600 shrink-0 font-mono text-[11px]">
                   {it.shipment.tracking_number || ""}
                 </span>
               </div>
-              <div className="text-[11px] text-slate-500 truncate">
-                {it.shipment.customer_name || "—"} · {it.task.title}
+              <div className="text-[11px] text-slate-600 truncate mt-0.5">
+                {it.shipment.customer_name || "—"} · {it.shipment.shipment_status || "no status"}
+              </div>
+              <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                {it.task.title}
               </div>
             </button>
           </li>
