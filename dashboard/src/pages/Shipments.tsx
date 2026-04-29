@@ -157,7 +157,22 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   } | null>(null);
 
   // Action override modal (manual YES/NO/clear).
-  const [overrideModal, setOverrideModal] = useState<null | { value: "YES" | "NO" | "RESOLVED" | null; reason: string; busy: boolean }>(null);
+  // overrideModal also carries two booleans for "also create a carrier
+  // followup task" / "also create a customer followup task". Both can
+  // be true — applyOverride will create both tasks in the same submit.
+  // Reason doubles as the suffix for any auto-created followup task
+  // titles (so the operator only types once). autoDraftEmail piggybacks
+  // off the same submit: when true, the AI email-draft modal opens
+  // immediately after the override applies, defaulting to the audience
+  // implied by the selected followup checkboxes (carrier wins ties).
+  const [overrideModal, setOverrideModal] = useState<null | {
+    value: "YES" | "NO" | "RESOLVED" | null;
+    reason: string;
+    busy: boolean;
+    createCarrierFollowup: boolean;
+    createCustomerFollowup: boolean;
+    autoDraftEmail: boolean;
+  }>(null);
 
   // Re-analyze button state — busy flag prevents double-click during a Claude
   // round-trip (typically 2-3s).
@@ -333,11 +348,11 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       setDrawerTasks((p) => p.map((x) => (x.id === r.task.id ? r.task : x)));
     } catch (e) { setErr((e as Error).message); }
   }
-  async function openEmailDraft(audience: "carrier" | "customer") {
+  async function openEmailDraft(audience: "carrier" | "customer", notes?: string) {
     if (!drawerId) return;
     setEmailModal({ audience, data: null, loading: true, copied: false });
     try {
-      const draft = await api.emailDraft.generate(drawerId, audience);
+      const draft = await api.emailDraft.generate(drawerId, audience, notes);
       setEmailModal({ audience, data: draft, loading: false, copied: false });
     } catch (e) {
       setEmailModal({ audience, data: { subject: "Error", body: (e as Error).message }, loading: false, copied: false });
@@ -395,18 +410,55 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
   async function applyOverride() {
     if (!drawerId || !overrideModal) return;
-    setOverrideModal({ ...overrideModal, busy: true });
+    const m = overrideModal;
+    setOverrideModal({ ...m, busy: true });
     try {
+      // Step 1: apply the override.
       const r = await api.shipments.overrideAction(drawerId, {
-        action_required: overrideModal.value,
-        reason: overrideModal.reason || undefined,
+        action_required: m.value,
+        reason: m.reason || undefined,
       });
-      // Refresh drawer + table
       setDrawerData((prev) => prev ? { ...prev, shipment: r.shipment } : prev);
       setRows((prev) => prev.map((row) => row.id === r.shipment.id ? r.shipment : row));
+
+      // Step 2: create followup tasks for whichever audiences were
+      // checked. Reason field doubles as the title suffix so the
+      // operator only types once. Falls back to a sensible default
+      // suffix so the matcher always picks the task up.
+      const reason = m.reason.trim();
+      const tasksToCreate: { title: string }[] = [];
+      if (m.createCarrierFollowup) {
+        tasksToCreate.push({ title: `Carrier followup: ${reason || "follow-up needed"}` });
+      }
+      if (m.createCustomerFollowup) {
+        tasksToCreate.push({ title: `Customer followup: ${reason || "status update needed"}` });
+      }
+      const createdTasks = await Promise.all(
+        tasksToCreate.map((body) => api.tasks.create(drawerId, body)),
+      );
+      if (createdTasks.length) {
+        // Prepend so the new task is visible immediately on the Tasks tab.
+        setDrawerTasks((p) => [...createdTasks.map((t) => t.task), ...p]);
+      }
+
+      // Step 3: optionally auto-draft an email. Audience is implied by
+      // the followup checkboxes — if both, carrier wins (matches the
+      // operational sequence: chase the carrier first, brief the
+      // customer second). If neither was checked but the operator
+      // still asked for a draft, default to carrier.
+      if (m.autoDraftEmail) {
+        const audience: "carrier" | "customer" =
+          m.createCarrierFollowup ? "carrier"
+          : m.createCustomerFollowup ? "customer"
+          : "carrier";
+        // Close override first so the email modal stacks cleanly.
+        setOverrideModal(null);
+        await openEmailDraft(audience, reason || undefined);
+        return;
+      }
       setOverrideModal(null);
     } catch (e) {
-      setOverrideModal({ ...overrideModal, busy: false });
+      setOverrideModal({ ...m, busy: false });
       setErr((e as Error).message);
     }
   }
@@ -522,6 +574,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             value: drawerData.shipment.action_required === "YES" ? "NO" : "YES",
             reason: "",
             busy: false,
+            createCarrierFollowup: false,
+            createCustomerFollowup: false,
+            autoDraftEmail: false,
           });
         }
         return;
@@ -871,6 +926,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   value: drawerData.shipment.action_required === "YES" ? "NO" : "YES",
                   reason: "",
                   busy: false,
+                  createCarrierFollowup: false,
+                  createCustomerFollowup: false,
+                  autoDraftEmail: false,
                 })
               }
               actionEditOptIn={actionEditOptIn}
@@ -1043,7 +1101,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                           {drawerData.shipment.action_source === "manual" ? "Manual" : "From AI"}
                         </span>
                         <button
-                          onClick={() => setOverrideModal({ value: drawerData.shipment.action_required === "YES" ? "NO" : "YES", reason: "", busy: false })}
+                          onClick={() => setOverrideModal({ value: drawerData.shipment.action_required === "YES" ? "NO" : "YES", reason: "", busy: false, createCarrierFollowup: false, createCustomerFollowup: false, autoDraftEmail: false })}
                           className="text-[11px] text-sky-700 hover:text-sky-900 underline"
                         >Override</button>
                         {/* Opt-in to inline modify — keeps accidental clicks
@@ -1468,10 +1526,56 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             <input
               value={overrideModal.reason}
               onChange={(e) => setOverrideModal({ ...overrideModal, reason: e.target.value })}
-              placeholder="Why are you overriding the AI?"
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm mb-4"
+              placeholder="Why are you overriding the AI? (also used as the followup task suffix)"
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm mb-3"
               maxLength={500}
             />
+            {/* Combo actions: create followup task(s) + optionally auto-
+                draft an AI email in the same submit. Both followup
+                boxes can be checked → both tasks created. autoDraftEmail
+                opens the email modal targeted at carrier (preferred)
+                or customer when only the customer box is ticked. */}
+            <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 px-3 py-2.5 mb-4 space-y-2">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Also do</div>
+              <label className="flex items-start gap-2 text-sm cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={overrideModal.createCarrierFollowup}
+                  onChange={(e) => setOverrideModal({ ...overrideModal, createCarrierFollowup: e.target.checked })}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300"
+                />
+                <span>
+                  <span className="font-medium text-slate-900">Create Carrier Followup task</span>
+                  <span className="text-[11px] text-slate-500 block">Title: <span className="font-mono">Carrier followup: {overrideModal.reason.trim() || "follow-up needed"}</span></span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 text-sm cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={overrideModal.createCustomerFollowup}
+                  onChange={(e) => setOverrideModal({ ...overrideModal, createCustomerFollowup: e.target.checked })}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300"
+                />
+                <span>
+                  <span className="font-medium text-slate-900">Create Customer Followup task</span>
+                  <span className="text-[11px] text-slate-500 block">Title: <span className="font-mono">Customer followup: {overrideModal.reason.trim() || "status update needed"}</span></span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 text-sm cursor-pointer select-none border-t border-slate-200 pt-2 mt-1">
+                <input
+                  type="checkbox"
+                  checked={overrideModal.autoDraftEmail}
+                  onChange={(e) => setOverrideModal({ ...overrideModal, autoDraftEmail: e.target.checked })}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300"
+                />
+                <span>
+                  <span className="font-medium text-slate-900">Auto-draft email with AI</span>
+                  <span className="text-[11px] text-slate-500 block">
+                    Opens the email-draft modal after override. Targets <span className="font-semibold">{overrideModal.createCustomerFollowup && !overrideModal.createCarrierFollowup ? "customer" : "carrier"}</span> (carrier wins ties).
+                  </span>
+                </span>
+              </label>
+            </div>
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setOverrideModal(null)}
@@ -1482,7 +1586,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 onClick={applyOverride}
                 disabled={overrideModal.busy}
                 className="px-4 py-2 text-sm rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
-              >{overrideModal.busy ? "Saving…" : (overrideModal.value === null ? "Clear override" : "Apply override")}</button>
+              >{overrideModal.busy ? "Saving…" : (overrideModal.value === null && !overrideModal.createCarrierFollowup && !overrideModal.createCustomerFollowup && !overrideModal.autoDraftEmail ? "Clear override" : "Apply")}</button>
             </div>
           </div>
         </div>
