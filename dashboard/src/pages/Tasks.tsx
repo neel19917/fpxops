@@ -546,10 +546,11 @@ export function TasksPage() {
           <button
             onClick={startAllOpen}
             disabled={bulkBusy || counts.open === 0}
-            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-2 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
             title="Mark every open task as In Progress"
           >
-            <Rocket className="h-4 w-4" /> {bulkBusy ? "Starting…" : `Start all open (${counts.open})`}
+            <Rocket className="h-4 w-4 shrink-0" />
+            <span>{bulkBusy ? "Starting…" : `Start all open (${counts.open})`}</span>
           </button>
           {/* Walk-through scope: prefer the currently-visible filter, but
               fall back to the "active" set (open + in_progress) when the
@@ -575,12 +576,13 @@ export function TasksPage() {
                   nav.openTask(first.id);
                 }}
                 disabled={walkCount === 0}
-                className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 title={fallbackHint
                   ? `Current filter has no tasks — walking the ${walkCount} active task${walkCount === 1 ? "" : "s"} instead`
                   : "Open the first visible task and walk through them with n / p"}
               >
-                <ChevronRight className="h-4 w-4" /> Walk through ({walkCount})
+                <ChevronRight className="h-4 w-4 shrink-0" />
+                <span>Walk through ({walkCount})</span>
               </button>
             );
           })()}

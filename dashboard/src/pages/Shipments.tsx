@@ -16,7 +16,10 @@ import {
   saveColumnPrefs,
   type ColumnPrefs,
 } from "../lib/shipmentColumns";
-import { exportShipmentsXlsx } from "../lib/exportShipments";
+// exportShipmentsXlsx is dynamically imported below so the xlsx-js-style
+// library (~300 KB minified) is only fetched when the operator actually
+// clicks "Export all". Keeps the Shipments chunk slim for the
+// 99% of page loads where nobody exports.
 
 // FreightPOP-style stat pills. Pills are mutually exclusive click-to-filter.
 // Status matchers run against shipment_status; ISSUES uses action_required.
@@ -237,12 +240,19 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     if (exporting) return;
     setExporting(true); setErr(null);
     try {
-      const r = await api.shipments.list({ limit: 5000 });
+      // Pull the data + the (heavy) xlsx-js-style library in parallel
+      // so the click→download latency is bounded by the slower of
+      // the two. Vite splits exportShipments into its own chunk
+      // because we use dynamic import here.
+      const [r, mod] = await Promise.all([
+        api.shipments.list({ limit: 5000 }),
+        import("../lib/exportShipments"),
+      ]);
       if (!r.data?.length) {
         setErr("No shipments to export.");
         return;
       }
-      exportShipmentsXlsx(r.data);
+      mod.exportShipmentsXlsx(r.data);
     } catch (e) { setErr((e as Error).message); }
     finally { setExporting(false); }
   }
