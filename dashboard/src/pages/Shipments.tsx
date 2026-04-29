@@ -411,7 +411,10 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       if (customerFilter && r.customer_name !== customerFilter) return false;
       if (sourceFilter && r.action_source !== sourceFilter) return false;
       if (q) {
-        const hay = [r.tracking_number, r.customer_name, r.carrier_name, r.carrier, r.ai_issue, r.shipment_status]
+        // shipment_id is the FreightPOP-side unique id (e.g. "13583467")
+        // and is the operator's primary handle; included alongside the
+        // existing tracking + customer + carrier search axes.
+        const hay = [r.shipment_id, r.tracking_number, r.customer_name, r.carrier_name, r.carrier, r.ai_issue, r.shipment_status]
           .map((x) => (x || "").toLowerCase()).join(" ");
         if (!hay.includes(q.toLowerCase())) return false;
       }
@@ -594,7 +597,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             <Search className="h-4 w-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
               className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-300 text-sm focus:ring-2 focus:ring-sky-400 focus:border-sky-400"
-              placeholder="Search tracking, customer, carrier, issue…"
+              placeholder="Search shipment id, tracking, customer, carrier…"
               value={q}
               onChange={(e) => setQ(e.target.value)}
             />
@@ -845,9 +848,44 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             {/* High-level summary card. Pinned above every drawer tab so
                 the operator always has the five identifiers / status they
                 need to talk about the shipment, no matter which tab they
-                navigate to. Mirrors what the user would scribble at the
-                top of a sticky note. */}
-            <ShipmentSummaryHeader shipment={drawerData.shipment} />
+                navigate to. The Action control is rendered inline so an
+                operator can override / Modify without scrolling to the
+                Overview tab. */}
+            <ShipmentSummaryHeader
+              shipment={drawerData.shipment}
+              onOverrideClick={() =>
+                setOverrideModal({
+                  value: drawerData.shipment.action_required === "YES" ? "NO" : "YES",
+                  reason: "",
+                  busy: false,
+                })
+              }
+              actionEditOptIn={actionEditOptIn}
+              onActionEditOptInChange={setActionEditOptIn}
+              actionEditBusy={actionEditBusy}
+              onSetAction={async (v) => {
+                if (!drawerId) return;
+                setActionEditBusy(true);
+                try {
+                  await api.shipments.overrideAction(drawerId, { action_required: v });
+                  const r = await api.shipments.get(drawerId);
+                  setDrawerData(r);
+                  setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                } catch (e) { setErr((e as Error).message); }
+                finally { setActionEditBusy(false); }
+              }}
+              onRevertToAi={async () => {
+                if (!drawerId) return;
+                setActionEditBusy(true);
+                try {
+                  await api.shipments.overrideAction(drawerId, { action_required: null });
+                  const r = await api.shipments.get(drawerId);
+                  setDrawerData(r);
+                  setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                } catch (e) { setErr((e as Error).message); }
+                finally { setActionEditBusy(false); }
+              }}
+            />
             <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
               <div className="inline-flex items-center rounded-lg ring-1 ring-slate-200 bg-white">
                 <button
@@ -1495,8 +1533,28 @@ const TASK_STATUS_LABEL: Record<string, string> = {
 // the top of the drawer body. We surface it on EVERY drawer tab (not
 // just Overview) because the rep often jumps to Email / Drafts /
 // Analysis and still needs these top-of-mind without scrolling back.
+// Also embeds the Action control (override / Modify) so the rep can
+// flip the action state without scrolling to the Overview tab.
 // =====================================================================
-function ShipmentSummaryHeader({ shipment }: { shipment: Shipment }) {
+interface ShipmentSummaryHeaderProps {
+  shipment: Shipment;
+  onOverrideClick: () => void;
+  actionEditOptIn: boolean;
+  onActionEditOptInChange: (v: boolean) => void;
+  actionEditBusy: boolean;
+  onSetAction: (v: "YES" | "NO" | "RESOLVED") => void | Promise<void>;
+  onRevertToAi: () => void | Promise<void>;
+}
+
+function ShipmentSummaryHeader({
+  shipment,
+  onOverrideClick,
+  actionEditOptIn,
+  onActionEditOptInChange,
+  actionEditBusy,
+  onSetAction,
+  onRevertToAi,
+}: ShipmentSummaryHeaderProps) {
   const status = shipment.shipment_status || "—";
   const carrier = shipment.carrier_name || shipment.carrier || "—";
   // Tone the status pill based on common-case strings; default to slate.
@@ -1537,13 +1595,81 @@ function ShipmentSummaryHeader({ shipment }: { shipment: Shipment }) {
             {carrier}
           </div>
         </div>
-        <div className="col-span-2">
+        <div className="col-span-2 sm:col-span-1">
           <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Status</div>
           <div className="mt-0.5">
             <span className={`inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full ring-1 ${statusTone}`}>
               {status}
             </span>
           </div>
+        </div>
+        <div className="col-span-2 sm:col-span-1">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Action</div>
+          <div className="mt-0.5 flex items-center gap-2 flex-wrap">
+            <ActionBadge action={shipment.action_required} />
+            <span
+              className={
+                "text-[10px] px-2 py-0.5 rounded-full font-medium " +
+                (shipment.action_source === "manual"
+                  ? "bg-amber-100 text-amber-800 ring-1 ring-amber-200"
+                  : "bg-slate-100 text-slate-600")
+              }
+              title={
+                shipment.action_source === "manual"
+                  ? `Overridden by ${shipment.action_overridden_by || "?"}${shipment.action_override_reason ? ` — ${shipment.action_override_reason}` : ""}`
+                  : "Set by AI"
+              }
+            >
+              {shipment.action_source === "manual" ? "Manual" : "From AI"}
+            </span>
+            <button
+              onClick={onOverrideClick}
+              className="text-[11px] text-sky-700 hover:text-sky-900 underline"
+            >
+              Override
+            </button>
+            <label className="inline-flex items-center gap-1 text-[11px] text-slate-500 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={actionEditOptIn}
+                onChange={(e) => onActionEditOptInChange(e.target.checked)}
+                className="h-3 w-3 rounded border-slate-300"
+              />
+              Modify
+            </label>
+          </div>
+          {actionEditOptIn ? (
+            <div className="mt-1.5 inline-flex items-center gap-1.5 flex-wrap">
+              {(["YES", "NO", "RESOLVED"] as const).map((v) => {
+                const active = shipment.action_required === v;
+                const tone =
+                  v === "YES"
+                    ? "bg-rose-50 text-rose-700 ring-rose-200 hover:bg-rose-100"
+                    : v === "NO"
+                    ? "bg-emerald-50 text-emerald-700 ring-emerald-200 hover:bg-emerald-100"
+                    : "bg-violet-50 text-violet-700 ring-violet-200 hover:bg-violet-100";
+                return (
+                  <button
+                    key={v}
+                    disabled={actionEditBusy || active}
+                    onClick={() => onSetAction(v)}
+                    className={`text-[11px] font-semibold rounded-md px-2 py-0.5 ring-1 transition ${tone} disabled:opacity-50 disabled:cursor-not-allowed`}
+                    title={active ? "Already set" : `Set action to ${v}`}
+                  >
+                    {v === "RESOLVED" ? "Resolved" : v}
+                  </button>
+                );
+              })}
+              <button
+                disabled={actionEditBusy || shipment.action_source !== "manual"}
+                onClick={onRevertToAi}
+                className="text-[11px] text-slate-600 hover:text-slate-900 underline disabled:opacity-40 disabled:no-underline"
+                title="Clear override and let the AI value stand"
+              >
+                Revert to AI
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

@@ -92,7 +92,12 @@ export function mapShipment(raw, runnerName) {
   return {
     created_by: runnerName || null,
     tracking_number: pick(raw, ["_trackingNumber", "Tracking Number", "TRACKING"]),
-    shipment_id: pick(raw, ["Shipment ID", "SHIPMENT ID", "shipment_id"]),
+    // FreightPOP actually emits "Shipment Id" (capital S, lowercase d)
+    // — the older "Shipment ID" / "SHIPMENT ID" keys have never matched
+    // a real scrape, which is why the drawer was falling back to the
+    // tracking number. Order matters: try the real grid label first,
+    // then the legacy variants for safety.
+    shipment_id: pick(raw, ["Shipment Id", "Shipment ID", "SHIPMENT ID", "shipment_id"]),
     customer_name: guessedCustomer,
     customer_id: pick(raw, ["Customer ID", "CUSTOMER ID"]),
     account_manager: pick(raw, ["Account Manager", "ACCOUNT MANAGER"]),

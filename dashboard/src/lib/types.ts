@@ -221,6 +221,12 @@ export type TaskPriority = "low" | "normal" | "high" | "urgent";
 export interface ShipmentTask {
   id: string;
   shipment_id: string;
+  // FreightPOP-side shipment id (e.g. "13583467"), pulled by the
+  // /api/tasks list route from the joined shipment row. Null if the
+  // shipment has no external id yet (legacy rows pre-backfill, or the
+  // shipment was deleted). The task's own shipment_id column above is
+  // the internal UUID FK — different value, different purpose.
+  shipment_external_id?: string | null;
   tracking_number: string | null;
   title: string;
   description: string | null;

@@ -1,9 +1,30 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Lock, Package, ReceiptText, Sparkles, TrendingUp } from "lucide-react";
+import { AlertTriangle, Lock, Package, ReceiptText, Sparkles, TrendingUp, Copy, Check, ExternalLink } from "lucide-react";
 import { publicShare } from "../lib/api";
 import { fmtDate, fmtDateTime, fmtNum, fmtPct, fmtUsd } from "../lib/format";
 import { ActionBadge } from "../components/Badge";
 import type { AiAnalysis, GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditRow, Shipment } from "../lib/types";
+
+// Default FreightPOP URL the public share page embeds. No public deep-link
+// route per shipment, so we drop the recipient on the dashboard with the
+// tracking number front-and-center for one-click paste into the grid's
+// search. Hardcoded here (rather than fetched from fpx_settings via auth)
+// because the share page is intentionally unauthed — keeping this static
+// avoids leaking tenant settings to anonymous viewers.
+const FREIGHTPOP_PUBLIC_URL = "https://app.freightpop.com/dashboard";
+
+// Same permissions-policy bundle the in-app overlay uses so login flows
+// and copy/paste work for whoever opens the share link.
+const EMBED_ALLOW = [
+  "storage-access *",
+  "publickey-credentials-get *",
+  "publickey-credentials-create *",
+  "clipboard-read *",
+  "clipboard-write *",
+  "forms *",
+  "autoplay *",
+  "fullscreen *",
+].join("; ");
 
 interface Props { token: string }
 
@@ -112,44 +133,143 @@ function formatType(t: string) {
 function SharedShipment({ data }: { data: { shipment: Shipment; analyses: AiAnalysis[] } }) {
   const s = data.shipment;
   return (
-    <div className="bg-white rounded-2xl ring-1 ring-slate-200 p-6 space-y-5">
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="text-xs uppercase tracking-wide text-slate-500">Tracking number</div>
-          <div className="text-xl font-semibold">{s.tracking_number || "—"}</div>
-        </div>
-        <ActionBadge action={s.action_required} />
-      </div>
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
-        <Stat label="Customer" value={s.customer_name} />
-        <Stat label="Carrier" value={s.carrier_name || s.carrier} />
-        <Stat label="Mode" value={s.mode} />
-        <Stat label="Status" value={s.shipment_status} />
-        <Stat label="Pickup" value={fmtDate(s.pickup_date)} />
-        <Stat label="Delivery" value={fmtDate(s.delivery_date)} />
-        <Stat label="Origin" value={s.ship_from || s.origin} />
-        <Stat label="Destination" value={s.ship_to || s.destination} />
-        <Stat label="Signed by" value={s.signed_by} />
-      </div>
-      {s.ai_issue || s.ai_recommendation ? (
-        <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 p-4">
-          <h3 className="text-sm font-semibold flex items-center gap-1.5"><Sparkles className="h-4 w-4 text-sky-500" /> AI summary</h3>
-          <div className="mt-2 text-sm"><b className="text-slate-700">Issue:</b> {s.ai_issue || "—"}</div>
-          <div className="mt-1 text-sm"><b className="text-slate-700">Recommendation:</b> {s.ai_recommendation || "—"}</div>
-        </div>
-      ) : null}
-      {data.analyses.length > 0 ? (
-        <div>
-          <h3 className="text-sm font-semibold mb-2">Analysis history ({data.analyses.length})</h3>
-          <div className="space-y-2">
-            {data.analyses.map((a) => (
-              <div key={a.id} className="rounded-lg bg-slate-50 ring-1 ring-slate-200 p-3 text-sm">
-                <div className="text-xs text-slate-500 mb-0.5">{fmtDateTime(a.created_at)} · {a.model}</div>
-                {a.issue && <div><b>Issue:</b> {a.issue}</div>}
-                {a.recommendation && <div><b>Rec:</b> {a.recommendation}</div>}
-              </div>
-            ))}
+    <div className="space-y-5">
+      <div className="bg-white rounded-2xl ring-1 ring-slate-200 p-6 space-y-5">
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="text-xs uppercase tracking-wide text-slate-500">Tracking number</div>
+            <div className="text-xl font-semibold">{s.tracking_number || "—"}</div>
           </div>
+          <ActionBadge action={s.action_required} />
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
+          <Stat label="Customer" value={s.customer_name} />
+          <Stat label="Carrier" value={s.carrier_name || s.carrier} />
+          <Stat label="Mode" value={s.mode} />
+          <Stat label="Status" value={s.shipment_status} />
+          <Stat label="Pickup" value={fmtDate(s.pickup_date)} />
+          <Stat label="Delivery" value={fmtDate(s.delivery_date)} />
+          <Stat label="Origin" value={s.ship_from || s.origin} />
+          <Stat label="Destination" value={s.ship_to || s.destination} />
+          <Stat label="Signed by" value={s.signed_by} />
+        </div>
+        {s.ai_issue || s.ai_recommendation ? (
+          <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 p-4">
+            <h3 className="text-sm font-semibold flex items-center gap-1.5"><Sparkles className="h-4 w-4 text-sky-500" /> AI summary</h3>
+            <div className="mt-2 text-sm"><b className="text-slate-700">Issue:</b> {s.ai_issue || "—"}</div>
+            <div className="mt-1 text-sm"><b className="text-slate-700">Recommendation:</b> {s.ai_recommendation || "—"}</div>
+          </div>
+        ) : null}
+        {data.analyses.length > 0 ? (
+          <div>
+            <h3 className="text-sm font-semibold mb-2">Analysis history ({data.analyses.length})</h3>
+            <div className="space-y-2">
+              {data.analyses.map((a) => (
+                <div key={a.id} className="rounded-lg bg-slate-50 ring-1 ring-slate-200 p-3 text-sm">
+                  <div className="text-xs text-slate-500 mb-0.5">{fmtDateTime(a.created_at)} · {a.model}</div>
+                  {a.issue && <div><b>Issue:</b> {a.issue}</div>}
+                  {a.recommendation && <div><b>Rec:</b> {a.recommendation}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
+      <SharedFreightPopEmbed shipment={s} />
+    </div>
+  );
+}
+
+// FreightPOP embed for the public share page. The recipient is typically
+// not an FPX rep, so the Chrome-extension bridge that drives the in-app
+// overlay's auto-filter doesn't apply here. We surface the tracking
+// number prominently for paste-into-search and let the iframe load the
+// generic FreightPOP dashboard. Collapsed by default — the recipient
+// opts in via the toggle, so the iframe's third-party-cookie probe
+// doesn't fire on every share-link open.
+function SharedFreightPopEmbed({ shipment }: { shipment: Shipment }) {
+  const tracking = shipment.tracking_number || "";
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function copyTracking() {
+    if (!tracking) return;
+    try {
+      await navigator.clipboard.writeText(tracking);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked — no-op */ }
+  }
+
+  return (
+    <div className="bg-white rounded-2xl ring-1 ring-slate-200 overflow-hidden">
+      <div className="px-6 py-4 flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold flex items-center gap-1.5">
+            <Package className="h-4 w-4 text-sky-600" /> Track this shipment in FreightPOP
+          </h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Open the live FreightPOP grid below (sign-in required) and paste the tracking number to jump to this shipment.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {tracking ? (
+            <button
+              onClick={copyTracking}
+              className="text-xs px-2.5 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1.5"
+              title="Copy tracking number"
+            >
+              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              {copied ? "Copied" : `Copy ${tracking}`}
+            </button>
+          ) : null}
+          <a
+            href={FREIGHTPOP_PUBLIC_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs px-2.5 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1.5"
+          >
+            <ExternalLink className="h-3.5 w-3.5" /> New tab
+          </a>
+          <button
+            onClick={() => setOpen((v) => !v)}
+            className="text-xs px-2.5 py-1.5 rounded-lg bg-sky-600 text-white hover:bg-sky-700 inline-flex items-center gap-1.5"
+            aria-pressed={open}
+          >
+            {open ? "Hide embed" : "Show embed"}
+          </button>
+        </div>
+      </div>
+      {open ? (
+        <div className="border-t border-slate-200 bg-slate-50 px-3 pt-3 pb-3 sm:px-6 sm:pb-6">
+          {tracking ? (
+            <div className="rounded-lg bg-white ring-1 ring-slate-200 px-3 py-2 mb-3 flex items-center gap-2 flex-wrap">
+              <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-500 shrink-0">Tracking #</span>
+              <span className="font-mono text-sm font-semibold text-slate-900 truncate flex-1">{tracking}</span>
+              <button
+                onClick={copyTracking}
+                className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50"
+                title="Copy tracking number"
+              >
+                {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+          ) : null}
+          <div className="rounded-lg ring-1 ring-slate-200 overflow-hidden bg-white" style={{ height: "70vh" }}>
+            <iframe
+              src={FREIGHTPOP_PUBLIC_URL}
+              className="w-full h-full block"
+              title="FreightPOP shipment view"
+              allow={EMBED_ALLOW}
+              referrerPolicy="no-referrer-when-downgrade"
+            />
+          </div>
+          <p className="text-[11px] text-slate-500 mt-2 leading-snug">
+            FreightPOP doesn't expose a deep-link URL per shipment — paste the tracking number above into the grid's search to jump
+            to this shipment. If the panel is blank, FreightPOP is blocking iframe embedding for this origin
+            (X-Frame-Options / CSP); use the <span className="font-medium">New tab</span> link instead.
+          </p>
         </div>
       ) : null}
     </div>

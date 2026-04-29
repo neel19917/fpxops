@@ -20,11 +20,13 @@ import { TasksPage } from "./pages/Tasks";
 import { FeedbackPage } from "./pages/Feedback";
 import { AuditLogPage } from "./pages/AuditLog";
 import { SettingsPage } from "./pages/Settings";
+import { OpsPage } from "./pages/Ops";
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
   tracking: "/tracking",
   tasks: "/tasks",
+  ops: "/ops",
   analyses: "/analyses",
   gp: "/audits/gp",
   invoice: "/audits/invoice",
@@ -48,6 +50,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
   if (pathname.startsWith("/tasks")) return "tasks";
+  if (pathname.startsWith("/ops")) return "ops";
   if (pathname.startsWith("/analyses")) return "analyses";
   if (pathname.startsWith("/shares")) return "shares";
   if (pathname.startsWith("/feedback")) return "feedback";
@@ -130,6 +133,7 @@ function AuthedApp() {
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
           <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
+          <Route path="/ops" element={<OpsPage />} />
           <Route path="/analyses" element={<AnalysesPage />} />
           <Route path="/audits/gp" element={<GpAuditsPage />} />
           <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />

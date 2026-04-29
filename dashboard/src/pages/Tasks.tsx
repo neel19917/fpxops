@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search } from "lucide-react";
 import { api } from "../lib/api";
 import type { CarrierFollowupShipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { useNav } from "../lib/nav";
@@ -137,6 +137,12 @@ export function TasksPage() {
   const [statusFilter, setStatusFilter] = useState<string>(() => {
     try { return localStorage.getItem(FILTER_KEY) ?? "active"; } catch { return "active"; }
   });
+  // Free-text filter, applied AFTER the status filter. Matches against
+  // shipment_external_id (FreightPOP-side, e.g. "13583467"),
+  // tracking_number, title, description, and assigned_to. Persisted
+  // intentionally NOT — search is a transient navigation tool, not a
+  // saved view; resetting on reload matches what users expect.
+  const [search, setSearch] = useState("");
   const [viewMode, setViewMode] = useState<"table" | "kanban">(() => {
     try {
       const v = localStorage.getItem(VIEW_KEY);
@@ -161,16 +167,25 @@ export function TasksPage() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [editingAssigneeId, setEditingAssigneeId] = useState<string | null>(null);
   const lastGAt = useRef<number>(0); // for the gg jump-to-top sequence
-  // visibleIds tracks the *currently rendered* rows so select-all / focused
-  // navigation only act on what the user sees.
-  const visibleIds = useMemo(
-    () => (statusFilter === "active"
-      ? tasks.filter((t) => t.status === "open" || t.status === "in_progress")
-      : statusFilter
-        ? tasks.filter((t) => t.status === statusFilter)
-        : tasks).map((t) => t.id),
-    [tasks, statusFilter],
-  );
+  // visibleIds tracks the *currently rendered* rows so select-all /
+  // focused navigation only act on what the user sees. Mirrors the
+  // status + search filtering applied to visibleTasks below — kept in
+  // a separate memo so it materializes before visibleTasks (we need
+  // visibleIds in the keyboard-nav effects which run higher up).
+  const visibleIds = useMemo(() => {
+    let list = tasks;
+    if (statusFilter === "active") list = list.filter((t) => t.status === "open" || t.status === "in_progress");
+    else if (statusFilter) list = list.filter((t) => t.status === statusFilter);
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter((t) => {
+        const hay = [t.shipment_external_id, t.tracking_number, t.title, t.description, t.assigned_to]
+          .filter(Boolean).join(" ").toLowerCase();
+        return hay.includes(q);
+      });
+    }
+    return list.map((t) => t.id);
+  }, [tasks, statusFilter, search]);
   const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
   function toggle(id: string) {
     setSelected((prev) => {
@@ -272,13 +287,31 @@ export function TasksPage() {
     }
   }
 
-  // Visible rows after applying the current filter. KPIs above use the raw
-  // `tasks` list so totals stay honest no matter which chip is selected.
+  // Visible rows after applying status + search filters. KPIs above use
+  // the raw `tasks` list so totals stay honest no matter which chip is
+  // selected. Search runs over the union of identifiers an operator
+  // would actually paste into the box: FreightPOP shipment id,
+  // tracking number, title, description, assignee. Case-insensitive
+  // substring; whitespace-trimmed query; empty string short-circuits.
   const visibleTasks = useMemo(() => {
-    if (!statusFilter) return tasks;
-    if (statusFilter === "active") return tasks.filter((t) => t.status === "open" || t.status === "in_progress");
-    return tasks.filter((t) => t.status === statusFilter);
-  }, [tasks, statusFilter]);
+    let list = tasks;
+    if (statusFilter === "active") list = list.filter((t) => t.status === "open" || t.status === "in_progress");
+    else if (statusFilter) list = list.filter((t) => t.status === statusFilter);
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter((t) => {
+        const hay = [
+          t.shipment_external_id,
+          t.tracking_number,
+          t.title,
+          t.description,
+          t.assigned_to,
+        ].filter(Boolean).join(" ").toLowerCase();
+        return hay.includes(q);
+      });
+    }
+    return list;
+  }, [tasks, statusFilter, search]);
 
   // Filter changes are now client-side over the already-loaded list, so we
   // only fetch on mount + on explicit Refresh.
@@ -544,6 +577,29 @@ export function TasksPage() {
               </button>
             );
           })()}
+          {/* Free-text filter. Searches Shipment ID (FreightPOP), tracking
+              number, title, description, and assignee in a single box. */}
+          <div className="relative">
+            <Search className="h-4 w-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+            <input
+              type="search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search shipment id, tracking, title…"
+              className="rounded-lg border border-slate-200 pl-8 pr-8 py-2 text-sm bg-white w-72 focus:border-sky-400 focus:ring-1 focus:ring-sky-200 focus:outline-none"
+              aria-label="Search tasks"
+            />
+            {search ? (
+              <button
+                type="button"
+                onClick={() => setSearch("")}
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                aria-label="Clear search"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
@@ -893,6 +949,12 @@ interface KanbanBoardProps {
   onOpenTask: (taskId: string) => void;
 }
 
+// Drag/drop dataTransfer key for a kanban card. Custom MIME so we
+// don't collide with browser-native drags (e.g. dragging a link). We
+// also set "text/plain" with the same id for compat with some
+// browsers that demand plain text to fire dragover.
+const KANBAN_DT = "application/x-fpx-task-id";
+
 function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenTask }: KanbanBoardProps) {
   const grouped = useMemo(() => {
     const m: Record<TaskStatus, ShipmentTask[]> = {
@@ -902,12 +964,64 @@ function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenTask }: Kan
     return m;
   }, [tasks]);
 
+  // Tracks which column is currently the drop target for visual
+  // feedback. Cleared on drop, dragend, or dragleave-from-board.
+  const [dragOver, setDragOver] = useState<TaskStatus | null>(null);
+  // Tracks the source column of the in-flight drag so we can dim it
+  // and skip the highlight when hovering back over the original.
+  const [draggingFrom, setDraggingFrom] = useState<TaskStatus | null>(null);
+  // Map id → task so the drop handler can resolve the dragged task
+  // without scanning the full list each time.
+  const byId = useMemo(() => {
+    const m = new Map<string, ShipmentTask>();
+    for (const t of tasks) m.set(t.id, t);
+    return m;
+  }, [tasks]);
+
+  function handleDrop(targetStatus: TaskStatus, e: React.DragEvent) {
+    e.preventDefault();
+    setDragOver(null);
+    setDraggingFrom(null);
+    const id = e.dataTransfer.getData(KANBAN_DT) || e.dataTransfer.getData("text/plain");
+    if (!id) return;
+    const task = byId.get(id);
+    if (!task) return;
+    if (task.status === targetStatus) return;
+    onSetStatus(task, targetStatus);
+  }
+
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
       {KANBAN_COLS.map((col) => {
         const items = grouped[col.id] || [];
+        const isTarget = dragOver === col.id && draggingFrom !== col.id;
         return (
-          <div key={col.id} className={`rounded-xl ring-1 ${col.tone} flex flex-col min-h-[200px]`}>
+          <div
+            key={col.id}
+            onDragOver={(e) => {
+              // Allow drops by preventing default; set effect so the
+              // cursor shows "move" instead of the deny circle.
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              if (dragOver !== col.id) setDragOver(col.id);
+            }}
+            onDragLeave={(e) => {
+              // Only clear when the pointer leaves the column entirely
+              // (relatedTarget falls outside this DOM subtree). Without
+              // this guard, hovering over child elements re-fires
+              // dragleave and the highlight flickers off.
+              const next = e.relatedTarget as Node | null;
+              if (!next || !(e.currentTarget as HTMLElement).contains(next)) {
+                setDragOver((cur) => (cur === col.id ? null : cur));
+              }
+            }}
+            onDrop={(e) => handleDrop(col.id, e)}
+            className={
+              `rounded-xl ring-1 ${col.tone} flex flex-col min-h-[200px] transition ` +
+              (isTarget ? "ring-2 ring-offset-2 ring-sky-500 shadow-md" : "")
+            }
+            aria-dropeffect="move"
+          >
             <div className="px-3 py-2.5 flex items-center justify-between border-b border-white/60">
               <span className="text-sm font-semibold text-slate-800">{col.label}</span>
               <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${col.chip}`}>
@@ -916,7 +1030,9 @@ function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenTask }: Kan
             </div>
             <div className="p-2 space-y-2 flex-1">
               {items.length === 0 ? (
-                <div className="text-xs text-slate-400 text-center py-6">Nothing here</div>
+                <div className={"text-xs text-center py-6 " + (isTarget ? "text-sky-600 font-medium" : "text-slate-400")}>
+                  {isTarget ? `Drop to mark ${col.label}` : "Nothing here"}
+                </div>
               ) : items.map((t) => (
                 <KanbanCard
                   key={t.id}
@@ -925,6 +1041,16 @@ function KanbanBoard({ tasks, focusedId, onFocus, onSetStatus, onOpenTask }: Kan
                   onFocus={onFocus}
                   onSetStatus={onSetStatus}
                   onOpenTask={onOpenTask}
+                  onDragStart={(e) => {
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData(KANBAN_DT, t.id);
+                    e.dataTransfer.setData("text/plain", t.id);
+                    setDraggingFrom(t.status);
+                  }}
+                  onDragEnd={() => {
+                    setDragOver(null);
+                    setDraggingFrom(null);
+                  }}
                 />
               ))}
             </div>
@@ -941,9 +1067,13 @@ interface KanbanCardProps {
   onFocus: (id: string) => void;
   onSetStatus: (t: ShipmentTask, s: TaskStatus) => void;
   onOpenTask: (taskId: string) => void;
+  // Drag handlers fed in from KanbanBoard so the board can track which
+  // column the card was lifted from (for highlight-skip + drop logic).
+  onDragStart?: (e: React.DragEvent) => void;
+  onDragEnd?: (e: React.DragEvent) => void;
 }
 
-function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask }: KanbanCardProps) {
+function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask, onDragStart, onDragEnd }: KanbanCardProps) {
   // Action choices per column. Open → Start. In Progress → Done | Block.
   // Blocked → Reopen. Done → Reopen. Keeps the card terse — at most two
   // buttons.
@@ -964,12 +1094,35 @@ function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask }: KanbanC
     return [];
   })();
 
+  // Track whether the card itself is being dragged so we can dim it.
+  // Local state (vs hoisting to KanbanBoard) keeps the prop surface
+  // narrow and limits re-renders to the dragged card.
+  const [dragging, setDragging] = useState(false);
   return (
     <div
       onClick={() => onFocus(task.id)}
+      draggable
+      onDragStart={(e) => {
+        // Don't initiate the drag if the user grabbed an interactive
+        // child (button, link). HTML5 fires dragstart on the outer
+        // draggable element regardless, but cancelling here keeps the
+        // click semantics on those children intact.
+        const target = e.target as HTMLElement | null;
+        if (target && target.closest("button, a, input, textarea, select")) {
+          e.preventDefault();
+          return;
+        }
+        setDragging(true);
+        onDragStart?.(e);
+      }}
+      onDragEnd={(e) => {
+        setDragging(false);
+        onDragEnd?.(e);
+      }}
       className={
-        "bg-white rounded-lg ring-1 p-2.5 cursor-pointer transition " +
-        (focused ? "ring-2 ring-sky-400 shadow-sm" : "ring-slate-200 hover:ring-slate-300")
+        "bg-white rounded-lg ring-1 p-2.5 cursor-grab active:cursor-grabbing transition " +
+        (focused ? "ring-2 ring-sky-400 shadow-sm" : "ring-slate-200 hover:ring-slate-300") +
+        (dragging ? " opacity-50" : "")
       }
     >
       <div className="text-sm text-slate-900 font-medium leading-snug line-clamp-3">

@@ -28,7 +28,30 @@ tasksRouter.get("/", async (req, res) => {
   if (req.query.priority) q = q.eq("priority", String(req.query.priority));
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data: data || [] });
+
+  // Attach the FreightPOP-side shipment_id (string) per task so the
+  // Tasks page can search/filter by it without an extra round trip. The
+  // task row only carries shipment_id (UUID) + tracking_number; the
+  // human-facing FreightPOP id lives on the shipment. We do this as a
+  // batch lookup against the unique shipment uuids — typically 100s of
+  // tasks → 10s of distinct shipments, well under the 1k cap.
+  const tasks = data || [];
+  const shipmentUuids = Array.from(new Set(tasks.map((t) => t.shipment_id).filter(Boolean)));
+  let externalById = new Map();
+  if (shipmentUuids.length) {
+    const { data: ships, error: shipErr } = await supabase
+      .from("fpx_shipments")
+      .select("id, shipment_id")
+      .in("id", shipmentUuids);
+    if (!shipErr && ships) {
+      externalById = new Map(ships.map((s) => [s.id, s.shipment_id]));
+    }
+  }
+  const enriched = tasks.map((t) => ({
+    ...t,
+    shipment_external_id: externalById.get(t.shipment_id) || null,
+  }));
+  res.json({ data: enriched });
 });
 
 // GET /tasks/carrier-followups

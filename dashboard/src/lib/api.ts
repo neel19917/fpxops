@@ -324,7 +324,26 @@ export const api = {
       }),
     refresh: () => request<{ ok: boolean }>("/api/settings/refresh", { method: "POST" }),
   },
+  ops: {
+    metrics: (days = 30) =>
+      request<OpsMetrics>("/api/ops/metrics", { params: { days } }),
+  },
 };
+
+export interface OpsDailyRow {
+  date: string;
+  shipments_analyzed: number;
+  tasks_completed: number;
+  emails_generated: number;
+}
+export interface OpsMetrics {
+  range: { from: string; to: string; days: number };
+  totals: { shipments_analyzed: number; tasks_completed: number; emails_generated: number };
+  today: { date: string; shipments_analyzed: number; tasks_completed: number; emails_generated: number };
+  last7: { shipments_analyzed: number; tasks_completed: number; emails_generated: number };
+  daily: OpsDailyRow[];
+  byOperator: { operator: string; tasks_completed: number; emails_generated: number }[];
+}
 
 export interface SettingRow {
   key: string;

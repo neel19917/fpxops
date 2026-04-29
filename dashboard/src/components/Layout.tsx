@@ -1,17 +1,18 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "audit" | "settings";
+export type TabId = "tracking" | "tasks" | "ops" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "audit" | "settings";
 
 interface TabDef { id: TabId; label: string; Icon: typeof Package; adminOnly?: boolean }
 
 const ALL_TABS: TabDef[] = [
   { id: "tracking", label: "Tracking", Icon: Package },
   { id: "tasks",    label: "Tasks", Icon: ListChecks },
+  { id: "ops",      label: "Ops", Icon: Activity },
   { id: "analyses", label: "AI Analyses", Icon: Sparkles },
   { id: "gp",       label: "GP Audits", Icon: TrendingUp },
   { id: "invoice",  label: "Invoice Audits", Icon: ReceiptText },
