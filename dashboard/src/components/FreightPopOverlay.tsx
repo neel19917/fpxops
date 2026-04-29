@@ -1,7 +1,24 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Check, ExternalLink } from "lucide-react";
+import { Copy, Check, ExternalLink, Filter } from "lucide-react";
 import { useFrameState } from "../lib/freightpopFrame";
 import { useAuth } from "../lib/auth";
+
+// postMessage bridge to the FPXpress Chrome extension. The extension's
+// content script runs inside the FreightPOP iframe (its host permissions
+// cover app.freightpop.com regardless of frame depth) and listens for
+// these messages to drive the live Kendo grid's column filters.
+//
+// Protocol mirrors extension/content.js:
+//   { source: "fpxpress", type: "fpxFilter", column, value }
+// The extension responds with { source: "fpx-extension", type: "fpxFilterAck"|"fpxPong"|"fpxHello", ... }.
+type FpxFilterColumn = "Tracking Number" | "Shipment status" | "Mode" | "Carrier Name" | "Company Name";
+function postFpxFilter(iframe: HTMLIFrameElement | null, column: FpxFilterColumn, value: string) {
+  if (!iframe || !iframe.contentWindow) return;
+  // We don't know the iframe's origin until it answers fpxPong, but the
+  // payload is non-sensitive and the extension validates *our* origin
+  // before acting, so '*' is fine here.
+  iframe.contentWindow.postMessage({ source: "fpxpress", type: "fpxFilter", column, value }, "*");
+}
 
 // Permissions-policy bundle for the FreightPOP iframe. Each entry corresponds
 // to a feature browsers default-deny for cross-origin frames; allowing them
@@ -61,15 +78,57 @@ export function FreightPopOverlay() {
   const [copied, setCopied] = useState<"email" | "password" | null>(null);
   const [credsOpen, setCredsOpen] = useState(false);
   const [creds, setCreds] = useState<SavedCreds>(() => loadCreds());
+  // Tracks whether the FPXpress Chrome extension has greeted us from
+  // inside the iframe (window.parent.postMessage("fpxHello")). When true,
+  // the "Filter to this shipment" button can drive the Kendo grid; when
+  // false, we tell the user to install/enable the extension.
+  const [bridgeReady, setBridgeReady] = useState(false);
+  // Last column we asked the extension to filter on — used to flip the
+  // button's icon between "apply" and "filtered".
+  const [lastFilter, setLastFilter] = useState<{ column: string; value: string } | null>(null);
 
   // Persist creds whenever the user edits them in the popover.
   useEffect(() => { saveCreds(creds); }, [creds]);
+
+  // Listen for messages from the extension's content script inside the
+  // iframe. We only act on the magic source tag and ignore everything else
+  // (FreightPOP's own postMessages, third-party widgets, etc.).
+  useEffect(() => {
+    function onMessage(e: MessageEvent) {
+      const d = e.data;
+      if (!d || typeof d !== "object") return;
+      if (d.source !== "fpx-extension") return;
+      if (d.type === "fpxHello" || d.type === "fpxPong") {
+        setBridgeReady(true);
+      } else if (d.type === "fpxFilterAck") {
+        if (d.ok) setLastFilter({ column: String(d.column || ""), value: String(d.value || "") });
+      }
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  // Periodically ping in case the iframe loaded before our listener was
+  // attached (race on first render). Stops once the bridge answers.
+  useEffect(() => {
+    if (bridgeReady) return;
+    const id = setInterval(() => {
+      iframeRef.current?.contentWindow?.postMessage({ source: "fpxpress", type: "fpxPing" }, "*");
+    }, 1500);
+    return () => clearInterval(id);
+  }, [bridgeReady]);
 
   // If the embed is disabled OR the iframe has never been asked to load,
   // render nothing. Once it's loaded once we keep it in the DOM (just
   // hide it via display:none) so the FreightPOP session survives.
   if (!cfg?.enabled) return null;
   if (!frame.url) return null;
+
+  function applyFilterNow() {
+    if (!frame.trackingNumber) return;
+    postFpxFilter(iframeRef.current, "Tracking Number", frame.trackingNumber);
+  }
+  const isFilteredToCurrent = !!(lastFilter && frame.trackingNumber && lastFilter.column === "Tracking Number" && lastFilter.value === frame.trackingNumber);
 
   async function copyOne(kind: "email" | "password") {
     const v = kind === "email" ? creds.email : creds.password;
@@ -109,6 +168,25 @@ export function FreightPopOverlay() {
           ) : null}
         </div>
         <div className="ml-auto flex items-center gap-2">
+          {frame.trackingNumber ? (
+            <button
+              onClick={applyFilterNow}
+              disabled={!bridgeReady}
+              className={"text-xs px-2 py-1 rounded ring-1 inline-flex items-center gap-1 " + (isFilteredToCurrent
+                ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                : bridgeReady
+                  ? "bg-violet-600 text-white ring-violet-600 hover:bg-violet-700"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed")}
+              title={bridgeReady
+                ? (isFilteredToCurrent
+                    ? `Filtered to ${frame.trackingNumber}`
+                    : `Apply Kendo filter: Tracking Number = ${frame.trackingNumber}`)
+                : "Install/enable the FPXpress Chrome extension to filter the embedded grid"}
+            >
+              <Filter className="h-3.5 w-3.5" />
+              {isFilteredToCurrent ? "Filtered" : "Filter to #"}
+            </button>
+          ) : null}
           <button
             onClick={() => setCredsOpen((v) => !v)}
             className="text-xs px-2 py-1 rounded ring-1 ring-slate-200 text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1"

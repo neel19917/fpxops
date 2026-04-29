@@ -90,9 +90,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  // Boot path is the cause of the long-standing "click refresh twice" bug.
+  // sb.auth.getSession() returns whatever's cached in localStorage, which is
+  // sometimes a session whose access_token has already expired but whose
+  // refresh_token is still good. The first profile lookup (and every API
+  // call after) goes out with the stale token and 401s. The user reloads;
+  // by then the SDK's autoRefresh has rotated → second load works.
+  //
+  // Fix: if the cached token is within 60s of expiry (or already past),
+  // call refreshSession() before doing anything that depends on it.
+  // Keeps the boot path single-loop without a 401 detour.
+  async function bootSession(): Promise<{ session: Session | null }> {
+    const REFRESH_SKEW_S = 60;
+    const { data } = await sb.auth.getSession();
+    const sess = data.session;
+    if (!sess) return { session: null };
+    const exp = sess.expires_at;
+    const stale = exp ? Date.now() / 1000 > exp - REFRESH_SKEW_S : false;
+    if (!stale || !sess.refresh_token) return { session: sess };
+    try {
+      const { data: refreshed, error } = await sb.auth.refreshSession();
+      if (!error && refreshed.session) return { session: refreshed.session };
+    } catch { /* fall through with the stale session */ }
+    return { session: sess };
+  }
+
   useEffect(() => {
     let mounted = true;
-    sb.auth.getSession().then(async ({ data }) => {
+    bootSession().then(async (data) => {
       if (!mounted) return;
       setSession(data.session);
       try { await loadProfile(data.session); } catch (e) { setError((e as Error).message); }

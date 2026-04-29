@@ -2966,3 +2966,78 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
   }
 });
+
+// =====================================================================
+// FreightPOP iframe ↔ FPXpress dashboard bridge
+//
+// When the FreightPOP page is loaded inside the FPXpress dashboard's
+// iframe (the "FreightPOP" embed), the dashboard can't reach across
+// origins to filter the Kendo grid for the focused shipment. This
+// extension's content script DOES run inside that iframe (its host
+// permissions match app.freightpop.com regardless of frame depth),
+// so it can act as a postMessage bridge.
+//
+// Protocol (window.postMessage from the dashboard parent):
+//   { source: "fpxpress", type: "fpxFilter",
+//     column: "Tracking Number" | "Shipment status" | …,
+//     value:  "<filter value>" }
+//
+// We accept messages only when (a) the message has the magic source
+// tag (so we don't react to FreightPOP's own postMessages) and
+// (b) the parent's origin matches the FPXpress dashboard hosts we
+// trust. Anyone embedding FreightPOP as a third-party can't drive
+// the filter.
+// =====================================================================
+const FPX_TRUSTED_PARENT_ORIGINS = [
+  "https://fpxpress.netlify.app",
+  "https://fpx.netlify.app",
+  "http://localhost:5173",
+  "http://localhost:4173",
+];
+
+function fpxIsTrustedParentOrigin(origin) {
+  if (!origin || typeof origin !== "string") return false;
+  if (FPX_TRUSTED_PARENT_ORIGINS.includes(origin)) return true;
+  // Allow Netlify deploy-preview / branch subdomains under the same site.
+  if (/^https:\/\/(?:[a-z0-9-]+--)?fpxpress\.netlify\.app$/.test(origin)) return true;
+  if (/^https:\/\/deploy-preview-\d+--fpxpress\.netlify\.app$/.test(origin)) return true;
+  return false;
+}
+
+window.addEventListener("message", async (event) => {
+  const data = event.data;
+  if (!data || typeof data !== "object") return;
+  if (data.source !== "fpxpress") return;
+  if (!fpxIsTrustedParentOrigin(event.origin)) {
+    console.warn("[FPX] Ignored bridge message from untrusted origin:", event.origin);
+    return;
+  }
+  if (data.type === "fpxFilter") {
+    const col = String(data.column || "").trim();
+    const val = String(data.value || "").trim();
+    if (!col || !val) return;
+    sendStatus(`Bridge: filtering ${col} → "${val}"`);
+    try {
+      await applyFilter(col, val);
+      // Acknowledge so the dashboard can flip a "filtered" indicator.
+      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true }, event.origin); } catch {}
+    } catch (e) {
+      console.warn("[FPX] Bridge filter failed:", e);
+      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: false, error: String(e?.message || e) }, event.origin); } catch {}
+    }
+  } else if (data.type === "fpxPing") {
+    // Lets the dashboard detect whether the extension is installed +
+    // running inside this iframe. No filter side effects.
+    try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxPong" }, event.origin); } catch {}
+  }
+});
+
+// Announce presence to the parent on every load so the dashboard's overlay
+// can show an "extension connected" indicator without polling. Parent's
+// origin is unknown until it greets us; the targetOrigin '*' is fine here
+// because the payload is just a presence ping with no privileged data.
+try {
+  if (window.parent !== window) {
+    window.parent.postMessage({ source: "fpx-extension", type: "fpxHello" }, "*");
+  }
+} catch {}
