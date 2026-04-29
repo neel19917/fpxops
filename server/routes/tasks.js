@@ -255,7 +255,13 @@ tasksRouter.post("/customer-email-draft", async (req, res) => {
 // This is the single "database route lookup" the drawer relies on so URL
 // state alone (/tasks/:id) is enough to render — no fragile passing of
 // in-memory task lists across page transitions.
-tasksRouter.get("/:id", async (req, res) => {
+//
+// The :id pattern is constrained to a UUID-shaped regex so this route
+// can never accidentally swallow a sibling like /customer-followups or
+// /carrier-followups in the future. Without the regex, registration
+// order is the only thing keeping those routes safe — easy to break
+// during a refactor. (Express 4 supports inline regex via `:param(re)`.)
+tasksRouter.get("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", async (req, res) => {
   const { data: task, error } = await supabase
     .from("fpx_shipment_tasks").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
@@ -371,7 +377,8 @@ tasksRouter.post("/bulk-delete", async (req, res) => {
 });
 
 // PATCH /tasks/:id  { status?, priority?, assigned_to?, title?, description?, due_at? }
-tasksRouter.patch("/:id", async (req, res) => {
+// Same UUID constraint as GET /:id — see the rationale above.
+tasksRouter.patch("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", async (req, res) => {
   const allowed = ["status", "priority", "assigned_to", "title", "description", "due_at"];
   const patch = {};
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
@@ -390,8 +397,8 @@ tasksRouter.patch("/:id", async (req, res) => {
   res.json({ task: data });
 });
 
-// DELETE /tasks/:id
-tasksRouter.delete("/:id", async (req, res) => {
+// DELETE /tasks/:id  — UUID-constrained for the same reason as GET /:id.
+tasksRouter.delete("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", async (req, res) => {
   const { data: before } = await supabase
     .from("fpx_shipment_tasks").select("id, title, shipment_id").eq("id", req.params.id).maybeSingle();
   const { error } = await supabase.from("fpx_shipment_tasks").delete().eq("id", req.params.id);

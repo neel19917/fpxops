@@ -303,11 +303,24 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     finally { setNotesBusy(false); }
   }
 
-  async function addDrawerTask() {
-    if (!drawerId || !newTaskTitle.trim()) return;
+  async function addDrawerTask(opts: { prefix?: "carrier" | "customer" } = {}) {
+    if (!drawerId) return;
+    const typed = newTaskTitle.trim();
+    // For followup quick-buttons, allow an empty input — fall back to a
+    // sensible default suffix so the followup matcher still detects the
+    // task and the operator can refine the title later if they want.
+    if (!opts.prefix && !typed) return;
+    let finalTitle: string;
+    if (opts.prefix === "carrier") {
+      finalTitle = `Carrier followup: ${typed || "follow-up needed"}`;
+    } else if (opts.prefix === "customer") {
+      finalTitle = `Customer followup: ${typed || "status update needed"}`;
+    } else {
+      finalTitle = typed;
+    }
     setNewTaskBusy(true);
     try {
-      const r = await api.tasks.create(drawerId, { title: newTaskTitle.trim() });
+      const r = await api.tasks.create(drawerId, { title: finalTitle });
       setDrawerTasks((p) => [r.task, ...p]);
       setNewTaskTitle("");
     } catch (e) { setErr((e as Error).message); }
@@ -1158,7 +1171,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
             {drawerTab === "tasks" && (
               <Section title={`Tasks (${drawerTasks.length})`}>
-                <div className="flex gap-2 mb-4">
+                <div className="flex gap-2 mb-2">
                   <input
                     value={newTaskTitle}
                     onChange={(e) => setNewTaskTitle(e.target.value)}
@@ -1167,12 +1180,37 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                     className="flex-1 px-3 py-2 rounded-lg border border-slate-300 text-sm"
                   />
                   <button
-                    onClick={addDrawerTask}
+                    onClick={() => addDrawerTask()}
                     disabled={!newTaskTitle.trim() || newTaskBusy}
                     className="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1"
                   >
                     <Plus className="h-4 w-4" /> Add
                   </button>
+                </div>
+                {/* Quick-add buttons for followup-tagged tasks. Title input
+                    above is optional — leaving it blank uses a sensible
+                    default suffix so the followup matcher (carrier or
+                    customer) still picks the task up on the Tasks page. */}
+                <div className="flex gap-2 mb-4 flex-wrap">
+                  <button
+                    onClick={() => addDrawerTask({ prefix: "carrier" })}
+                    disabled={newTaskBusy}
+                    className="px-3 py-1.5 rounded-lg bg-violet-600 text-white text-xs font-semibold hover:bg-violet-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+                    title="Create a task tagged Carrier followup: <suffix>. Surfaces in the Carrier Followups panel on /tasks."
+                  >
+                    <Plus className="h-3.5 w-3.5" /> Add carrier followup
+                  </button>
+                  <button
+                    onClick={() => addDrawerTask({ prefix: "customer" })}
+                    disabled={newTaskBusy}
+                    className="px-3 py-1.5 rounded-lg bg-sky-600 text-white text-xs font-semibold hover:bg-sky-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+                    title="Create a task tagged Customer followup: <suffix>. Surfaces in the Customer Followups panel on /tasks."
+                  >
+                    <Plus className="h-3.5 w-3.5" /> Add customer followup
+                  </button>
+                  <span className="text-[11px] text-slate-500 self-center leading-snug">
+                    Type the suffix above, then click. Empty = sensible default.
+                  </span>
                 </div>
                 {drawerTasks.length === 0 ? (
                   <div className="text-sm text-slate-500 text-center py-6">No tasks yet. Auto-assigned to <b>{drawerData.shipment.created_by || "—"}</b> when created here.</div>
