@@ -38,10 +38,80 @@ function buildPerShipmentUserMessage(template, logic, dataJson) {
 export async function analyzeExistingShipment(row, { reqContext } = {}) {
   if (!row?.id) return null;
   const settings = await getSettings("prompt.system", "prompt.per_shipment", "prompt.per_shipment_logic");
+
+  // Build prior-context: previous analysis + recent change log so the
+  // model can reason about what's new vs already-handled. Two parallel
+  // queries — one against fpx_ai_analyses for the most recent
+  // per_shipment row, one against fpx_shipment_scrapes for the most
+  // recent material-diff. Both are best-effort; if either returns no
+  // rows the analysis just runs without that context.
+  const [priorAnalysis, recentScrape] = await Promise.all([
+    supabase
+      .from("fpx_ai_analyses")
+      .select("created_at, model, action_required, issue, recommendation, response_text, rating, rating_reason")
+      .eq("shipment_uuid", row.id)
+      .eq("kind", "per_shipment")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then((r) => r.data || null)
+      .catch(() => null),
+    supabase
+      .from("fpx_shipment_scrapes")
+      .select("scraped_at, diff")
+      .eq("shipment_id", row.id)
+      .not("diff", "is", null)
+      .order("scraped_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then((r) => r.data || null)
+      .catch(() => null),
+  ]);
+  const slim = slimShipment(row.raw_data || row);
+  // The prompt template only knows about a flat data object, so we
+  // tuck the prior context into reserved keys. The model picks them
+  // up out of the JSON and the editable prompt logic already says to
+  // weigh "what changed since last analysis" — a small prompt update
+  // in Settings can lean into these keys harder.
+  if (priorAnalysis) {
+    slim.prior_ai_analysis = JSON.stringify({
+      when: priorAnalysis.created_at,
+      model: priorAnalysis.model,
+      action_required: priorAnalysis.action_required,
+      issue: priorAnalysis.issue,
+      recommendation: priorAnalysis.recommendation,
+      // Operator's quality rating on that analysis. 👎 means the
+      // last verdict missed the mark; the model should treat that
+      // recommendation skeptically and consider revising.
+      rating: priorAnalysis.rating || null,
+      rating_reason: priorAnalysis.rating_reason || null,
+      // Truncated raw response so the model can see the prior
+      // reasoning, not just the parsed fields. Capped at 1500 chars
+      // so we don't bloat the prompt window.
+      prior_response_text: typeof priorAnalysis.response_text === "string"
+        ? priorAnalysis.response_text.slice(0, 1500)
+        : null,
+    });
+  }
+  if (recentScrape && recentScrape.diff && typeof recentScrape.diff === "object") {
+    // Compact "field: prev → next" lines so the model has a quick
+    // change-log to reason against without re-deriving from raw_data.
+    const lines = Object.entries(recentScrape.diff).slice(0, 25).map(([field, change]) => {
+      if (change && typeof change === "object" && "prev" in change && "next" in change) {
+        return `${field}: ${JSON.stringify(change.prev)} → ${JSON.stringify(change.next)}`;
+      }
+      return `${field}: ${JSON.stringify(change)}`;
+    });
+    slim.recent_changes = JSON.stringify({
+      since: recentScrape.scraped_at,
+      changes: lines,
+    });
+  }
+
   const userMsg = buildPerShipmentUserMessage(
     settings["prompt.per_shipment"],
     settings["prompt.per_shipment_logic"],
-    JSON.stringify(slimShipment(row.raw_data || row)),
+    JSON.stringify(slim),
   );
   const result = await callClaude({
     systemPrompt: settings["prompt.system"],
