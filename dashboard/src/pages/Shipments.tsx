@@ -9,7 +9,7 @@ import { ShareButton } from "../components/ShareButton";
 import { ColumnSelector } from "../components/ColumnSelector";
 import { UserPicker } from "../components/UserPicker";
 import { useAuth } from "../lib/auth";
-import { showFrame, hideFrame } from "../lib/freightpopFrame";
+import { showFrame, hideFrame, requestAutoFilter } from "../lib/freightpopFrame";
 import {
   SHIPMENT_COLUMNS,
   loadColumnPrefs,
@@ -865,17 +865,34 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 </button>
               </div>
               <div className="flex items-center gap-2">
+                {embedCfg?.enabled && drawerData?.shipment.tracking_number ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // If split-view is off, turn it on so the iframe is
+                      // actually visible to receive the filter; the
+                      // overlay will fire the postMessage as soon as it's
+                      // mounted and the bridge is ready.
+                      if (!splitView) setSplitView(true);
+                      requestAutoFilter();
+                    }}
+                    className="text-xs px-2.5 py-1.5 rounded-md ring-1 ring-violet-600 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1.5"
+                    title={`Load shipment ${drawerData.shipment.tracking_number} in FreightPOP and filter the grid`}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" /> Load in FreightPOP
+                  </button>
+                ) : null}
                 {embedCfg?.enabled ? (
                   <button
                     type="button"
                     onClick={() => setSplitView((v) => !v)}
                     className={"text-xs px-2.5 py-1.5 rounded-md ring-1 inline-flex items-center gap-1.5 " + (splitView
-                      ? "bg-violet-600 text-white ring-violet-600 hover:bg-violet-700"
+                      ? "bg-white text-violet-700 ring-violet-200 hover:bg-violet-50"
                       : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50")}
                     title={splitView ? "Hide FreightPOP side panel" : "Show FreightPOP side panel"}
                     aria-pressed={splitView}
                   >
-                    <ExternalLink className="h-3.5 w-3.5" /> {splitView ? "FreightPOP on" : "FreightPOP"}
+                    {splitView ? "Panel: on" : "Panel: off"}
                   </button>
                 ) : null}
                 <button
@@ -1511,6 +1528,16 @@ function TaskBanner({ task, busy, onSetStatus }: {
           <span>created {new Date(task.created_at).toLocaleDateString()}</span>
         </div>
         <div className="inline-flex items-center gap-1.5 flex-wrap">
+          {task.tracking_number ? (
+            <button
+              type="button"
+              onClick={() => requestAutoFilter()}
+              className="text-xs font-semibold rounded-md px-2.5 py-1 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1"
+              title={`Filter the embedded FreightPOP grid to ${task.tracking_number}`}
+            >
+              Load in FreightPOP
+            </button>
+          ) : null}
           {actions.map((a) => (
             <button
               key={a.label}
