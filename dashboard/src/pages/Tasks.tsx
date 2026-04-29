@@ -1240,6 +1240,29 @@ interface FollowupItem { task: ShipmentTask; shipment: CarrierFollowupShipment; 
 // on `kind` for `g.carrier` vs `g.customer` — both come in as `name`.
 interface FollowupGroup { name: string; items: FollowupItem[] }
 
+// Module-level TTL cache for the followups fetch so toggling sub-tabs
+// (carrier ↔ customer) within a 30-second window doesn't re-hit the
+// API. Each kind has its own slot. Refresh button + creating a new
+// followup task both bust the cache for the relevant kind.
+const FOLLOWUPS_TTL_MS = 30_000;
+const followupsCache: Record<FollowupKind, { ts: number; data: { groups: FollowupGroup[]; total: number } } | null> = {
+  carrier: null,
+  customer: null,
+};
+function readFollowupsCache(kind: FollowupKind): { groups: FollowupGroup[]; total: number } | null {
+  const slot = followupsCache[kind];
+  if (!slot) return null;
+  if (Date.now() - slot.ts > FOLLOWUPS_TTL_MS) return null;
+  return slot.data;
+}
+function writeFollowupsCache(kind: FollowupKind, data: { groups: FollowupGroup[]; total: number }) {
+  followupsCache[kind] = { ts: Date.now(), data };
+}
+function bustFollowupsCache(kind?: FollowupKind) {
+  if (kind) followupsCache[kind] = null;
+  else { followupsCache.carrier = null; followupsCache.customer = null; }
+}
+
 const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
   title: string;          // "Carrier Followups"
   groupNoun: string;      // "carrier" / "customer"
@@ -1262,8 +1285,12 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
     groupNoun: "carrier",
     emptyExample: "Carrier followup: missing POD",
     fetch: async () => {
+      const cached = readFollowupsCache("carrier");
+      if (cached) return cached;
       const r = await api.tasks.carrierFollowups();
-      return { total: r.total, groups: r.groups.map((g) => ({ name: g.carrier, items: g.items })) };
+      const out = { total: r.total, groups: r.groups.map((g) => ({ name: g.carrier, items: g.items })) };
+      writeFollowupsCache("carrier", out);
+      return out;
     },
     emailDraft: ({ name, task_ids, notes }) =>
       api.tasks.carrierEmailDraft({ carrier: name, task_ids, notes }),
@@ -1280,8 +1307,12 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
     groupNoun: "customer",
     emptyExample: "Customer followup: needs ETA",
     fetch: async () => {
+      const cached = readFollowupsCache("customer");
+      if (cached) return cached;
       const r = await api.tasks.customerFollowups();
-      return { total: r.total, groups: r.groups.map((g) => ({ name: g.customer, items: g.items })) };
+      const out = { total: r.total, groups: r.groups.map((g) => ({ name: g.customer, items: g.items })) };
+      writeFollowupsCache("customer", out);
+      return out;
     },
     emailDraft: ({ name, task_ids, notes }) =>
       api.tasks.customerEmailDraft({ customer: name, task_ids, notes }),
@@ -1306,7 +1337,8 @@ function FollowupsPanel({ kind, onTaskClick }: {
   const [emailFor, setEmailFor] = useState<FollowupGroup | null>(null);
   const [addOpen, setAddOpen] = useState(false);
 
-  async function load() {
+  async function load(force = false) {
+    if (force) bustFollowupsCache(kind);
     setLoading(true); setErr(null);
     try {
       const r = await cfg.fetch();
@@ -1352,7 +1384,7 @@ function FollowupsPanel({ kind, onTaskClick }: {
           </button>
         </div>
         {addOpen ? (
-          <AddFollowupTaskModal kind={kind} onClose={() => setAddOpen(false)} onCreated={() => { setAddOpen(false); load(); }} />
+          <AddFollowupTaskModal kind={kind} onClose={() => setAddOpen(false)} onCreated={() => { setAddOpen(false); load(true); }} />
         ) : null}
       </>
     );
@@ -1377,9 +1409,9 @@ function FollowupsPanel({ kind, onTaskClick }: {
             <Plus className="h-3 w-3" /> Add
           </button>
           <button
-            onClick={load}
+            onClick={() => load(true)}
             className={`text-[11px] ${cfg.iconTone} hover:opacity-80 inline-flex items-center gap-1`}
-            title={`Refresh ${cfg.groupNoun} followups`}
+            title={`Refresh ${cfg.groupNoun} followups (busts the 30s client cache)`}
           >
             <RefreshCw className="h-3 w-3" /> Refresh
           </button>
