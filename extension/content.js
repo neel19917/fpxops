@@ -247,20 +247,54 @@ async function applyFilter(colName, value) {
     return;
   }
 
+  // Find the header column. Strategies in order:
+  //   1. data-field exact match (e.g. "TrackingNumber") — survives renames
+  //   2. header text starts-with (legacy behavior)
+  //   3. case-insensitive header substring (catches "Tracking #" / "Tracking No")
   const headerCells = document.querySelectorAll(".k-grid th");
+  const fieldGuess = colName.replace(/\s+/g, ""); // "Tracking Number" → "TrackingNumber"
   let targetHeader = null;
+
+  // 1. data-field
   for (const cell of headerCells) {
-    const link = cell.querySelector("a.k-link");
-    const text = link ? link.textContent.trim() : cell.textContent.trim();
-    if (text.startsWith(colName)) {
-      targetHeader = cell;
-      break;
+    const f = cell.getAttribute("data-field") || cell.getAttribute("data-title");
+    if (!f) continue;
+    if (f.toLowerCase() === fieldGuess.toLowerCase() || f.toLowerCase() === colName.toLowerCase()) {
+      targetHeader = cell; break;
+    }
+  }
+  // 2. starts-with
+  if (!targetHeader) {
+    for (const cell of headerCells) {
+      const link = cell.querySelector("a.k-link");
+      const text = (link ? link.textContent : cell.textContent || "").trim();
+      if (text.startsWith(colName)) { targetHeader = cell; break; }
+    }
+  }
+  // 3. fuzzy contains
+  if (!targetHeader) {
+    const wantLower = colName.toLowerCase();
+    for (const cell of headerCells) {
+      const link = cell.querySelector("a.k-link");
+      const text = (link ? link.textContent : cell.textContent || "").trim().toLowerCase();
+      // Match "Tracking" against "Tracking Number" etc., but skip
+      // false-positive "Tracking Comments" when looking for "Tracking Number".
+      if (text === wantLower) { targetHeader = cell; break; }
+      if (text.includes(wantLower) && !text.includes("comment")) { targetHeader = cell; break; }
     }
   }
 
   if (!targetHeader) {
-    sendStatus(`"${colName}" column header not found — skipping filter.`);
-    return;
+    // Surface the header list once so the bridge ack carries something
+    // actionable — far more useful than "not found".
+    const seen = Array.from(headerCells).map((c) => {
+      const f = c.getAttribute("data-field") || "";
+      const t = (c.querySelector("a.k-link")?.textContent || c.textContent || "").trim();
+      return f ? `${t} (${f})` : t;
+    }).filter(Boolean);
+    const msg = `"${colName}" column not found in this view. Visible headers: ${seen.join(", ") || "(none)"}.`;
+    sendStatus(msg);
+    throw new Error(msg);
   }
 
   const filterIcon =
@@ -3004,6 +3038,45 @@ function fpxIsTrustedParentOrigin(origin) {
   return false;
 }
 
+// Drive the Kendo grid's underlying dataSource directly. This is by far
+// the most reliable filter path — bypasses popup timing, dropdown state,
+// and visible-column requirements. Returns true on success.
+//
+// Strategy: discover Kendo widget instances via window.$ (jQuery) +
+// .data('kendoGrid'). Iterate over candidate fields in case the grid
+// uses TrackingNumber / trackingNumber / Tracking_Number etc.
+function fpxFilterViaKendoApi(value, fieldCandidates) {
+  try {
+    const $ = window.jQuery || window.$;
+    if (!$ || typeof $.fn?.data !== "function") return false;
+    const grids = $(".k-grid").toArray();
+    if (!grids.length) return false;
+    const fields = fieldCandidates && fieldCandidates.length
+      ? fieldCandidates
+      : ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"];
+    for (const el of grids) {
+      const grid = $(el).data("kendoGrid");
+      if (!grid?.dataSource) continue;
+      // Pick a field that exists in the grid's column model when we can,
+      // otherwise just try them all.
+      const cols = (grid.columns || []).map((c) => c.field).filter(Boolean);
+      const tryFields = cols.length
+        ? fields.filter((f) => cols.some((c) => c.toLowerCase() === f.toLowerCase())).concat(fields)
+        : fields;
+      for (const field of tryFields) {
+        try {
+          grid.dataSource.filter({ field, operator: "eq", value });
+          console.log(`[FPX] Bridge: Kendo dataSource.filter applied — ${field}=${value}`);
+          return true;
+        } catch (e) { console.warn("[FPX] Kendo filter try failed for", field, e); }
+      }
+    }
+  } catch (e) {
+    console.warn("[FPX] Kendo API filter unavailable:", e);
+  }
+  return false;
+}
+
 // Native value setter — required when programmatically filling React /
 // Kendo inputs so their internal state listeners actually run. A plain
 // `input.value = "..."` mutates the DOM but the framework misses it.
@@ -3072,25 +3145,46 @@ window.addEventListener("message", async (event) => {
     if (!col || !val) return;
     sendStatus(`Bridge: filtering ${col} → "${val}"`);
     let applied = false;
+    let strategy = "";
     let lastErr = null;
-    // Strategy 1: top-level Tracking Number search input (Dashboard view).
-    if (col.toLowerCase().includes("tracking")) {
+    // Strategy 1: Kendo dataSource API (most reliable; bypasses UI).
+    // Tries common field-name variants so it works regardless of which
+    // FreightPOP grid is on screen.
+    try {
+      if (fpxFilterViaKendoApi(val, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"])) {
+        applied = true; strategy = "kendo-api";
+      }
+    } catch (e) { lastErr = e; }
+    // Strategy 2: top-level Tracking Number search input (Dashboard view
+    // doesn't always have a Tracking Number column at all — but it has
+    // a free-form Tracking Number search box at the top of the page).
+    if (!applied && col.toLowerCase().includes("tracking")) {
       try {
         applied = await fpxFillTopSearch(val);
-        if (applied) console.log("[FPX] Bridge: filled top-level Tracking search");
+        if (applied) strategy = "top-search";
       } catch (e) { lastErr = e; }
     }
-    // Strategy 2: Kendo column-header filter (Transactions view + others).
+    // Strategy 3: Kendo column-header UI filter (Transactions view).
+    // Tries the requested column first, then falls back to common
+    // synonyms ("Tracking Number" ↔ "Tracking #" ↔ "Tracking No").
     if (!applied) {
-      try {
-        await applyFilter(col, val);
-        applied = true;
-      } catch (e) { lastErr = e; }
+      const candidates = [col];
+      if (col.toLowerCase().includes("tracking")) {
+        candidates.push("Tracking Number", "Tracking #", "Tracking No", "Tracking");
+      }
+      for (const c of candidates) {
+        try {
+          await applyFilter(c, val);
+          applied = true; strategy = `kendo-ui:${c}`;
+          break;
+        } catch (e) { lastErr = e; }
+      }
     }
     if (applied) {
-      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true }, event.origin); } catch {}
+      console.log(`[FPX] Bridge filter ok via ${strategy}: ${col}="${val}"`);
+      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true, strategy }, event.origin); } catch {}
     } else {
-      console.warn("[FPX] Bridge filter failed:", lastErr);
+      console.warn("[FPX] Bridge filter failed (all strategies):", lastErr);
       try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: false, error: String(lastErr?.message || lastErr || "no matching input") }, event.origin); } catch {}
     }
   } else if (data.type === "fpxPing") {
