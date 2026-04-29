@@ -193,6 +193,14 @@ export const api = {
   analyses: {
     list: (params?: { limit?: number; kind?: string; tracking_number?: string }) =>
       request<{ data: AiAnalysis[] }>("/api/analyses", { params }),
+    // Reps rate AI generations 👍 / 👎 so the team can iterate on
+    // prompts. Passing rating=null clears a prior rating (mistaken
+    // click). Reason is optional but encouraged on 👎.
+    rate: (id: string, body: { rating: "up" | "down" | null; reason?: string }) =>
+      request<{ analysis: { id: string; rating: "up" | "down" | null; rating_reason: string | null; rated_by: string | null; rated_at: string | null } }>(
+        `/api/analyses/${id}/rating`,
+        { method: "POST", body: JSON.stringify(body) },
+      ),
   },
   audits: {
     gp: {
@@ -367,6 +375,10 @@ export interface GroupEmailDraft {
   cost_usd: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
+  rating?: "up" | "down" | null;
+  rating_reason?: string | null;
+  rated_by?: string | null;
+  rated_at?: string | null;
 }
 
 export interface OpsDailyRow {

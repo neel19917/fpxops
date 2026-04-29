@@ -174,7 +174,7 @@ async function listGroupDrafts({ subkind, groupKey, groupValue, limit }) {
   // the request to stay fast.
   const { data, error } = await supabase
     .from("fpx_ai_analyses")
-    .select("id, created_at, model, response_text, input_tokens, output_tokens, cost_usd, metadata")
+    .select("id, created_at, model, response_text, input_tokens, output_tokens, cost_usd, metadata, rating, rating_reason, rated_by, rated_at")
     .eq("metadata->>subkind", subkind)
     .eq(`metadata->>${groupKey}`, groupValue)
     .order("created_at", { ascending: false })
@@ -205,6 +205,10 @@ async function listGroupDrafts({ subkind, groupKey, groupValue, limit }) {
       cost_usd: a.cost_usd,
       input_tokens: a.input_tokens,
       output_tokens: a.output_tokens,
+      rating: a.rating || null,
+      rating_reason: a.rating_reason || null,
+      rated_by: a.rated_by || null,
+      rated_at: a.rated_at || null,
     };
   });
   return drafts;

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus, ThumbsUp, ThumbsDown } from "lucide-react";
 import { api, type GroupEmailDraft } from "../lib/api";
 import type { CarrierFollowupShipment, Shipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { fmtRelative } from "../lib/format";
@@ -1654,6 +1654,30 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
     } catch { /* clipboard blocked */ }
   }
 
+  // Toggle rating on the selected draft. Clicking the same thumb that's
+  // already active clears the rating (mistaken click). Updates the
+  // local list optimistically; on error, refetches from the server.
+  const [rateBusy, setRateBusy] = useState(false);
+  async function rateDraft(rating: "up" | "down") {
+    if (!selected || rateBusy) return;
+    const next = selected.rating === rating ? null : rating;
+    setRateBusy(true);
+    // Optimistic local update so the click feels instant.
+    setDrafts((prev) => prev.map((d) => d.id === selected.id ? { ...d, rating: next, rated_by: d.rated_by, rated_at: next ? new Date().toISOString() : null } : d));
+    try {
+      await api.analyses.rate(selected.id, { rating: next });
+    } catch (e) {
+      setErr((e as Error).message);
+      // Roll back by refetching the canonical list.
+      try {
+        const list = await cfg.emailDraftsList(group.name);
+        setDrafts(list.drafts || []);
+      } catch { /* leave optimistic state in place */ }
+    } finally {
+      setRateBusy(false);
+    }
+  }
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
     window.addEventListener("keydown", onKey);
@@ -1720,6 +1744,11 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
                           <span>{fmtRelative(d.created_at)}</span>
                           {d.model ? <span className="font-mono">{d.model}</span> : null}
                           {d.count ? <span>· {d.count} ship.</span> : null}
+                          {d.rating === "up" ? (
+                            <ThumbsUp className="h-3 w-3 text-emerald-600" aria-label="Rated good" />
+                          ) : d.rating === "down" ? (
+                            <ThumbsDown className="h-3 w-3 text-rose-600" aria-label="Rated needs work" />
+                          ) : null}
                         </div>
                       </button>
                     </li>
@@ -1817,6 +1846,51 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
                   <span>Generated {fmtRelative(selected.created_at)}</span>
                   {selected.model ? <span>· <span className="font-mono">{selected.model}</span></span> : null}
                   {selected.cost_usd ? <span>· cost ${Number(selected.cost_usd).toFixed(4)}</span> : null}
+                </div>
+                {/* Prompt-quality rating. Reps mark drafts 👍 / 👎 so
+                    the team can iterate. Clicking the active thumb
+                    clears the rating. Both icon + label so the
+                    affordance is unambiguous. */}
+                <div className="flex items-center justify-between gap-3 flex-wrap rounded-lg ring-1 ring-slate-200 bg-slate-50 px-3 py-2">
+                  <div className="text-[11px] text-slate-500 leading-snug">
+                    <span className="font-semibold text-slate-700">Was this draft useful?</span>
+                    <span> Your feedback helps us tune the prompts.</span>
+                    {selected.rated_by ? (
+                      <span className="block text-slate-400 mt-0.5">
+                        Last rated by {selected.rated_by} {selected.rated_at ? fmtRelative(selected.rated_at) : ""}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => rateDraft("up")}
+                      disabled={rateBusy}
+                      className={
+                        "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
+                        (selected.rating === "up"
+                          ? "bg-emerald-600 text-white ring-emerald-700"
+                          : "bg-white text-slate-700 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
+                      }
+                      aria-pressed={selected.rating === "up"}
+                      title={selected.rating === "up" ? "Click again to clear" : "Mark this draft as useful"}
+                    >
+                      <ThumbsUp className="h-3.5 w-3.5" /> Good
+                    </button>
+                    <button
+                      onClick={() => rateDraft("down")}
+                      disabled={rateBusy}
+                      className={
+                        "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
+                        (selected.rating === "down"
+                          ? "bg-rose-600 text-white ring-rose-700"
+                          : "bg-white text-slate-700 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
+                      }
+                      aria-pressed={selected.rating === "down"}
+                      title={selected.rating === "down" ? "Click again to clear" : "Mark this draft as not useful"}
+                    >
+                      <ThumbsDown className="h-3.5 w-3.5" /> Needs work
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : !loadingDrafts && !busy ? (

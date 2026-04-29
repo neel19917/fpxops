@@ -115,6 +115,12 @@ export interface AiAnalysis {
   error: string | null;
   metadata: Record<string, unknown> | null;
   created_at: string;
+  // Rep-supplied prompt-quality rating. Null = unrated. Set via the
+  // 👍 / 👎 buttons on analysis cards / draft cards.
+  rating?: "up" | "down" | null;
+  rating_reason?: string | null;
+  rated_by?: string | null;
+  rated_at?: string | null;
 }
 
 export interface GpAudit {
