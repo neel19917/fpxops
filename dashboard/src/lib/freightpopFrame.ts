@@ -18,9 +18,15 @@ export interface FrameState {
   // across navigations so the iframe `src` never changes (the iframe stays
   // logged in). null until something opens the drawer with embed enabled.
   url: string | null;
+  // One-shot signal: when the user clicks "Load shipment" on a task, we
+  // want the FreightPOP iframe to auto-apply the Kendo grid filter once
+  // the bridge is ready. The overlay consumes the flag (sets it back to
+  // false) after firing the postMessage so it doesn't re-fire on every
+  // bridge-ready / tracking-number change.
+  autoFilterPending: boolean;
 }
 
-const INITIAL: FrameState = { visible: false, trackingNumber: null, shipmentId: null, url: null };
+const INITIAL: FrameState = { visible: false, trackingNumber: null, shipmentId: null, url: null, autoFilterPending: false };
 
 let state: FrameState = INITIAL;
 const listeners = new Set<(s: FrameState) => void>();
@@ -53,12 +59,27 @@ export function showFrame(input: { url: string; shipmentId: string | null; track
     shipmentId: input.shipmentId,
     // Only update url when it actually differs — preserves login session.
     url: state.url === input.url ? state.url : input.url,
+    autoFilterPending: state.autoFilterPending,
   };
   publish();
 }
 
 export function hideFrame() {
   state = { ...state, visible: false };
+  publish();
+}
+
+// Tasks page calls this when the user clicks "Load shipment" — the overlay
+// will fire one Kendo-grid filter postMessage as soon as the bridge is
+// ready and the focused tracking number arrives, then clear the flag.
+export function requestAutoFilter() {
+  state = { ...state, autoFilterPending: true };
+  publish();
+}
+
+export function consumeAutoFilter() {
+  if (!state.autoFilterPending) return;
+  state = { ...state, autoFilterPending: false };
   publish();
 }
 

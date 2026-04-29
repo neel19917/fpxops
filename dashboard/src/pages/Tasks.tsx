@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck } from "lucide-react";
 import { api } from "../lib/api";
 import type { ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { useNav } from "../lib/nav";
 import { UserPicker } from "../components/UserPicker";
+import { requestAutoFilter } from "../lib/freightpopFrame";
 
 // Keyboard shortcut catalog — kept here so the help modal renders the same
 // thing the handler implements. Order matters; this is the help-modal order.
@@ -784,6 +785,15 @@ export function TasksPage() {
                 </td>
                 <td className="px-4 py-3 text-slate-500 text-xs">{new Date(t.created_at).toLocaleString()}</td>
                 <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                  {t.shipment_id && t.tracking_number ? (
+                    <button
+                      onClick={() => { requestAutoFilter(); nav.openTask(t.id); }}
+                      className="px-2 py-1 mr-1 text-xs font-medium rounded-md bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1"
+                      title={`Load shipment ${t.tracking_number} — opens the task drawer and filters the FreightPOP grid by Tracking Number`}
+                    >
+                      <Truck className="h-3.5 w-3.5" /> Load shipment
+                    </button>
+                  ) : null}
                   {t.shipment_id ? (
                     <button
                       onClick={() => nav.openTask(t.id)}
@@ -967,19 +977,26 @@ function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask }: KanbanC
       {task.assigned_to ? (
         <div className="mt-1.5 text-[11px] text-slate-500 truncate">{task.assigned_to}</div>
       ) : null}
-      {actions.length > 0 ? (
-        <div className="mt-2 flex items-center gap-1.5">
-          {actions.map((a) => (
-            <button
-              key={a.label}
-              onClick={(e) => { e.stopPropagation(); onSetStatus(task, a.status); }}
-              className={`text-[11px] font-semibold rounded-md px-2 py-1 inline-flex items-center gap-1 ${a.tone}`}
-            >
-              {a.icon} {a.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
+      <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+        {task.shipment_id && task.tracking_number ? (
+          <button
+            onClick={(e) => { e.stopPropagation(); requestAutoFilter(); onOpenTask(task.id); }}
+            className="text-[11px] font-semibold rounded-md px-2 py-1 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1"
+            title={`Load shipment ${task.tracking_number} — opens the task drawer and filters the FreightPOP grid`}
+          >
+            <Truck className="h-3 w-3" /> Load
+          </button>
+        ) : null}
+        {actions.map((a) => (
+          <button
+            key={a.label}
+            onClick={(e) => { e.stopPropagation(); onSetStatus(task, a.status); }}
+            className={`text-[11px] font-semibold rounded-md px-2 py-1 inline-flex items-center gap-1 ${a.tone}`}
+          >
+            {a.icon} {a.label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

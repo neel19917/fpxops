@@ -195,10 +195,24 @@ function TaskWalkRoute() {
   // the active scope and shift the prev/next pointers).
   const [reloadKey, setReloadKey] = useState(0);
 
+  // While loading a *different* task than the one currently resolved, keep
+  // the previous resolved in place so the drawer + iframe stay mounted —
+  // walk transitions feel instant instead of blanking to a loading screen.
+  // The "loading" indicator below picks up only on the genuine first load
+  // (when there's nothing to show yet).
+  const [loading, setLoading] = useState(false);
+  // Hard-stop spinner: if the lookup hasn't returned in 8s, surface a
+  // Retry path instead of an indefinite "Loading task…". Stale tokens,
+  // dropped Railway connections, and ad-blockers silently chewing the
+  // request all manifest as a hung fetch — the timeout gives the user a
+  // way out.
+  const [stalled, setStalled] = useState(false);
+
   useEffect(() => {
     if (!taskId) return;
     let cancelled = false;
-    setResolved(null); setError(null);
+    setError(null); setLoading(true); setStalled(false);
+    const stallTimer = setTimeout(() => { if (!cancelled) setStalled(true); }, 8000);
     api.tasks.get(taskId, { walk: "active" })
       .then((r) => {
         if (cancelled) return;
@@ -215,24 +229,60 @@ function TaskWalkRoute() {
           total: r.walk?.total ?? 1,
         });
       })
-      .catch((e: Error) => { if (!cancelled) setError(e.message); });
-    return () => { cancelled = true; };
+      .catch((e: Error) => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; clearTimeout(stallTimer); };
   }, [taskId, reloadKey]);
 
   if (error) {
     return (
       <div className="p-6 max-w-md mx-auto text-sm text-slate-600">
         <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-4 py-3 text-rose-800">{error}</div>
-        <button
-          onClick={() => navigate("/tasks")}
-          className="mt-3 text-sky-700 hover:text-sky-900 hover:underline"
-        >← Back to Tasks</button>
+        <div className="mt-3 flex items-center gap-3">
+          <button
+            onClick={() => setReloadKey((k) => k + 1)}
+            className="text-sky-700 hover:text-sky-900 hover:underline"
+          >Retry</button>
+          <button
+            onClick={() => navigate("/tasks")}
+            className="text-slate-600 hover:text-slate-900 hover:underline"
+          >← Back to Tasks</button>
+        </div>
       </div>
     );
   }
   if (!resolved || !taskId) {
-    return <div className="p-6 text-sm text-slate-400">Loading task…</div>;
+    // First-ever load (no previous resolved). After 8s of waiting we offer
+    // a Retry so the user isn't pinned to "Loading task…" forever.
+    return (
+      <div className="p-6 max-w-md mx-auto text-sm text-slate-500 space-y-3">
+        <div>Loading task…</div>
+        {stalled ? (
+          <div className="rounded-lg bg-amber-50 ring-1 ring-amber-200 px-4 py-3 text-amber-900 text-xs">
+            <div className="font-medium mb-1">Taking longer than expected.</div>
+            <div className="text-amber-800">
+              The lookup hasn't returned in 8 seconds. The Railway server may be slow or your
+              session may have expired. Retry or go back to the Tasks list.
+            </div>
+            <div className="mt-2 flex items-center gap-3">
+              <button
+                onClick={() => setReloadKey((k) => k + 1)}
+                className="text-sky-700 hover:text-sky-900 hover:underline"
+              >Retry</button>
+              <button
+                onClick={() => navigate("/tasks")}
+                className="text-slate-600 hover:text-slate-900 hover:underline"
+              >← Back to Tasks</button>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
   }
+  // resolved.task.id may not yet match the URL's taskId (a walk transition
+  // is in flight); we still render the previous shipment so the drawer
+  // doesn't flicker. The next render refreshes with the new resolved.
+  void loading;
 
   return (
     <ShipmentsPage

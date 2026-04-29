@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Copy, Check, ExternalLink, Filter } from "lucide-react";
-import { useFrameState } from "../lib/freightpopFrame";
+import { useFrameState, consumeAutoFilter } from "../lib/freightpopFrame";
 import { useAuth } from "../lib/auth";
 
 // postMessage bridge to the FPXpress Chrome extension. The extension's
@@ -117,6 +117,18 @@ export function FreightPopOverlay() {
     }, 1500);
     return () => clearInterval(id);
   }, [bridgeReady]);
+
+  // Auto-filter on demand: the Tasks page calls requestAutoFilter() when
+  // the user clicks "Load shipment". Once the bridge is alive AND the
+  // tracking number is populated, fire the filter once and consume the
+  // flag so it doesn't re-fire on subsequent renders.
+  useEffect(() => {
+    if (!frame.autoFilterPending) return;
+    if (!bridgeReady) return;
+    if (!frame.trackingNumber) return;
+    postFpxFilter(iframeRef.current, "Tracking Number", frame.trackingNumber);
+    consumeAutoFilter();
+  }, [frame.autoFilterPending, bridgeReady, frame.trackingNumber]);
 
   // If the embed is disabled OR the iframe has never been asked to load,
   // render nothing. Once it's loaded once we keep it in the DOM (just
