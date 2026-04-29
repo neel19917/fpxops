@@ -1427,6 +1427,15 @@ function FollowupsPanel({ kind, onTaskClick }: {
             kind={kind}
             onTaskClick={onTaskClick}
             onEmail={() => setEmailFor(g)}
+            onSetStatus={async (task, status) => {
+              // Same code path as the per-row Status button on the
+              // table view: PATCH the task, then refetch (cache-bust)
+              // so the panel reflects the new state. Done tasks fall
+              // out of the "active" set and the card recomputes.
+              try {
+                await api.tasks.update(task.id, { status });
+              } finally { load(true); }
+            }}
           />
         ))}
       </div>
@@ -1445,13 +1454,28 @@ function FollowupsPanel({ kind, onTaskClick }: {
   );
 }
 
-function FollowupGroupCard({ group, kind, onTaskClick, onEmail }: {
+function FollowupGroupCard({ group, kind, onTaskClick, onEmail, onSetStatus }: {
   group: FollowupGroup;
   kind: FollowupKind;
   onTaskClick: (taskId: string) => void;
   onEmail: () => void;
+  onSetStatus: (task: ShipmentTask, status: TaskStatus) => Promise<void> | void;
 }) {
   const cfg = FOLLOWUP_KIND_CONFIG[kind];
+  // Per-row busy guard so the operator can't double-click the action
+  // before the server responds. Keyed on task.id so simultaneous
+  // actions on different rows still work.
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  // Pick the next-step action for a task based on its current status.
+  // Mirrors KanbanCard's logic so the buttons feel identical to what
+  // the operator sees on the regular Kanban view.
+  function nextAction(t: ShipmentTask): { label: string; status: TaskStatus; tone: string } | null {
+    if (t.status === "open") return { label: "Start", status: "in_progress", tone: "bg-indigo-600 text-white hover:bg-indigo-700" };
+    if (t.status === "in_progress") return { label: "Done", status: "done", tone: "bg-emerald-600 text-white hover:bg-emerald-700" };
+    if (t.status === "blocked") return { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" };
+    if (t.status === "done") return { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" };
+    return null;
+  }
   const groupNounCap = cfg.groupNoun.charAt(0).toUpperCase() + cfg.groupNoun.slice(1);
   return (
     <div className={`rounded-lg bg-white ring-1 ${cfg.ringTone} shadow-sm flex flex-col`}>
@@ -1467,30 +1491,62 @@ function FollowupGroupCard({ group, kind, onTaskClick, onEmail }: {
         </span>
       </div>
       <ul className={`px-3 py-2 space-y-1.5 max-h-80 overflow-y-auto`}>
-        {group.items.map((it) => (
-          <li key={it.task.id} className="text-xs">
-            <button
-              onClick={() => { requestAutoFilter(); onTaskClick(it.task.id); }}
-              className={`w-full text-left rounded-md px-2 py-1.5 hover:${cfg.bgTone} group ring-1 ring-transparent hover:${cfg.ringTone}`}
-              title={`Open ${it.shipment.tracking_number || it.task.title} in task-walk mode`}
+        {group.items.map((it) => {
+          const action = nextAction(it.task);
+          const rowBusy = busyTaskId === it.task.id;
+          return (
+            <li
+              key={it.task.id}
+              className={`text-xs rounded-md ring-1 ring-transparent hover:ring-slate-200 hover:bg-slate-50 ${rowBusy ? "opacity-60" : ""}`}
             >
-              <div className="flex items-center justify-between gap-2 min-w-0">
-                <span className="font-semibold text-slate-900 truncate text-sm">
-                  {it.shipment.shipment_id || "(no shipment id)"}
-                </span>
-                <span className="text-slate-600 shrink-0 font-mono text-[11px]">
-                  {it.shipment.tracking_number || ""}
-                </span>
+              <div className="flex items-stretch">
+                {/* Clickable text region — opens task-walk mode for the
+                    operator to drill in. Click bubbles up only when the
+                    operator hits the body of the row, not the action
+                    buttons we render to the right. */}
+                <button
+                  onClick={() => { requestAutoFilter(); onTaskClick(it.task.id); }}
+                  className="flex-1 text-left px-2 py-1.5 min-w-0"
+                  title={`Open ${it.shipment.tracking_number || it.task.title} in task-walk mode`}
+                >
+                  <div className="flex items-center justify-between gap-2 min-w-0">
+                    <span className="font-semibold text-slate-900 truncate text-sm">
+                      {it.shipment.shipment_id || "(no shipment id)"}
+                    </span>
+                    <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                      {it.shipment.tracking_number || ""}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-600 truncate mt-0.5">
+                    {it.shipment.customer_name || "—"} · {it.shipment.shipment_status || "no status"}
+                  </div>
+                  <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                    {it.task.title}
+                  </div>
+                </button>
+                {/* Per-row status action — Start / Done / Reopen
+                    depending on the task's current status. Same shape
+                    as the per-row button on the table view so the
+                    affordance feels familiar. */}
+                {action ? (
+                  <button
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      setBusyTaskId(it.task.id);
+                      try { await onSetStatus(it.task, action.status); }
+                      finally { setBusyTaskId(null); }
+                    }}
+                    disabled={rowBusy}
+                    className={`text-[11px] font-semibold rounded-md px-2 py-1 inline-flex items-center self-center mr-1 ${action.tone} disabled:opacity-50`}
+                    title={`Mark this task as ${action.status.replace("_", " ")}`}
+                  >
+                    {rowBusy ? "…" : action.label}
+                  </button>
+                ) : null}
               </div>
-              <div className="text-[11px] text-slate-600 truncate mt-0.5">
-                {it.shipment.customer_name || "—"} · {it.shipment.shipment_status || "no status"}
-              </div>
-              <div className="text-[11px] text-slate-500 truncate mt-0.5">
-                {it.task.title}
-              </div>
-            </button>
-          </li>
-        ))}
+            </li>
+          );
+        })}
       </ul>
       <div className={`px-3 py-2 border-t ${cfg.ringTone} flex items-center gap-2`}>
         <button
@@ -1532,6 +1588,18 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
   const [err, setErr] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [copied, setCopied] = useState(false);
+  // Task ids the operator has X'd out of the next Generate — those
+  // shipments don't get sent to the LLM. Excluding doesn't touch the
+  // task itself; it only scopes this email round.
+  const [excludedIds, setExcludedIds] = useState<Set<string>>(new Set());
+  const includedItems = group.items.filter((it) => !excludedIds.has(it.task.id));
+  function toggleExclude(taskId: string) {
+    setExcludedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+      return next;
+    });
+  }
 
   // Fetch the prior drafts for this group on mount. We always render
   // them — even if the operator never clicks Generate inside this
@@ -1553,11 +1621,12 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
   const selected = drafts.find((d) => d.id === selectedId) || null;
 
   async function generate() {
+    if (!includedItems.length) { setErr("Include at least one shipment."); return; }
     setBusy(true); setErr(null);
     try {
       const r = await cfg.emailDraft({
         name: group.name,
-        task_ids: group.items.map((it) => it.task.id),
+        task_ids: includedItems.map((it) => it.task.id),
         notes: notes.trim() || undefined,
       });
       // Refetch the list — the server just inserted a new analyses
@@ -1665,27 +1734,53 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
               scroll the right side independently of the drafts list. */}
           <div className="overflow-y-auto p-5 space-y-4">
             <div>
-              <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
-                Shipments included
+              <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 flex items-center justify-between">
+                <span>Shipments included ({includedItems.length} / {group.items.length})</span>
+                {excludedIds.size > 0 ? (
+                  <button
+                    onClick={() => setExcludedIds(new Set())}
+                    className="text-[11px] font-medium text-sky-700 hover:text-sky-900 normal-case"
+                  >
+                    Restore all
+                  </button>
+                ) : null}
               </div>
               <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-40 overflow-y-auto">
                 <ul className="divide-y divide-slate-200">
-                  {group.items.map((it) => (
-                    <li key={it.task.id} className="px-3 py-2 text-xs">
-                      <div className="flex items-center justify-between gap-2 min-w-0">
-                        <span className="font-medium text-slate-900 truncate">
-                          {it.shipment.shipment_id || "(no shipment id)"}
-                        </span>
-                        <span className="text-slate-600 shrink-0 font-mono text-[11px]">
-                          {it.shipment.tracking_number || ""}
-                        </span>
-                      </div>
-                      <div className="text-slate-500 truncate">
-                        {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
-                      </div>
-                      <div className="text-slate-700 mt-0.5">{it.task.title}</div>
-                    </li>
-                  ))}
+                  {group.items.map((it) => {
+                    const excluded = excludedIds.has(it.task.id);
+                    return (
+                      <li key={it.task.id} className={`px-3 py-2 text-xs flex items-start gap-2 ${excluded ? "opacity-50" : ""}`}>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2 min-w-0">
+                            <span className={`font-medium text-slate-900 truncate ${excluded ? "line-through" : ""}`}>
+                              {it.shipment.shipment_id || "(no shipment id)"}
+                            </span>
+                            <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                              {it.shipment.tracking_number || ""}
+                            </span>
+                          </div>
+                          <div className="text-slate-500 truncate">
+                            {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
+                          </div>
+                          <div className="text-slate-700 mt-0.5">{it.task.title}</div>
+                        </div>
+                        <button
+                          onClick={() => toggleExclude(it.task.id)}
+                          className={
+                            "shrink-0 p-1 rounded transition " +
+                            (excluded
+                              ? "text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50"
+                              : "text-slate-400 hover:text-rose-600 hover:bg-rose-50")
+                          }
+                          title={excluded ? "Re-include this shipment" : "Exclude this shipment from the next Generate"}
+                          aria-label={excluded ? "Include shipment" : "Exclude shipment"}
+                        >
+                          {excluded ? <Plus className="h-3.5 w-3.5" /> : <X className="h-3.5 w-3.5" />}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             </div>
