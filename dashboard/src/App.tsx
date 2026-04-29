@@ -10,16 +10,13 @@ import { NavCtx, type NavApi } from "./lib/nav";
 import { SignInPage } from "./pages/SignIn";
 import { PendingApprovalPage } from "./pages/PendingApproval";
 
-// Tracking + Tasks are the daily-driver views — keep them in the main
-// chunk so the most-common landings are instant. Everything else is
-// lazy-loaded so the initial JS payload doesn't carry Settings,
-// AuditLog, the Audits suite, etc. for users who never open them.
-import { ShipmentsPage } from "./pages/Shipments";
-import { TasksPage } from "./pages/Tasks";
-import { SharedViewPage } from "./pages/SharedView";
-
-// Named-export pages need a small wrapper so lazy() can pull them by
-// default. Vite splits each into its own chunk automatically.
+// Every page is now lazy-loaded to keep the initial JS payload minimal.
+// Tracking and Tasks pick up a ~50–100 ms first-route delay on a cold
+// cache; subsequent visits hit the warm chunk and are instant.
+// Vite splits each named-export wrapper into its own chunk.
+const ShipmentsPage   = lazy(() => import("./pages/Shipments").then((m) => ({ default: m.ShipmentsPage })));
+const TasksPage       = lazy(() => import("./pages/Tasks").then((m) => ({ default: m.TasksPage })));
+const SharedViewPage  = lazy(() => import("./pages/SharedView").then((m) => ({ default: m.SharedViewPage })));
 const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
 const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
 const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
@@ -82,7 +79,11 @@ export default function App() {
 
 function SharedViewRoute() {
   const { token = "" } = useParams<{ token: string }>();
-  return <SharedViewPage token={token} />;
+  return (
+    <Suspense fallback={<RouteFallback />}>
+      <SharedViewPage token={token} />
+    </Suspense>
+  );
 }
 
 function AuthedApp() {

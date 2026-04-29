@@ -172,8 +172,8 @@ export const api = {
   },
 
   shipments: {
-    list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string }) =>
-      request<{ data: Shipment[] }>("/api/shipments", { params }),
+    list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string; before?: string }) =>
+      request<{ data: Shipment[]; next_cursor: string | null }>("/api/shipments", { params }),
     get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[] }>(`/api/shipments/${id}`),
     overrideAction: (id: string, body: { action_required: string | null; reason?: string }) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),

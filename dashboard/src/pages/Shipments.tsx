@@ -247,16 +247,36 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     finally { setExporting(false); }
   }
 
+  // Cursor for the next page on "Load more". Null = no more rows OR
+  // we haven't fetched yet. The server returns this as scraped_at of
+  // the last row on the current page.
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+
   async function load() {
     setLoading(true); setErr(null);
     try {
-      // Initial render is what users feel — keep it tight. Daily volume sits
-      // around 200 rows; 500 is generous headroom. Export pulls the full
-      // 5000-cap separately so this doesn't bound that workflow.
-      const r = await api.shipments.list({ limit: 500 });
+      // Initial render is what users feel — keep it tight. Daily volume
+      // typically sits around 200 rows; smaller initial fetch makes the
+      // page paint faster on slow connections, and "Load more" pulls
+      // the next 500 if the operator wants more history.
+      const r = await api.shipments.list({ limit: 200 });
       setRows(r.data);
+      setNextCursor(r.next_cursor);
     } catch (e) { setErr((e as Error).message); }
     setLoading(false);
+  }
+  async function loadMore() {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const r = await api.shipments.list({ limit: 500, before: nextCursor });
+      // Append rather than replace so the existing scroll position
+      // and selection state stay intact.
+      setRows((prev) => [...prev, ...r.data]);
+      setNextCursor(r.next_cursor);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setLoadingMore(false); }
   }
   useEffect(() => { load(); }, []);
 
@@ -303,6 +323,21 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       })
       .catch(() => { setDrawerData(null); setDrawerTasks([]); });
   }, [drawerId]);
+
+  // Re-fetch the focused shipment and mirror the result into the
+  // table row + drawer data. Used after any single-shipment action
+  // that the server side-effects (override, reanalyze, notes save,
+  // etc.) so both the drawer and the row in the table reflect the
+  // new state without an extra round trip per consumer. Returns the
+  // refreshed shipment so callers can chain on it if they need to.
+  async function refreshDrawer(id: string = drawerId || "") {
+    if (!id) return null;
+    const r = await api.shipments.get(id);
+    setDrawerData(r);
+    setDrawerTasks(r.tasks || []);
+    setRows((prev) => prev.map((row) => (row.id === id ? r.shipment : row)));
+    return r;
+  }
 
   async function saveNotes() {
     if (!drawerId || notesBusy) return;
@@ -795,6 +830,29 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             </tbody>
           </table>
         </div>
+        {/* Load-more strip — only renders when the server says there
+            are more rows. The "Showing N rows" line gives the
+            operator a sense of scope before they choose to fetch
+            another 500. */}
+        <div className="px-4 py-3 border-t border-slate-100 flex items-center justify-between gap-3 text-xs text-slate-500">
+          <span>
+            Showing {rows.length} row{rows.length === 1 ? "" : "s"}
+            {rows.length !== filtered.length ? <> · {filtered.length} after filters</> : null}
+          </span>
+          {nextCursor ? (
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 text-xs font-medium disabled:opacity-50"
+              title="Fetch the next 500 older shipments from the server"
+            >
+              <Download className="h-3.5 w-3.5" />
+              {loadingMore ? "Loading…" : "Load more"}
+            </button>
+          ) : (
+            <span className="text-slate-400">End of list</span>
+          )}
+        </div>
       </div>
 
       {bulkOpen ? (
@@ -939,9 +997,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 setActionEditBusy(true);
                 try {
                   await api.shipments.overrideAction(drawerId, { action_required: v });
-                  const r = await api.shipments.get(drawerId);
-                  setDrawerData(r);
-                  setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                  await refreshDrawer();
                 } catch (e) { setErr((e as Error).message); }
                 finally { setActionEditBusy(false); }
               }}
@@ -950,9 +1006,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 setActionEditBusy(true);
                 try {
                   await api.shipments.overrideAction(drawerId, { action_required: null });
-                  const r = await api.shipments.get(drawerId);
-                  setDrawerData(r);
-                  setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                  await refreshDrawer();
                 } catch (e) { setErr((e as Error).message); }
                 finally { setActionEditBusy(false); }
               }}
@@ -1143,9 +1197,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                                   setActionEditBusy(true);
                                   try {
                                     await api.shipments.overrideAction(drawerId, { action_required: v });
-                                    const r = await api.shipments.get(drawerId);
-                                    setDrawerData(r);
-                                    setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                                    await refreshDrawer();
                                   } catch (e) { setErr((e as Error).message); }
                                   finally { setActionEditBusy(false); }
                                 }}
@@ -1163,9 +1215,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                               setActionEditBusy(true);
                               try {
                                 await api.shipments.overrideAction(drawerId, { action_required: null });
-                                const r = await api.shipments.get(drawerId);
-                                setDrawerData(r);
-                                setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                                await refreshDrawer();
                               } catch (e) { setErr((e as Error).message); }
                               finally { setActionEditBusy(false); }
                             }}
