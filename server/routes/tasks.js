@@ -169,14 +169,17 @@ tasksRouter.post("/carrier-email-draft", async (req, res) => {
 // helper so the two endpoints stay in lockstep.
 async function listGroupDrafts({ subkind, groupKey, groupValue, limit }) {
   if (!groupValue) return [];
-  // Supabase JSONB: filter by metadata->>'subkind' and metadata->>groupKey.
-  // Limit defaulted modestly — the modal only renders a list and we want
-  // the request to stay fast.
+  // Use jsonb containment (@>) so Postgres can hit the
+  // fpx_ai_analyses_metadata_gin_idx GIN index. The .eq("metadata->>...")
+  // form translates to text equality which doesn't use the GIN index
+  // and would seq-scan the table once we cross ~10k analyses rows.
+  // .contains() in supabase-js compiles to `metadata @> '...'::jsonb`
+  // which the planner turns into a Bitmap Index Scan.
+  const matcher = { subkind, [groupKey]: groupValue };
   const { data, error } = await supabase
     .from("fpx_ai_analyses")
     .select("id, created_at, model, response_text, input_tokens, output_tokens, cost_usd, metadata, rating, rating_reason, rated_by, rated_at")
-    .eq("metadata->>subkind", subkind)
-    .eq(`metadata->>${groupKey}`, groupValue)
+    .contains("metadata", matcher)
     .order("created_at", { ascending: false })
     .limit(limit);
   if (error) return { error };

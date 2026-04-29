@@ -386,12 +386,27 @@ export interface OpsDailyRow {
   shipments_analyzed: number;
   tasks_completed: number;
   emails_generated: number;
+  cost_usd: number;
 }
 export interface OpsMetrics {
   range: { from: string; to: string; days: number };
-  totals: { shipments_analyzed: number; tasks_completed: number; emails_generated: number };
-  today: { date: string; shipments_analyzed: number; tasks_completed: number; emails_generated: number };
-  last7: { shipments_analyzed: number; tasks_completed: number; emails_generated: number };
+  totals: {
+    shipments_analyzed: number;
+    tasks_completed: number;
+    emails_generated: number;
+    cost_usd: number;
+    // Per-category cost split: per-shipment AI analyses, single-
+    // shipment emails (carrier/customer drafts in the drawer), bulk
+    // group emails, and anything else (gp/invoice audits, ad-hoc).
+    cost_breakdown: {
+      per_shipment_analysis: number;
+      email_single: number;
+      email_group: number;
+      other: number;
+    };
+  };
+  today: { date: string; shipments_analyzed: number; tasks_completed: number; emails_generated: number; cost_usd: number };
+  last7: { shipments_analyzed: number; tasks_completed: number; emails_generated: number; cost_usd: number };
   daily: OpsDailyRow[];
   byOperator: { operator: string; tasks_completed: number; emails_generated: number }[];
 }

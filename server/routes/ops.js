@@ -38,10 +38,10 @@ opsRouter.get("/metrics", async (req, res) => {
   ] = await Promise.all([
     supabase
       .from("fpx_ai_analyses")
-      .select("id, kind, created_at, metadata, system_prompt, user_message")
-      // We pull a bit extra (system_prompt/user_message excluded by default
-      // on Supabase since they're text — we need them only for length-based
-      // bucketing; keep this select narrow).
+      // cost_usd + token columns added so we can roll up AI spend on
+      // the Ops dashboard. system_prompt / user_message stay out of
+      // the select — they're text and we don't need them here.
+      .select("id, kind, model, created_at, metadata, cost_usd, input_tokens, output_tokens")
       .gte("created_at", fromIso)
       .limit(20000),
     supabase
@@ -66,28 +66,53 @@ opsRouter.get("/metrics", async (req, res) => {
     shipments_analyzed: 0,
     tasks_completed: 0,
     emails_generated: 0,
+    // cost is summed across every analyses row landing in this day's
+    // bucket (per-shipment + email drafts + bulk groups). The chart
+    // doesn't render this yet — it powers the new "AI cost" KPI.
+    cost_usd: 0,
   }]));
 
   // Email-draft analyses also count as "emails_generated" — but we DO NOT
   // double-count them as "shipments_analyzed" since the per_shipment
   // analyses are what the title implies.
   let totalShipments = 0, totalEmails = 0, totalTasks = 0;
+  // Cost rollups: total AI spend in window + breakdown by category so
+  // the Ops dashboard can show where the money is going (per-shipment
+  // analysis vs single-shipment emails vs bulk group emails).
+  const cost = {
+    total: 0,
+    per_shipment: 0,            // kind = per_shipment
+    email_single: 0,            // subkind = email_draft_carrier / customer
+    email_group: 0,             // subkind = email_draft_carrier_group / customer_group
+    other: 0,                   // anything else (gp/invoice audits, ad-hoc)
+  };
   const opEmails = new Map();
   for (const a of analysesRes.data || []) {
     const k = dayKey(a.created_at);
     const bucket = dailyByKey.get(k);
     if (!bucket) continue;
+    const c = Number(a.cost_usd) || 0;
+    bucket.cost_usd += c;
+    cost.total += c;
     if (a.kind === "per_shipment") {
       bucket.shipments_analyzed++;
       totalShipments++;
+      cost.per_shipment += c;
+      continue;
     }
     const sub = (a.metadata && typeof a.metadata === "object" && a.metadata.subkind) || null;
     if (typeof sub === "string" && sub.startsWith("email_draft_")) {
       bucket.emails_generated++;
       totalEmails++;
+      // Group emails are tagged email_draft_carrier_group / _customer_group.
+      // Single-shipment drafts are email_draft_carrier / _customer.
+      if (sub.endsWith("_group")) cost.email_group += c;
+      else cost.email_single += c;
       const operator = (a.metadata && typeof a.metadata === "object" && a.metadata.user_email) || "(automated)";
       opEmails.set(operator, (opEmails.get(operator) || 0) + 1);
+      continue;
     }
+    cost.other += c;
   }
 
   const opTasks = new Map();
@@ -119,13 +144,13 @@ opsRouter.get("/metrics", async (req, res) => {
   // "Today" rollup = the most recent UTC bucket so the KPI strip
   // matches the right-most bar on the daily chart.
   const todayKey = days_list[days_list.length - 1];
-  const today = dailyByKey.get(todayKey) || { shipments_analyzed: 0, tasks_completed: 0, emails_generated: 0 };
+  const today = dailyByKey.get(todayKey) || { shipments_analyzed: 0, tasks_completed: 0, emails_generated: 0, cost_usd: 0 };
   // 7d rollup is the trailing 7 buckets of `daily` (inclusive of today).
   const last7 = days_list.slice(-7);
-  let s7 = 0, t7 = 0, e7 = 0;
+  let s7 = 0, t7 = 0, e7 = 0, c7 = 0;
   for (const k of last7) {
     const b = dailyByKey.get(k); if (!b) continue;
-    s7 += b.shipments_analyzed; t7 += b.tasks_completed; e7 += b.emails_generated;
+    s7 += b.shipments_analyzed; t7 += b.tasks_completed; e7 += b.emails_generated; c7 += b.cost_usd;
   }
 
   res.json({
@@ -134,14 +159,26 @@ opsRouter.get("/metrics", async (req, res) => {
       shipments_analyzed: totalShipments,
       tasks_completed: totalTasks,
       emails_generated: totalEmails,
+      // AI spend over the window. cost.total covers everything in
+      // fpx_ai_analyses; the per-category breakdown (per_shipment vs
+      // single-shipment emails vs bulk group emails) sits alongside
+      // so the dashboard can show where the money goes.
+      cost_usd: cost.total,
+      cost_breakdown: {
+        per_shipment_analysis: cost.per_shipment,
+        email_single: cost.email_single,
+        email_group: cost.email_group,
+        other: cost.other,
+      },
     },
     today: {
       date: todayKey,
       shipments_analyzed: today.shipments_analyzed,
       tasks_completed: today.tasks_completed,
       emails_generated: today.emails_generated,
+      cost_usd: today.cost_usd || 0,
     },
-    last7: { shipments_analyzed: s7, tasks_completed: t7, emails_generated: e7 },
+    last7: { shipments_analyzed: s7, tasks_completed: t7, emails_generated: e7, cost_usd: c7 },
     daily: days_list.map((k) => dailyByKey.get(k)),
     byOperator,
   });
