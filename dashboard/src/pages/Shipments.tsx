@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -340,6 +340,19 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   // etc.) so both the drawer and the row in the table reflect the
   // new state without an extra round trip per consumer. Returns the
   // refreshed shipment so callers can chain on it if they need to.
+  // Patch a single analysis row inside drawerData.analyses by id —
+  // used by AnalysisThumbs to apply a rating change without
+  // refetching the whole drawer.
+  function patchAnalysisLocal(id: string, patch: Partial<AiAnalysis>) {
+    setDrawerData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        analyses: prev.analyses.map((a) => (a.id === id ? { ...a, ...patch } : a)),
+      };
+    });
+  }
+
   async function refreshDrawer(id: string = drawerId || "") {
     if (!id) return null;
     const r = await api.shipments.get(id);
@@ -1413,19 +1426,25 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                         <div className="text-sm font-semibold text-slate-900 mb-2">{parsed.subject}</div>
                       ) : null}
                       <pre className="text-sm whitespace-pre-wrap font-sans text-slate-700 leading-relaxed bg-slate-50 ring-1 ring-slate-200 rounded-lg p-3 max-h-72 overflow-auto">{parsed.body || "(empty)"}</pre>
-                      <div className="flex items-center justify-end gap-3 mt-2">
-                        {parsed.subject || parsed.body ? (
-                          <a
-                            href={`mailto:?subject=${encodeURIComponent(parsed.subject || "")}&body=${encodeURIComponent(parsed.body || "")}`}
-                            className="text-xs text-sky-700 hover:text-sky-900 font-medium"
-                          >Open in mail →</a>
-                        ) : null}
-                        <button
-                          onClick={() => copyText(`Subject: ${parsed.subject || ""}\n\n${parsed.body || ""}`)}
-                          className="text-xs px-2 py-1 rounded-lg bg-slate-900 text-white hover:bg-slate-800 flex items-center gap-1"
-                        >
-                          <Copy className="h-3 w-3" /> Copy
-                        </button>
+                      <div className="flex items-center justify-between gap-3 mt-2 flex-wrap">
+                        <AnalysisThumbs
+                          analysis={a}
+                          onRated={(patch) => patchAnalysisLocal(a.id, patch)}
+                        />
+                        <div className="flex items-center gap-3">
+                          {parsed.subject || parsed.body ? (
+                            <a
+                              href={`mailto:?subject=${encodeURIComponent(parsed.subject || "")}&body=${encodeURIComponent(parsed.body || "")}`}
+                              className="text-xs text-sky-700 hover:text-sky-900 font-medium"
+                            >Open in mail →</a>
+                          ) : null}
+                          <button
+                            onClick={() => copyText(`Subject: ${parsed.subject || ""}\n\n${parsed.body || ""}`)}
+                            className="text-xs px-2 py-1 rounded-lg bg-slate-900 text-white hover:bg-slate-800 flex items-center gap-1"
+                          >
+                            <Copy className="h-3 w-3" /> Copy
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -1481,6 +1500,17 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                         <div className="text-[11px] text-slate-400 mt-2">
                           {a.input_tokens.toLocaleString()} in / {a.output_tokens.toLocaleString()} out tokens
                           {a.duration_ms ? ` · ${(a.duration_ms / 1000).toFixed(1)}s` : ""}
+                        </div>
+                      ) : null}
+                      {parsed.flavor === "shipment" ? (
+                        <div className="mt-3 pt-3 border-t border-slate-100 flex items-center justify-between gap-3 flex-wrap">
+                          <span className="text-[11px] text-slate-500 leading-snug">
+                            Was this analysis useful? <span className="text-slate-400">Feedback feeds the next AI run on this shipment.</span>
+                          </span>
+                          <AnalysisThumbs
+                            analysis={a}
+                            onRated={(patch) => patchAnalysisLocal(a.id, patch)}
+                          />
                         </div>
                       ) : null}
                     </div>
@@ -1814,6 +1844,82 @@ function RecentChangeLog({ diff }: { diff: ShipmentRecentDiff | null }) {
         </div>
       </div>
     </Section>
+  );
+}
+
+// =====================================================================
+// AnalysisThumbs — 👍 / 👎 buttons for any AI analysis (per-shipment
+// analysis, single-shipment email draft, etc.). Posts the rating to
+// /api/analyses/:id/rating, calls onRated() so the parent can update
+// its local drawerData and the prior_ai_analysis prompt context picks
+// up the rating on the next per-shipment AI re-run. Clicking the
+// active thumb clears the rating (mistaken click).
+// =====================================================================
+function AnalysisThumbs({ analysis, onRated }: {
+  analysis: AiAnalysis;
+  onRated: (next: { rating: "up" | "down" | null; rated_by: string | null; rated_at: string | null }) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  async function rate(target: "up" | "down") {
+    if (busy) return;
+    const next = analysis.rating === target ? null : target;
+    setBusy(true);
+    // Optimistic local update — parent state mutates instantly so the
+    // active thumb flips before the request returns. Roll back on
+    // error by reverting to whatever the row had before.
+    onRated({ rating: next, rated_by: null, rated_at: next ? new Date().toISOString() : null });
+    try {
+      const r = await api.analyses.rate(analysis.id, { rating: next });
+      onRated({
+        rating: r.analysis.rating,
+        rated_by: r.analysis.rated_by,
+        rated_at: r.analysis.rated_at,
+      });
+    } catch {
+      // Revert on failure.
+      onRated({
+        rating: analysis.rating ?? null,
+        rated_by: analysis.rated_by ?? null,
+        rated_at: analysis.rated_at ?? null,
+      });
+    } finally { setBusy(false); }
+  }
+  return (
+    <div className="inline-flex items-center gap-1.5">
+      <button
+        onClick={() => rate("up")}
+        disabled={busy}
+        className={
+          "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
+          (analysis.rating === "up"
+            ? "bg-emerald-600 text-white ring-emerald-700"
+            : "bg-white text-slate-600 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
+        }
+        aria-pressed={analysis.rating === "up"}
+        title={analysis.rating === "up" ? "Click again to clear" : "Mark this AI output as useful"}
+      >
+        <ThumbsUp className="h-3 w-3" /> Good
+      </button>
+      <button
+        onClick={() => rate("down")}
+        disabled={busy}
+        className={
+          "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
+          (analysis.rating === "down"
+            ? "bg-rose-600 text-white ring-rose-700"
+            : "bg-white text-slate-600 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
+        }
+        aria-pressed={analysis.rating === "down"}
+        title={analysis.rating === "down" ? "Click again to clear" : "Mark this AI output as not useful — feeds into the next analysis"}
+      >
+        <ThumbsDown className="h-3 w-3" /> Needs work
+      </button>
+      {analysis.rated_by ? (
+        <span className="text-[10px] text-slate-400 ml-1" title={`Rated ${analysis.rated_at ? fmtRelative(analysis.rated_at) : ""}`}>
+          by {analysis.rated_by}
+        </span>
+      ) : null}
+    </div>
   );
 }
 
