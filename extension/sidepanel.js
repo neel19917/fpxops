@@ -253,6 +253,37 @@ if (serverToggleBtn) {
 refreshServerCard();
 setInterval(checkServer, 15000);
 
+// Persistent-upload queue indicator. Renders as a small chip next to
+// the server-status display so the rep sees pending/dead chunks at a
+// glance. We poll every 10 s — chrome.storage events would be more
+// elegant but the chip is unobtrusive enough that polling is fine.
+function refreshQueueStatus() {
+  chrome.runtime.sendMessage({ type: "getQueueStatus" }, (res) => {
+    if (chrome.runtime.lastError || !res) return;
+    const el = document.getElementById("fp-queue-status");
+    if (!el) return;
+    const total = (res.pending || 0) + (res.dead || 0);
+    if (total === 0) { el.hidden = true; return; }
+    el.hidden = false;
+    const parts = [];
+    if (res.pending) parts.push(`${res.pending} pending`);
+    if (res.dead)    parts.push(`${res.dead} failed`);
+    el.textContent = `Upload queue: ${parts.join(" · ")} (${res.total_rows} row${res.total_rows === 1 ? "" : "s"})`;
+    el.title = res.last_errors && res.last_errors.length
+      ? `Last errors:\n${res.last_errors.map((e) => `• ${e.error}`).join("\n")}\nClick to retry.`
+      : "Click to retry the queue manually.";
+  });
+}
+const queueStatusEl = document.getElementById("fp-queue-status");
+if (queueStatusEl) {
+  queueStatusEl.addEventListener("click", () => {
+    queueStatusEl.textContent = "Retrying queue…";
+    chrome.runtime.sendMessage({ type: "flushQueue" }, () => refreshQueueStatus());
+  });
+}
+refreshQueueStatus();
+setInterval(refreshQueueStatus, 10000);
+
 // Re-evaluate when the popup saves a new URL/key.
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "apiKeyUpdated") {
