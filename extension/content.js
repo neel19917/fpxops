@@ -391,13 +391,24 @@ async function applyFilter(colName, value) {
 
   if (!valueSet) {
     const textInput = filterPopup.querySelector(
-      'input[type="text"], input.k-textbox, input:not([type="hidden"]):not([type="checkbox"])'
+      'input[type="text"], input.k-textbox, input.k-input, input:not([type="hidden"]):not([type="checkbox"])'
     );
     if (textInput) {
       textInput.focus();
-      textInput.value = value;
-      textInput.dispatchEvent(new Event("input", { bubbles: true }));
-      textInput.dispatchEvent(new Event("change", { bubbles: true }));
+      // Use the native value setter — a plain `input.value = "..."`
+      // updates the DOM but doesn't notify Kendo / React so the Filter
+      // button stays disabled and the entered value reverts on focus
+      // change. This was the cause of "filter popup opens but value
+      // never sticks" on the Tracking Number column.
+      try { fpxSetReactInputValue(textInput, value); }
+      catch {
+        textInput.value = value;
+        textInput.dispatchEvent(new Event("input", { bubbles: true }));
+        textInput.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      // Some Kendo inputs validate on blur — fire a synthetic blur after
+      // setting so the framework commits the value.
+      textInput.dispatchEvent(new Event("blur", { bubbles: true }));
       valueSet = true;
       await humanDelay(200, 500);
     }
@@ -3038,43 +3049,59 @@ function fpxIsTrustedParentOrigin(origin) {
   return false;
 }
 
-// Drive the Kendo grid's underlying dataSource directly. This is by far
-// the most reliable filter path — bypasses popup timing, dropdown state,
-// and visible-column requirements. Returns true on success.
+// Drive the Kendo grid's underlying dataSource directly via the page's
+// main-world jQuery + Kendo. The content script's isolated world doesn't
+// see window.jQuery (that's a hard Chrome boundary), so we inject
+// inject-kendo-filter.js as a real <script> tag, pass the value via
+// data-* attributes, and listen for its postMessage result.
 //
-// Strategy: discover Kendo widget instances via window.$ (jQuery) +
-// .data('kendoGrid'). Iterate over candidate fields in case the grid
-// uses TrackingNumber / trackingNumber / Tracking_Number etc.
+// Returns true if the filter was applied, false otherwise. Times out at
+// 1.5s — if the page didn't answer by then, jQuery / Kendo wasn't
+// available and the bridge falls back to the column-filter UI path.
 function fpxFilterViaKendoApi(value, fieldCandidates) {
-  try {
-    const $ = window.jQuery || window.$;
-    if (!$ || typeof $.fn?.data !== "function") return false;
-    const grids = $(".k-grid").toArray();
-    if (!grids.length) return false;
-    const fields = fieldCandidates && fieldCandidates.length
-      ? fieldCandidates
-      : ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"];
-    for (const el of grids) {
-      const grid = $(el).data("kendoGrid");
-      if (!grid?.dataSource) continue;
-      // Pick a field that exists in the grid's column model when we can,
-      // otherwise just try them all.
-      const cols = (grid.columns || []).map((c) => c.field).filter(Boolean);
-      const tryFields = cols.length
-        ? fields.filter((f) => cols.some((c) => c.toLowerCase() === f.toLowerCase())).concat(fields)
-        : fields;
-      for (const field of tryFields) {
-        try {
-          grid.dataSource.filter({ field, operator: "eq", value });
-          console.log(`[FPX] Bridge: Kendo dataSource.filter applied — ${field}=${value}`);
-          return true;
-        } catch (e) { console.warn("[FPX] Kendo filter try failed for", field, e); }
-      }
+  return new Promise((resolve) => {
+    const requestId = "fpx-filter-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    let settled = false;
+    function onMessage(e) {
+      if (e.source !== window) return;
+      const d = e.data;
+      if (!d || d.type !== "fpx-kendo-filter-result" || d.requestId !== requestId) return;
+      window.removeEventListener("message", onMessage);
+      settled = true;
+      console.log("[FPX] Inject filter result:", d.ok ? "ok" : "fail", "—", d.detail);
+      resolve(!!d.ok);
     }
-  } catch (e) {
-    console.warn("[FPX] Kendo API filter unavailable:", e);
-  }
-  return false;
+    window.addEventListener("message", onMessage);
+
+    let scriptUrl;
+    try { scriptUrl = chrome.runtime.getURL("inject-kendo-filter.js"); }
+    catch { resolve(false); return; }
+    const script = document.createElement("script");
+    script.src = scriptUrl;
+    script.setAttribute("data-fpx-request-id", requestId);
+    script.setAttribute("data-fpx-value", String(value));
+    script.setAttribute("data-fpx-fields", JSON.stringify(fieldCandidates || ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"]));
+    script.onload = () => script.remove();
+    script.onerror = () => {
+      script.remove();
+      if (!settled) {
+        window.removeEventListener("message", onMessage);
+        settled = true;
+        console.warn("[FPX] inject-kendo-filter.js failed to load");
+        resolve(false);
+      }
+    };
+    (document.head || document.documentElement).appendChild(script);
+
+    setTimeout(() => {
+      if (!settled) {
+        window.removeEventListener("message", onMessage);
+        settled = true;
+        console.warn("[FPX] Kendo API filter timed out (jQuery not on page?)");
+        resolve(false);
+      }
+    }, 1500);
+  });
 }
 
 // Native value setter — required when programmatically filling React /
@@ -3148,10 +3175,11 @@ window.addEventListener("message", async (event) => {
     let strategy = "";
     let lastErr = null;
     // Strategy 1: Kendo dataSource API (most reliable; bypasses UI).
-    // Tries common field-name variants so it works regardless of which
-    // FreightPOP grid is on screen.
+    // Runs in the page's main world via inject-kendo-filter.js so it can
+    // see window.jQuery + Kendo widgets (content scripts are sandboxed
+    // away from those by Chrome's isolated-world rules).
     try {
-      if (fpxFilterViaKendoApi(val, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"])) {
+      if (await fpxFilterViaKendoApi(val, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"])) {
         applied = true; strategy = "kendo-api";
       }
     } catch (e) { lastErr = e; }
