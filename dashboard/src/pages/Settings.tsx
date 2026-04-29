@@ -672,31 +672,33 @@ function SelectEditor({ value, options, onChange }: { value: string; options: { 
 // at a glance which state the row is in.
 function ToggleEditor({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={value}
-      onClick={() => onChange(!value)}
-      className={
-        "inline-flex items-center gap-3 px-1.5 py-1 rounded-full transition select-none " +
-        (value ? "bg-emerald-600" : "bg-slate-300")
-      }
-    >
-      <span
+    <div className="inline-flex items-center gap-2 select-none">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={value}
+        onClick={() => onChange(!value)}
         className={
-          "block h-5 w-5 rounded-full bg-white shadow-sm transition " +
-          (value ? "translate-x-5" : "translate-x-0")
+          "relative h-6 w-11 rounded-full transition focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-emerald-500 " +
+          (value ? "bg-emerald-600" : "bg-slate-300")
         }
-      />
+      >
+        <span
+          className={
+            "absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform " +
+            (value ? "translate-x-5" : "translate-x-0")
+          }
+        />
+      </button>
       <span
         className={
-          "text-xs font-semibold pr-2 transition " +
-          (value ? "text-white" : "text-slate-700")
+          "text-xs font-semibold transition " +
+          (value ? "text-emerald-700" : "text-slate-500")
         }
       >
         {value ? "Enabled" : "Disabled"}
       </span>
-    </button>
+    </div>
   );
 }
 
