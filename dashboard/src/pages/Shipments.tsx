@@ -84,7 +84,7 @@ interface ShipmentsPageProps {
   } | null;
 }
 
-const DRAWER_TABS = ["overview", "tasks", "email", "drafts", "history", "freightpop", "raw"] as const;
+const DRAWER_TABS = ["overview", "tasks", "email", "drafts", "history", "raw"] as const;
 type DrawerTabId = typeof DRAWER_TABS[number];
 function asDrawerTab(s: string | null | undefined): DrawerTabId {
   return DRAWER_TABS.includes(s as DrawerTabId) ? (s as DrawerTabId) : "overview";
@@ -203,7 +203,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     showFrame({
       url,
       shipmentId: ship.id,
+      shipmentLabel: ship.shipment_id || null,
       trackingNumber: ship.tracking_number || null,
+      customerName: ship.customer_name || null,
     });
   }, [embedCfg?.enabled, embedCfg?.url_template, splitView, drawerId, drawerData]);
 
@@ -824,8 +826,15 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       <Drawer
         open={!!drawerId}
         onClose={() => setDrawerId(null)}
-        title={drawerData?.shipment.tracking_number || "Shipment"}
-        subtitle={drawerData?.shipment.customer_name || undefined}
+        // Shipment ID is the unique identifier in the operator's mental
+        // map, so we lead with it. Tracking number + customer follow as
+        // secondary context. Falls back gracefully when shipment_id isn't
+        // populated on legacy rows.
+        title={drawerData?.shipment.shipment_id || drawerData?.shipment.tracking_number || "Shipment"}
+        subtitle={drawerData ? [
+          drawerData.shipment.shipment_id ? `Tracking ${drawerData.shipment.tracking_number || "—"}` : null,
+          drawerData.shipment.customer_name || null,
+        ].filter(Boolean).join(" · ") || undefined : undefined}
         // Suppress the dimmed backdrop when the FreightPOP overlay is
         // visible — the overlay (mounted at App scope) takes over the
         // gray space.
@@ -917,7 +926,6 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 { id: "email", label: "Email", count: null },
                 { id: "drafts", label: "Drafts", count: drawerData.analyses.filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_")).length },
                 { id: "history", label: "Analysis", count: drawerData.analyses.filter((a) => a.kind === "per_shipment" || a.kind === "summary").length },
-                ...(embedCfg?.enabled ? [{ id: "freightpop" as const, label: "FreightPOP", count: null }] : []),
                 { id: "raw", label: "Raw", count: null },
               ] as { id: typeof DRAWER_TABS[number]; label: string; count: number | null }[]).map((t) => (
                 <button
@@ -1271,13 +1279,6 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               );
             })()}
 
-            {drawerTab === "freightpop" && embedCfg?.enabled && (
-              <FreightPopEmbed
-                template={embedCfg.url_template}
-                shipment={drawerData.shipment}
-              />
-            )}
-
             {drawerTab === "raw" && (
               <Section title="Raw scrape">
                 <pre className="text-[11px] bg-slate-900 text-slate-100 p-3 rounded-lg whitespace-pre-wrap max-h-[60vh] overflow-auto">
@@ -1554,131 +1555,7 @@ function TaskBanner({ task, busy, onSetStatus }: {
   );
 }
 
-// =====================================================================
-// FreightPOP iframe embed. Toggled by embed.freightpop.* settings. The
-// default template is the base FreightPOP URL with no placeholders —
-// FreightPOP has no public deep-link route for an individual shipment,
-// so we mirror the Chrome extension's flow: load the live grid inside
-// the iframe and let the user paste the tracking number into search.
-// (If a tenant DOES have a per-shipment URL, placeholder substitution
-// still works: {tracking_number}, {shipment_id}, {order_number}.)
-// =====================================================================
-const EMBED_PLACEHOLDERS = /\{(tracking_number|shipment_id|order_number)\}/;
-
-function buildEmbedUrl(template: string, shipment: Shipment): string {
-  return template
-    .replace(/\{tracking_number\}/g, encodeURIComponent(shipment.tracking_number || ""))
-    .replace(/\{shipment_id\}/g, encodeURIComponent(shipment.shipment_id || shipment.id))
-    .replace(/\{order_number\}/g, encodeURIComponent(shipment.order_number || ""));
-}
-
-function FreightPopEmbed({ template, shipment }: { template: string; shipment: Shipment }) {
-  // When the template has no placeholders, the iframe URL doesn't change
-  // when the user navigates between shipments — keep `shipment` out of the
-  // memo deps so the iframe doesn't reload (and the user doesn't lose
-  // their FreightPOP session/scroll) on every walk step.
-  const hasPlaceholder = EMBED_PLACEHOLDERS.test(template || "");
-  const url = useMemo(() => {
-    if (!template) return "";
-    try { return buildEmbedUrl(template, shipment); }
-    catch { return ""; }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, hasPlaceholder ? [template, shipment] : [template]);
-  const [copied, setCopied] = useState(false);
-  const tracking = shipment.tracking_number || "";
-
-  async function copyTracking() {
-    if (!tracking) return;
-    try {
-      await navigator.clipboard.writeText(tracking);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch { /* clipboard blocked — no-op */ }
-  }
-
-  if (!url) {
-    return (
-      <Section title="FreightPOP">
-        <div className="text-sm text-slate-500">
-          The FreightPOP embed URL hasn't been configured yet. Go to
-          <span className="font-mono mx-1">Settings → embed.freightpop.url_template</span>
-          to set it.
-        </div>
-      </Section>
-    );
-  }
-  return (
-    <Section title="FreightPOP">
-      <div className="rounded-lg bg-slate-50 ring-1 ring-slate-200 px-3 py-2 mb-2 flex items-center justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-500 shrink-0">Tracking #</span>
-          <span className="font-mono text-sm text-slate-900 truncate">{tracking || "—"}</span>
-          {tracking ? (
-            <button
-              onClick={copyTracking}
-              className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50"
-              title="Copy tracking number"
-            >
-              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-              {copied ? "Copied" : "Copy"}
-            </button>
-          ) : null}
-        </div>
-        <a
-          href={url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-xs text-sky-700 hover:text-sky-900 underline inline-flex items-center gap-1 shrink-0"
-        >
-          <ExternalLink className="h-3.5 w-3.5" /> Open FreightPOP in new tab
-        </a>
-      </div>
-      <div className="rounded-lg ring-1 ring-slate-200 overflow-hidden bg-white" style={{ height: "70vh" }}>
-        <iframe
-          src={url}
-          className="w-full h-full"
-          title="FreightPOP shipment view"
-          // No sandbox: a sandbox would block password-manager autofill,
-          // WebAuthn (passkeys / security keys), and bearer/access tokens
-          // stored in the iframe's localStorage. Same-origin within the
-          // iframe handles its own auth; we just don't get in the way.
-          // The `allow=` policy explicitly opts the iframe in to the
-          // permission-policy gates that browsers default-deny for
-          // cross-origin frames.
-          allow={EMBED_ALLOW}
-          referrerPolicy="no-referrer-when-downgrade"
-        />
-      </div>
-      <p className="text-[11px] text-slate-500 mt-2">
-        Paste the tracking number above into FreightPOP's search to jump to this shipment —
-        FreightPOP doesn't expose a deep-link URL, so we mirror what the Chrome extension does
-        (navigate the live grid). If the panel is blank, FreightPOP is blocking iframe embedding
-        for this origin (X-Frame-Options / CSP); use the "Open in new tab" link instead.
-      </p>
-    </Section>
-  );
-}
-
-// Permissions-policy bundle for FreightPOP iframes. Each entry corresponds
-// to a feature browsers default-deny for cross-origin frames; allowing them
-// here lets FreightPOP's login/session work the way it does in a normal tab:
-//   storage-access                        — Storage Access API (third-party
-//                                            cookies after user grants)
-//   publickey-credentials-{get,create}    — WebAuthn (passkeys, security keys)
-//   clipboard-read / clipboard-write      — paste + copy inside FreightPOP
-//   forms / autoplay / fullscreen         — generic UX features the app uses
-const EMBED_ALLOW = [
-  "storage-access *",
-  "publickey-credentials-get *",
-  "publickey-credentials-create *",
-  "clipboard-read *",
-  "clipboard-write *",
-  "forms *",
-  "autoplay *",
-  "fullscreen *",
-].join("; ");
-
-// FreightPopSidebar was the previous in-page split-view iframe. It was
-// replaced by the singleton FreightPopOverlay (mounted at App scope) so
-// the iframe survives route changes and keeps the user logged into
-// FreightPOP across every prev/next walk.
+// The previous in-page FreightPopEmbed and split-view sidebar were
+// retired in favor of the singleton FreightPopOverlay (mounted at App
+// scope) so the iframe survives route changes and keeps the user
+// logged into FreightPOP across every prev/next walk.

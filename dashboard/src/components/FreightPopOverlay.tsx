@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Copy, Check, ExternalLink, Filter } from "lucide-react";
-import { useFrameState, consumeAutoFilter } from "../lib/freightpopFrame";
+import { useFrameState } from "../lib/freightpopFrame";
 import { useAuth } from "../lib/auth";
 
 // postMessage bridge to the FPXpress Chrome extension. The extension's
@@ -129,17 +129,22 @@ export function FreightPopOverlay() {
     return () => clearInterval(id);
   }, [bridgeReady]);
 
-  // Auto-filter on demand: the Tasks page calls requestAutoFilter() when
-  // the user clicks "Load shipment". Once the bridge is alive AND the
-  // tracking number is populated, fire the filter once and consume the
-  // flag so it doesn't re-fire on subsequent renders.
+  // Auto-filter on demand. Keys on (trackingNumber + autoFilterTick): a
+  // new tracking number arriving via showFrame fires once; a tick bump
+  // (Tasks "Load shipment" / drawer "Load in FreightPOP") forces a
+  // re-fire even when the tracking number hasn't changed. The keying
+  // also makes the pipeline race-free vs the order in which
+  // requestAutoFilter and showFrame land on the store — both
+  // permutations produce exactly one fire per (tracking, tick) pair.
+  const lastAutoFilteredKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!frame.autoFilterPending) return;
     if (!bridgeReady) return;
     if (!frame.trackingNumber) return;
+    const key = `${frame.trackingNumber}#${frame.autoFilterTick}`;
+    if (lastAutoFilteredKeyRef.current === key) return;
+    lastAutoFilteredKeyRef.current = key;
     postFpxFilter(iframeRef.current, "Tracking Number", frame.trackingNumber);
-    consumeAutoFilter();
-  }, [frame.autoFilterPending, bridgeReady, frame.trackingNumber]);
+  }, [bridgeReady, frame.trackingNumber, frame.autoFilterTick]);
 
   // If the embed is disabled OR the iframe has never been asked to load,
   // render nothing. Once it's loaded once we keep it in the DOM (just
@@ -173,8 +178,11 @@ export function FreightPopOverlay() {
     >
       <div className="flex items-center gap-3 px-3 py-2 bg-white border-b border-slate-200 shadow-sm">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 shrink-0">FreightPOP · Tracking #</span>
-          <span className="font-mono text-sm text-slate-900 truncate">{frame.trackingNumber || "—"}</span>
+          {/* Lead with the FreightPOP shipment id — that's the unique
+              identifier in the operator's mental map. Tracking number is
+              secondary (mono, smaller) and customer name caps the line. */}
+          <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 shrink-0">FreightPOP · Shipment</span>
+          <span className="text-sm font-semibold text-slate-900 truncate">{frame.shipmentLabel || "—"}</span>
           {/* Bridge presence dot: green when the extension's content script
               has greeted us (auto-filter works), amber when still pinging
               (extension may not be installed/reloaded). Hovers explain. */}
@@ -185,6 +193,17 @@ export function FreightPopOverlay() {
               : "Extension bridge not detected — install/reload the FPXpress Chrome extension and refresh"}
           />
           {frame.trackingNumber ? (
+            <span className="hidden sm:inline-flex items-center gap-1 text-[11px] text-slate-500 shrink-0 min-w-0">
+              <span className="uppercase tracking-wider font-semibold">Tracking</span>
+              <span className="font-mono text-slate-700 truncate max-w-[180px]">{frame.trackingNumber}</span>
+            </span>
+          ) : null}
+          {frame.customerName ? (
+            <span className="hidden md:inline text-[11px] text-slate-500 truncate max-w-[220px]" title={frame.customerName}>
+              · {frame.customerName}
+            </span>
+          ) : null}
+          {frame.trackingNumber ? (
             <button
               onClick={() => {
                 navigator.clipboard.writeText(frame.trackingNumber || "").then(() => {
@@ -192,7 +211,7 @@ export function FreightPopOverlay() {
                   setTimeout(() => setCopied(null), 1500);
                 }).catch(() => {});
               }}
-              className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50"
+              className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50 shrink-0"
               title="Copy tracking number"
             >
               <Copy className="h-3.5 w-3.5" /> Copy

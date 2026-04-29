@@ -1,19 +1,36 @@
 import { useEffect, useState } from "react";
-import { Link2, Copy, Trash2, Eye, Lock, Clock } from "lucide-react";
+import { Link2, Copy, Trash2, Eye, Lock, Clock, Filter } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtNum } from "../lib/format";
 import type { ShareLink, ShareLinkView } from "../lib/types";
 import { Drawer, Field, Section } from "../components/Drawer";
+import { useAuth } from "../lib/auth";
+import { showFrame, hideFrame, requestAutoFilter } from "../lib/freightpopFrame";
 
 function publicUrlFor(token: string) {
   return `${window.location.origin}/share/${token}`;
 }
 
 export function ShareLinksPage() {
+  const { clientConfig } = useAuth();
+  const embedCfg = clientConfig?.embed_freightpop;
   const [rows, setRows] = useState<ShareLink[]>([]);
   const [loading, setLoading] = useState(true);
   const [detail, setDetail] = useState<{ link: ShareLink; views: ShareLinkView[] } | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
+  // Tracks the shipment-flavored share link's resolved shipment (so we can
+  // surface tracking number + customer name and drive the singleton
+  // FreightPOP overlay). null when the link isn't a shipment link OR the
+  // lookup failed (revoked underlying record, RLS, etc.).
+  const [shipmentMeta, setShipmentMeta] = useState<{
+    id: string;
+    shipment_id: string | null;
+    tracking_number: string | null;
+    customer_name: string | null;
+  } | null>(null);
+  // True while the "Load in FreightPOP" handler is mid-flight; lets us
+  // disable the button so a double-click doesn't fire two postMessages.
+  const [embedBusy, setEmbedBusy] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -22,9 +39,65 @@ export function ShareLinksPage() {
   }
   useEffect(() => { load(); }, []);
   useEffect(() => {
-    if (!openId) { setDetail(null); return; }
+    if (!openId) { setDetail(null); setShipmentMeta(null); return; }
     api.shareLinks.get(openId).then(setDetail).catch(() => setDetail(null));
   }, [openId]);
+
+  // When the opened share link points at a shipment, look the shipment up
+  // so the drawer can show tracking + customer and offer the embed button.
+  useEffect(() => {
+    setShipmentMeta(null);
+    if (!detail) return;
+    if (detail.link.resource_type !== "shipment") return;
+    const id = detail.link.resource_id;
+    let cancelled = false;
+    api.shipments.get(id)
+      .then((r) => {
+        if (cancelled) return;
+        setShipmentMeta({
+          id: r.shipment.id,
+          shipment_id: r.shipment.shipment_id,
+          tracking_number: r.shipment.tracking_number,
+          customer_name: r.shipment.customer_name,
+        });
+      })
+      .catch(() => { if (!cancelled) setShipmentMeta(null); });
+    return () => { cancelled = true; };
+  }, [detail]);
+
+  // Drawer close ⇒ tear down the overlay so the iframe doesn't sit on top
+  // of the rest of the dashboard. We don't unmount the iframe (the
+  // singleton overlay only toggles visibility), so login state survives.
+  useEffect(() => {
+    if (openId) return;
+    hideFrame();
+  }, [openId]);
+  // Page-leave cleanup mirrors what the Shipments page does.
+  useEffect(() => () => { hideFrame(); }, []);
+
+  function loadEmbed() {
+    if (embedBusy) return;
+    if (!embedCfg?.enabled) return;
+    if (!shipmentMeta) return;
+    setEmbedBusy(true);
+    try {
+      const url = (embedCfg.url_template || "")
+        .replace(/\{tracking_number\}/g, encodeURIComponent(shipmentMeta.tracking_number || ""))
+        .replace(/\{shipment_id\}/g, encodeURIComponent(shipmentMeta.shipment_id || shipmentMeta.id))
+        .replace(/\{order_number\}/g, "");
+      showFrame({
+        url,
+        shipmentId: shipmentMeta.id,
+        shipmentLabel: shipmentMeta.shipment_id,
+        trackingNumber: shipmentMeta.tracking_number,
+        customerName: shipmentMeta.customer_name,
+      });
+      // Bump the tick so the overlay re-fires the Kendo filter even if
+      // this exact tracking number was loaded previously (e.g. operator
+      // already has the iframe open from a different surface).
+      requestAutoFilter();
+    } finally { setEmbedBusy(false); }
+  }
 
   async function revoke(id: string, label: string | null) {
     if (!confirm(`Revoke link "${label || id}"? Anyone with the link will get a 410 response.`)) return;
@@ -99,9 +172,44 @@ export function ShareLinksPage() {
         onClose={() => setOpenId(null)}
         title={detail?.link.label || "Share link"}
         subtitle={detail ? `${detail.link.resource_type} · ${detail.views.length} views` : undefined}
+        // The singleton FreightPOP overlay paints over the gray space when
+        // the operator clicks "Load in FreightPOP" from this drawer; the
+        // backdrop would dim it.
+        suppressBackdrop={!!(embedCfg?.enabled && shipmentMeta)}
       >
         {detail ? (
           <>
+            {detail.link.resource_type === "shipment" && shipmentMeta ? (
+              <Section title="Shipment">
+                <div className="grid grid-cols-2 gap-4 mb-3">
+                  <Field label="Shipment ID">
+                    <span className="font-semibold">{shipmentMeta.shipment_id || "—"}</span>
+                  </Field>
+                  <Field label="Customer">{shipmentMeta.customer_name || "—"}</Field>
+                  <Field label="Tracking #">
+                    <span className="font-mono">{shipmentMeta.tracking_number || "—"}</span>
+                  </Field>
+                </div>
+                {embedCfg?.enabled ? (
+                  <button
+                    type="button"
+                    onClick={loadEmbed}
+                    disabled={embedBusy || !shipmentMeta.tracking_number}
+                    className="text-xs px-3 py-1.5 rounded-md ring-1 ring-violet-600 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title={shipmentMeta.tracking_number
+                      ? `Load FreightPOP and filter the grid to ${shipmentMeta.tracking_number}`
+                      : "No tracking number on this shipment"}
+                  >
+                    <Filter className="h-3.5 w-3.5" /> Load in FreightPOP
+                  </button>
+                ) : (
+                  <div className="text-[11px] text-slate-500">
+                    Set <span className="font-mono">embed.freightpop.url_template</span> in Settings
+                    to enable the in-page FreightPOP embed.
+                  </div>
+                )}
+              </Section>
+            ) : null}
             <Section title="Link">
               <Field label="Public URL">
                 <div className="flex items-center gap-2">
