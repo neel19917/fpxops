@@ -307,6 +307,17 @@ export const api = {
         "/api/tasks/customer-email-draft",
         { method: "POST", body: JSON.stringify(body) },
       ),
+    // Lists prior bulk drafts for a single group, newest-first. The
+    // Group Email modal calls this on open so the operator can see
+    // every draft we've ever written for that carrier / customer.
+    carrierEmailDrafts: (carrier: string, limit = 20) =>
+      request<{ drafts: GroupEmailDraft[] }>("/api/tasks/carrier-email-drafts", {
+        params: { carrier, limit },
+      }),
+    customerEmailDrafts: (customer: string, limit = 20) =>
+      request<{ drafts: GroupEmailDraft[] }>("/api/tasks/customer-email-drafts", {
+        params: { customer, limit },
+      }),
   },
   feedback: {
     list: (params?: { status?: string; category?: string }) =>
@@ -341,6 +352,22 @@ export const api = {
       request<OpsMetrics>("/api/ops/metrics", { params: { days } }),
   },
 };
+
+// Stored bulk-email draft as returned by the carrier-email-drafts /
+// customer-email-drafts list endpoints. Pulled from fpx_ai_analyses
+// rows tagged with metadata.subkind=email_draft_*_group.
+export interface GroupEmailDraft {
+  id: string;
+  created_at: string;
+  model: string | null;
+  subject: string | null;
+  body: string | null;
+  raw: string | null;
+  count: number | null;
+  cost_usd: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+}
 
 export interface OpsDailyRow {
   date: string;

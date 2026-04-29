@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus } from "lucide-react";
-import { api } from "../lib/api";
+import { api, type GroupEmailDraft } from "../lib/api";
 import type { CarrierFollowupShipment, Shipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
+import { fmtRelative } from "../lib/format";
 import { useNav } from "../lib/nav";
 import { UserPicker } from "../components/UserPicker";
 import { requestAutoFilter } from "../lib/freightpopFrame";
@@ -1246,6 +1247,9 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
   fetch: () => Promise<{ groups: FollowupGroup[]; total: number }>;
   emailDraft: (body: { name: string; task_ids: string[]; notes?: string }) =>
     Promise<{ subject: string; body: string; count: number; model: string | null }>;
+  // Prior-drafts list — used by the Group Email modal so the operator
+  // can see every email we've ever drafted for this group.
+  emailDraftsList: (name: string) => Promise<{ drafts: GroupEmailDraft[] }>;
   ringTone: string;       // tailwind ring class
   bgTone: string;         // tailwind bg class
   chipTone: string;
@@ -1263,6 +1267,7 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
     },
     emailDraft: ({ name, task_ids, notes }) =>
       api.tasks.carrierEmailDraft({ carrier: name, task_ids, notes }),
+    emailDraftsList: (name) => api.tasks.carrierEmailDrafts(name),
     ringTone: "ring-violet-200",
     bgTone: "bg-violet-50/40",
     chipTone: "bg-violet-100 text-violet-800",
@@ -1280,6 +1285,7 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
     },
     emailDraft: ({ name, task_ids, notes }) =>
       api.tasks.customerEmailDraft({ customer: name, task_ids, notes }),
+    emailDraftsList: (name) => api.tasks.customerEmailDrafts(name),
     ringTone: "ring-sky-200",
     bgTone: "bg-sky-50/40",
     chipTone: "bg-sky-100 text-sky-800",
@@ -1479,29 +1485,67 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
 }) {
   const cfg = FOLLOWUP_KIND_CONFIG[kind];
   const [busy, setBusy] = useState(false);
-  const [draft, setDraft] = useState<{ subject: string; body: string; model: string | null } | null>(null);
+  // Live list of drafts for this group, freshest-first. Includes both
+  // historical drafts pulled on open AND any new drafts the operator
+  // generates inside this session — we prepend new ones rather than
+  // replacing the list so the history stays intact.
+  const [drafts, setDrafts] = useState<GroupEmailDraft[]>([]);
+  // Selected draft id within `drafts`. Null until the list loads or
+  // a fresh generate fires. Driven by the buttons in the prior-drafts
+  // strip on the left.
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [loadingDrafts, setLoadingDrafts] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [copied, setCopied] = useState(false);
 
+  // Fetch the prior drafts for this group on mount. We always render
+  // them — even if the operator never clicks Generate inside this
+  // modal session, the prior drafts give them something to copy.
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingDrafts(true);
+    cfg.emailDraftsList(group.name)
+      .then((r) => {
+        if (cancelled) return;
+        setDrafts(r.drafts || []);
+        if (r.drafts && r.drafts.length) setSelectedId(r.drafts[0].id);
+      })
+      .catch((e) => { if (!cancelled) setErr((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoadingDrafts(false); });
+    return () => { cancelled = true; };
+  }, [group.name, cfg]);
+
+  const selected = drafts.find((d) => d.id === selectedId) || null;
+
   async function generate() {
-    setBusy(true); setErr(null); setDraft(null);
+    setBusy(true); setErr(null);
     try {
       const r = await cfg.emailDraft({
         name: group.name,
         task_ids: group.items.map((it) => it.task.id),
         notes: notes.trim() || undefined,
       });
-      setDraft({ subject: r.subject, body: r.body, model: r.model });
+      // Refetch the list — the server just inserted a new analyses
+      // row and we want the modal to reflect it (new draft, accurate
+      // timestamps, future drafts also pickable).
+      const list = await cfg.emailDraftsList(group.name);
+      setDrafts(list.drafts || []);
+      // Select the freshest draft. Match on subject+body since the
+      // generate response doesn't include the analyses row id.
+      const fresh = (list.drafts || []).find(
+        (d) => d.subject === r.subject && d.body === r.body,
+      );
+      setSelectedId(fresh ? fresh.id : ((list.drafts || [])[0]?.id || null));
     } catch (e) {
       setErr((e as Error).message);
     } finally { setBusy(false); }
   }
 
   async function copy() {
-    if (!draft) return;
+    if (!selected) return;
     try {
-      await navigator.clipboard.writeText(`Subject: ${draft.subject}\n\n${draft.body}`);
+      await navigator.clipboard.writeText(`Subject: ${selected.subject || ""}\n\n${selected.body || ""}`);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch { /* clipboard blocked */ }
@@ -1519,7 +1563,7 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[88vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
@@ -1529,7 +1573,7 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
               Group email · {group.name}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              {group.items.length} shipment{group.items.length === 1 ? "" : "s"} · one consolidated email · prompts editable in Settings
+              {group.items.length} shipment{group.items.length === 1 ? "" : "s"} · prior drafts shown on the left · prompts editable in Settings
             </p>
           </div>
           <button onClick={onClose} className="text-slate-500 hover:text-slate-900 p-2 rounded-lg hover:bg-slate-100">
@@ -1537,94 +1581,141 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
           </button>
         </div>
 
-        <div className="p-5 overflow-y-auto flex-1 space-y-4">
-          <div>
-            <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
-              Shipments included
+        <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-[260px_1fr] divide-x divide-slate-200">
+          {/* Prior drafts strip — newest first. Selecting one pulls
+              its subject + body into the right pane. */}
+          <div className="overflow-y-auto p-3">
+            <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-2">
+              Drafts ({drafts.length})
             </div>
-            <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-44 overflow-y-auto">
-              <ul className="divide-y divide-slate-200">
-                {group.items.map((it) => (
-                  <li key={it.task.id} className="px-3 py-2 text-xs">
-                    <div className="flex items-center justify-between gap-2 min-w-0">
-                      <span className="font-medium text-slate-900 truncate">
-                        {it.shipment.shipment_id || "(no shipment id)"}
-                      </span>
-                      <span className="text-slate-600 shrink-0 font-mono text-[11px]">
-                        {it.shipment.tracking_number || ""}
-                      </span>
-                    </div>
-                    <div className="text-slate-500 truncate">
-                      {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
-                    </div>
-                    <div className="text-slate-700 mt-0.5">{it.task.title}</div>
-                    {it.task.description ? (
-                      <div className="text-slate-500 line-clamp-2">{it.task.description}</div>
-                    ) : null}
-                  </li>
-                ))}
+            {loadingDrafts ? (
+              <div className="text-xs text-slate-500 px-2 py-1">Loading…</div>
+            ) : drafts.length === 0 ? (
+              <div className="text-xs text-slate-500 px-2 py-3 leading-relaxed">
+                No drafts yet for {cfg.groupNoun} <span className="font-semibold">{group.name}</span>. Click <span className="font-semibold">Generate</span> below.
+              </div>
+            ) : (
+              <ul className="space-y-1">
+                {drafts.map((d) => {
+                  const active = d.id === selectedId;
+                  return (
+                    <li key={d.id}>
+                      <button
+                        onClick={() => setSelectedId(d.id)}
+                        className={
+                          "w-full text-left rounded-lg px-3 py-2 text-xs transition " +
+                          (active
+                            ? `${cfg.bgTone} ring-1 ${cfg.ringTone}`
+                            : "hover:bg-slate-50 ring-1 ring-transparent")
+                        }
+                        title={d.subject || "(no subject)"}
+                      >
+                        <div className={"font-medium truncate " + (active ? "text-slate-900" : "text-slate-700")}>
+                          {d.subject || "(no subject)"}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5 flex items-center gap-1.5 flex-wrap">
+                          <span>{fmtRelative(d.created_at)}</span>
+                          {d.model ? <span className="font-mono">{d.model}</span> : null}
+                          {d.count ? <span>· {d.count} ship.</span> : null}
+                        </div>
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
+            )}
+          </div>
+
+          {/* Right pane: shipments-included + notes input + selected
+              draft preview. Stacked vertically so the operator can
+              scroll the right side independently of the drafts list. */}
+          <div className="overflow-y-auto p-5 space-y-4">
+            <div>
+              <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                Shipments included
+              </div>
+              <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-40 overflow-y-auto">
+                <ul className="divide-y divide-slate-200">
+                  {group.items.map((it) => (
+                    <li key={it.task.id} className="px-3 py-2 text-xs">
+                      <div className="flex items-center justify-between gap-2 min-w-0">
+                        <span className="font-medium text-slate-900 truncate">
+                          {it.shipment.shipment_id || "(no shipment id)"}
+                        </span>
+                        <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                          {it.shipment.tracking_number || ""}
+                        </span>
+                      </div>
+                      <div className="text-slate-500 truncate">
+                        {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
+                      </div>
+                      <div className="text-slate-700 mt-0.5">{it.task.title}</div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             </div>
-          </div>
 
-          <div>
-            <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
-              Operator notes (optional)
-            </label>
-            <textarea
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="Anything the model should emphasize across the whole batch (e.g. 'all of these have been silent for 48h, ask for ETAs and POD where applicable')"
-              className="w-full text-sm px-3 py-2 rounded-lg ring-1 ring-slate-200 focus:ring-sky-400 focus:outline-none min-h-[60px]"
-            />
-          </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+                Operator notes (optional, applied to next Generate)
+              </label>
+              <textarea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="Anything the model should emphasize across the whole batch."
+                className="w-full text-sm px-3 py-2 rounded-lg ring-1 ring-slate-200 focus:ring-sky-400 focus:outline-none min-h-[50px]"
+              />
+            </div>
 
-          {err ? (
-            <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-3 py-2 text-sm text-rose-800">{err}</div>
-          ) : null}
+            {err ? (
+              <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-3 py-2 text-sm text-rose-800">{err}</div>
+            ) : null}
 
-          {draft ? (
-            <div className="space-y-3">
-              <div>
-                <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Subject</div>
-                <div className="text-sm font-medium text-slate-900 px-3 py-2 rounded-lg bg-slate-50 ring-1 ring-slate-200">
-                  {draft.subject}
+            {selected ? (
+              <div className="space-y-3">
+                <div>
+                  <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Subject</div>
+                  <div className="text-sm font-medium text-slate-900 px-3 py-2 rounded-lg bg-slate-50 ring-1 ring-slate-200">
+                    {selected.subject || "(no subject — model returned non-JSON)"}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Body</div>
+                  <pre className="text-sm whitespace-pre-wrap text-slate-800 px-3 py-3 rounded-lg bg-slate-50 ring-1 ring-slate-200 leading-relaxed">{selected.body || selected.raw || "(empty)"}</pre>
+                </div>
+                <div className="text-[11px] text-slate-500 flex items-center gap-3 flex-wrap">
+                  <span>Generated {fmtRelative(selected.created_at)}</span>
+                  {selected.model ? <span>· <span className="font-mono">{selected.model}</span></span> : null}
+                  {selected.cost_usd ? <span>· cost ${Number(selected.cost_usd).toFixed(4)}</span> : null}
                 </div>
               </div>
-              <div>
-                <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Body</div>
-                <pre className="text-sm whitespace-pre-wrap text-slate-800 px-3 py-3 rounded-lg bg-slate-50 ring-1 ring-slate-200 leading-relaxed">{draft.body}</pre>
+            ) : !loadingDrafts && !busy ? (
+              <div className="text-sm text-slate-500">
+                No draft selected. Click <span className="font-semibold">Generate</span> below to write the first one for this {cfg.groupNoun}.
               </div>
-              {draft.model ? (
-                <div className="text-[11px] text-slate-500">Generated by <span className="font-mono">{draft.model}</span></div>
-              ) : null}
-            </div>
-          ) : !busy ? (
-            <div className="text-sm text-slate-500">
-              Click <span className="font-semibold">Generate</span> to draft one email covering every shipment above. The
-              system + audience prompts and the model are all editable in <span className="font-mono">Settings → prompt.email_draft.carrier_group.*</span>.
-            </div>
-          ) : null}
+            ) : null}
+          </div>
         </div>
 
         <div className="px-5 py-4 border-t border-slate-200 flex items-center justify-between gap-3">
           <button
             onClick={generate}
             disabled={busy}
-            className="px-4 py-2 rounded-lg bg-violet-600 text-white text-sm font-semibold hover:bg-violet-700 disabled:opacity-50 inline-flex items-center gap-2"
+            className={`px-4 py-2 rounded-lg text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-50 ${cfg.buttonTone}`}
           >
             {busy ? (
               <><RefreshCw className="h-4 w-4 animate-spin" /> Drafting…</>
-            ) : draft ? (
-              <><RefreshCw className="h-4 w-4" /> Regenerate</>
+            ) : drafts.length ? (
+              <><RefreshCw className="h-4 w-4" /> Generate new draft</>
             ) : (
               <><Send className="h-4 w-4" /> Generate</>
             )}
           </button>
-          {draft ? (
+          {selected ? (
             <div className="flex items-center gap-3">
               <a
-                href={`mailto:?subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`}
+                href={`mailto:?subject=${encodeURIComponent(selected.subject || "")}&body=${encodeURIComponent(selected.body || "")}`}
                 className="text-sm text-sky-700 hover:text-sky-900 font-medium"
               >Open in mail client →</a>
               <button
