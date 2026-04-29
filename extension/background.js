@@ -553,6 +553,86 @@ function accumulateCost(result) {
   }
 }
 
+// ---------- Cross-origin message listener (dashboard relay) ----------
+//
+// The dashboard hands a Supabase session to the extension via
+// chrome.runtime.sendMessage(EXT_ID, ...). Without this relay,
+// every rep would have to add their unpacked-extension's unique
+// chromiumapp.org URL to Supabase Auth → Redirect URLs by hand —
+// the IDs change per install. Going through the dashboard means
+// only ONE redirect URL (the dashboard origin) ever needs to be
+// registered.
+//
+// Sender origin allowlist matches manifest.externally_connectable —
+// belt-and-suspenders here in case Chrome lets a stray origin
+// through (it shouldn't).
+const RELAY_ORIGINS = [
+  "https://fpxpress.netlify.app",
+  "http://localhost:5173",
+];
+chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+  // sender.url is the page that called sendMessage; sender.origin is
+  // available in MV3. Allow either signal — Chrome currently sets
+  // sender.url for content / page contexts.
+  const origin = sender.origin || (sender.url ? new URL(sender.url).origin : "");
+  const matchesAllowed = RELAY_ORIGINS.includes(origin) || /^https:\/\/[^/]+--fpxpress\.netlify\.app$/.test(origin);
+  if (!matchesAllowed) {
+    sendResponse({ ok: false, error: `Origin not allowed: ${origin || "(unknown)"}` });
+    return false;
+  }
+  if (msg && msg.type === "fpxOauthSession" && msg.session) {
+    (async () => {
+      try {
+        const s = msg.session;
+        if (!s.access_token) {
+          sendResponse({ ok: false, error: "session.access_token missing" });
+          return;
+        }
+        // Normalize to the same shape we use for chrome.identity-driven
+        // sign-ins so downstream code (callApi, isSessionLive, etc.)
+        // doesn't need to branch.
+        const expires_at = typeof s.expires_at === "number"
+          ? s.expires_at
+          : (s.expires_in ? Math.floor(Date.now() / 1000) + Number(s.expires_in) : Math.floor(Date.now() / 1000) + 3600);
+        const claims = decodeJwtPayload(s.access_token) || {};
+        const session = {
+          access_token: s.access_token,
+          refresh_token: s.refresh_token || null,
+          expires_at,
+          email: s.email || claims.email || null,
+          provider: s.provider || "azure",
+        };
+        await saveSupabaseSession(session);
+        // Same name auto-stamp the chrome.identity flow does.
+        const profile = await fetchProfileWithSession(session);
+        if (profile?.fullName || profile?.email) {
+          const name = profile.fullName || profile.email.split("@")[0];
+          await chrome.storage.local.set({ fpxUserName: name });
+        }
+        sendResponse({
+          ok: true,
+          email: session.email,
+          approved: !!profile?.enabled,
+          role: profile?.role || null,
+          fullName: profile?.fullName || null,
+        });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true; // keep the channel open for the async sendResponse
+  }
+  if (msg && msg.type === "fpxRelayPing") {
+    // Lets the dashboard test "is the extension installed" before
+    // bothering with the OAuth flow. Returns the extension's id +
+    // version so the dashboard can render a sensible banner.
+    sendResponse({ ok: true, version: chrome.runtime.getManifest().version });
+    return false;
+  }
+  sendResponse({ ok: false, error: `Unknown message type: ${msg && msg.type}` });
+  return false;
+});
+
 // ---------- Message router ----------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "status" || msg.type === "gpAuditStatus" || msg.type === "invoiceAuditStatus") {
@@ -725,6 +805,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const result = await signInWithMicrosoft();
       sendResponse(result);
+    })();
+    return true;
+  } else if (msg.type === "getRelayUrl") {
+    // Composes the dashboard /ext-login URL with this install's
+    // chrome.runtime.id baked in as ?extId. The dashboard reads
+    // that param and uses it to route the session back to us via
+    // chrome.runtime.sendMessage(extId, ...). FPX_API_URL doubles
+    // as the dashboard origin discriminator — extension assumes
+    // dashboard lives at the same origin as the API for prod, with
+    // a localhost fallback for dev.
+    (async () => {
+      const apiUrl = await getApiUrl();
+      // Heuristic: FPX_API_URL points at Railway in prod and
+      // localhost:3210 in dev. The dashboard origin is
+      // fpxpress.netlify.app in prod and localhost:5173 in dev.
+      // Map between them so the relay always lands on the right
+      // dashboard.
+      let dashOrigin;
+      if (apiUrl && /localhost|127\.0\.0\.1/i.test(apiUrl)) {
+        dashOrigin = "http://localhost:5173";
+      } else {
+        dashOrigin = "https://fpxpress.netlify.app";
+      }
+      const url = `${dashOrigin}/ext-login?extId=${encodeURIComponent(chrome.runtime.id)}`;
+      sendResponse({ ok: true, url });
     })();
     return true;
   } else if (msg.type === "signOutSupabase") {
