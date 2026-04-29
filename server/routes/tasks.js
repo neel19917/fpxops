@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
+import { computeWalkContext } from "../lib/taskWalk.js";
 
 export const tasksRouter = Router();
 
@@ -42,21 +43,9 @@ tasksRouter.get("/:id", async (req, res) => {
     // "all" → no status filter.
     const { data: list, error: listErr } = await q;
     if (!listErr && list) {
-      // Always include the focused task even if it falls out of the filter
-      // (e.g. you walked into a blocked task while filtered to active).
-      const idx = list.findIndex((t) => t.id === task.id);
-      const safeList = idx >= 0 ? list : [task, ...list];
-      const safeIdx = idx >= 0 ? idx : 0;
-      walk = {
-        mode: walkParam,
-        index: safeIdx,
-        total: safeList.length,
-        prev_id: safeIdx > 0 ? safeList[safeIdx - 1].id : null,
-        next_id: safeIdx < safeList.length - 1 ? safeList[safeIdx + 1].id : null,
-        prev_shipment_id: safeIdx > 0 ? safeList[safeIdx - 1].shipment_id : null,
-        next_shipment_id: safeIdx < safeList.length - 1 ? safeList[safeIdx + 1].shipment_id : null,
-        ids: safeList.map((t) => t.id),
-      };
+      // Pure resolver lives in lib/taskWalk.js so it's testable without
+      // mocking supabase.
+      walk = computeWalkContext(task, list, walkParam);
     }
   }
   res.json({ task, walk });
