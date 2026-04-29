@@ -524,13 +524,19 @@ shipmentsRouter.post("/:id/tasks", async (req, res) => {
   if (shipErr) return res.status(500).json({ error: shipErr.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
   const creatorName = req.user?.email || req.apiKey?.name || req.header("x-fpx-user-name") || null;
+  // Allow callers to specify an initial status — the followup add-task
+  // modal needs in_progress / blocked options because operators
+  // sometimes know the shipment is already mid-pursuit at creation
+  // time. "done"/"cancelled" intentionally not allowed via this path
+  // (use the separate update flow with completed_at handling).
+  const allowedStatus = ["open", "in_progress", "blocked"];
   const row = {
     shipment_id: ship.id,
     tracking_number: ship.tracking_number,
     title,
     description: req.body?.description ? String(req.body.description) : null,
     priority: ["low","normal","high","urgent"].includes(req.body?.priority) ? req.body.priority : "normal",
-    status: "open",
+    status: allowedStatus.includes(req.body?.status) ? req.body.status : "open",
     assigned_to: req.body?.assigned_to || ship.created_by || null,
     created_by: creatorName,
     due_at: req.body?.due_at || null,

@@ -145,3 +145,50 @@ export async function generateCarrierGroupEmail({ carrier, items, notes, callMet
   }
   return { subject: parsed.subject, body: parsed.body, model: result.model };
 }
+
+// Bulk customer-followup email — same shape as the carrier-group flow
+// but swaps the audience to the end customer (shipper / consignee) and
+// reads its prompts from the customer_group settings keys. The slim
+// shape is identical because the model still benefits from the same
+// per-shipment context regardless of who's reading.
+export async function generateCustomerGroupEmail({ customer, items, notes, callMeta }) {
+  if (!Array.isArray(items) || items.length === 0) return { error: "No shipments supplied" };
+  const settings = await getSettings(
+    "prompt.email_draft.customer_group.system_base",
+    "prompt.email_draft.customer_group.audience",
+    "prompt.email_draft.customer_group.model",
+  );
+  const audienceCopy = settings["prompt.email_draft.customer_group.audience"];
+  const systemPrompt = String(settings["prompt.email_draft.customer_group.system_base"] || "")
+    .replace("{{audienceCopy}}", audienceCopy);
+  const modelOverride = settings["prompt.email_draft.customer_group.model"] || undefined;
+
+  const slim = items.map((it) => slimShipmentForGroup(it.shipment, it.task?.title, it.task?.description));
+  const userMessage = `Customer: ${customer || "(unknown)"}\n` +
+    `Shipments needing follow-up (count=${slim.length}):\n${JSON.stringify(slim, null, 2)}\n\n` +
+    (notes ? `Operator notes for this batch: ${notes}\n\n` : "") +
+    "Write the consolidated customer-facing email now. JSON only, no preamble.";
+
+  const result = await callClaude({
+    systemPrompt,
+    userMessage,
+    maxTokens: 2000,
+    modelOverride,
+    metadata: {
+      kind: "other",
+      ...(callMeta || {}),
+      metadata: { subkind: "email_draft_customer_group", customer, count: slim.length, ...((callMeta?.metadata) || {}) },
+    },
+  });
+  if (result.error) return { error: result.error };
+
+  let parsed = null;
+  try {
+    const m = result.text.match(/\{[\s\S]*\}/);
+    if (m) parsed = JSON.parse(m[0]);
+  } catch {}
+  if (!parsed?.subject || !parsed?.body) {
+    return { subject: "(draft)", body: result.text, raw: result.text };
+  }
+  return { subject: parsed.subject, body: parsed.body, model: result.model };
+}

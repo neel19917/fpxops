@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus } from "lucide-react";
 import { api } from "../lib/api";
-import type { CarrierFollowupShipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
+import type { CarrierFollowupShipment, Shipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { useNav } from "../lib/nav";
 import { UserPicker } from "../components/UserPicker";
 import { requestAutoFilter } from "../lib/freightpopFrame";
@@ -712,12 +712,15 @@ export function TasksPage() {
         </div>
       ) : null}
 
-      {/* Carrier Followups panel sits above both views so it's always
-          findable, regardless of whether the user is in Kanban or
-          Table mode. The panel itself collapses to a one-liner when
-          there are no follow-up tasks, so this isn't visual noise on
-          quiet days. */}
-      <CarrierFollowupsPanel onTaskClick={(taskId) => nav.openTask(taskId)} />
+      {/* Followup panels (carrier + customer) sit above both views so
+          they're always findable, regardless of whether the user is in
+          Kanban or Table mode. Each panel collapses to a one-liner
+          (with an inline "+ Add" button) when its scope is empty, so
+          quiet days don't crowd the regular Kanban below. Carrier
+          before Customer to mirror the operational sequence — chase
+          the carrier first, brief the customer second. */}
+      <FollowupsPanel kind="carrier" onTaskClick={(taskId) => nav.openTask(taskId)} />
+      <FollowupsPanel kind="customer" onTaskClick={(taskId) => nav.openTask(taskId)} />
 
       {viewMode === "kanban" ? (
         <KanbanBoard
@@ -1172,81 +1175,166 @@ function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask, onDragSta
 }
 
 // ===========================================================================
-// Carrier Followups panel — surfaces tasks whose title flags them as
-// carrier follow-ups, grouped by carrier. Each carrier card lists its
-// shipments and exposes a "Group email" button that drafts ONE Claude
-// email covering every shipment for that carrier (Opus by default).
+// Followups panels — surfaces tasks whose titles flag them as carrier or
+// customer follow-ups, grouped by carrier name / customer name. Each card
+// lists the shipments and exposes a "Group email" button that drafts ONE
+// Claude email covering every shipment for that group (Opus by default).
+// Carrier and Customer panels share the same component, parameterized by
+// `kind` so we don't fork ~200 lines of identical layout/state code.
 // ===========================================================================
 
-interface CarrierFollowupItem { task: ShipmentTask; shipment: CarrierFollowupShipment; }
-interface CarrierFollowupGroup { carrier: string; items: CarrierFollowupItem[]; }
+type FollowupKind = "carrier" | "customer";
+interface FollowupItem { task: ShipmentTask; shipment: CarrierFollowupShipment; }
+// Internal normalized group shape so the renderer doesn't need to switch
+// on `kind` for `g.carrier` vs `g.customer` — both come in as `name`.
+interface FollowupGroup { name: string; items: FollowupItem[] }
 
-function CarrierFollowupsPanel({ onTaskClick }: { onTaskClick: (taskId: string) => void }) {
-  const [groups, setGroups] = useState<CarrierFollowupGroup[]>([]);
+const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
+  title: string;          // "Carrier Followups"
+  groupNoun: string;      // "carrier" / "customer"
+  emptyExample: string;   // example title to show in empty state
+  fetch: () => Promise<{ groups: FollowupGroup[]; total: number }>;
+  emailDraft: (body: { name: string; task_ids: string[]; notes?: string }) =>
+    Promise<{ subject: string; body: string; count: number; model: string | null }>;
+  ringTone: string;       // tailwind ring class
+  bgTone: string;         // tailwind bg class
+  chipTone: string;
+  textTone: string;
+  iconTone: string;
+  buttonTone: string;
+}> = {
+  carrier: {
+    title: "Carrier Followups",
+    groupNoun: "carrier",
+    emptyExample: "Carrier followup: missing POD",
+    fetch: async () => {
+      const r = await api.tasks.carrierFollowups();
+      return { total: r.total, groups: r.groups.map((g) => ({ name: g.carrier, items: g.items })) };
+    },
+    emailDraft: ({ name, task_ids, notes }) =>
+      api.tasks.carrierEmailDraft({ carrier: name, task_ids, notes }),
+    ringTone: "ring-violet-200",
+    bgTone: "bg-violet-50/40",
+    chipTone: "bg-violet-100 text-violet-800",
+    textTone: "text-violet-900",
+    iconTone: "text-violet-700",
+    buttonTone: "bg-violet-600 hover:bg-violet-700",
+  },
+  customer: {
+    title: "Customer Followups",
+    groupNoun: "customer",
+    emptyExample: "Customer followup: needs ETA",
+    fetch: async () => {
+      const r = await api.tasks.customerFollowups();
+      return { total: r.total, groups: r.groups.map((g) => ({ name: g.customer, items: g.items })) };
+    },
+    emailDraft: ({ name, task_ids, notes }) =>
+      api.tasks.customerEmailDraft({ customer: name, task_ids, notes }),
+    ringTone: "ring-sky-200",
+    bgTone: "bg-sky-50/40",
+    chipTone: "bg-sky-100 text-sky-800",
+    textTone: "text-sky-900",
+    iconTone: "text-sky-700",
+    buttonTone: "bg-sky-600 hover:bg-sky-700",
+  },
+};
+
+function FollowupsPanel({ kind, onTaskClick }: {
+  kind: FollowupKind;
+  onTaskClick: (taskId: string) => void;
+}) {
+  const cfg = FOLLOWUP_KIND_CONFIG[kind];
+  const [groups, setGroups] = useState<FollowupGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
-  const [emailFor, setEmailFor] = useState<CarrierFollowupGroup | null>(null);
+  const [emailFor, setEmailFor] = useState<FollowupGroup | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   async function load() {
     setLoading(true); setErr(null);
     try {
-      const r = await api.tasks.carrierFollowups();
+      const r = await cfg.fetch();
       setGroups(r.groups);
     } catch (e) { setErr((e as Error).message); }
     finally { setLoading(false); }
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [kind]);
 
-  // Empty state and loading state are intentionally compact — when no
-  // carrier-followup tasks exist, this panel should disappear into a
-  // single hint line so it doesn't crowd the regular Kanban below it.
   if (loading) {
     return (
-      <div className="mb-4 rounded-xl ring-1 ring-violet-200 bg-violet-50/40 px-4 py-3 text-sm text-violet-900">
-        Loading carrier follow-ups…
+      <div className={`mb-4 rounded-xl ring-1 ${cfg.ringTone} ${cfg.bgTone} px-4 py-3 text-sm ${cfg.textTone}`}>
+        Loading {cfg.groupNoun} follow-ups…
       </div>
     );
   }
   if (err) {
     return (
       <div className="mb-4 rounded-xl ring-1 ring-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-        Couldn't load carrier follow-ups: {err}
+        Couldn't load {cfg.groupNoun} follow-ups: {err}
       </div>
     );
   }
+  // Empty state still shows an Add button so operators can create the first
+  // followup without having to hunt down the Tasks page detail view.
   if (groups.length === 0) {
     return (
-      <div className="mb-4 rounded-xl ring-1 ring-slate-200 bg-white px-4 py-2.5 text-[12px] text-slate-500">
-        <span className="font-semibold text-slate-700">Carrier Followups</span>
-        <span className="mx-1.5">·</span>
-        No active carrier-follow-up tasks. Tag a task title with “carrier followup” (e.g. <span className="font-mono text-[11px] bg-slate-100 px-1.5 py-0.5 rounded">Carrier followup: missing POD</span>) and it'll surface here grouped by carrier.
-      </div>
+      <>
+        <div className="mb-4 rounded-xl ring-1 ring-slate-200 bg-white px-4 py-2.5 text-[12px] text-slate-500 flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <span className="font-semibold text-slate-700">{cfg.title}</span>
+            <span className="mx-1.5">·</span>
+            No active {cfg.groupNoun}-follow-up tasks. Use <span className="font-semibold">+ Add</span> or tag a task title with
+            <span className="font-mono text-[11px] bg-slate-100 px-1.5 py-0.5 rounded mx-1">{cfg.emptyExample}</span>
+            and it'll surface here grouped by {cfg.groupNoun}.
+          </div>
+          <button
+            onClick={() => setAddOpen(true)}
+            className={`text-xs font-semibold rounded-md px-2.5 py-1.5 text-white inline-flex items-center gap-1.5 ${cfg.buttonTone}`}
+            title={`Create a ${cfg.groupNoun}-followup task`}
+          >
+            <Plus className="h-3.5 w-3.5" /> Add
+          </button>
+        </div>
+        {addOpen ? (
+          <AddFollowupTaskModal kind={kind} onClose={() => setAddOpen(false)} onCreated={() => { setAddOpen(false); load(); }} />
+        ) : null}
+      </>
     );
   }
   const total = groups.reduce((n, g) => n + g.items.length, 0);
   return (
-    <div className="mb-4 rounded-xl ring-1 ring-violet-200 bg-violet-50/40">
-      <div className="px-4 py-2.5 flex items-center justify-between border-b border-violet-200/80">
+    <div className={`mb-4 rounded-xl ring-1 ${cfg.ringTone} ${cfg.bgTone}`}>
+      <div className={`px-4 py-2.5 flex items-center justify-between border-b ${cfg.ringTone}`}>
         <div className="flex items-center gap-2">
-          <Mail className="h-4 w-4 text-violet-700" />
-          <span className="text-sm font-semibold text-slate-800">Carrier Followups</span>
-          <span className="text-[11px] font-semibold px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-800">
-            {total} task{total === 1 ? "" : "s"} · {groups.length} carrier{groups.length === 1 ? "" : "s"}
+          <Mail className={`h-4 w-4 ${cfg.iconTone}`} />
+          <span className="text-sm font-semibold text-slate-800">{cfg.title}</span>
+          <span className={`text-[11px] font-semibold px-1.5 py-0.5 rounded-full ${cfg.chipTone}`}>
+            {total} task{total === 1 ? "" : "s"} · {groups.length} {cfg.groupNoun}{groups.length === 1 ? "" : "s"}
           </span>
         </div>
-        <button
-          onClick={load}
-          className="text-[11px] text-violet-700 hover:text-violet-900 inline-flex items-center gap-1"
-          title="Refresh carrier followups"
-        >
-          <RefreshCw className="h-3 w-3" /> Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setAddOpen(true)}
+            className={`text-xs font-semibold rounded-md px-2 py-1 text-white inline-flex items-center gap-1 ${cfg.buttonTone}`}
+            title={`Create a ${cfg.groupNoun}-followup task`}
+          >
+            <Plus className="h-3 w-3" /> Add
+          </button>
+          <button
+            onClick={load}
+            className={`text-[11px] ${cfg.iconTone} hover:opacity-80 inline-flex items-center gap-1`}
+            title={`Refresh ${cfg.groupNoun} followups`}
+          >
+            <RefreshCw className="h-3 w-3" /> Refresh
+          </button>
+        </div>
       </div>
       <div className="p-3 grid grid-cols-1 lg:grid-cols-2 gap-3">
         {groups.map((g) => (
-          <CarrierGroupCard
-            key={g.carrier}
+          <FollowupGroupCard
+            key={g.name}
             group={g}
+            kind={kind}
             onTaskClick={onTaskClick}
             onEmail={() => setEmailFor(g)}
           />
@@ -1254,39 +1342,46 @@ function CarrierFollowupsPanel({ onTaskClick }: { onTaskClick: (taskId: string) 
       </div>
 
       {emailFor ? (
-        <CarrierGroupEmailModal
+        <FollowupGroupEmailModal
           group={emailFor}
+          kind={kind}
           onClose={() => setEmailFor(null)}
         />
+      ) : null}
+      {addOpen ? (
+        <AddFollowupTaskModal kind={kind} onClose={() => setAddOpen(false)} onCreated={() => { setAddOpen(false); load(); }} />
       ) : null}
     </div>
   );
 }
 
-function CarrierGroupCard({ group, onTaskClick, onEmail }: {
-  group: CarrierFollowupGroup;
+function FollowupGroupCard({ group, kind, onTaskClick, onEmail }: {
+  group: FollowupGroup;
+  kind: FollowupKind;
   onTaskClick: (taskId: string) => void;
   onEmail: () => void;
 }) {
+  const cfg = FOLLOWUP_KIND_CONFIG[kind];
+  const groupNounCap = cfg.groupNoun.charAt(0).toUpperCase() + cfg.groupNoun.slice(1);
   return (
-    <div className="rounded-lg bg-white ring-1 ring-violet-200 shadow-sm flex flex-col">
-      <div className="px-3 py-2 border-b border-violet-100 flex items-center justify-between gap-2">
+    <div className={`rounded-lg bg-white ring-1 ${cfg.ringTone} shadow-sm flex flex-col`}>
+      <div className={`px-3 py-2 border-b ${cfg.ringTone} flex items-center justify-between gap-2`}>
         <div className="min-w-0">
-          <div className="text-[10px] uppercase tracking-wider font-bold text-violet-700">Carrier</div>
-          <div className="text-sm font-semibold text-slate-900 truncate" title={group.carrier}>
-            {group.carrier}
+          <div className={`text-[10px] uppercase tracking-wider font-bold ${cfg.iconTone}`}>{groupNounCap}</div>
+          <div className="text-sm font-semibold text-slate-900 truncate" title={group.name}>
+            {group.name}
           </div>
         </div>
-        <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-violet-100 text-violet-800 shrink-0">
+        <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${cfg.chipTone} shrink-0`}>
           {group.items.length}
         </span>
       </div>
-      <ul className="px-3 py-2 space-y-1.5 max-h-80 overflow-y-auto">
+      <ul className={`px-3 py-2 space-y-1.5 max-h-80 overflow-y-auto`}>
         {group.items.map((it) => (
           <li key={it.task.id} className="text-xs">
             <button
               onClick={() => { requestAutoFilter(); onTaskClick(it.task.id); }}
-              className="w-full text-left rounded-md px-2 py-1.5 hover:bg-violet-50 group ring-1 ring-transparent hover:ring-violet-200"
+              className={`w-full text-left rounded-md px-2 py-1.5 hover:${cfg.bgTone} group ring-1 ring-transparent hover:${cfg.ringTone}`}
               title={`Open ${it.shipment.tracking_number || it.task.title} in task-walk mode`}
             >
               <div className="flex items-center justify-between gap-2 min-w-0">
@@ -1307,11 +1402,11 @@ function CarrierGroupCard({ group, onTaskClick, onEmail }: {
           </li>
         ))}
       </ul>
-      <div className="px-3 py-2 border-t border-violet-100 flex items-center gap-2">
+      <div className={`px-3 py-2 border-t ${cfg.ringTone} flex items-center gap-2`}>
         <button
           onClick={onEmail}
-          className="text-xs font-semibold rounded-md px-2.5 py-1.5 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1.5"
-          title={`Draft one consolidated email to ${group.carrier} covering all ${group.items.length} shipment(s)`}
+          className={`text-xs font-semibold rounded-md px-2.5 py-1.5 text-white inline-flex items-center gap-1.5 ${cfg.buttonTone}`}
+          title={`Draft one consolidated email to ${group.name} covering all ${group.items.length} shipment(s)`}
         >
           <Send className="h-3.5 w-3.5" /> Group email
         </button>
@@ -1323,14 +1418,16 @@ function CarrierGroupCard({ group, onTaskClick, onEmail }: {
   );
 }
 
-// Modal: previews the carrier's task list, fires the bulk email-draft
+// Modal: previews the group's task list, fires the bulk email-draft
 // endpoint on demand, and renders the resulting subject/body with copy
 // + mailto helpers. We don't auto-generate on open — bulk Opus calls
 // cost money and the operator may just be browsing.
-function CarrierGroupEmailModal({ group, onClose }: {
-  group: CarrierFollowupGroup;
+function FollowupGroupEmailModal({ group, kind, onClose }: {
+  group: FollowupGroup;
+  kind: FollowupKind;
   onClose: () => void;
 }) {
+  const cfg = FOLLOWUP_KIND_CONFIG[kind];
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState<{ subject: string; body: string; model: string | null } | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -1340,8 +1437,8 @@ function CarrierGroupEmailModal({ group, onClose }: {
   async function generate() {
     setBusy(true); setErr(null); setDraft(null);
     try {
-      const r = await api.tasks.carrierEmailDraft({
-        carrier: group.carrier,
+      const r = await cfg.emailDraft({
+        name: group.name,
         task_ids: group.items.map((it) => it.task.id),
         notes: notes.trim() || undefined,
       });
@@ -1360,8 +1457,6 @@ function CarrierGroupEmailModal({ group, onClose }: {
     } catch { /* clipboard blocked */ }
   }
 
-  // esc-to-close, mirroring the per-shipment email modal in Shipments.tsx
-  // for keyboard parity.
   useEffect(() => {
     function onKey(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
     window.addEventListener("keydown", onKey);
@@ -1380,8 +1475,8 @@ function CarrierGroupEmailModal({ group, onClose }: {
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
           <div className="min-w-0">
             <h2 className="text-lg font-semibold flex items-center gap-2">
-              <Mail className="h-5 w-5 text-violet-700" />
-              Group email · {group.carrier}
+              <Mail className={`h-5 w-5 ${cfg.iconTone}`} />
+              Group email · {group.name}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
               {group.items.length} shipment{group.items.length === 1 ? "" : "s"} · one consolidated email · prompts editable in Settings
@@ -1490,6 +1585,281 @@ function CarrierGroupEmailModal({ group, onClose }: {
               </button>
             </div>
           ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================
+// Add-followup-task modal — opens from the "+ Add" button on a
+// Followups panel. Picks a shipment via a search-driven combo, then
+// creates a task whose title is auto-prefixed with the followup
+// convention so it lands in the panel that triggered the modal.
+// Status dropdown lets the operator drop the task directly into "In
+// Progress" / "Blocked" instead of always starting at Open.
+// =====================================================================
+function AddFollowupTaskModal({ kind, onClose, onCreated }: {
+  kind: FollowupKind;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const cfg = FOLLOWUP_KIND_CONFIG[kind];
+  // Title prefix the panel matches against. We literally prepend this
+  // so even if the operator types a barebones title ("missing POD"),
+  // it'll still be detected by isCarrier/CustomerFollowupTitle on the
+  // server. Hyphenated form not used because the matcher tolerates
+  // both "follow up" and "followup".
+  const titlePrefix = kind === "carrier" ? "Carrier followup: " : "Customer followup: ";
+  const [shipmentQuery, setShipmentQuery] = useState("");
+  const [shipmentResults, setShipmentResults] = useState<Shipment[]>([]);
+  const [shipmentSearching, setShipmentSearching] = useState(false);
+  const [shipment, setShipment] = useState<Shipment | null>(null);
+  const [titleSuffix, setTitleSuffix] = useState("");
+  const [description, setDescription] = useState("");
+  const [priority, setPriority] = useState<TaskPriority>("normal");
+  const [status, setStatus] = useState<"open" | "in_progress" | "blocked">("open");
+  const [assignedTo, setAssignedTo] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Debounced shipment search. Hits the existing /api/shipments?q=
+  // search and shows the top hits; user clicks to lock one in.
+  useEffect(() => {
+    if (shipment) return; // already chose one — don't keep searching
+    const q = shipmentQuery.trim();
+    if (q.length < 2) { setShipmentResults([]); return; }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      setShipmentSearching(true);
+      try {
+        const r = await api.shipments.list({ q, limit: 25 });
+        if (!cancelled) setShipmentResults(r.data || []);
+      } catch (e) { if (!cancelled) setErr((e as Error).message); }
+      finally { if (!cancelled) setShipmentSearching(false); }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [shipmentQuery, shipment]);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  async function submit() {
+    if (!shipment) { setErr("Pick a shipment first."); return; }
+    const finalTitle = titlePrefix + (titleSuffix.trim() || (kind === "carrier" ? "follow-up needed" : "status update needed"));
+    setBusy(true); setErr(null);
+    try {
+      await api.tasks.create(shipment.id, {
+        title: finalTitle,
+        description: description.trim() || undefined,
+        priority,
+        status,
+        assigned_to: assignedTo || undefined,
+      });
+      onCreated();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[88vh] flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+          <div>
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <Plus className={`h-5 w-5 ${cfg.iconTone}`} />
+              Add {cfg.groupNoun} followup
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Title is auto-prefixed with <span className="font-mono">{titlePrefix.trim()}</span> so it lands in the {cfg.title} panel.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-900 p-2 rounded-lg hover:bg-slate-100">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="p-5 overflow-y-auto flex-1 space-y-4">
+          {/* Shipment picker — type to filter, click a row to lock in. */}
+          <div>
+            <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+              Shipment
+            </label>
+            {shipment ? (
+              <div className="flex items-center justify-between gap-2 rounded-lg ring-1 ring-slate-200 bg-slate-50 px-3 py-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-slate-900">
+                    {shipment.shipment_id || shipment.tracking_number || "(no id)"}
+                  </div>
+                  <div className="text-[11px] text-slate-500 truncate">
+                    {shipment.customer_name || "—"} · {shipment.carrier_name || shipment.carrier || "—"} · {shipment.shipment_status || "no status"}
+                  </div>
+                </div>
+                <button
+                  onClick={() => { setShipment(null); setShipmentQuery(""); }}
+                  className="text-xs text-slate-500 hover:text-slate-900 px-2 py-1 rounded hover:bg-slate-100"
+                >
+                  Change
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="relative">
+                  <Search className="h-4 w-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                  <input
+                    type="search"
+                    autoFocus
+                    value={shipmentQuery}
+                    onChange={(e) => setShipmentQuery(e.target.value)}
+                    placeholder="Search by Shipment ID, tracking, customer, carrier…"
+                    className="w-full rounded-lg border border-slate-200 pl-8 pr-3 py-2 text-sm focus:border-sky-400 focus:ring-1 focus:ring-sky-200 focus:outline-none"
+                  />
+                </div>
+                <div className="mt-2 rounded-lg ring-1 ring-slate-200 bg-white max-h-60 overflow-y-auto">
+                  {shipmentSearching ? (
+                    <div className="px-3 py-3 text-xs text-slate-500">Searching…</div>
+                  ) : shipmentQuery.trim().length < 2 ? (
+                    <div className="px-3 py-3 text-xs text-slate-500">Start typing to find a shipment.</div>
+                  ) : shipmentResults.length === 0 ? (
+                    <div className="px-3 py-3 text-xs text-slate-500">No matches.</div>
+                  ) : (
+                    <ul className="divide-y divide-slate-100">
+                      {shipmentResults.map((s) => (
+                        <li key={s.id}>
+                          <button
+                            onClick={() => setShipment(s)}
+                            className="w-full text-left px-3 py-2 text-xs hover:bg-sky-50"
+                          >
+                            <div className="flex items-center justify-between gap-2 min-w-0">
+                              <span className="font-semibold text-slate-900 truncate">
+                                {s.shipment_id || "(no id)"}
+                              </span>
+                              <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                                {s.tracking_number || ""}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-500 truncate">
+                              {s.customer_name || "—"} · {s.carrier_name || s.carrier || "—"} · {s.shipment_status || "no status"}
+                            </div>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Title — operator types only the meat; prefix is auto-prepended. */}
+          <div>
+            <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+              Title
+            </label>
+            <div className="flex items-stretch rounded-lg ring-1 ring-slate-200 overflow-hidden focus-within:ring-1 focus-within:ring-sky-200 focus-within:border-sky-400">
+              <span className="px-3 py-2 text-sm font-mono text-slate-500 bg-slate-50 border-r border-slate-200 whitespace-nowrap">
+                {titlePrefix.trim()}
+              </span>
+              <input
+                type="text"
+                value={titleSuffix}
+                onChange={(e) => setTitleSuffix(e.target.value)}
+                placeholder={kind === "carrier" ? "missing POD / pickup confirmation / ETA…" : "needs ETA / appointment / status update…"}
+                className="flex-1 px-3 py-2 text-sm focus:outline-none"
+              />
+            </div>
+            <div className="text-[11px] text-slate-500 mt-1">
+              Final title: <span className="font-mono">{titlePrefix}{titleSuffix.trim() || (kind === "carrier" ? "follow-up needed" : "status update needed")}</span>
+            </div>
+          </div>
+
+          {/* Description, priority, status, assignee — three-up grid for the
+              two enums + one text textarea on its own row. */}
+          <div>
+            <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+              Description (optional)
+            </label>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Anything the assignee should know — context, blockers, due dates."
+              className="w-full text-sm px-3 py-2 rounded-lg ring-1 ring-slate-200 focus:ring-sky-400 focus:outline-none min-h-[80px]"
+            />
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+                Priority
+              </label>
+              <select
+                value={priority}
+                onChange={(e) => setPriority(e.target.value as TaskPriority)}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white"
+              >
+                <option value="low">Low</option>
+                <option value="normal">Normal</option>
+                <option value="high">High</option>
+                <option value="urgent">Urgent</option>
+              </select>
+            </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+                Status
+              </label>
+              <select
+                value={status}
+                onChange={(e) => setStatus(e.target.value as typeof status)}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white"
+              >
+                <option value="open">Open</option>
+                <option value="in_progress">In Progress</option>
+                <option value="blocked">Blocked</option>
+              </select>
+            </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+                Assignee
+              </label>
+              <UserPicker
+                value={assignedTo}
+                onChange={setAssignedTo}
+                placeholder="Defaults to scraper"
+                size="sm"
+                className="w-full"
+              />
+            </div>
+          </div>
+
+          {err ? (
+            <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-3 py-2 text-sm text-rose-800">{err}</div>
+          ) : null}
+        </div>
+
+        <div className="px-5 py-4 border-t border-slate-200 flex items-center justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 rounded-lg"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={submit}
+            disabled={busy || !shipment}
+            className={`px-4 py-2 rounded-lg text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${cfg.buttonTone}`}
+          >
+            {busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+            {busy ? "Creating…" : "Create task"}
+          </button>
         </div>
       </div>
     </div>

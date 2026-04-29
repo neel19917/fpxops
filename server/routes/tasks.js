@@ -2,7 +2,7 @@ import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { computeWalkContext } from "../lib/taskWalk.js";
-import { generateCarrierGroupEmail } from "../lib/emailDraft.js";
+import { generateCarrierGroupEmail, generateCustomerGroupEmail } from "../lib/emailDraft.js";
 
 export const tasksRouter = Router();
 
@@ -16,6 +16,22 @@ export function isCarrierFollowupTitle(title) {
   if (typeof title !== "string") return false;
   const t = title.toLowerCase();
   return t.includes("carrier") && t.includes("follow");
+}
+
+// Customer follow-up uses the same convention with "customer" + "follow".
+// Edge case: a title containing BOTH "carrier" and "customer" (e.g.
+// "Customer wants carrier followup") is ambiguous — we resolve in
+// favor of the carrier panel by excluding such titles from this
+// matcher. Without that exclusion the same task would appear in both
+// panels and confuse the bulk-email flow (which carrier should we
+// write to vs which customer?). Operators who really want a single
+// task in both panels can create two tasks.
+export function isCustomerFollowupTitle(title) {
+  if (typeof title !== "string") return false;
+  const t = title.toLowerCase();
+  if (!t.includes("customer") || !t.includes("follow")) return false;
+  if (t.includes("carrier")) return false;
+  return true;
 }
 
 // GET /tasks?status=open&assigned_to=...&limit=200
@@ -143,6 +159,91 @@ tasksRouter.post("/carrier-email-draft", async (req, res) => {
     action: "create", entity_type: "email_draft",
     summary: `Drafted carrier follow-up email to "${carrier}" covering ${items.length} shipment(s)`,
     metadata: { carrier, task_ids: taskIds, count: items.length, model: result.model || null },
+  });
+  res.json({ subject: result.subject, body: result.body, count: items.length, model: result.model || null });
+});
+
+// GET /tasks/customer-followups  — mirror of /carrier-followups grouped
+// by customer_name. Detection uses isCustomerFollowupTitle, which
+// excludes carrier-titled tasks (so the same task never shows up in
+// both panels). Empty / "(unassigned)" customer rows are bucketed
+// under a placeholder rather than dropped — operators should see a
+// gap they can clean up rather than have it disappear silently.
+tasksRouter.get("/customer-followups", async (req, res) => {
+  const { data: tasks, error } = await supabase
+    .from("fpx_shipment_tasks")
+    .select("*")
+    .in("status", ["open", "in_progress"])
+    .order("created_at", { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  const followups = (tasks || []).filter((t) => isCustomerFollowupTitle(t.title));
+  if (!followups.length) return res.json({ groups: [], total: 0 });
+
+  const shipIds = Array.from(new Set(followups.map((t) => t.shipment_id).filter(Boolean)));
+  const { data: ships, error: shipErr } = await supabase
+    .from("fpx_shipments")
+    .select("id, tracking_number, shipment_id, customer_name, carrier, carrier_name, mode, shipment_status, pickup_date, updated_eta, estimated_arrival, delivery_date, pickup_response, confirmation_number, pickup_request_number, origin, destination, ship_from, ship_to, ai_issue, ai_recommendation, action_required")
+    .in("id", shipIds);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  const byId = new Map((ships || []).map((s) => [s.id, s]));
+
+  const groupsMap = new Map();
+  for (const t of followups) {
+    const ship = byId.get(t.shipment_id);
+    if (!ship) continue;
+    const customer = (ship.customer_name || "(unassigned)").trim() || "(unassigned)";
+    if (!groupsMap.has(customer)) groupsMap.set(customer, []);
+    groupsMap.get(customer).push({ task: t, shipment: ship });
+  }
+  const groups = Array.from(groupsMap.entries())
+    .map(([customer, items]) => ({ customer, items }))
+    .sort((a, b) => b.items.length - a.items.length || a.customer.localeCompare(b.customer));
+  res.json({ groups, total: followups.length });
+});
+
+// POST /tasks/customer-email-draft  { customer, task_ids: string[], notes? }
+// Mirror of carrier-email-draft. Validates titles via
+// isCustomerFollowupTitle so a stray carrier-tagged id can't slip
+// through into the customer flow.
+tasksRouter.post("/customer-email-draft", async (req, res) => {
+  const customer = typeof req.body?.customer === "string" ? req.body.customer.trim() : "";
+  const taskIds = Array.isArray(req.body?.task_ids)
+    ? req.body.task_ids.filter((x) => typeof x === "string" && x)
+    : [];
+  if (!customer) return res.status(400).json({ error: "customer required" });
+  if (!taskIds.length) return res.status(400).json({ error: "task_ids required" });
+
+  const { data: tasks, error: taskErr } = await supabase
+    .from("fpx_shipment_tasks").select("*").in("id", taskIds);
+  if (taskErr) return res.status(500).json({ error: taskErr.message });
+  const followupTasks = (tasks || []).filter((t) => isCustomerFollowupTitle(t.title));
+  if (!followupTasks.length) {
+    return res.status(400).json({ error: "No customer-followup tasks in supplied ids" });
+  }
+  const shipIds = Array.from(new Set(followupTasks.map((t) => t.shipment_id).filter(Boolean)));
+  if (!shipIds.length) return res.status(400).json({ error: "No shipments linked to supplied tasks" });
+
+  const { data: ships, error: shipErr } = await supabase
+    .from("fpx_shipments").select("*").in("id", shipIds);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  const shipById = new Map((ships || []).map((s) => [s.id, s]));
+
+  const items = followupTasks
+    .map((t) => ({ task: t, shipment: shipById.get(t.shipment_id) }))
+    .filter((it) => it.shipment);
+  if (!items.length) return res.status(404).json({ error: "Shipments not found" });
+
+  const result = await generateCustomerGroupEmail({
+    customer,
+    items,
+    notes: req.body?.notes,
+    callMeta: { api_key_id: req.apiKey?.id, user_email: req.user?.email },
+  });
+  if (result.error) return res.status(500).json({ error: result.error });
+  logAudit(req, {
+    action: "create", entity_type: "email_draft",
+    summary: `Drafted customer follow-up email to "${customer}" covering ${items.length} shipment(s)`,
+    metadata: { customer, task_ids: taskIds, count: items.length, model: result.model || null },
   });
   res.json({ subject: result.subject, body: result.body, count: items.length, model: result.model || null });
 });

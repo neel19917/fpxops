@@ -270,7 +270,7 @@ export const api = {
       }>(`/api/tasks/${id}`, { params }),
     listForShipment: (shipmentId: string) =>
       request<{ data: ShipmentTask[] }>(`/api/shipments/${shipmentId}/tasks`),
-    create: (shipmentId: string, body: { title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string }) =>
+    create: (shipmentId: string, body: { title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string; status?: "open" | "in_progress" | "blocked" }) =>
       request<{ task: ShipmentTask }>(`/api/shipments/${shipmentId}/tasks`, { method: "POST", body: JSON.stringify(body) }),
     update: (id: string, patch: Partial<Pick<ShipmentTask, "status" | "priority" | "assigned_to" | "title" | "description" | "due_at">>) =>
       request<{ task: ShipmentTask }>(`/api/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
@@ -293,6 +293,18 @@ export const api = {
     carrierEmailDraft: (body: { carrier: string; task_ids: string[]; notes?: string }) =>
       request<{ subject: string; body: string; count: number; model: string | null }>(
         "/api/tasks/carrier-email-draft",
+        { method: "POST", body: JSON.stringify(body) },
+      ),
+    // Customer-side mirror of carrierFollowups: groups active customer-
+    // followup-titled tasks by customer name, joined to shipment data.
+    customerFollowups: () =>
+      request<{
+        groups: { customer: string; items: { task: ShipmentTask; shipment: CarrierFollowupShipment }[] }[];
+        total: number;
+      }>("/api/tasks/customer-followups"),
+    customerEmailDraft: (body: { customer: string; task_ids: string[]; notes?: string }) =>
+      request<{ subject: string; body: string; count: number; model: string | null }>(
+        "/api/tasks/customer-email-draft",
         { method: "POST", body: JSON.stringify(body) },
       ),
   },
