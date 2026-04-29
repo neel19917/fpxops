@@ -381,6 +381,19 @@ shipmentsRouter.post("/", async (req, res) => {
     // clears stale once it's set. (Avoids flapping if the carrier flips a
     // status field then flips it back.)
 
+    // Stamp last_material_change_at for every materially-changed
+    // shipment so the Tracking table can render a "just changed"
+    // pill on those rows. Same timestamp for the batch — operators
+    // think in scrape-events, not row-by-row instants. Skipped when
+    // no material changes happened so we don't churn the column on
+    // every unchanged scrape.
+    if (materialChangedIds.size) {
+      const stamp = new Date().toISOString();
+      await supabase.from("fpx_shipments")
+        .update({ last_material_change_at: stamp })
+        .in("id", Array.from(materialChangedIds));
+    }
+
     // ---- Background: re-analyze + tasks + drafts -----------------------
     const backgroundWork = (async () => {
       const freshlyAnalyzed = await autoAnalyzeUpserted(req, upsertedIds, { materialChangedIds });
