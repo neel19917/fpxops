@@ -3062,6 +3062,60 @@ function fpxIsTrustedParentOrigin(origin) {
 // in the fpxFilterAck so failures are debuggable from the parent's
 // console without DevTools-frame-switching.
 let fpxLastInjectDetail = "";
+
+// Drive the Kendo column-filter popup (open icon → set "Is equal to" →
+// fill input via Kendo widget API → click Filter) entirely in the page's
+// main world. This is the same flow that the existing "Mode → LTL" path
+// uses, but ported to a free-text column. Required for Tracking Number
+// because the popup's text input is a Kendo widget whose value() method
+// is only reachable from the main world (jQuery.data(...) doesn't work
+// across the content-script isolated boundary).
+function fpxFilterViaKendoPopup(colName, value) {
+  return new Promise((resolve) => {
+    const requestId = "fpx-popup-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    let settled = false;
+    function onMessage(e) {
+      if (e.source !== window) return;
+      const d = e.data;
+      if (!d || d.type !== "fpx-kendo-popup-result" || d.requestId !== requestId) return;
+      window.removeEventListener("message", onMessage);
+      settled = true;
+      fpxLastInjectDetail = d.detail || "";
+      console.log("[FPX] Inject popup result:", d.ok ? "ok" : "fail", "—", d.detail);
+      resolve(!!d.ok);
+    }
+    window.addEventListener("message", onMessage);
+
+    let scriptUrl;
+    try { scriptUrl = chrome.runtime.getURL("inject-kendo-popup.js"); }
+    catch { resolve(false); return; }
+    const script = document.createElement("script");
+    script.src = scriptUrl;
+    script.setAttribute("data-fpx-request-id", requestId);
+    script.setAttribute("data-fpx-column", String(colName));
+    script.setAttribute("data-fpx-value", String(value));
+    script.onload = () => script.remove();
+    script.onerror = () => {
+      script.remove();
+      if (!settled) {
+        window.removeEventListener("message", onMessage);
+        settled = true;
+        console.warn("[FPX] inject-kendo-popup.js failed to load");
+        resolve(false);
+      }
+    };
+    (document.head || document.documentElement).appendChild(script);
+
+    setTimeout(() => {
+      if (!settled) {
+        window.removeEventListener("message", onMessage);
+        settled = true;
+        console.warn("[FPX] Kendo popup driver timed out");
+        resolve(false);
+      }
+    }, 4000);
+  });
+}
 function fpxFilterViaKendoApi(value, fieldCandidates) {
   return new Promise((resolve) => {
     const requestId = "fpx-filter-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
@@ -3188,6 +3242,19 @@ window.addEventListener("message", async (event) => {
         applied = true; strategy = "kendo-api";
       }
     } catch (e) { lastErr = e; }
+    // Strategy 1b: Kendo popup driver in main world. Same UI path the
+    // "Mode → LTL" flow uses (open filter icon → set "Is equal to" →
+    // fill input → click Filter), but the value-fill goes through the
+    // input's Kendo widget API which only works from the main world.
+    // Fixes the symptom where the popup opens but the text never
+    // sticks, especially on Tracking Number.
+    if (!applied) {
+      try {
+        if (await fpxFilterViaKendoPopup(col, val)) {
+          applied = true; strategy = "kendo-popup-main-world";
+        }
+      } catch (e) { lastErr = e; }
+    }
     // Strategy 2: top-level Tracking Number search input (Dashboard view
     // doesn't always have a Tracking Number column at all — but it has
     // a free-form Tracking Number search box at the top of the page).
