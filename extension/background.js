@@ -597,7 +597,13 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
   // available in MV3. Allow either signal — Chrome currently sets
   // sender.url for content / page contexts.
   const origin = sender.origin || (sender.url ? new URL(sender.url).origin : "");
-  const matchesAllowed = RELAY_ORIGINS.includes(origin) || /^https:\/\/[^/]+--fpxpress\.netlify\.app$/.test(origin);
+  // Strict allow-list match. Deploy-preview support was removed
+  // because Chrome's externally_connectable match-pattern syntax
+  // doesn't accept middle-wildcard hosts ('https://*--fpxpress.netlify.app').
+  // If a preview ever needs to relay a session, add its full
+  // origin to RELAY_ORIGINS + manifest.externally_connectable.matches
+  // and reload the extension.
+  const matchesAllowed = RELAY_ORIGINS.includes(origin);
   if (!matchesAllowed) {
     sendResponse({ ok: false, error: `Origin not allowed: ${origin || "(unknown)"}` });
     return false;
