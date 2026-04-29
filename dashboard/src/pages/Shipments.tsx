@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink } from "lucide-react";
-import { api } from "../lib/api";
+import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
 import { ActionBadge } from "../components/Badge";
@@ -120,7 +120,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }, [columnPrefs]);
 
   const [drawerId, setDrawerIdState] = useState<string | null>(null);
-  const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[]; tasks: ShipmentTask[] } | null>(null);
+  const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[]; tasks: ShipmentTask[]; recent_diff: ShipmentRecentDiff | null } | null>(null);
   // Wrap state changes so opening / closing the drawer also updates the URL.
   function setDrawerId(next: string | null) {
     setDrawerIdState(next);
@@ -1438,10 +1438,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 .filter((a) => a.kind === "per_shipment" || a.kind === "summary")
                 .map((a) => ({ a, parsed: parseAnalysis(a) }));
               return (
-                <Section title={`Analysis history (${items.length})`}>
-                  {items.length === 0 ? (
-                    <div className="text-sm text-slate-500">No analyses yet. Run the extension on this shipment.</div>
-                  ) : items.map(({ a, parsed }) => (
+                <>
+                  <RecentChangeLog diff={drawerData.recent_diff} />
+                  <Section title={`Analysis history (${items.length})`}>
+                    {items.length === 0 ? (
+                      <div className="text-sm text-slate-500">No analyses yet. Run the extension on this shipment.</div>
+                    ) : items.map(({ a, parsed }) => (
                     <div key={a.id} className="rounded-xl bg-white ring-1 ring-slate-200 p-4 mb-3">
                       <div className="flex items-center justify-between text-xs text-slate-500 mb-2">
                         <div className="flex items-center gap-2">
@@ -1482,8 +1484,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                         </div>
                       ) : null}
                     </div>
-                  ))}
-                </Section>
+                    ))}
+                  </Section>
+                </>
               );
             })()}
 
@@ -1754,6 +1757,64 @@ interface ShipmentSummaryHeaderProps {
   actionEditBusy: boolean;
   onSetAction: (v: "YES" | "NO" | "RESOLVED") => void | Promise<void>;
   onRevertToAi: () => void | Promise<void>;
+}
+
+// =====================================================================
+// RecentChangeLog — surfaces the field-level diff from the most recent
+// scrape (the same `recent_changes` block the per-shipment AI prompt
+// now sees). Renders nothing when there's no diff (first scrape, or
+// no material changes since last time). Helps reps eyeball "what
+// moved" so they can sanity-check the AI's verdict against the real
+// change.
+// =====================================================================
+function RecentChangeLog({ diff }: { diff: ShipmentRecentDiff | null }) {
+  if (!diff || !diff.diff || typeof diff.diff !== "object") return null;
+  const entries = Object.entries(diff.diff);
+  if (entries.length === 0) return null;
+
+  function fmtVal(v: unknown): string {
+    if (v === null || v === undefined) return "—";
+    if (typeof v === "string") return v.trim() || "—";
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+
+  return (
+    <Section title="What changed since last scrape">
+      <div className="rounded-xl bg-amber-50 ring-1 ring-amber-200 p-3 mb-3 text-xs">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-amber-800">
+            {entries.length} field{entries.length === 1 ? "" : "s"} changed
+          </span>
+          <span className="text-[11px] text-amber-700">
+            scraped {fmtRelative(diff.scraped_at)}{diff.scraped_by ? ` by ${diff.scraped_by}` : ""}
+          </span>
+        </div>
+        <div className="space-y-1.5">
+          {entries.map(([field, change]) => {
+            const prev = change && typeof change === "object" && "prev" in change ? change.prev : undefined;
+            const next = change && typeof change === "object" && "next" in change ? change.next : undefined;
+            return (
+              <div key={field} className="grid grid-cols-[140px_1fr] gap-2 items-start">
+                <div className="text-[11px] font-mono font-semibold text-slate-700 truncate" title={field}>
+                  {field}
+                </div>
+                <div className="text-[11px] flex items-center gap-1.5 flex-wrap">
+                  <span className="line-through text-slate-500 break-all">{fmtVal(prev)}</span>
+                  <span className="text-slate-400">→</span>
+                  <span className="text-slate-900 font-medium break-all">{fmtVal(next)}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="mt-2 pt-2 border-t border-amber-200/80 text-[10px] text-amber-700/80 leading-snug">
+          The per-shipment AI sees this same change-log when it re-analyzes — flags
+          and recommendations should reflect what just moved.
+        </div>
+      </div>
+    </Section>
+  );
 }
 
 function ShipmentSummaryHeader({

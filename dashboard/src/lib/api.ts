@@ -174,7 +174,7 @@ export const api = {
   shipments: {
     list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string; before?: string }) =>
       request<{ data: Shipment[]; next_cursor: string | null }>("/api/shipments", { params }),
-    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[] }>(`/api/shipments/${id}`),
+    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[]; recent_diff: ShipmentRecentDiff | null }>(`/api/shipments/${id}`),
     overrideAction: (id: string, body: { action_required: string | null; reason?: string }) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>
@@ -360,6 +360,17 @@ export const api = {
       request<OpsMetrics>("/api/ops/metrics", { params: { days } }),
   },
 };
+
+// Recent material-diff for a shipment, returned by GET /api/shipments/:id.
+// Mirrors fpx_shipment_scrapes.diff which the AI prompt also sees as
+// recent_changes. Each key in `diff` is a column name; the value is
+// { prev, next } showing what moved between the prior scrape and the
+// most recent one.
+export interface ShipmentRecentDiff {
+  scraped_at: string;
+  scraped_by: string | null;
+  diff: Record<string, { prev: unknown; next: unknown }> | null;
+}
 
 // Stored bulk-email draft as returned by the carrier-email-drafts /
 // customer-email-drafts list endpoints. Pulled from fpx_ai_analyses

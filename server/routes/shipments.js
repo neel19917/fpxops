@@ -254,7 +254,7 @@ shipmentsRouter.get("/:id", async (req, res) => {
   const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
-  const [analysesRes, historyRes, tasksRes] = await Promise.all([
+  const [analysesRes, historyRes, tasksRes, recentDiffRes] = await Promise.all([
     supabase
       .from("fpx_ai_analyses").select("*")
       .or(`shipment_uuid.eq.${ship.id},tracking_number.eq.${ship.tracking_number || "__none__"}`)
@@ -265,12 +265,25 @@ shipmentsRouter.get("/:id", async (req, res) => {
           .order("scraped_at", { ascending: false }).limit(20)
       : Promise.resolve({ data: [] }),
     supabase.from("fpx_shipment_tasks").select("*").eq("shipment_id", ship.id).order("created_at", { ascending: false }),
+    // Most recent material diff from fpx_shipment_scrapes — same row
+    // the AI per-shipment prompt now sees as recent_changes. Surfacing
+    // it on the drawer lets the rep eyeball "what moved since last
+    // scrape" without diffing two snapshots manually. Best-effort —
+    // a missing scrape row just hides the section in the UI.
+    supabase.from("fpx_shipment_scrapes")
+      .select("scraped_at, scraped_by, diff")
+      .eq("shipment_id", ship.id)
+      .not("diff", "is", null)
+      .order("scraped_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
   ]);
   res.json({
     shipment: ship,
     analyses: analysesRes.data || [],
     history: historyRes.data || [],
     tasks: tasksRes.data || [],
+    recent_diff: recentDiffRes.data || null,
   });
 });
 
