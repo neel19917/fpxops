@@ -90,7 +90,7 @@ The XLSX is parsed in Node (same logic as `sidepanel.js`'s `parseInvoiceFile`)
 ## Smoke-test the harness
 
 Verify the install + extension load + Railway connectivity + session
-state without running a real scrape (CI-friendly, no side effects):
+state without running a real scrape (no side effects):
 
 ```bash
 FPX_API_URL=https://fpxtrackingchromeextension-production.up.railway.app \
@@ -107,8 +107,35 @@ Reports a checklist:
 - ✔ Upload queue clean / N chunks pending
 
 Exits 0 on full pass, 1 on any failure with the offending row
-flagged. Run this after install, after every extension version
-bump, and from cron to alert when something drifts.
+flagged.
+
+### Why does this need a Chrome window?
+
+**Chrome's `--headless=new` does not load MV3 extensions reliably**
+— the extension is technically installed but its service worker is
+invisible to the DevTools Protocol that Puppeteer uses. Stock
+**Google Chrome additionally blocks `--load-extension`** as a
+security policy ("not allowed in Google Chrome, ignoring").
+
+The harness defaults to offscreen-headed mode (window pushed to
+`-2000,-2000` so it doesn't steal focus) which works on:
+
+- **Chromium** — `brew install --cask chromium`, then
+  `CHROME_PATH=/Applications/Chromium.app/Contents/MacOS/Chromium`
+- **Chrome for Testing** —
+  `npx @puppeteer/browsers install chrome@stable` (downloads to
+  `./chrome/`), then point `CHROME_PATH` at the binary it prints
+- **Chrome Canary** — `brew install --cask google-chrome-canary`
+
+For real cron jobs on Linux, use `xvfb-run -a node run.js …` so
+the offscreen window has a virtual display.
+
+### What works on stock Google Chrome
+
+The `--login` flow works fine on stock Chrome (it opens visibly so
+you can clear MFA). Only `--mode <…>` and `--smoke-test` need a
+build that honors `--load-extension`. Most operators install Chrome
+for Testing once via the npx command above and forget about it.
 
 ## Cron example
 

@@ -88,31 +88,100 @@ function parseInvoiceXlsx(xlsxPath) {
   return { shipments, skippedRows };
 }
 
-async function launchBrowser({ headed, chromePath }) {
+async function launchBrowser({ headed, chromePath, offscreen = false }) {
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  // Chrome's --headless=new mode does NOT reliably register MV3
+  // service workers as debug targets (extension is loaded but the SW
+  // is invisible to CDP). Stock Google Chrome additionally strips
+  // --load-extension as a security policy. The reliable pattern is
+  // headed mode with the window pushed off-screen — works on both
+  // Chrome for Testing and Chromium and is what we default to when
+  // the caller asks for offscreen mode (the smoke-test flow).
+  const offscreenArgs = offscreen
+    ? ["--window-position=-2000,-2000", "--window-size=1,1"]
+    : [];
+  const launchArgs = [
+    `--disable-extensions-except=${EXT_PATH}`,
+    `--load-extension=${EXT_PATH}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-features=DialMediaRouteProvider",
+    ...offscreenArgs,
+  ];
   return puppeteer.launch({
-    headless: headed ? false : "new",
+    headless: headed || offscreen ? false : "new",
     executablePath: chromePath,
     userDataDir: PROFILE_DIR,
     defaultViewport: { width: 1440, height: 900 },
-    args: [
-      `--disable-extensions-except=${EXT_PATH}`,
-      `--load-extension=${EXT_PATH}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-features=DialMediaRouteProvider",
-    ],
+    args: launchArgs,
   });
 }
 
 async function getServiceWorker(browser) {
-  const target = await browser.waitForTarget(
+  // Fast path: the SW might already be alive in Puppeteer's target list.
+  const alive = browser.targets().find(
     (t) => t.type() === "service_worker" && t.url().startsWith("chrome-extension://"),
-    { timeout: 30_000 }
   );
-  const extensionId = new URL(target.url()).host;
-  const worker = await target.worker();
-  return { worker, extensionId };
+  if (alive) {
+    return { worker: await alive.worker(), extensionId: new URL(alive.url()).host };
+  }
+
+  // Slow path: MV3 service workers in headless Chrome are dormant
+  // by default and Puppeteer's targets() filter sometimes hides
+  // them. Two-pronged wake-up:
+  //   (a) Use CDP Target.getTargets — that low-level call enumerates
+  //       dormant service_worker targets even when puppeteer's
+  //       higher-level browser.targets() omits them. Once we have
+  //       the extension id we can attach to the SW.
+  //   (b) Open chrome-extension://<id>/popup.html — loading the
+  //       popup forces Chrome to start the worker, after which
+  //       browser.waitForTarget() reliably resolves.
+
+  const cdp = await browser.target().createCDPSession();
+  const { targetInfos } = await cdp.send("Target.getTargets");
+  const swInfo = targetInfos.find(
+    (t) => t.type === "service_worker" && t.url.startsWith("chrome-extension://"),
+  );
+  if (!swInfo) {
+    // Most common cause: the user is running stock Google Chrome,
+    // which silently ignores --load-extension / --disable-extensions-except
+    // as a security policy. Chromium / Chrome for Testing / Chrome
+    // Canary all honor those flags. Surface the fix instead of a
+    // generic "service worker not found" error.
+    throw new Error(
+      "Extension service worker not registered with Chrome.\n" +
+      "Most likely cause: Google Chrome blocks --load-extension as a security policy.\n" +
+      "Fix: install Chrome for Testing and point the harness at it:\n" +
+      "  npx @puppeteer/browsers install chrome@stable\n" +
+      "  CHROME_PATH=/path/to/chrome-for-testing node run.js --smoke-test\n" +
+      "Or use Chromium (brew install --cask chromium) / Chrome Canary.\n" +
+      "Stock Google Chrome does not support automated extension loading."
+    );
+  }
+  const extensionId = new URL(swInfo.url).host;
+
+  // Wake the SW by loading its popup page. The page itself is
+  // discarded immediately — we only need the start-up event.
+  let wakePage;
+  try {
+    wakePage = await browser.newPage();
+    await wakePage.goto(`chrome-extension://${extensionId}/popup.html`, {
+      waitUntil: "domcontentloaded",
+      timeout: 10_000,
+    }).catch(() => { /* the popup might fail to render — SW still wakes */ });
+  } catch { /* fall through */ }
+
+  try {
+    const target = await browser.waitForTarget(
+      (t) => t.type() === "service_worker" && t.url() === swInfo.url,
+      { timeout: 15_000 },
+    );
+    const worker = await target.worker();
+    if (!worker) throw new Error("Got SW target but worker() returned null.");
+    return { worker, extensionId };
+  } finally {
+    if (wakePage) await wakePage.close().catch(() => {});
+  }
 }
 
 async function installSentinelListener(worker) {
@@ -262,11 +331,19 @@ async function cmdSmokeTest(argv) {
     process.exit(1);
   }
 
-  // 2. Boot Chrome with the extension loaded
+  // 2. Boot Chrome with the extension loaded.
+  //    Default to offscreen-headed so the smoke test works reliably
+  //    on systems where Chrome's --headless=new can't see the
+  //    extension's service worker. Caller can override with --headed
+  //    to get a visible window for debugging.
   let browser;
   try {
-    browser = await launchBrowser({ headed: !!argv.headed, chromePath });
-    pass("Chrome booted with extension", `profile=${PROFILE_DIR}`);
+    browser = await launchBrowser({
+      headed: !!argv.headed,
+      chromePath,
+      offscreen: !argv.headed,
+    });
+    pass("Chrome booted with extension", `profile=${PROFILE_DIR}, mode=${argv.headed ? "headed" : "offscreen"}`);
   } catch (e) {
     fail("Chrome booted with extension", e);
     printSmokeReport(checks);
