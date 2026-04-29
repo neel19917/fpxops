@@ -15,11 +15,20 @@ async function loadClientConfig() {
   const s = await getSettings(
     "embed.freightpop.enabled",
     "embed.freightpop.url_template",
+    "ui.tracking.recent_change_window_hours",
   );
+  // Coerce the change-window setting to a sane number — admins can
+  // type anything in the Settings input. Clamp to [0, 720] (≈30 days)
+  // so a fat-fingered "10000000" doesn't make the pill stick forever.
+  const rawWindow = Number(s["ui.tracking.recent_change_window_hours"]);
+  const changeWindowH = Number.isFinite(rawWindow) ? Math.max(0, Math.min(720, rawWindow)) : 24;
   return {
     embed_freightpop: {
       enabled: !!s["embed.freightpop.enabled"],
       url_template: String(s["embed.freightpop.url_template"] || ""),
+    },
+    tracking_ui: {
+      recent_change_window_hours: changeWindowH,
     },
   };
 }

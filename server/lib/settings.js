@@ -58,6 +58,12 @@ const FALLBACKS = {
   // {order_number}) for tenants with custom URL routes.
   "embed.freightpop.enabled": true,
   "embed.freightpop.url_template": "https://app.freightpop.com/dashboard",
+  // How long the "Changed Xh ago" pill stays on a Tracking row after
+  // the most recent material change. Admin-tunable from /admin/settings;
+  // 24h is a sensible default ("anything that moved during my shift").
+  // Setting to 0 hides the pill entirely without disabling the
+  // last_material_change_at column itself.
+  "ui.tracking.recent_change_window_hours": 24,
 };
 
 const TTL_MS = 30_000;

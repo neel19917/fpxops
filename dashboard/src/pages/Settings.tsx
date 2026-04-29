@@ -71,6 +71,13 @@ const GROUPS: {
     match: (k) => k.startsWith("embed."),
   },
   {
+    id: "tracking_ui",
+    label: "Tracking page UI",
+    description: "Operator-facing toggles for the Tracking table — what gets surfaced inline on rows, time windows for indicators, etc.",
+    Icon: Sliders,
+    match: (k) => k.startsWith("ui.tracking."),
+  },
+  {
     id: "other",
     label: "Other",
     description: "Settings that haven't been categorized yet.",
@@ -106,6 +113,7 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "model.large": "Large model (long prompts ≥ ~12k chars)",
   "embed.freightpop.enabled": "FreightPOP embed — enabled",
   "embed.freightpop.url_template": "FreightPOP embed — URL template",
+  "ui.tracking.recent_change_window_hours": "Tracking row \"Changed Xh ago\" pill window (hours)",
 };
 
 // Per-setting enum options. Keys without an entry render as free-text/JSON.

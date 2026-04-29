@@ -136,6 +136,12 @@ export interface ClientConfig {
     enabled: boolean;
     url_template: string;
   };
+  // How long the "Changed Xh ago" pill stays on Tracking rows after
+  // the most recent material change. Admin-tunable from Settings;
+  // 0 hides the pill entirely (the column itself is unaffected).
+  tracking_ui: {
+    recent_change_window_hours: number;
+  };
 }
 
 export const api = {

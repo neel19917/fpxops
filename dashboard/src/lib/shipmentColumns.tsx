@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { Shipment } from "./types";
 import { ActionBadge } from "../components/Badge";
 import { fmtDate, fmtDateTime, fmtRelative } from "./format";
+import { useAuth } from "./auth";
 
 // Single source of truth for the Tracking-page table columns. Adding a
 // column = adding an entry here. Visibility + order are user-configurable
@@ -21,16 +22,19 @@ const dash = (v: string | null | undefined) => (v ? v : "—");
 const yesNo = (v: boolean | null) => (v === true ? "Yes" : v === false ? "No" : "—");
 
 // "Just changed" pill — surfaces shipments whose most recent scrape
-// detected a material diff vs the prior version. The pill stays for
-// 24h so reps can still spot rows that moved overnight; after that
-// it fades. Click-through is the same as the rest of the row (open
-// drawer → Analysis tab shows the full change-log).
-const RECENT_CHANGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+// detected a material diff vs the prior version. Window is admin-
+// configurable in Settings (key: ui.tracking.recent_change_window_hours);
+// default = 24h. Setting it to 0 hides the pill entirely without
+// disabling the underlying last_material_change_at column.
 function TrackingCell({ row }: { row: Shipment }) {
+  const { clientConfig } = useAuth();
   const tn = row.tracking_number;
   if (!row.last_material_change_at) return <>{dash(tn)}</>;
+  const windowH = clientConfig?.tracking_ui?.recent_change_window_hours ?? 24;
+  if (windowH <= 0) return <>{dash(tn)}</>;
   const ageMs = Date.now() - new Date(row.last_material_change_at).getTime();
-  if (!(ageMs >= 0 && ageMs <= RECENT_CHANGE_WINDOW_MS)) return <>{dash(tn)}</>;
+  const windowMs = windowH * 60 * 60 * 1000;
+  if (!(ageMs >= 0 && ageMs <= windowMs)) return <>{dash(tn)}</>;
   return (
     <span className="inline-flex items-center gap-1.5">
       <span title={`Material change ${fmtRelative(row.last_material_change_at)}`}>{dash(tn)}</span>
