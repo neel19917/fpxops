@@ -385,38 +385,160 @@ async function callApi(path, body, options = {}) {
   return { error: lastError || "Request failed after retries" };
 }
 
-// Bulk shipment upload with chunking + per-chunk retry. The plain
-// /api/shipments route accepts arbitrarily-large arrays, but bulk
-// payloads >500 rows can hit Railway's request-body cap and bounce
-// the whole batch. Chunking caps each upload at 250 rows and surfaces
-// per-chunk progress; a bad row (rare) only kills its own chunk
-// instead of the whole scrape. Returns aggregate { ok, count,
-// chunks, failed }.
+// Bulk shipment upload with chunking + per-chunk retry, backed by a
+// chrome.storage queue so the work survives a service-worker
+// restart. MV3 service workers are aggressively suspended after
+// ~30s idle and can be killed mid-fetch — without this queue, an
+// in-flight chunk would just vanish and the rep would need to re-
+// scrape from scratch.
+//
+// Persistence shape (chrome.storage.local):
+//   pendingUploads: [
+//     { id: <uuid>, rows: [...], attempts: 0, queuedAt: <iso>, lastError?: string }
+//   ]
+//
+// Lifecycle:
+// 1. New upload → split into chunks → push every chunk into the queue
+//    (each chunk gets its own queue entry so partial successes
+//    persist as removed entries).
+// 2. flushPendingUploads() drains the queue with bounded concurrency.
+//    On success the chunk is removed from storage; on failure it
+//    stays with attempts++.
+// 3. flushPendingUploads also runs on service-worker startup so any
+//    chunk still pending from a prior session attempts again.
+// 4. After MAX_QUEUE_ATTEMPTS the chunk is left in place but skipped
+//    by future flushes — surfaced via getQueueStatus() for the side
+//    panel + popup UIs to render.
+
 const BULK_CHUNK_SIZE = 250;
-async function upsertShipmentsBulkRobust(rows) {
-  if (!Array.isArray(rows) || !rows.length) return { ok: true, count: 0, chunks: 0, failed: [] };
-  const chunks = [];
+const MAX_QUEUE_ATTEMPTS = 5;
+const QUEUE_KEY = "pendingUploads";
+let _flushInFlight = false;
+
+async function readQueue() {
+  const stored = await chrome.storage.local.get(QUEUE_KEY);
+  const arr = stored[QUEUE_KEY];
+  return Array.isArray(arr) ? arr : [];
+}
+async function writeQueue(queue) {
+  await chrome.storage.local.set({ [QUEUE_KEY]: queue });
+}
+function newQueueId() {
+  // Crypto.randomUUID is available in MV3 service workers.
+  return (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `q-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function enqueueChunks(rows) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+  const queue = await readQueue();
+  const queuedAt = new Date().toISOString();
+  const newEntries = [];
   for (let i = 0; i < rows.length; i += BULK_CHUNK_SIZE) {
-    chunks.push(rows.slice(i, i + BULK_CHUNK_SIZE));
+    newEntries.push({
+      id: newQueueId(),
+      rows: rows.slice(i, i + BULK_CHUNK_SIZE),
+      attempts: 0,
+      queuedAt,
+    });
   }
+  await writeQueue([...queue, ...newEntries]);
+  return newEntries;
+}
+
+// Drain the persistent queue. Bounded by a single in-flight guard so
+// concurrent calls (one from the message handler, one from the
+// startup hook) don't double-process. Returns aggregate counts so
+// the caller can report progress.
+async function flushPendingUploads() {
+  if (_flushInFlight) return { skipped: true };
+  _flushInFlight = true;
+  let succeeded = 0;
   let totalCount = 0;
-  const failed = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const result = await callApi("/api/shipments", { shipments: chunks[i] });
-    if (result.error) {
-      failed.push({ chunk: i, size: chunks[i].length, error: result.error });
-      console.warn(`[FPX] bulk chunk ${i + 1}/${chunks.length} (${chunks[i].length} rows) failed: ${result.error}`);
-    } else {
-      totalCount += result.count || chunks[i].length;
+  let failed = 0;
+  let dead = 0;
+  try {
+    let queue = await readQueue();
+    for (let i = 0; i < queue.length; i++) {
+      const entry = queue[i];
+      if (entry.attempts >= MAX_QUEUE_ATTEMPTS) { dead++; continue; }
+      const result = await callApi("/api/shipments", { shipments: entry.rows });
+      if (result.error) {
+        // Leave the entry in the queue with attempts++ so the next
+        // flush picks it up again. callApi already retried 3x with
+        // backoff before returning an error, so this is a hard fail
+        // for this round.
+        entry.attempts = (entry.attempts || 0) + 1;
+        entry.lastError = result.error;
+        failed++;
+        // Persist the bumped attempts even if subsequent chunks
+        // succeed — readers should always see the latest state.
+        await writeQueue(queue);
+        console.warn(`[FPX] queue chunk ${entry.id} failed (attempt ${entry.attempts}/${MAX_QUEUE_ATTEMPTS}): ${result.error}`);
+      } else {
+        // Success — remove the entry from the queue.
+        succeeded++;
+        totalCount += result.count || entry.rows.length;
+        queue = queue.filter((q) => q.id !== entry.id);
+        await writeQueue(queue);
+        // i was incremented past the now-removed entry; rewind one
+        // step so the next iteration picks up what was previously
+        // queue[i+1].
+        i--;
+      }
     }
+  } finally {
+    _flushInFlight = false;
   }
+  return { succeeded, failed, dead, count: totalCount };
+}
+
+// Public-ish: returns queue stats so the side panel / popup can show
+// "N pending, K failed" without subscribing to storage events.
+async function getQueueStatus() {
+  const queue = await readQueue();
   return {
-    ok: failed.length === 0,
-    count: totalCount,
-    chunks: chunks.length,
-    failed,
+    pending: queue.filter((q) => q.attempts < MAX_QUEUE_ATTEMPTS).length,
+    dead: queue.filter((q) => q.attempts >= MAX_QUEUE_ATTEMPTS).length,
+    total_rows: queue.reduce((n, q) => n + (q.rows?.length || 0), 0),
+    last_errors: queue.filter((q) => q.lastError).slice(-3).map((q) => ({ chunk: q.id, attempts: q.attempts, error: q.lastError })),
   };
 }
+
+// Top-level upload entry point. Enqueues every chunk first so even
+// if Railway is down or the worker dies mid-flush the rows aren't
+// lost; then immediately flushes to deliver the happy-path quickly.
+async function upsertShipmentsBulkRobust(rows) {
+  if (!Array.isArray(rows) || !rows.length) return { ok: true, count: 0, chunks: 0, failed: [] };
+  const enqueued = await enqueueChunks(rows);
+  const flushResult = await flushPendingUploads();
+  // Re-read the queue post-flush to figure out what's still pending
+  // for THIS upload (vs entries from prior failed sessions).
+  const remaining = await readQueue();
+  const stillPendingFromThisCall = remaining.filter((q) => enqueued.some((e) => e.id === q.id));
+  return {
+    ok: stillPendingFromThisCall.length === 0,
+    count: flushResult.count || 0,
+    chunks: enqueued.length,
+    failed: stillPendingFromThisCall.map((q) => ({ chunk: q.id, size: q.rows.length, error: q.lastError || "pending retry", attempts: q.attempts })),
+  };
+}
+
+// Service-worker startup hook: replay anything left in the queue
+// from a prior session. Fire-and-forget — we don't block boot on it,
+// but we do log the outcome so the operator can see "5 chunks
+// recovered" in the worker console after a restart.
+(async () => {
+  try {
+    const status = await getQueueStatus();
+    if (status.pending > 0) {
+      console.log(`[FPX] queue: ${status.pending} chunk(s) pending from prior session, flushing…`);
+      const r = await flushPendingUploads();
+      console.log(`[FPX] queue replay: ${r.succeeded} succeeded, ${r.failed} failed, ${r.dead} skipped (max attempts), ${r.count} rows`);
+    }
+  } catch (e) {
+    console.warn("[FPX] queue replay failed:", e.message);
+  }
+})();
 
 function accumulateCost(result) {
   if (!result || result.error) return;
@@ -507,6 +629,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await new Promise((r) => setTimeout(r, 2000));
         } else sendResponse({ error: result.error });
       }
+    })();
+    return true;
+  } else if (msg.type === "getQueueStatus") {
+    // Surfaced to the side panel so the rep can see "N rows pending,
+    // K failed". Sync read off chrome.storage; cheap.
+    (async () => { sendResponse(await getQueueStatus()); })();
+    return true;
+  } else if (msg.type === "flushQueue") {
+    // Manual retry button on the side panel pulls all pending chunks
+    // through one more time. Useful when the rep notices the
+    // pending-count is non-zero and the network's back up.
+    (async () => { sendResponse(await flushPendingUploads()); })();
+    return true;
+  } else if (msg.type === "clearQueue") {
+    // Operator escape hatch for the rare case where a chunk is dead
+    // but they don't want to wait for MAX_QUEUE_ATTEMPTS to bury it
+    // — admin acknowledges + drops it.
+    (async () => {
+      await writeQueue([]);
+      sendResponse({ ok: true });
     })();
     return true;
   } else if (msg.type === "checkServer") {

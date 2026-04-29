@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FPXpress Tracking Refresh",
-  "version": "3.7",
+  "version": "3.8",
   "description": "Automates tracking refresh on the FPXpress dashboard with AI-powered issue analysis via Claude Haiku.",
   "permissions": ["activeTab", "scripting", "storage", "sidePanel", "nativeMessaging", "identity", "tabs"],
   "host_permissions": [
