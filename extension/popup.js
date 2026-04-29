@@ -30,6 +30,7 @@ const els = {
   msSignedInEmail:$("msSignedInEmail"),
   msSignOutLink:  $("msSignOutLink"),
   msRecheckLink:  $("msRecheckLink"),
+  msDashboardLink:$("msDashboardLink"),
 };
 
 // Parse a credentials file the admin downloaded from the dashboard. Handles
@@ -278,6 +279,27 @@ els.msSignInBtn?.addEventListener("click", () => {
       els.keyMsg.textContent = (res && res.error) || "Sign-in failed.";
       els.keyMsg.className = "save-msg err";
     }
+  });
+});
+
+// Dashboard-relay fallback. Opens the dashboard's /ext-login page in
+// a new tab with the extension id passed as a query param. The
+// dashboard runs the OAuth flow there (its origin is registered with
+// Supabase), then sends the resulting session back via
+// chrome.runtime.sendMessage(extId, ...) — see background.js's
+// onMessageExternal handler. The popup itself can be closed; the
+// session lands silently when the rep finishes signing in.
+els.msDashboardLink?.addEventListener("click", (e) => {
+  e.preventDefault();
+  chrome.runtime.sendMessage({ type: "getRelayUrl" }, (res) => {
+    if (chrome.runtime.lastError || !res || !res.url) {
+      els.keyMsg.textContent = (chrome.runtime.lastError && chrome.runtime.lastError.message) || (res && res.error) || "Couldn't open the relay.";
+      els.keyMsg.className = "save-msg err";
+      return;
+    }
+    chrome.tabs.create({ url: res.url });
+    els.keyMsg.textContent = "Opened the dashboard in a new tab — finish signing in there.";
+    els.keyMsg.className = "save-msg";
   });
 });
 

@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import compression from "compression";
 
 // Surface crashes in Railway's deploy logs instead of silently exiting.
 process.on("uncaughtException", (e) => {
@@ -30,6 +31,23 @@ import { opsRouter } from "./routes/ops.js";
 
 const app = express();
 app.set("trust proxy", 1);
+
+// gzip every response over ~1KB. /api/shipments lists routinely
+// run 50-200KB of JSON; gzip drops them ~80%. The cost is 1-2ms
+// of CPU per response, dwarfed by the wire-time savings on slow
+// internet (rep on a 3G phone tether: 200KB → 40KB = 4 seconds
+// saved per page render). filter() defers to the browser's
+// Accept-Encoding so anything that wouldn't help gets passed
+// through uncompressed.
+app.use(compression({
+  threshold: 1024,
+  // Skip compression when the caller explicitly opted out (rare,
+  // e.g. a debug curl with -H "Accept-Encoding: identity").
+  filter: (req, res) => {
+    if (req.headers["x-no-compression"]) return false;
+    return compression.filter(req, res);
+  },
+}));
 
 // CORS — comma-separated origin allowlist. Wildcards supported via `host/*` suffix
 // and the chrome-extension://* pattern. The default covers the Chrome

@@ -1,0 +1,24 @@
+{
+  "name": "fpxpress-headless",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless Puppeteer driver for the FPXpress Chrome extension. Runs Refresh All / GP Audit / Invoice Audit from the terminal without a visible browser.",
+  "type": "module",
+  "bin": {
+    "fpx-headless": "./run.js"
+  },
+  "scripts": {
+    "login": "node run.js --login",
+    "refresh": "node run.js --mode refreshAll",
+    "gp": "node run.js --mode gpAudit",
+    "invoice": "node run.js --mode invoiceAudit"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.0.0",
+    "xlsx": "^0.18.5",
+    "yargs": "^17.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

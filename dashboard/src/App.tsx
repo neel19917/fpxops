@@ -17,6 +17,7 @@ import { PendingApprovalPage } from "./pages/PendingApproval";
 const ShipmentsPage   = lazy(() => import("./pages/Shipments").then((m) => ({ default: m.ShipmentsPage })));
 const TasksPage       = lazy(() => import("./pages/Tasks").then((m) => ({ default: m.TasksPage })));
 const SharedViewPage  = lazy(() => import("./pages/SharedView").then((m) => ({ default: m.SharedViewPage })));
+const ExtLoginPage    = lazy(() => import("./pages/ExtLogin").then((m) => ({ default: m.ExtLoginPage })));
 const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
 const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
 const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
@@ -70,6 +71,15 @@ export default function App() {
         <Routes>
           {/* Public share viewer bypasses all auth. */}
           <Route path="/share/:token" element={<SharedViewRoute />} />
+          {/* OAuth relay for the Chrome extension. Lives outside the
+              authed-app gate so the unauthenticated landing handles
+              the sign-in flow itself, then posts the session to the
+              extension via externally_connectable. */}
+          <Route path="/ext-login" element={
+            <Suspense fallback={<RouteFallback />}>
+              <ExtLoginPage />
+            </Suspense>
+          } />
           <Route path="/*" element={<AuthedApp />} />
         </Routes>
       </AuthProvider>

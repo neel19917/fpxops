@@ -320,6 +320,12 @@
             · <a href="#" id="msRecheckLink" style="color:var(--fp-blue-600);">Recheck approval</a>
             · <a href="#" id="msSignOutLink" style="color:var(--fp-slate-500);">Sign out</a>
           </div>
+          <!-- Fallback: dashboard relay. Skips the per-install Supabase
+               redirect URL setup. Works for any unpacked extension
+               regardless of the install id. -->
+          <div style="margin-top:6px;font-size:11px;color:var(--fp-slate-500);">
+            Trouble with the popup? <a href="#" id="msDashboardLink" style="color:var(--fp-blue-600);">Sign in via the dashboard instead</a>.
+          </div>
         </div>
       </div>
 
