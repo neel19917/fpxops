@@ -114,10 +114,21 @@ async function autoCreateActionTasks(req, upsertedRows) {
     const reasonLine = s.ai_recommendation
       ? String(s.ai_recommendation).split(/[.!?]\s/)[0].slice(0, 140)
       : (s.ai_issue ? String(s.ai_issue).slice(0, 140) : "Action needed on this shipment");
+    // When the AI knows who to chase (action_target), prefix the task
+    // title with the matching followup convention so the task lands
+    // in the Carrier Followups or Customer Followups panel on /tasks.
+    // Without this prefix, auto-created tasks were "stranded" in the
+    // generic Kanban — the operator had to hand-tag every one to
+    // surface it in the grouped view.
+    const tgt = String(s.action_target || "").toLowerCase();
+    const prefix =
+      tgt === "carrier" ? "Carrier followup: "
+      : tgt === "customer" ? "Customer followup: "
+      : "";
     return {
       shipment_id: s.id,
       tracking_number: s.tracking_number,
-      title: reasonLine,
+      title: prefix + reasonLine,
       description: [s.ai_issue, s.ai_recommendation].filter(Boolean).join("\n\n"),
       status: "open",
       priority: "high",

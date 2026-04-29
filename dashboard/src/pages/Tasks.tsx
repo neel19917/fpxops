@@ -149,6 +149,12 @@ export function TasksPage() {
       return v === "kanban" ? "kanban" : "table";
     } catch { return "table"; }
   });
+  // Page-level sub-tab. Default = "all" so the existing flow is
+  // preserved (KPIs + bulk toolbar + Kanban/Table over the full task
+  // list). The followup tabs hide the all-tasks view to keep each
+  // section focused — operators on the carrier panel don't need to
+  // scroll past the entire Kanban to reach it.
+  const [pageTab, setPageTab] = useState<"all" | "carrier" | "customer">("all");
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     try { localStorage.setItem(FILTER_KEY, statusFilter); } catch {}
@@ -629,6 +635,54 @@ export function TasksPage() {
         </div>
       </div>
 
+      {/* Page-level sub-tabs. "All" is the default — KPIs + bulk +
+          Kanban/Table on the full task list. Carrier / Customer focus
+          the entire page on one followup panel without the surrounding
+          chrome, so the operator can work a single audience without
+          the kanban scrolling underneath. */}
+      <div className="flex items-center gap-1 border-b border-slate-200 mb-4 -mx-1 px-1 overflow-x-auto">
+        {([
+          { id: "all" as const,      label: "All Tasks",          count: tasks.length, tone: "border-slate-900 text-slate-900" },
+          { id: "carrier" as const,  label: "Carrier Followups",  count: tasks.filter((t) => isCarrierFollowupTitle(t.title) && (t.status === "open" || t.status === "in_progress")).length, tone: "border-violet-600 text-violet-700" },
+          { id: "customer" as const, label: "Customer Followups", count: tasks.filter((t) => {
+            const ti = (t.title || "").toLowerCase();
+            const isCarrier = ti.includes("carrier") && ti.includes("follow");
+            const isCustomer = ti.includes("customer") && ti.includes("follow") && !ti.includes("carrier");
+            return isCustomer && !isCarrier && (t.status === "open" || t.status === "in_progress");
+          }).length, tone: "border-sky-600 text-sky-700" },
+        ]).map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setPageTab(t.id)}
+            className={
+              "px-3 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px transition inline-flex items-center gap-1.5 " +
+              (pageTab === t.id
+                ? t.tone
+                : "border-transparent text-slate-500 hover:text-slate-900")
+            }
+          >
+            {t.label}
+            <span className={
+              "text-[10px] font-semibold px-1.5 py-0.5 rounded-full tabular-nums " +
+              (pageTab === t.id
+                ? t.id === "carrier" ? "bg-violet-100 text-violet-700"
+                : t.id === "customer" ? "bg-sky-100 text-sky-700"
+                : "bg-slate-100 text-slate-700"
+                : "bg-slate-100 text-slate-600")
+            }>
+              {t.count}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {pageTab === "carrier" ? (
+        <FollowupsPanel kind="carrier" onTaskClick={(taskId) => nav.openTask(taskId)} />
+      ) : pageTab === "customer" ? (
+        <FollowupsPanel kind="customer" onTaskClick={(taskId) => nav.openTask(taskId)} />
+      ) : (
+      <>
+
       <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mb-4">
         {([
           { id: "active",      label: "Active",      count: counts.open + counts.in_progress, tone: "bg-violet-50 text-violet-800 ring-violet-200" },
@@ -712,15 +766,9 @@ export function TasksPage() {
         </div>
       ) : null}
 
-      {/* Followup panels (carrier + customer) sit above both views so
-          they're always findable, regardless of whether the user is in
-          Kanban or Table mode. Each panel collapses to a one-liner
-          (with an inline "+ Add" button) when its scope is empty, so
-          quiet days don't crowd the regular Kanban below. Carrier
-          before Customer to mirror the operational sequence — chase
-          the carrier first, brief the customer second. */}
-      <FollowupsPanel kind="carrier" onTaskClick={(taskId) => nav.openTask(taskId)} />
-      <FollowupsPanel kind="customer" onTaskClick={(taskId) => nav.openTask(taskId)} />
+      {/* Followup panels are now driven by the page-level sub-tabs
+          above (Carrier / Customer). Removed from the All view so the
+          Kanban / Table doesn't have to scroll past them every time. */}
 
       {viewMode === "kanban" ? (
         <KanbanBoard
@@ -894,6 +942,8 @@ export function TasksPage() {
       <p className="text-xs text-slate-500 mt-3 text-center">
         Press <kbd className="px-1.5 py-0.5 rounded bg-white ring-1 ring-slate-200 font-mono text-[10px]">?</kbd> for keyboard shortcuts.
       </p>
+      </>
+      )}
 
       {helpOpen ? (
         <div
