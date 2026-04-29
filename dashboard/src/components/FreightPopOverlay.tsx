@@ -164,6 +164,15 @@ export function FreightPopOverlay() {
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 shrink-0">FreightPOP · Tracking #</span>
           <span className="font-mono text-sm text-slate-900 truncate">{frame.trackingNumber || "—"}</span>
+          {/* Bridge presence dot: green when the extension's content script
+              has greeted us (auto-filter works), amber when still pinging
+              (extension may not be installed/reloaded). Hovers explain. */}
+          <span
+            className={"inline-block h-2 w-2 rounded-full shrink-0 " + (bridgeReady ? "bg-emerald-500" : "bg-amber-400")}
+            title={bridgeReady
+              ? "Extension bridge connected — auto-filter works"
+              : "Extension bridge not detected — install/reload the FPXpress Chrome extension and refresh"}
+          />
           {frame.trackingNumber ? (
             <button
               onClick={() => {
