@@ -1074,6 +1074,14 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   } catch (e) { setErr((e as Error).message); }
                   finally { setTaskBusy(false); }
                 }}
+                onCreateInverseFollowup={async (kind) => {
+                  // Add a parallel followup to the OTHER audience for the
+                  // same shipment, so the operator can chase carrier and
+                  // brief customer in one motion. Reuses the existing
+                  // drawer-task path so the new task lands in the correct
+                  // panel automatically (matcher pattern).
+                  await addDrawerTask({ prefix: kind });
+                }}
               />
             ) : null}
 
@@ -1818,11 +1826,43 @@ function ShipmentSummaryHeader({
   );
 }
 
-function TaskBanner({ task, busy, onSetStatus }: {
+function TaskBanner({ task, busy, onSetStatus, onCreateInverseFollowup }: {
   task: ShipmentTask;
   busy: boolean;
   onSetStatus: (status: TaskStatus) => Promise<void> | void;
+  // Hands a "create the inverse audience's followup" request back to
+  // the parent so a carrier-followup walker can spawn a parallel
+  // customer followup (and vice-versa) without leaving the drawer.
+  onCreateInverseFollowup?: (kind: "carrier" | "customer") => Promise<void> | void;
 }) {
+  // Detect which audience this task addresses (if any) so we can offer
+  // a one-click "also create a parallel followup" for the other side.
+  // Mirrors isCarrierFollowupTitle/isCustomerFollowupTitle on the
+  // server — kept inline here so the drawer doesn't need to import
+  // them from the Tasks page module (which would pull in unrelated
+  // state).
+  const titleLower = (task.title || "").toLowerCase();
+  const isCarrierFollowup = titleLower.includes("carrier") && titleLower.includes("follow");
+  const isCustomerFollowup = !isCarrierFollowup && titleLower.includes("customer") && titleLower.includes("follow");
+  // The inverse audience — what's missing right now.
+  const inverseAudience: "carrier" | "customer" | null =
+    isCarrierFollowup ? "customer"
+    : isCustomerFollowup ? "carrier"
+    : null;
+  const [inverseBusy, setInverseBusy] = useState(false);
+  const [inverseDone, setInverseDone] = useState(false);
+
+  async function handleInverse() {
+    if (!inverseAudience || !onCreateInverseFollowup) return;
+    setInverseBusy(true);
+    try {
+      await onCreateInverseFollowup(inverseAudience);
+      setInverseDone(true);
+      setTimeout(() => setInverseDone(false), 2500);
+    } catch { /* parent surfaces the error */ }
+    finally { setInverseBusy(false); }
+  }
+
   // Build the action set per current status so the banner only shows
   // moves that make sense (matches the per-row status button on Tasks).
   const actions: { label: string; status: TaskStatus; tone: string }[] = (() => {
@@ -1865,6 +1905,28 @@ function TaskBanner({ task, busy, onSetStatus }: {
           <span>created {new Date(task.created_at).toLocaleDateString()}</span>
         </div>
         <div className="inline-flex items-center gap-1.5 flex-wrap">
+          {inverseAudience ? (
+            <button
+              type="button"
+              disabled={inverseBusy}
+              onClick={handleInverse}
+              className={
+                "text-xs font-semibold rounded-md px-2.5 py-1 inline-flex items-center gap-1 ring-1 transition disabled:opacity-50 " +
+                (inverseDone
+                  ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                  : inverseAudience === "carrier"
+                  ? "bg-white text-violet-700 ring-violet-200 hover:bg-violet-50"
+                  : "bg-white text-sky-700 ring-sky-200 hover:bg-sky-50")
+              }
+              title={`Create a parallel ${inverseAudience} followup task for this shipment so the ${inverseAudience} side has a pending follow-up too.`}
+            >
+              {inverseBusy
+                ? "Creating…"
+                : inverseDone
+                ? `${inverseAudience === "carrier" ? "Carrier" : "Customer"} followup added`
+                : `+ Add ${inverseAudience} followup`}
+            </button>
+          ) : null}
           {task.tracking_number ? (
             <button
               type="button"
