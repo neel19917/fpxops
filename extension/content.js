@@ -3004,6 +3004,60 @@ function fpxIsTrustedParentOrigin(origin) {
   return false;
 }
 
+// Native value setter — required when programmatically filling React /
+// Kendo inputs so their internal state listeners actually run. A plain
+// `input.value = "..."` mutates the DOM but the framework misses it.
+function fpxSetReactInputValue(input, value) {
+  const proto = input.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+  if (setter) setter.call(input, value);
+  else input.value = value;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+// Try the page's top-level "Tracking Number" search box first — that's
+// what the FPXpress dashboard exposes (Dashboard / In Transit views).
+// If the input + Search button are present, this is far more reliable
+// than poking at column-level Kendo filters.
+async function fpxFillTopSearch(value) {
+  // Enumerate plausible inputs. Match by adjacent label text or placeholder.
+  const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])'));
+  function labelMatches(el) {
+    const ph = (el.placeholder || el.getAttribute("aria-label") || "").toLowerCase();
+    if (ph.includes("tracking")) return true;
+    // Walk up to a small wrapper, then look for a label with "Tracking" in it.
+    let n = el;
+    for (let i = 0; i < 4 && n; i++) {
+      n = n.parentElement;
+      if (!n) break;
+      const lbl = n.querySelector?.("label");
+      if (lbl && /tracking/i.test(lbl.textContent || "")) return true;
+    }
+    // Sibling text node (some pages render label as plain text before input).
+    const prev = el.previousElementSibling;
+    if (prev && /tracking/i.test(prev.textContent || "")) return true;
+    return false;
+  }
+  const target = inputs.find(labelMatches);
+  if (!target) return false;
+  fpxSetReactInputValue(target, value);
+  // Look for a Search button on the same row (very small DOM neighborhood).
+  let host = target.parentElement;
+  for (let i = 0; i < 5 && host; i++) {
+    const btn = Array.from(host.querySelectorAll("button, a")).find(
+      (b) => /^\s*search\s*$/i.test(b.textContent || ""),
+    );
+    if (btn) { btn.click(); return true; }
+    host = host.parentElement;
+  }
+  // No explicit Search button — try Enter on the input. Some grids submit
+  // on enter via React handlers.
+  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  target.dispatchEvent(new KeyboardEvent("keyup",   { key: "Enter", bubbles: true }));
+  return true;
+}
+
 window.addEventListener("message", async (event) => {
   const data = event.data;
   if (!data || typeof data !== "object") return;
@@ -3017,13 +3071,27 @@ window.addEventListener("message", async (event) => {
     const val = String(data.value || "").trim();
     if (!col || !val) return;
     sendStatus(`Bridge: filtering ${col} → "${val}"`);
-    try {
-      await applyFilter(col, val);
-      // Acknowledge so the dashboard can flip a "filtered" indicator.
+    let applied = false;
+    let lastErr = null;
+    // Strategy 1: top-level Tracking Number search input (Dashboard view).
+    if (col.toLowerCase().includes("tracking")) {
+      try {
+        applied = await fpxFillTopSearch(val);
+        if (applied) console.log("[FPX] Bridge: filled top-level Tracking search");
+      } catch (e) { lastErr = e; }
+    }
+    // Strategy 2: Kendo column-header filter (Transactions view + others).
+    if (!applied) {
+      try {
+        await applyFilter(col, val);
+        applied = true;
+      } catch (e) { lastErr = e; }
+    }
+    if (applied) {
       try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true }, event.origin); } catch {}
-    } catch (e) {
-      console.warn("[FPX] Bridge filter failed:", e);
-      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: false, error: String(e?.message || e) }, event.origin); } catch {}
+    } else {
+      console.warn("[FPX] Bridge filter failed:", lastErr);
+      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: false, error: String(lastErr?.message || lastErr || "no matching input") }, event.origin); } catch {}
     }
   } else if (data.type === "fpxPing") {
     // Lets the dashboard detect whether the extension is installed +
