@@ -302,6 +302,35 @@ async function getPrompts() {
 }
 
 // ---------- Railway API helper ----------
+//
+// Robustness:
+// - Retries with exponential backoff on transient failures: network
+//   errors (DNS, connection reset, TLS hiccup), 5xx server errors,
+//   and 429 rate-limit. 4xx OTHER than 429 is returned immediately —
+//   those are caller-fixable (auth, validation) and retrying just
+//   wastes time.
+// - Backoff: 500ms, 1s, 2s with ±20% jitter. Three attempts total
+//   (one shot + two retries).
+// - Caller can opt out of retry by passing options.retry = false.
+// - Returns the same { error } / payload shape as before so all
+//   existing call sites keep working.
+
+const TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504, 408, 522]);
+function isTransientError(err) {
+  if (!err) return false;
+  const msg = String(err.message || err || "").toLowerCase();
+  return msg.includes("fetch") || msg.includes("network") || msg.includes("typeerror") ||
+    msg.includes("timeout") || msg.includes("aborted") || msg.includes("connection");
+}
+function jitterDelay(baseMs) {
+  // ±20% jitter so simultaneous retries from multiple tabs don't
+  // synchronize into a thundering herd.
+  return baseMs * (0.8 + Math.random() * 0.4);
+}
+async function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
 async function callApi(path, body, options = {}) {
   const [apiUrl, apiKey, userName, session] = await Promise.all([
     getApiUrl(), getApiKey(), getUserName(), getSupabaseSession(),
@@ -317,21 +346,76 @@ async function callApi(path, body, options = {}) {
   else headers["x-api-key"] = apiKey;
   if (userName) headers["x-fpx-user-name"] = userName;
 
-  try {
-    const resp = await fetch(`${apiUrl}${path}`, {
-      method: options.method || "POST",
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: options.signal,
-    });
-    if (!resp.ok) {
-      const text = await resp.text();
-      return { error: `API ${resp.status}: ${text.slice(0, 200)}` };
+  const wantRetry = options.retry !== false;
+  const maxAttempts = wantRetry ? 3 : 1;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = await fetch(`${apiUrl}${path}`, {
+        method: options.method || "POST",
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: options.signal,
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        const errMsg = `API ${resp.status}: ${text.slice(0, 200)}`;
+        if (TRANSIENT_STATUSES.has(resp.status) && attempt < maxAttempts) {
+          lastError = errMsg;
+          const backoff = jitterDelay(500 * Math.pow(2, attempt - 1));
+          console.warn(`[FPX] callApi ${path} ${resp.status} — retrying in ${Math.round(backoff)}ms (attempt ${attempt}/${maxAttempts})`);
+          await sleep(backoff);
+          continue;
+        }
+        return { error: errMsg };
+      }
+      return await resp.json();
+    } catch (e) {
+      lastError = e.message;
+      if (isTransientError(e) && attempt < maxAttempts) {
+        const backoff = jitterDelay(500 * Math.pow(2, attempt - 1));
+        console.warn(`[FPX] callApi ${path} threw "${e.message}" — retrying in ${Math.round(backoff)}ms (attempt ${attempt}/${maxAttempts})`);
+        await sleep(backoff);
+        continue;
+      }
+      return { error: e.message };
     }
-    return await resp.json();
-  } catch (e) {
-    return { error: e.message };
   }
+  return { error: lastError || "Request failed after retries" };
+}
+
+// Bulk shipment upload with chunking + per-chunk retry. The plain
+// /api/shipments route accepts arbitrarily-large arrays, but bulk
+// payloads >500 rows can hit Railway's request-body cap and bounce
+// the whole batch. Chunking caps each upload at 250 rows and surfaces
+// per-chunk progress; a bad row (rare) only kills its own chunk
+// instead of the whole scrape. Returns aggregate { ok, count,
+// chunks, failed }.
+const BULK_CHUNK_SIZE = 250;
+async function upsertShipmentsBulkRobust(rows) {
+  if (!Array.isArray(rows) || !rows.length) return { ok: true, count: 0, chunks: 0, failed: [] };
+  const chunks = [];
+  for (let i = 0; i < rows.length; i += BULK_CHUNK_SIZE) {
+    chunks.push(rows.slice(i, i + BULK_CHUNK_SIZE));
+  }
+  let totalCount = 0;
+  const failed = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const result = await callApi("/api/shipments", { shipments: chunks[i] });
+    if (result.error) {
+      failed.push({ chunk: i, size: chunks[i].length, error: result.error });
+      console.warn(`[FPX] bulk chunk ${i + 1}/${chunks.length} (${chunks[i].length} rows) failed: ${result.error}`);
+    } else {
+      totalCount += result.count || chunks[i].length;
+    }
+  }
+  return {
+    ok: failed.length === 0,
+    count: totalCount,
+    chunks: chunks.length,
+    failed,
+  };
 }
 
 function accumulateCost(result) {
@@ -400,8 +484,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   } else if (msg.type === "upsertShipmentsBulk") {
     (async () => {
-      const result = await callApi("/api/shipments", { shipments: msg.rows });
-      sendResponse(result.error ? { ok: false, error: result.error } : { ok: true, count: result.count });
+      // Route through the chunking + retry helper so partial failures
+      // are surfaced per chunk instead of dropping the whole scrape.
+      // Side panel + dashboard both treat ok=true as "all chunks
+      // landed"; ok=false means at least one chunk failed and the
+      // operator can retry just those rows.
+      const result = await upsertShipmentsBulkRobust(msg.rows);
+      sendResponse(result.ok
+        ? { ok: true, count: result.count, chunks: result.chunks }
+        : { ok: false, error: `${result.failed.length} of ${result.chunks} chunk(s) failed`, count: result.count, chunks: result.chunks, failed: result.failed });
     })();
     return true;
   } else if (msg.type === "analyzeBatch") {
