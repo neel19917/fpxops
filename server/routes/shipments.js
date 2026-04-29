@@ -114,10 +114,21 @@ async function autoCreateActionTasks(req, upsertedRows) {
     const reasonLine = s.ai_recommendation
       ? String(s.ai_recommendation).split(/[.!?]\s/)[0].slice(0, 140)
       : (s.ai_issue ? String(s.ai_issue).slice(0, 140) : "Action needed on this shipment");
+    // When the AI knows who to chase (action_target), prefix the task
+    // title with the matching followup convention so the task lands
+    // in the Carrier Followups or Customer Followups panel on /tasks.
+    // Without this prefix, auto-created tasks were "stranded" in the
+    // generic Kanban — the operator had to hand-tag every one to
+    // surface it in the grouped view.
+    const tgt = String(s.action_target || "").toLowerCase();
+    const prefix =
+      tgt === "carrier" ? "Carrier followup: "
+      : tgt === "customer" ? "Customer followup: "
+      : "";
     return {
       shipment_id: s.id,
       tracking_number: s.tracking_number,
-      title: reasonLine,
+      title: prefix + reasonLine,
       description: [s.ai_issue, s.ai_recommendation].filter(Boolean).join("\n\n"),
       status: "open",
       priority: "high",
@@ -197,12 +208,29 @@ async function autoDraftEmails(upsertedRows) {
   return count;
 }
 
-// GET /shipments?limit=500&customer=Acme&action=YES&status=Issue&q=track123&source=ai|manual
+// GET /shipments?limit=200&before=<scraped_at iso>&customer=Acme&action=YES&status=Issue&q=track123&source=ai|manual
 // Reads from fpx_shipments_latest (view) — one row per tracking_number, most recent
 // scrape. Base table fpx_shipments keeps the full history; hit /shipments/:id to see it.
+//
+// Pagination: cursor-based on scraped_at desc. The dashboard fetches
+// ?limit=200 on initial mount and pages with ?before=<oldest scraped_at
+// from prior page>&limit=500 on each "Load more" click. Cursor beats
+// offset because new scrapes can land between pages and offset would
+// double-count or skip rows; with a strict-less-than scraped_at filter
+// the next page is always the next chunk of older rows.
 shipmentsRouter.get("/", async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 500, 5000);
+  const limit = Math.min(Number(req.query.limit) || 200, 5000);
   let q = supabase.from("fpx_shipments_latest").select(LIST_COLUMNS).order("scraped_at", { ascending: false }).limit(limit);
+  if (req.query.before) {
+    // Parse to ISO so a malformed cursor returns 400 instead of an
+    // opaque postgres error. The view's scraped_at is timestamptz —
+    // a strict `lt` on iso strings sorts correctly.
+    const cursor = new Date(String(req.query.before));
+    if (Number.isNaN(cursor.getTime())) {
+      return res.status(400).json({ error: "before cursor must be an ISO timestamp" });
+    }
+    q = q.lt("scraped_at", cursor.toISOString());
+  }
   if (req.query.customer) q = q.eq("customer_name", String(req.query.customer));
   if (req.query.action) q = q.eq("action_required", String(req.query.action));
   if (req.query.source && ["ai", "manual", "none"].includes(String(req.query.source))) {
@@ -215,14 +243,18 @@ shipmentsRouter.get("/", async (req, res) => {
   }
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data: data || [] });
+  // Surface the "next" cursor when we returned a full page so the
+  // dashboard knows whether to keep showing the Load more button.
+  // null = end of list.
+  const nextCursor = (data && data.length === limit && data[data.length - 1]?.scraped_at) || null;
+  res.json({ data: data || [], next_cursor: nextCursor });
 });
 
 shipmentsRouter.get("/:id", async (req, res) => {
   const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
-  const [analysesRes, historyRes, tasksRes] = await Promise.all([
+  const [analysesRes, historyRes, tasksRes, recentDiffRes] = await Promise.all([
     supabase
       .from("fpx_ai_analyses").select("*")
       .or(`shipment_uuid.eq.${ship.id},tracking_number.eq.${ship.tracking_number || "__none__"}`)
@@ -233,12 +265,25 @@ shipmentsRouter.get("/:id", async (req, res) => {
           .order("scraped_at", { ascending: false }).limit(20)
       : Promise.resolve({ data: [] }),
     supabase.from("fpx_shipment_tasks").select("*").eq("shipment_id", ship.id).order("created_at", { ascending: false }),
+    // Most recent material diff from fpx_shipment_scrapes — same row
+    // the AI per-shipment prompt now sees as recent_changes. Surfacing
+    // it on the drawer lets the rep eyeball "what moved since last
+    // scrape" without diffing two snapshots manually. Best-effort —
+    // a missing scrape row just hides the section in the UI.
+    supabase.from("fpx_shipment_scrapes")
+      .select("scraped_at, scraped_by, diff")
+      .eq("shipment_id", ship.id)
+      .not("diff", "is", null)
+      .order("scraped_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
   ]);
   res.json({
     shipment: ship,
     analyses: analysesRes.data || [],
     history: historyRes.data || [],
     tasks: tasksRes.data || [],
+    recent_diff: recentDiffRes.data || null,
   });
 });
 
@@ -335,6 +380,19 @@ shipmentsRouter.post("/", async (req, res) => {
     // and was previously marked stale, leave it as-is — only operator action
     // clears stale once it's set. (Avoids flapping if the carrier flips a
     // status field then flips it back.)
+
+    // Stamp last_material_change_at for every materially-changed
+    // shipment so the Tracking table can render a "just changed"
+    // pill on those rows. Same timestamp for the batch — operators
+    // think in scrape-events, not row-by-row instants. Skipped when
+    // no material changes happened so we don't churn the column on
+    // every unchanged scrape.
+    if (materialChangedIds.size) {
+      const stamp = new Date().toISOString();
+      await supabase.from("fpx_shipments")
+        .update({ last_material_change_at: stamp })
+        .in("id", Array.from(materialChangedIds));
+    }
 
     // ---- Background: re-analyze + tasks + drafts -----------------------
     const backgroundWork = (async () => {

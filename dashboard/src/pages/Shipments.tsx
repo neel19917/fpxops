@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink } from "lucide-react";
-import { api } from "../lib/api";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown } from "lucide-react";
+import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
 import { ActionBadge } from "../components/Badge";
@@ -16,7 +16,10 @@ import {
   saveColumnPrefs,
   type ColumnPrefs,
 } from "../lib/shipmentColumns";
-import { exportShipmentsXlsx } from "../lib/exportShipments";
+// exportShipmentsXlsx is dynamically imported below so the xlsx-js-style
+// library (~300 KB minified) is only fetched when the operator actually
+// clicks "Export all". Keeps the Shipments chunk slim for the
+// 99% of page loads where nobody exports.
 
 // FreightPOP-style stat pills. Pills are mutually exclusive click-to-filter.
 // Status matchers run against shipment_status; ISSUES uses action_required.
@@ -117,7 +120,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }, [columnPrefs]);
 
   const [drawerId, setDrawerIdState] = useState<string | null>(null);
-  const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[]; tasks: ShipmentTask[] } | null>(null);
+  const [drawerData, setDrawerData] = useState<{ shipment: Shipment; analyses: AiAnalysis[]; tasks: ShipmentTask[]; recent_diff: ShipmentRecentDiff | null } | null>(null);
   // Wrap state changes so opening / closing the drawer also updates the URL.
   function setDrawerId(next: string | null) {
     setDrawerIdState(next);
@@ -237,26 +240,53 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     if (exporting) return;
     setExporting(true); setErr(null);
     try {
-      const r = await api.shipments.list({ limit: 5000 });
+      // Pull the data + the (heavy) xlsx-js-style library in parallel
+      // so the click→download latency is bounded by the slower of
+      // the two. Vite splits exportShipments into its own chunk
+      // because we use dynamic import here.
+      const [r, mod] = await Promise.all([
+        api.shipments.list({ limit: 5000 }),
+        import("../lib/exportShipments"),
+      ]);
       if (!r.data?.length) {
         setErr("No shipments to export.");
         return;
       }
-      exportShipmentsXlsx(r.data);
+      mod.exportShipmentsXlsx(r.data);
     } catch (e) { setErr((e as Error).message); }
     finally { setExporting(false); }
   }
 
+  // Cursor for the next page on "Load more". Null = no more rows OR
+  // we haven't fetched yet. The server returns this as scraped_at of
+  // the last row on the current page.
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+
   async function load() {
     setLoading(true); setErr(null);
     try {
-      // Initial render is what users feel — keep it tight. Daily volume sits
-      // around 200 rows; 500 is generous headroom. Export pulls the full
-      // 5000-cap separately so this doesn't bound that workflow.
-      const r = await api.shipments.list({ limit: 500 });
+      // Initial render is what users feel — keep it tight. Daily volume
+      // typically sits around 200 rows; smaller initial fetch makes the
+      // page paint faster on slow connections, and "Load more" pulls
+      // the next 500 if the operator wants more history.
+      const r = await api.shipments.list({ limit: 200 });
       setRows(r.data);
+      setNextCursor(r.next_cursor);
     } catch (e) { setErr((e as Error).message); }
     setLoading(false);
+  }
+  async function loadMore() {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const r = await api.shipments.list({ limit: 500, before: nextCursor });
+      // Append rather than replace so the existing scroll position
+      // and selection state stay intact.
+      setRows((prev) => [...prev, ...r.data]);
+      setNextCursor(r.next_cursor);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setLoadingMore(false); }
   }
   useEffect(() => { load(); }, []);
 
@@ -303,6 +333,34 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       })
       .catch(() => { setDrawerData(null); setDrawerTasks([]); });
   }, [drawerId]);
+
+  // Re-fetch the focused shipment and mirror the result into the
+  // table row + drawer data. Used after any single-shipment action
+  // that the server side-effects (override, reanalyze, notes save,
+  // etc.) so both the drawer and the row in the table reflect the
+  // new state without an extra round trip per consumer. Returns the
+  // refreshed shipment so callers can chain on it if they need to.
+  // Patch a single analysis row inside drawerData.analyses by id —
+  // used by AnalysisThumbs to apply a rating change without
+  // refetching the whole drawer.
+  function patchAnalysisLocal(id: string, patch: Partial<AiAnalysis>) {
+    setDrawerData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        analyses: prev.analyses.map((a) => (a.id === id ? { ...a, ...patch } : a)),
+      };
+    });
+  }
+
+  async function refreshDrawer(id: string = drawerId || "") {
+    if (!id) return null;
+    const r = await api.shipments.get(id);
+    setDrawerData(r);
+    setDrawerTasks(r.tasks || []);
+    setRows((prev) => prev.map((row) => (row.id === id ? r.shipment : row)));
+    return r;
+  }
 
   async function saveNotes() {
     if (!drawerId || notesBusy) return;
@@ -795,6 +853,29 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             </tbody>
           </table>
         </div>
+        {/* Load-more strip — only renders when the server says there
+            are more rows. The "Showing N rows" line gives the
+            operator a sense of scope before they choose to fetch
+            another 500. */}
+        <div className="px-4 py-3 border-t border-slate-100 flex items-center justify-between gap-3 text-xs text-slate-500">
+          <span>
+            Showing {rows.length} row{rows.length === 1 ? "" : "s"}
+            {rows.length !== filtered.length ? <> · {filtered.length} after filters</> : null}
+          </span>
+          {nextCursor ? (
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 text-xs font-medium disabled:opacity-50"
+              title="Fetch the next 500 older shipments from the server"
+            >
+              <Download className="h-3.5 w-3.5" />
+              {loadingMore ? "Loading…" : "Load more"}
+            </button>
+          ) : (
+            <span className="text-slate-400">End of list</span>
+          )}
+        </div>
       </div>
 
       {bulkOpen ? (
@@ -939,9 +1020,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 setActionEditBusy(true);
                 try {
                   await api.shipments.overrideAction(drawerId, { action_required: v });
-                  const r = await api.shipments.get(drawerId);
-                  setDrawerData(r);
-                  setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                  await refreshDrawer();
                 } catch (e) { setErr((e as Error).message); }
                 finally { setActionEditBusy(false); }
               }}
@@ -950,9 +1029,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 setActionEditBusy(true);
                 try {
                   await api.shipments.overrideAction(drawerId, { action_required: null });
-                  const r = await api.shipments.get(drawerId);
-                  setDrawerData(r);
-                  setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                  await refreshDrawer();
                 } catch (e) { setErr((e as Error).message); }
                 finally { setActionEditBusy(false); }
               }}
@@ -1074,6 +1151,14 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   } catch (e) { setErr((e as Error).message); }
                   finally { setTaskBusy(false); }
                 }}
+                onCreateInverseFollowup={async (kind) => {
+                  // Add a parallel followup to the OTHER audience for the
+                  // same shipment, so the operator can chase carrier and
+                  // brief customer in one motion. Reuses the existing
+                  // drawer-task path so the new task lands in the correct
+                  // panel automatically (matcher pattern).
+                  await addDrawerTask({ prefix: kind });
+                }}
               />
             ) : null}
 
@@ -1135,9 +1220,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                                   setActionEditBusy(true);
                                   try {
                                     await api.shipments.overrideAction(drawerId, { action_required: v });
-                                    const r = await api.shipments.get(drawerId);
-                                    setDrawerData(r);
-                                    setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                                    await refreshDrawer();
                                   } catch (e) { setErr((e as Error).message); }
                                   finally { setActionEditBusy(false); }
                                 }}
@@ -1155,9 +1238,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                               setActionEditBusy(true);
                               try {
                                 await api.shipments.overrideAction(drawerId, { action_required: null });
-                                const r = await api.shipments.get(drawerId);
-                                setDrawerData(r);
-                                setRows((prev) => prev.map((row) => row.id === drawerId ? r.shipment : row));
+                                await refreshDrawer();
                               } catch (e) { setErr((e as Error).message); }
                               finally { setActionEditBusy(false); }
                             }}
@@ -1345,19 +1426,25 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                         <div className="text-sm font-semibold text-slate-900 mb-2">{parsed.subject}</div>
                       ) : null}
                       <pre className="text-sm whitespace-pre-wrap font-sans text-slate-700 leading-relaxed bg-slate-50 ring-1 ring-slate-200 rounded-lg p-3 max-h-72 overflow-auto">{parsed.body || "(empty)"}</pre>
-                      <div className="flex items-center justify-end gap-3 mt-2">
-                        {parsed.subject || parsed.body ? (
-                          <a
-                            href={`mailto:?subject=${encodeURIComponent(parsed.subject || "")}&body=${encodeURIComponent(parsed.body || "")}`}
-                            className="text-xs text-sky-700 hover:text-sky-900 font-medium"
-                          >Open in mail →</a>
-                        ) : null}
-                        <button
-                          onClick={() => copyText(`Subject: ${parsed.subject || ""}\n\n${parsed.body || ""}`)}
-                          className="text-xs px-2 py-1 rounded-lg bg-slate-900 text-white hover:bg-slate-800 flex items-center gap-1"
-                        >
-                          <Copy className="h-3 w-3" /> Copy
-                        </button>
+                      <div className="flex items-center justify-between gap-3 mt-2 flex-wrap">
+                        <AnalysisThumbs
+                          analysis={a}
+                          onRated={(patch) => patchAnalysisLocal(a.id, patch)}
+                        />
+                        <div className="flex items-center gap-3">
+                          {parsed.subject || parsed.body ? (
+                            <a
+                              href={`mailto:?subject=${encodeURIComponent(parsed.subject || "")}&body=${encodeURIComponent(parsed.body || "")}`}
+                              className="text-xs text-sky-700 hover:text-sky-900 font-medium"
+                            >Open in mail →</a>
+                          ) : null}
+                          <button
+                            onClick={() => copyText(`Subject: ${parsed.subject || ""}\n\n${parsed.body || ""}`)}
+                            className="text-xs px-2 py-1 rounded-lg bg-slate-900 text-white hover:bg-slate-800 flex items-center gap-1"
+                          >
+                            <Copy className="h-3 w-3" /> Copy
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -1370,10 +1457,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 .filter((a) => a.kind === "per_shipment" || a.kind === "summary")
                 .map((a) => ({ a, parsed: parseAnalysis(a) }));
               return (
-                <Section title={`Analysis history (${items.length})`}>
-                  {items.length === 0 ? (
-                    <div className="text-sm text-slate-500">No analyses yet. Run the extension on this shipment.</div>
-                  ) : items.map(({ a, parsed }) => (
+                <>
+                  <RecentChangeLog diff={drawerData.recent_diff} />
+                  <Section title={`Analysis history (${items.length})`}>
+                    {items.length === 0 ? (
+                      <div className="text-sm text-slate-500">No analyses yet. Run the extension on this shipment.</div>
+                    ) : items.map(({ a, parsed }) => (
                     <div key={a.id} className="rounded-xl bg-white ring-1 ring-slate-200 p-4 mb-3">
                       <div className="flex items-center justify-between text-xs text-slate-500 mb-2">
                         <div className="flex items-center gap-2">
@@ -1413,9 +1502,21 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                           {a.duration_ms ? ` · ${(a.duration_ms / 1000).toFixed(1)}s` : ""}
                         </div>
                       ) : null}
+                      {parsed.flavor === "shipment" ? (
+                        <div className="mt-3 pt-3 border-t border-slate-100 flex items-center justify-between gap-3 flex-wrap">
+                          <span className="text-[11px] text-slate-500 leading-snug">
+                            Was this analysis useful? <span className="text-slate-400">Feedback feeds the next AI run on this shipment.</span>
+                          </span>
+                          <AnalysisThumbs
+                            analysis={a}
+                            onRated={(patch) => patchAnalysisLocal(a.id, patch)}
+                          />
+                        </div>
+                      ) : null}
                     </div>
-                  ))}
-                </Section>
+                    ))}
+                  </Section>
+                </>
               );
             })()}
 
@@ -1688,6 +1789,140 @@ interface ShipmentSummaryHeaderProps {
   onRevertToAi: () => void | Promise<void>;
 }
 
+// =====================================================================
+// RecentChangeLog — surfaces the field-level diff from the most recent
+// scrape (the same `recent_changes` block the per-shipment AI prompt
+// now sees). Renders nothing when there's no diff (first scrape, or
+// no material changes since last time). Helps reps eyeball "what
+// moved" so they can sanity-check the AI's verdict against the real
+// change.
+// =====================================================================
+function RecentChangeLog({ diff }: { diff: ShipmentRecentDiff | null }) {
+  if (!diff || !diff.diff || typeof diff.diff !== "object") return null;
+  const entries = Object.entries(diff.diff);
+  if (entries.length === 0) return null;
+
+  function fmtVal(v: unknown): string {
+    if (v === null || v === undefined) return "—";
+    if (typeof v === "string") return v.trim() || "—";
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+
+  return (
+    <Section title="What changed since last scrape">
+      <div className="rounded-xl bg-amber-50 ring-1 ring-amber-200 p-3 mb-3 text-xs">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-amber-800">
+            {entries.length} field{entries.length === 1 ? "" : "s"} changed
+          </span>
+          <span className="text-[11px] text-amber-700">
+            scraped {fmtRelative(diff.scraped_at)}{diff.scraped_by ? ` by ${diff.scraped_by}` : ""}
+          </span>
+        </div>
+        <div className="space-y-1.5">
+          {entries.map(([field, change]) => {
+            const prev = change && typeof change === "object" && "prev" in change ? change.prev : undefined;
+            const next = change && typeof change === "object" && "next" in change ? change.next : undefined;
+            return (
+              <div key={field} className="grid grid-cols-[140px_1fr] gap-2 items-start">
+                <div className="text-[11px] font-mono font-semibold text-slate-700 truncate" title={field}>
+                  {field}
+                </div>
+                <div className="text-[11px] flex items-center gap-1.5 flex-wrap">
+                  <span className="line-through text-slate-500 break-all">{fmtVal(prev)}</span>
+                  <span className="text-slate-400">→</span>
+                  <span className="text-slate-900 font-medium break-all">{fmtVal(next)}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="mt-2 pt-2 border-t border-amber-200/80 text-[10px] text-amber-700/80 leading-snug">
+          The per-shipment AI sees this same change-log when it re-analyzes — flags
+          and recommendations should reflect what just moved.
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+// =====================================================================
+// AnalysisThumbs — 👍 / 👎 buttons for any AI analysis (per-shipment
+// analysis, single-shipment email draft, etc.). Posts the rating to
+// /api/analyses/:id/rating, calls onRated() so the parent can update
+// its local drawerData and the prior_ai_analysis prompt context picks
+// up the rating on the next per-shipment AI re-run. Clicking the
+// active thumb clears the rating (mistaken click).
+// =====================================================================
+function AnalysisThumbs({ analysis, onRated }: {
+  analysis: AiAnalysis;
+  onRated: (next: { rating: "up" | "down" | null; rated_by: string | null; rated_at: string | null }) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  async function rate(target: "up" | "down") {
+    if (busy) return;
+    const next = analysis.rating === target ? null : target;
+    setBusy(true);
+    // Optimistic local update — parent state mutates instantly so the
+    // active thumb flips before the request returns. Roll back on
+    // error by reverting to whatever the row had before.
+    onRated({ rating: next, rated_by: null, rated_at: next ? new Date().toISOString() : null });
+    try {
+      const r = await api.analyses.rate(analysis.id, { rating: next });
+      onRated({
+        rating: r.analysis.rating,
+        rated_by: r.analysis.rated_by,
+        rated_at: r.analysis.rated_at,
+      });
+    } catch {
+      // Revert on failure.
+      onRated({
+        rating: analysis.rating ?? null,
+        rated_by: analysis.rated_by ?? null,
+        rated_at: analysis.rated_at ?? null,
+      });
+    } finally { setBusy(false); }
+  }
+  return (
+    <div className="inline-flex items-center gap-1.5">
+      <button
+        onClick={() => rate("up")}
+        disabled={busy}
+        className={
+          "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
+          (analysis.rating === "up"
+            ? "bg-emerald-600 text-white ring-emerald-700"
+            : "bg-white text-slate-600 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
+        }
+        aria-pressed={analysis.rating === "up"}
+        title={analysis.rating === "up" ? "Click again to clear" : "Mark this AI output as useful"}
+      >
+        <ThumbsUp className="h-3 w-3" /> Good
+      </button>
+      <button
+        onClick={() => rate("down")}
+        disabled={busy}
+        className={
+          "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
+          (analysis.rating === "down"
+            ? "bg-rose-600 text-white ring-rose-700"
+            : "bg-white text-slate-600 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
+        }
+        aria-pressed={analysis.rating === "down"}
+        title={analysis.rating === "down" ? "Click again to clear" : "Mark this AI output as not useful — feeds into the next analysis"}
+      >
+        <ThumbsDown className="h-3 w-3" /> Needs work
+      </button>
+      {analysis.rated_by ? (
+        <span className="text-[10px] text-slate-400 ml-1" title={`Rated ${analysis.rated_at ? fmtRelative(analysis.rated_at) : ""}`}>
+          by {analysis.rated_by}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 function ShipmentSummaryHeader({
   shipment,
   onOverrideClick,
@@ -1818,11 +2053,43 @@ function ShipmentSummaryHeader({
   );
 }
 
-function TaskBanner({ task, busy, onSetStatus }: {
+function TaskBanner({ task, busy, onSetStatus, onCreateInverseFollowup }: {
   task: ShipmentTask;
   busy: boolean;
   onSetStatus: (status: TaskStatus) => Promise<void> | void;
+  // Hands a "create the inverse audience's followup" request back to
+  // the parent so a carrier-followup walker can spawn a parallel
+  // customer followup (and vice-versa) without leaving the drawer.
+  onCreateInverseFollowup?: (kind: "carrier" | "customer") => Promise<void> | void;
 }) {
+  // Detect which audience this task addresses (if any) so we can offer
+  // a one-click "also create a parallel followup" for the other side.
+  // Mirrors isCarrierFollowupTitle/isCustomerFollowupTitle on the
+  // server — kept inline here so the drawer doesn't need to import
+  // them from the Tasks page module (which would pull in unrelated
+  // state).
+  const titleLower = (task.title || "").toLowerCase();
+  const isCarrierFollowup = titleLower.includes("carrier") && titleLower.includes("follow");
+  const isCustomerFollowup = !isCarrierFollowup && titleLower.includes("customer") && titleLower.includes("follow");
+  // The inverse audience — what's missing right now.
+  const inverseAudience: "carrier" | "customer" | null =
+    isCarrierFollowup ? "customer"
+    : isCustomerFollowup ? "carrier"
+    : null;
+  const [inverseBusy, setInverseBusy] = useState(false);
+  const [inverseDone, setInverseDone] = useState(false);
+
+  async function handleInverse() {
+    if (!inverseAudience || !onCreateInverseFollowup) return;
+    setInverseBusy(true);
+    try {
+      await onCreateInverseFollowup(inverseAudience);
+      setInverseDone(true);
+      setTimeout(() => setInverseDone(false), 2500);
+    } catch { /* parent surfaces the error */ }
+    finally { setInverseBusy(false); }
+  }
+
   // Build the action set per current status so the banner only shows
   // moves that make sense (matches the per-row status button on Tasks).
   const actions: { label: string; status: TaskStatus; tone: string }[] = (() => {
@@ -1865,6 +2132,28 @@ function TaskBanner({ task, busy, onSetStatus }: {
           <span>created {new Date(task.created_at).toLocaleDateString()}</span>
         </div>
         <div className="inline-flex items-center gap-1.5 flex-wrap">
+          {inverseAudience ? (
+            <button
+              type="button"
+              disabled={inverseBusy}
+              onClick={handleInverse}
+              className={
+                "text-xs font-semibold rounded-md px-2.5 py-1 inline-flex items-center gap-1 ring-1 transition disabled:opacity-50 " +
+                (inverseDone
+                  ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                  : inverseAudience === "carrier"
+                  ? "bg-white text-violet-700 ring-violet-200 hover:bg-violet-50"
+                  : "bg-white text-sky-700 ring-sky-200 hover:bg-sky-50")
+              }
+              title={`Create a parallel ${inverseAudience} followup task for this shipment so the ${inverseAudience} side has a pending follow-up too.`}
+            >
+              {inverseBusy
+                ? "Creating…"
+                : inverseDone
+                ? `${inverseAudience === "carrier" ? "Carrier" : "Customer"} followup added`
+                : `+ Add ${inverseAudience} followup`}
+            </button>
+          ) : null}
           {task.tracking_number ? (
             <button
               type="button"

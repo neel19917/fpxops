@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { Shipment } from "./types";
 import { ActionBadge } from "../components/Badge";
 import { fmtDate, fmtDateTime, fmtRelative } from "./format";
+import { useAuth } from "./auth";
 
 // Single source of truth for the Tracking-page table columns. Adding a
 // column = adding an entry here. Visibility + order are user-configurable
@@ -20,12 +21,40 @@ export interface ShipmentColumn {
 const dash = (v: string | null | undefined) => (v ? v : "—");
 const yesNo = (v: boolean | null) => (v === true ? "Yes" : v === false ? "No" : "—");
 
+// "Just changed" pill — surfaces shipments whose most recent scrape
+// detected a material diff vs the prior version. Window is admin-
+// configurable in Settings (key: ui.tracking.recent_change_window_hours);
+// default = 24h. Setting it to 0 hides the pill entirely without
+// disabling the underlying last_material_change_at column.
+function TrackingCell({ row }: { row: Shipment }) {
+  const { clientConfig } = useAuth();
+  const tn = row.tracking_number;
+  if (!row.last_material_change_at) return <>{dash(tn)}</>;
+  const windowH = clientConfig?.tracking_ui?.recent_change_window_hours ?? 24;
+  if (windowH <= 0) return <>{dash(tn)}</>;
+  const ageMs = Date.now() - new Date(row.last_material_change_at).getTime();
+  const windowMs = windowH * 60 * 60 * 1000;
+  if (!(ageMs >= 0 && ageMs <= windowMs)) return <>{dash(tn)}</>;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span title={`Material change ${fmtRelative(row.last_material_change_at)}`}>{dash(tn)}</span>
+      <span
+        className="inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-800 ring-1 ring-amber-200 px-1.5 py-0.5 text-[10px] font-semibold"
+        title={`Open the drawer's Analysis tab to see what changed (${fmtRelative(row.last_material_change_at)}).`}
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+        Changed {fmtRelative(row.last_material_change_at)}
+      </span>
+    </span>
+  );
+}
+
 export const SHIPMENT_COLUMNS: ShipmentColumn[] = [
   // Default-visible (current 8)
   { id: "scraped",   label: "Scraped",  defaultVisible: true, tdClass: "text-slate-500 whitespace-nowrap",
     title: (r) => fmtDateTime(r.scraped_at), render: (r) => fmtRelative(r.scraped_at) },
   { id: "tracking",  label: "Tracking", defaultVisible: true, tdClass: "font-medium whitespace-nowrap",
-    render: (r) => dash(r.tracking_number) },
+    render: (r) => <TrackingCell row={r} /> },
   { id: "customer",  label: "Customer", defaultVisible: true, tdClass: "whitespace-nowrap",
     render: (r) => dash(r.customer_name) },
   { id: "carrier",   label: "Carrier",  defaultVisible: true, tdClass: "whitespace-nowrap",

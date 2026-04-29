@@ -163,6 +163,94 @@ tasksRouter.post("/carrier-email-draft", async (req, res) => {
   res.json({ subject: result.subject, body: result.body, count: items.length, model: result.model || null });
 });
 
+// Pulls prior bulk-email drafts for a single group (carrier or customer)
+// from fpx_ai_analyses, parses out subject/body, and returns newest-first.
+// Both /carrier-email-drafts and /customer-email-drafts go through this
+// helper so the two endpoints stay in lockstep.
+async function listGroupDrafts({ subkind, groupKey, groupValue, limit }) {
+  if (!groupValue) return [];
+  // Use jsonb containment (@>) so Postgres can hit the
+  // fpx_ai_analyses_metadata_gin_idx GIN index. The .eq("metadata->>...")
+  // form translates to text equality which doesn't use the GIN index
+  // and would seq-scan the table once we cross ~10k analyses rows.
+  // .contains() in supabase-js compiles to `metadata @> '...'::jsonb`
+  // which the planner turns into a Bitmap Index Scan.
+  const matcher = { subkind, [groupKey]: groupValue };
+  const { data, error } = await supabase
+    .from("fpx_ai_analyses")
+    .select("id, created_at, model, response_text, input_tokens, output_tokens, cost_usd, metadata, rating, rating_reason, rated_by, rated_at")
+    .contains("metadata", matcher)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) return { error };
+  // Parse subject + body out of the JSON the model emitted. Same logic
+  // as generateCarrierGroupEmail / generateCustomerGroupEmail — kept
+  // here in the route layer so historical drafts render even if the
+  // generator's parser changes.
+  const drafts = (data || []).map((a) => {
+    let subject = null, body = null;
+    try {
+      const m = (a.response_text || "").match(/\{[\s\S]*\}/);
+      if (m) {
+        const parsed = JSON.parse(m[0]);
+        if (parsed?.subject) subject = String(parsed.subject);
+        if (parsed?.body) body = String(parsed.body);
+      }
+    } catch { /* fall through with nulls */ }
+    return {
+      id: a.id,
+      created_at: a.created_at,
+      model: a.model,
+      subject,
+      body,
+      raw: a.response_text,
+      count: (a.metadata && typeof a.metadata === "object" && Number(a.metadata.count)) || null,
+      cost_usd: a.cost_usd,
+      input_tokens: a.input_tokens,
+      output_tokens: a.output_tokens,
+      rating: a.rating || null,
+      rating_reason: a.rating_reason || null,
+      rated_by: a.rated_by || null,
+      rated_at: a.rated_at || null,
+    };
+  });
+  return drafts;
+}
+
+// GET /tasks/carrier-email-drafts?carrier=Pilot[&limit=20]
+// List of prior bulk drafts for a carrier, newest-first. Used by the
+// Group Email modal to show the operator the history of drafts for
+// that carrier, so they can compare or reuse one without burning a
+// fresh Opus call.
+tasksRouter.get("/carrier-email-drafts", async (req, res) => {
+  const carrier = typeof req.query.carrier === "string" ? req.query.carrier.trim() : "";
+  if (!carrier) return res.status(400).json({ error: "carrier required" });
+  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  const drafts = await listGroupDrafts({
+    subkind: "email_draft_carrier_group",
+    groupKey: "carrier",
+    groupValue: carrier,
+    limit,
+  });
+  if (drafts && drafts.error) return res.status(500).json({ error: drafts.error.message });
+  res.json({ drafts });
+});
+
+// GET /tasks/customer-email-drafts?customer=X[&limit=20]
+tasksRouter.get("/customer-email-drafts", async (req, res) => {
+  const customer = typeof req.query.customer === "string" ? req.query.customer.trim() : "";
+  if (!customer) return res.status(400).json({ error: "customer required" });
+  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  const drafts = await listGroupDrafts({
+    subkind: "email_draft_customer_group",
+    groupKey: "customer",
+    groupValue: customer,
+    limit,
+  });
+  if (drafts && drafts.error) return res.status(500).json({ error: drafts.error.message });
+  res.json({ drafts });
+});
+
 // GET /tasks/customer-followups  — mirror of /carrier-followups grouped
 // by customer_name. Detection uses isCustomerFollowupTitle, which
 // excludes carrier-titled tasks (so the same task never shows up in

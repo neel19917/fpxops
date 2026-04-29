@@ -589,6 +589,19 @@
     </div>
   </header>
 
+  <!-- Persistent upload-queue chip — renders only when there are
+       chunks pending or dead in chrome.storage.local. Click to manually
+       retry. Hidden by default; refreshQueueStatus() unhides on demand. -->
+  <button
+    id="fp-queue-status"
+    type="button"
+    hidden
+    style="display:block;width:calc(100% - 20px);margin:6px 10px 0;padding:6px 10px;border:1px solid #f59e0b;background:#fef3c7;color:#92400e;border-radius:6px;font-size:11px;font-weight:600;text-align:left;cursor:pointer;line-height:1.35;"
+    title="Click to retry the queue manually."
+  >
+    Upload queue: 0 pending
+  </button>
+
   <!-- Old badges kept in DOM (hidden) so existing JS can keep updating them
        without crashing. The new header status reflects API + server state in
        plain language. -->

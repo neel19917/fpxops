@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { api } from "./lib/api";
 import type { ShipmentTask } from "./lib/types";
 import { FreightPopOverlay } from "./components/FreightPopOverlay";
@@ -9,18 +9,24 @@ import { AuthProvider, useAuth } from "./lib/auth";
 import { NavCtx, type NavApi } from "./lib/nav";
 import { SignInPage } from "./pages/SignIn";
 import { PendingApprovalPage } from "./pages/PendingApproval";
-import { ShipmentsPage } from "./pages/Shipments";
-import { AnalysesPage } from "./pages/Analyses";
-import { GpAuditsPage, InvoiceAuditsPage } from "./pages/Audits";
-import { ApiKeysPage } from "./pages/ApiKeys";
-import { UsersPage } from "./pages/Users";
-import { ShareLinksPage } from "./pages/ShareLinks";
-import { SharedViewPage } from "./pages/SharedView";
-import { TasksPage } from "./pages/Tasks";
-import { FeedbackPage } from "./pages/Feedback";
-import { AuditLogPage } from "./pages/AuditLog";
-import { SettingsPage } from "./pages/Settings";
-import { OpsPage } from "./pages/Ops";
+
+// Every page is now lazy-loaded to keep the initial JS payload minimal.
+// Tracking and Tasks pick up a ~50–100 ms first-route delay on a cold
+// cache; subsequent visits hit the warm chunk and are instant.
+// Vite splits each named-export wrapper into its own chunk.
+const ShipmentsPage   = lazy(() => import("./pages/Shipments").then((m) => ({ default: m.ShipmentsPage })));
+const TasksPage       = lazy(() => import("./pages/Tasks").then((m) => ({ default: m.TasksPage })));
+const SharedViewPage  = lazy(() => import("./pages/SharedView").then((m) => ({ default: m.SharedViewPage })));
+const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
+const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
+const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
+const ApiKeysPage     = lazy(() => import("./pages/ApiKeys").then((m) => ({ default: m.ApiKeysPage })));
+const UsersPage       = lazy(() => import("./pages/Users").then((m) => ({ default: m.UsersPage })));
+const ShareLinksPage  = lazy(() => import("./pages/ShareLinks").then((m) => ({ default: m.ShareLinksPage })));
+const FeedbackPage    = lazy(() => import("./pages/Feedback").then((m) => ({ default: m.FeedbackPage })));
+const AuditLogPage    = lazy(() => import("./pages/AuditLog").then((m) => ({ default: m.AuditLogPage })));
+const SettingsPage    = lazy(() => import("./pages/Settings").then((m) => ({ default: m.SettingsPage })));
+const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default: m.OpsPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
@@ -73,7 +79,11 @@ export default function App() {
 
 function SharedViewRoute() {
   const { token = "" } = useParams<{ token: string }>();
-  return <SharedViewPage token={token} />;
+  return (
+    <Suspense fallback={<RouteFallback />}>
+      <SharedViewPage token={token} />
+    </Suspense>
+  );
 }
 
 function AuthedApp() {
@@ -125,30 +135,32 @@ function AuthedApp() {
         tab={tab}
         onTab={(t) => navigate(TAB_PATH[t])}
       >
-        <Routes>
-          <Route path="/" element={<Navigate to="/tracking" replace />} />
-          <Route path="/tracking" element={<ShipmentsRoute />} />
-          <Route path="/tracking/:id" element={<ShipmentsRoute />} />
-          <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
-          <Route path="/tasks" element={<TasksPage />} />
-          <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
-          <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
-          <Route path="/ops" element={<OpsPage />} />
-          <Route path="/analyses" element={<AnalysesPage />} />
-          <Route path="/audits/gp" element={<GpAuditsPage />} />
-          <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
-          <Route path="/shares" element={<ShareLinksPage />} />
-          <Route path="/feedback" element={<FeedbackPage />} />
-          {isAdmin ? (
-            <>
-              <Route path="/admin/users" element={<UsersPage />} />
-              <Route path="/admin/keys" element={<ApiKeysPage />} />
-              <Route path="/admin/audit" element={<AuditLogPage />} />
-              <Route path="/admin/settings" element={<SettingsPage />} />
-            </>
-          ) : null}
-          <Route path="*" element={<Navigate to="/tracking" replace />} />
-        </Routes>
+        <Suspense fallback={<RouteFallback />}>
+          <Routes>
+            <Route path="/" element={<Navigate to="/tracking" replace />} />
+            <Route path="/tracking" element={<ShipmentsRoute />} />
+            <Route path="/tracking/:id" element={<ShipmentsRoute />} />
+            <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
+            <Route path="/tasks" element={<TasksPage />} />
+            <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
+            <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
+            <Route path="/ops" element={<OpsPage />} />
+            <Route path="/analyses" element={<AnalysesPage />} />
+            <Route path="/audits/gp" element={<GpAuditsPage />} />
+            <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
+            <Route path="/shares" element={<ShareLinksPage />} />
+            <Route path="/feedback" element={<FeedbackPage />} />
+            {isAdmin ? (
+              <>
+                <Route path="/admin/users" element={<UsersPage />} />
+                <Route path="/admin/keys" element={<ApiKeysPage />} />
+                <Route path="/admin/audit" element={<AuditLogPage />} />
+                <Route path="/admin/settings" element={<SettingsPage />} />
+              </>
+            ) : null}
+            <Route path="*" element={<Navigate to="/tracking" replace />} />
+          </Routes>
+        </Suspense>
       </Layout>
     </NavCtx.Provider>
   );
@@ -328,3 +340,12 @@ function TaskWalkRoute() {
 
 // Re-export Outlet to keep TS happy if other modules pull it in later.
 export { Outlet };
+
+// Suspense fallback for lazy-loaded routes. Intentionally minimal —
+// secondary chunks usually arrive in <500ms on a warm cache. Anything
+// fancier would itself be a load on the route swap.
+function RouteFallback() {
+  return (
+    <div className="p-6 text-sm text-slate-500">Loading…</div>
+  );
+}

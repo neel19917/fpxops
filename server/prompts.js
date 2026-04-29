@@ -39,7 +39,11 @@ Shipment data:
 export const PER_SHIPMENT_LOGIC = `- If delivery_date is BEFORE the estimated delivery (updated_eta, falling back to original_eta), DO NOT flag. Note in "issue" that the shipment delivered early; set actionConfidence low and actionTarget to "none".
 - If delivery_date is AFTER the estimated delivery (updated_eta, falling back to original_eta), DO flag. Identify it as a late delivery, set actionTarget to "carrier" unless the data clearly points to the customer.
 - If the shipment has not yet been picked up (no actual_departure / no real pickup_date — pickup is only scheduled or pickup_response indicates "Pickup Request" / "Tendered" / "Confirmed" without a hauled status) AND the ETA has already passed, DO NOT flag the late ETA — pickup hasn't happened yet, so the ETA is moot. If pickup itself is overdue, that's the real issue: flag it as a pickup problem with actionTarget "carrier".
-- These rules override generic "status looks bad" heuristics. If a rule above applies, follow it.`;
+- These rules override generic "status looks bad" heuristics. If a rule above applies, follow it.
+
+Prior context (when present in the data):
+- "prior_ai_analysis" is the most recent AI verdict on THIS shipment (issue, recommendation, action_required, plus any operator rating). Use it as context: if the prior issue still applies, restate consistently; if the situation has resolved, say so explicitly in "issue" (e.g. "Previously flagged late delivery now confirmed delivered on <date>") and set actionConfidence low. If the operator rated the prior analysis 👎 (rating="down"), treat that recommendation skeptically and look for what it missed.
+- "recent_changes" is a change-log of which shipment fields moved between scrapes (status, dates, addresses, GP, etc.). Weight your verdict toward what's NEW since last analysis — if nothing material changed, you can confirm the prior verdict; if the change resolves the prior concern, mark it resolved; if a new concern shows up, flag it.`;
 
 export const PRIORITY_PROMPT = `URGENT SHIPMENT REVIEW — This shipment has been flagged as critical.
 

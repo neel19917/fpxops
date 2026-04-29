@@ -136,6 +136,12 @@ export interface ClientConfig {
     enabled: boolean;
     url_template: string;
   };
+  // How long the "Changed Xh ago" pill stays on Tracking rows after
+  // the most recent material change. Admin-tunable from Settings;
+  // 0 hides the pill entirely (the column itself is unaffected).
+  tracking_ui: {
+    recent_change_window_hours: number;
+  };
 }
 
 export const api = {
@@ -172,9 +178,9 @@ export const api = {
   },
 
   shipments: {
-    list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string }) =>
-      request<{ data: Shipment[] }>("/api/shipments", { params }),
-    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[] }>(`/api/shipments/${id}`),
+    list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string; before?: string }) =>
+      request<{ data: Shipment[]; next_cursor: string | null }>("/api/shipments", { params }),
+    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[]; recent_diff: ShipmentRecentDiff | null }>(`/api/shipments/${id}`),
     overrideAction: (id: string, body: { action_required: string | null; reason?: string }) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>
@@ -193,6 +199,14 @@ export const api = {
   analyses: {
     list: (params?: { limit?: number; kind?: string; tracking_number?: string }) =>
       request<{ data: AiAnalysis[] }>("/api/analyses", { params }),
+    // Reps rate AI generations 👍 / 👎 so the team can iterate on
+    // prompts. Passing rating=null clears a prior rating (mistaken
+    // click). Reason is optional but encouraged on 👎.
+    rate: (id: string, body: { rating: "up" | "down" | null; reason?: string }) =>
+      request<{ analysis: { id: string; rating: "up" | "down" | null; rating_reason: string | null; rated_by: string | null; rated_at: string | null } }>(
+        `/api/analyses/${id}/rating`,
+        { method: "POST", body: JSON.stringify(body) },
+      ),
   },
   audits: {
     gp: {
@@ -307,6 +321,17 @@ export const api = {
         "/api/tasks/customer-email-draft",
         { method: "POST", body: JSON.stringify(body) },
       ),
+    // Lists prior bulk drafts for a single group, newest-first. The
+    // Group Email modal calls this on open so the operator can see
+    // every draft we've ever written for that carrier / customer.
+    carrierEmailDrafts: (carrier: string, limit = 20) =>
+      request<{ drafts: GroupEmailDraft[] }>("/api/tasks/carrier-email-drafts", {
+        params: { carrier, limit },
+      }),
+    customerEmailDrafts: (customer: string, limit = 20) =>
+      request<{ drafts: GroupEmailDraft[] }>("/api/tasks/customer-email-drafts", {
+        params: { customer, limit },
+      }),
   },
   feedback: {
     list: (params?: { status?: string; category?: string }) =>
@@ -342,17 +367,63 @@ export const api = {
   },
 };
 
+// Recent material-diff for a shipment, returned by GET /api/shipments/:id.
+// Mirrors fpx_shipment_scrapes.diff which the AI prompt also sees as
+// recent_changes. Each key in `diff` is a column name; the value is
+// { prev, next } showing what moved between the prior scrape and the
+// most recent one.
+export interface ShipmentRecentDiff {
+  scraped_at: string;
+  scraped_by: string | null;
+  diff: Record<string, { prev: unknown; next: unknown }> | null;
+}
+
+// Stored bulk-email draft as returned by the carrier-email-drafts /
+// customer-email-drafts list endpoints. Pulled from fpx_ai_analyses
+// rows tagged with metadata.subkind=email_draft_*_group.
+export interface GroupEmailDraft {
+  id: string;
+  created_at: string;
+  model: string | null;
+  subject: string | null;
+  body: string | null;
+  raw: string | null;
+  count: number | null;
+  cost_usd: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  rating?: "up" | "down" | null;
+  rating_reason?: string | null;
+  rated_by?: string | null;
+  rated_at?: string | null;
+}
+
 export interface OpsDailyRow {
   date: string;
   shipments_analyzed: number;
   tasks_completed: number;
   emails_generated: number;
+  cost_usd: number;
 }
 export interface OpsMetrics {
   range: { from: string; to: string; days: number };
-  totals: { shipments_analyzed: number; tasks_completed: number; emails_generated: number };
-  today: { date: string; shipments_analyzed: number; tasks_completed: number; emails_generated: number };
-  last7: { shipments_analyzed: number; tasks_completed: number; emails_generated: number };
+  totals: {
+    shipments_analyzed: number;
+    tasks_completed: number;
+    emails_generated: number;
+    cost_usd: number;
+    // Per-category cost split: per-shipment AI analyses, single-
+    // shipment emails (carrier/customer drafts in the drawer), bulk
+    // group emails, and anything else (gp/invoice audits, ad-hoc).
+    cost_breakdown: {
+      per_shipment_analysis: number;
+      email_single: number;
+      email_group: number;
+      other: number;
+    };
+  };
+  today: { date: string; shipments_analyzed: number; tasks_completed: number; emails_generated: number; cost_usd: number };
+  last7: { shipments_analyzed: number; tasks_completed: number; emails_generated: number; cost_usd: number };
   daily: OpsDailyRow[];
   byOperator: { operator: string; tasks_completed: number; emails_generated: number }[];
 }

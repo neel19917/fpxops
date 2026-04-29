@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus } from "lucide-react";
-import { api } from "../lib/api";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus, ThumbsUp, ThumbsDown } from "lucide-react";
+import { api, type GroupEmailDraft } from "../lib/api";
 import type { CarrierFollowupShipment, Shipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
+import { fmtRelative } from "../lib/format";
 import { useNav } from "../lib/nav";
 import { UserPicker } from "../components/UserPicker";
 import { requestAutoFilter } from "../lib/freightpopFrame";
@@ -149,6 +150,12 @@ export function TasksPage() {
       return v === "kanban" ? "kanban" : "table";
     } catch { return "table"; }
   });
+  // Page-level sub-tab. Default = "all" so the existing flow is
+  // preserved (KPIs + bulk toolbar + Kanban/Table over the full task
+  // list). The followup tabs hide the all-tasks view to keep each
+  // section focused — operators on the carrier panel don't need to
+  // scroll past the entire Kanban to reach it.
+  const [pageTab, setPageTab] = useState<"all" | "carrier" | "customer">("all");
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     try { localStorage.setItem(FILTER_KEY, statusFilter); } catch {}
@@ -539,10 +546,11 @@ export function TasksPage() {
           <button
             onClick={startAllOpen}
             disabled={bulkBusy || counts.open === 0}
-            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-2 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
             title="Mark every open task as In Progress"
           >
-            <Rocket className="h-4 w-4" /> {bulkBusy ? "Starting…" : `Start all open (${counts.open})`}
+            <Rocket className="h-4 w-4 shrink-0" />
+            <span>{bulkBusy ? "Starting…" : `Start all open (${counts.open})`}</span>
           </button>
           {/* Walk-through scope: prefer the currently-visible filter, but
               fall back to the "active" set (open + in_progress) when the
@@ -568,12 +576,13 @@ export function TasksPage() {
                   nav.openTask(first.id);
                 }}
                 disabled={walkCount === 0}
-                className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 title={fallbackHint
                   ? `Current filter has no tasks — walking the ${walkCount} active task${walkCount === 1 ? "" : "s"} instead`
                   : "Open the first visible task and walk through them with n / p"}
               >
-                <ChevronRight className="h-4 w-4" /> Walk through ({walkCount})
+                <ChevronRight className="h-4 w-4 shrink-0" />
+                <span>Walk through ({walkCount})</span>
               </button>
             );
           })()}
@@ -628,6 +637,54 @@ export function TasksPage() {
           </button>
         </div>
       </div>
+
+      {/* Page-level sub-tabs. "All" is the default — KPIs + bulk +
+          Kanban/Table on the full task list. Carrier / Customer focus
+          the entire page on one followup panel without the surrounding
+          chrome, so the operator can work a single audience without
+          the kanban scrolling underneath. */}
+      <div className="flex items-center gap-1 border-b border-slate-200 mb-4 -mx-1 px-1 overflow-x-auto">
+        {([
+          { id: "all" as const,      label: "All Tasks",          count: tasks.length, tone: "border-slate-900 text-slate-900" },
+          { id: "carrier" as const,  label: "Carrier Followups",  count: tasks.filter((t) => isCarrierFollowupTitle(t.title) && (t.status === "open" || t.status === "in_progress")).length, tone: "border-violet-600 text-violet-700" },
+          { id: "customer" as const, label: "Customer Followups", count: tasks.filter((t) => {
+            const ti = (t.title || "").toLowerCase();
+            const isCarrier = ti.includes("carrier") && ti.includes("follow");
+            const isCustomer = ti.includes("customer") && ti.includes("follow") && !ti.includes("carrier");
+            return isCustomer && !isCarrier && (t.status === "open" || t.status === "in_progress");
+          }).length, tone: "border-sky-600 text-sky-700" },
+        ]).map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setPageTab(t.id)}
+            className={
+              "px-3 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px transition inline-flex items-center gap-1.5 " +
+              (pageTab === t.id
+                ? t.tone
+                : "border-transparent text-slate-500 hover:text-slate-900")
+            }
+          >
+            {t.label}
+            <span className={
+              "text-[10px] font-semibold px-1.5 py-0.5 rounded-full tabular-nums " +
+              (pageTab === t.id
+                ? t.id === "carrier" ? "bg-violet-100 text-violet-700"
+                : t.id === "customer" ? "bg-sky-100 text-sky-700"
+                : "bg-slate-100 text-slate-700"
+                : "bg-slate-100 text-slate-600")
+            }>
+              {t.count}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {pageTab === "carrier" ? (
+        <FollowupsPanel kind="carrier" onTaskClick={(taskId) => nav.openTask(taskId)} />
+      ) : pageTab === "customer" ? (
+        <FollowupsPanel kind="customer" onTaskClick={(taskId) => nav.openTask(taskId)} />
+      ) : (
+      <>
 
       <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mb-4">
         {([
@@ -712,15 +769,9 @@ export function TasksPage() {
         </div>
       ) : null}
 
-      {/* Followup panels (carrier + customer) sit above both views so
-          they're always findable, regardless of whether the user is in
-          Kanban or Table mode. Each panel collapses to a one-liner
-          (with an inline "+ Add" button) when its scope is empty, so
-          quiet days don't crowd the regular Kanban below. Carrier
-          before Customer to mirror the operational sequence — chase
-          the carrier first, brief the customer second. */}
-      <FollowupsPanel kind="carrier" onTaskClick={(taskId) => nav.openTask(taskId)} />
-      <FollowupsPanel kind="customer" onTaskClick={(taskId) => nav.openTask(taskId)} />
+      {/* Followup panels are now driven by the page-level sub-tabs
+          above (Carrier / Customer). Removed from the All view so the
+          Kanban / Table doesn't have to scroll past them every time. */}
 
       {viewMode === "kanban" ? (
         <KanbanBoard
@@ -894,6 +945,8 @@ export function TasksPage() {
       <p className="text-xs text-slate-500 mt-3 text-center">
         Press <kbd className="px-1.5 py-0.5 rounded bg-white ring-1 ring-slate-200 font-mono text-[10px]">?</kbd> for keyboard shortcuts.
       </p>
+      </>
+      )}
 
       {helpOpen ? (
         <div
@@ -1189,6 +1242,29 @@ interface FollowupItem { task: ShipmentTask; shipment: CarrierFollowupShipment; 
 // on `kind` for `g.carrier` vs `g.customer` — both come in as `name`.
 interface FollowupGroup { name: string; items: FollowupItem[] }
 
+// Module-level TTL cache for the followups fetch so toggling sub-tabs
+// (carrier ↔ customer) within a 30-second window doesn't re-hit the
+// API. Each kind has its own slot. Refresh button + creating a new
+// followup task both bust the cache for the relevant kind.
+const FOLLOWUPS_TTL_MS = 30_000;
+const followupsCache: Record<FollowupKind, { ts: number; data: { groups: FollowupGroup[]; total: number } } | null> = {
+  carrier: null,
+  customer: null,
+};
+function readFollowupsCache(kind: FollowupKind): { groups: FollowupGroup[]; total: number } | null {
+  const slot = followupsCache[kind];
+  if (!slot) return null;
+  if (Date.now() - slot.ts > FOLLOWUPS_TTL_MS) return null;
+  return slot.data;
+}
+function writeFollowupsCache(kind: FollowupKind, data: { groups: FollowupGroup[]; total: number }) {
+  followupsCache[kind] = { ts: Date.now(), data };
+}
+function bustFollowupsCache(kind?: FollowupKind) {
+  if (kind) followupsCache[kind] = null;
+  else { followupsCache.carrier = null; followupsCache.customer = null; }
+}
+
 const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
   title: string;          // "Carrier Followups"
   groupNoun: string;      // "carrier" / "customer"
@@ -1196,6 +1272,9 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
   fetch: () => Promise<{ groups: FollowupGroup[]; total: number }>;
   emailDraft: (body: { name: string; task_ids: string[]; notes?: string }) =>
     Promise<{ subject: string; body: string; count: number; model: string | null }>;
+  // Prior-drafts list — used by the Group Email modal so the operator
+  // can see every email we've ever drafted for this group.
+  emailDraftsList: (name: string) => Promise<{ drafts: GroupEmailDraft[] }>;
   ringTone: string;       // tailwind ring class
   bgTone: string;         // tailwind bg class
   chipTone: string;
@@ -1208,11 +1287,16 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
     groupNoun: "carrier",
     emptyExample: "Carrier followup: missing POD",
     fetch: async () => {
+      const cached = readFollowupsCache("carrier");
+      if (cached) return cached;
       const r = await api.tasks.carrierFollowups();
-      return { total: r.total, groups: r.groups.map((g) => ({ name: g.carrier, items: g.items })) };
+      const out = { total: r.total, groups: r.groups.map((g) => ({ name: g.carrier, items: g.items })) };
+      writeFollowupsCache("carrier", out);
+      return out;
     },
     emailDraft: ({ name, task_ids, notes }) =>
       api.tasks.carrierEmailDraft({ carrier: name, task_ids, notes }),
+    emailDraftsList: (name) => api.tasks.carrierEmailDrafts(name),
     ringTone: "ring-violet-200",
     bgTone: "bg-violet-50/40",
     chipTone: "bg-violet-100 text-violet-800",
@@ -1225,11 +1309,16 @@ const FOLLOWUP_KIND_CONFIG: Record<FollowupKind, {
     groupNoun: "customer",
     emptyExample: "Customer followup: needs ETA",
     fetch: async () => {
+      const cached = readFollowupsCache("customer");
+      if (cached) return cached;
       const r = await api.tasks.customerFollowups();
-      return { total: r.total, groups: r.groups.map((g) => ({ name: g.customer, items: g.items })) };
+      const out = { total: r.total, groups: r.groups.map((g) => ({ name: g.customer, items: g.items })) };
+      writeFollowupsCache("customer", out);
+      return out;
     },
     emailDraft: ({ name, task_ids, notes }) =>
       api.tasks.customerEmailDraft({ customer: name, task_ids, notes }),
+    emailDraftsList: (name) => api.tasks.customerEmailDrafts(name),
     ringTone: "ring-sky-200",
     bgTone: "bg-sky-50/40",
     chipTone: "bg-sky-100 text-sky-800",
@@ -1250,7 +1339,8 @@ function FollowupsPanel({ kind, onTaskClick }: {
   const [emailFor, setEmailFor] = useState<FollowupGroup | null>(null);
   const [addOpen, setAddOpen] = useState(false);
 
-  async function load() {
+  async function load(force = false) {
+    if (force) bustFollowupsCache(kind);
     setLoading(true); setErr(null);
     try {
       const r = await cfg.fetch();
@@ -1296,7 +1386,7 @@ function FollowupsPanel({ kind, onTaskClick }: {
           </button>
         </div>
         {addOpen ? (
-          <AddFollowupTaskModal kind={kind} onClose={() => setAddOpen(false)} onCreated={() => { setAddOpen(false); load(); }} />
+          <AddFollowupTaskModal kind={kind} onClose={() => setAddOpen(false)} onCreated={() => { setAddOpen(false); load(true); }} />
         ) : null}
       </>
     );
@@ -1321,9 +1411,9 @@ function FollowupsPanel({ kind, onTaskClick }: {
             <Plus className="h-3 w-3" /> Add
           </button>
           <button
-            onClick={load}
+            onClick={() => load(true)}
             className={`text-[11px] ${cfg.iconTone} hover:opacity-80 inline-flex items-center gap-1`}
-            title={`Refresh ${cfg.groupNoun} followups`}
+            title={`Refresh ${cfg.groupNoun} followups (busts the 30s client cache)`}
           >
             <RefreshCw className="h-3 w-3" /> Refresh
           </button>
@@ -1337,6 +1427,15 @@ function FollowupsPanel({ kind, onTaskClick }: {
             kind={kind}
             onTaskClick={onTaskClick}
             onEmail={() => setEmailFor(g)}
+            onSetStatus={async (task, status) => {
+              // Same code path as the per-row Status button on the
+              // table view: PATCH the task, then refetch (cache-bust)
+              // so the panel reflects the new state. Done tasks fall
+              // out of the "active" set and the card recomputes.
+              try {
+                await api.tasks.update(task.id, { status });
+              } finally { load(true); }
+            }}
           />
         ))}
       </div>
@@ -1355,13 +1454,28 @@ function FollowupsPanel({ kind, onTaskClick }: {
   );
 }
 
-function FollowupGroupCard({ group, kind, onTaskClick, onEmail }: {
+function FollowupGroupCard({ group, kind, onTaskClick, onEmail, onSetStatus }: {
   group: FollowupGroup;
   kind: FollowupKind;
   onTaskClick: (taskId: string) => void;
   onEmail: () => void;
+  onSetStatus: (task: ShipmentTask, status: TaskStatus) => Promise<void> | void;
 }) {
   const cfg = FOLLOWUP_KIND_CONFIG[kind];
+  // Per-row busy guard so the operator can't double-click the action
+  // before the server responds. Keyed on task.id so simultaneous
+  // actions on different rows still work.
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  // Pick the next-step action for a task based on its current status.
+  // Mirrors KanbanCard's logic so the buttons feel identical to what
+  // the operator sees on the regular Kanban view.
+  function nextAction(t: ShipmentTask): { label: string; status: TaskStatus; tone: string } | null {
+    if (t.status === "open") return { label: "Start", status: "in_progress", tone: "bg-indigo-600 text-white hover:bg-indigo-700" };
+    if (t.status === "in_progress") return { label: "Done", status: "done", tone: "bg-emerald-600 text-white hover:bg-emerald-700" };
+    if (t.status === "blocked") return { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" };
+    if (t.status === "done") return { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" };
+    return null;
+  }
   const groupNounCap = cfg.groupNoun.charAt(0).toUpperCase() + cfg.groupNoun.slice(1);
   return (
     <div className={`rounded-lg bg-white ring-1 ${cfg.ringTone} shadow-sm flex flex-col`}>
@@ -1377,30 +1491,62 @@ function FollowupGroupCard({ group, kind, onTaskClick, onEmail }: {
         </span>
       </div>
       <ul className={`px-3 py-2 space-y-1.5 max-h-80 overflow-y-auto`}>
-        {group.items.map((it) => (
-          <li key={it.task.id} className="text-xs">
-            <button
-              onClick={() => { requestAutoFilter(); onTaskClick(it.task.id); }}
-              className={`w-full text-left rounded-md px-2 py-1.5 hover:${cfg.bgTone} group ring-1 ring-transparent hover:${cfg.ringTone}`}
-              title={`Open ${it.shipment.tracking_number || it.task.title} in task-walk mode`}
+        {group.items.map((it) => {
+          const action = nextAction(it.task);
+          const rowBusy = busyTaskId === it.task.id;
+          return (
+            <li
+              key={it.task.id}
+              className={`text-xs rounded-md ring-1 ring-transparent hover:ring-slate-200 hover:bg-slate-50 ${rowBusy ? "opacity-60" : ""}`}
             >
-              <div className="flex items-center justify-between gap-2 min-w-0">
-                <span className="font-semibold text-slate-900 truncate text-sm">
-                  {it.shipment.shipment_id || "(no shipment id)"}
-                </span>
-                <span className="text-slate-600 shrink-0 font-mono text-[11px]">
-                  {it.shipment.tracking_number || ""}
-                </span>
+              <div className="flex items-stretch">
+                {/* Clickable text region — opens task-walk mode for the
+                    operator to drill in. Click bubbles up only when the
+                    operator hits the body of the row, not the action
+                    buttons we render to the right. */}
+                <button
+                  onClick={() => { requestAutoFilter(); onTaskClick(it.task.id); }}
+                  className="flex-1 text-left px-2 py-1.5 min-w-0"
+                  title={`Open ${it.shipment.tracking_number || it.task.title} in task-walk mode`}
+                >
+                  <div className="flex items-center justify-between gap-2 min-w-0">
+                    <span className="font-semibold text-slate-900 truncate text-sm">
+                      {it.shipment.shipment_id || "(no shipment id)"}
+                    </span>
+                    <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                      {it.shipment.tracking_number || ""}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-600 truncate mt-0.5">
+                    {it.shipment.customer_name || "—"} · {it.shipment.shipment_status || "no status"}
+                  </div>
+                  <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                    {it.task.title}
+                  </div>
+                </button>
+                {/* Per-row status action — Start / Done / Reopen
+                    depending on the task's current status. Same shape
+                    as the per-row button on the table view so the
+                    affordance feels familiar. */}
+                {action ? (
+                  <button
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      setBusyTaskId(it.task.id);
+                      try { await onSetStatus(it.task, action.status); }
+                      finally { setBusyTaskId(null); }
+                    }}
+                    disabled={rowBusy}
+                    className={`text-[11px] font-semibold rounded-md px-2 py-1 inline-flex items-center self-center mr-1 ${action.tone} disabled:opacity-50`}
+                    title={`Mark this task as ${action.status.replace("_", " ")}`}
+                  >
+                    {rowBusy ? "…" : action.label}
+                  </button>
+                ) : null}
               </div>
-              <div className="text-[11px] text-slate-600 truncate mt-0.5">
-                {it.shipment.customer_name || "—"} · {it.shipment.shipment_status || "no status"}
-              </div>
-              <div className="text-[11px] text-slate-500 truncate mt-0.5">
-                {it.task.title}
-              </div>
-            </button>
-          </li>
-        ))}
+            </li>
+          );
+        })}
       </ul>
       <div className={`px-3 py-2 border-t ${cfg.ringTone} flex items-center gap-2`}>
         <button
@@ -1429,32 +1575,107 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
 }) {
   const cfg = FOLLOWUP_KIND_CONFIG[kind];
   const [busy, setBusy] = useState(false);
-  const [draft, setDraft] = useState<{ subject: string; body: string; model: string | null } | null>(null);
+  // Live list of drafts for this group, freshest-first. Includes both
+  // historical drafts pulled on open AND any new drafts the operator
+  // generates inside this session — we prepend new ones rather than
+  // replacing the list so the history stays intact.
+  const [drafts, setDrafts] = useState<GroupEmailDraft[]>([]);
+  // Selected draft id within `drafts`. Null until the list loads or
+  // a fresh generate fires. Driven by the buttons in the prior-drafts
+  // strip on the left.
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [loadingDrafts, setLoadingDrafts] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [copied, setCopied] = useState(false);
+  // Task ids the operator has X'd out of the next Generate — those
+  // shipments don't get sent to the LLM. Excluding doesn't touch the
+  // task itself; it only scopes this email round.
+  const [excludedIds, setExcludedIds] = useState<Set<string>>(new Set());
+  const includedItems = group.items.filter((it) => !excludedIds.has(it.task.id));
+  function toggleExclude(taskId: string) {
+    setExcludedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+      return next;
+    });
+  }
+
+  // Fetch the prior drafts for this group on mount. We always render
+  // them — even if the operator never clicks Generate inside this
+  // modal session, the prior drafts give them something to copy.
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingDrafts(true);
+    cfg.emailDraftsList(group.name)
+      .then((r) => {
+        if (cancelled) return;
+        setDrafts(r.drafts || []);
+        if (r.drafts && r.drafts.length) setSelectedId(r.drafts[0].id);
+      })
+      .catch((e) => { if (!cancelled) setErr((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoadingDrafts(false); });
+    return () => { cancelled = true; };
+  }, [group.name, cfg]);
+
+  const selected = drafts.find((d) => d.id === selectedId) || null;
 
   async function generate() {
-    setBusy(true); setErr(null); setDraft(null);
+    if (!includedItems.length) { setErr("Include at least one shipment."); return; }
+    setBusy(true); setErr(null);
     try {
       const r = await cfg.emailDraft({
         name: group.name,
-        task_ids: group.items.map((it) => it.task.id),
+        task_ids: includedItems.map((it) => it.task.id),
         notes: notes.trim() || undefined,
       });
-      setDraft({ subject: r.subject, body: r.body, model: r.model });
+      // Refetch the list — the server just inserted a new analyses
+      // row and we want the modal to reflect it (new draft, accurate
+      // timestamps, future drafts also pickable).
+      const list = await cfg.emailDraftsList(group.name);
+      setDrafts(list.drafts || []);
+      // Select the freshest draft. Match on subject+body since the
+      // generate response doesn't include the analyses row id.
+      const fresh = (list.drafts || []).find(
+        (d) => d.subject === r.subject && d.body === r.body,
+      );
+      setSelectedId(fresh ? fresh.id : ((list.drafts || [])[0]?.id || null));
     } catch (e) {
       setErr((e as Error).message);
     } finally { setBusy(false); }
   }
 
   async function copy() {
-    if (!draft) return;
+    if (!selected) return;
     try {
-      await navigator.clipboard.writeText(`Subject: ${draft.subject}\n\n${draft.body}`);
+      await navigator.clipboard.writeText(`Subject: ${selected.subject || ""}\n\n${selected.body || ""}`);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch { /* clipboard blocked */ }
+  }
+
+  // Toggle rating on the selected draft. Clicking the same thumb that's
+  // already active clears the rating (mistaken click). Updates the
+  // local list optimistically; on error, refetches from the server.
+  const [rateBusy, setRateBusy] = useState(false);
+  async function rateDraft(rating: "up" | "down") {
+    if (!selected || rateBusy) return;
+    const next = selected.rating === rating ? null : rating;
+    setRateBusy(true);
+    // Optimistic local update so the click feels instant.
+    setDrafts((prev) => prev.map((d) => d.id === selected.id ? { ...d, rating: next, rated_by: d.rated_by, rated_at: next ? new Date().toISOString() : null } : d));
+    try {
+      await api.analyses.rate(selected.id, { rating: next });
+    } catch (e) {
+      setErr((e as Error).message);
+      // Roll back by refetching the canonical list.
+      try {
+        const list = await cfg.emailDraftsList(group.name);
+        setDrafts(list.drafts || []);
+      } catch { /* leave optimistic state in place */ }
+    } finally {
+      setRateBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -1469,7 +1690,7 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[88vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
@@ -1479,7 +1700,7 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
               Group email · {group.name}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              {group.items.length} shipment{group.items.length === 1 ? "" : "s"} · one consolidated email · prompts editable in Settings
+              {group.items.length} shipment{group.items.length === 1 ? "" : "s"} · prior drafts shown on the left · prompts editable in Settings
             </p>
           </div>
           <button onClick={onClose} className="text-slate-500 hover:text-slate-900 p-2 rounded-lg hover:bg-slate-100">
@@ -1487,94 +1708,217 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
           </button>
         </div>
 
-        <div className="p-5 overflow-y-auto flex-1 space-y-4">
-          <div>
-            <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
-              Shipments included
+        <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-[260px_1fr] divide-x divide-slate-200">
+          {/* Prior drafts strip — newest first. Selecting one pulls
+              its subject + body into the right pane. */}
+          <div className="overflow-y-auto p-3">
+            <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-2">
+              Drafts ({drafts.length})
             </div>
-            <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-44 overflow-y-auto">
-              <ul className="divide-y divide-slate-200">
-                {group.items.map((it) => (
-                  <li key={it.task.id} className="px-3 py-2 text-xs">
-                    <div className="flex items-center justify-between gap-2 min-w-0">
-                      <span className="font-medium text-slate-900 truncate">
-                        {it.shipment.shipment_id || "(no shipment id)"}
-                      </span>
-                      <span className="text-slate-600 shrink-0 font-mono text-[11px]">
-                        {it.shipment.tracking_number || ""}
-                      </span>
-                    </div>
-                    <div className="text-slate-500 truncate">
-                      {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
-                    </div>
-                    <div className="text-slate-700 mt-0.5">{it.task.title}</div>
-                    {it.task.description ? (
-                      <div className="text-slate-500 line-clamp-2">{it.task.description}</div>
-                    ) : null}
-                  </li>
-                ))}
+            {loadingDrafts ? (
+              <div className="text-xs text-slate-500 px-2 py-1">Loading…</div>
+            ) : drafts.length === 0 ? (
+              <div className="text-xs text-slate-500 px-2 py-3 leading-relaxed">
+                No drafts yet for {cfg.groupNoun} <span className="font-semibold">{group.name}</span>. Click <span className="font-semibold">Generate</span> below.
+              </div>
+            ) : (
+              <ul className="space-y-1">
+                {drafts.map((d) => {
+                  const active = d.id === selectedId;
+                  return (
+                    <li key={d.id}>
+                      <button
+                        onClick={() => setSelectedId(d.id)}
+                        className={
+                          "w-full text-left rounded-lg px-3 py-2 text-xs transition " +
+                          (active
+                            ? `${cfg.bgTone} ring-1 ${cfg.ringTone}`
+                            : "hover:bg-slate-50 ring-1 ring-transparent")
+                        }
+                        title={d.subject || "(no subject)"}
+                      >
+                        <div className={"font-medium truncate " + (active ? "text-slate-900" : "text-slate-700")}>
+                          {d.subject || "(no subject)"}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5 flex items-center gap-1.5 flex-wrap">
+                          <span>{fmtRelative(d.created_at)}</span>
+                          {d.model ? <span className="font-mono">{d.model}</span> : null}
+                          {d.count ? <span>· {d.count} ship.</span> : null}
+                          {d.rating === "up" ? (
+                            <ThumbsUp className="h-3 w-3 text-emerald-600" aria-label="Rated good" />
+                          ) : d.rating === "down" ? (
+                            <ThumbsDown className="h-3 w-3 text-rose-600" aria-label="Rated needs work" />
+                          ) : null}
+                        </div>
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
+            )}
+          </div>
+
+          {/* Right pane: shipments-included + notes input + selected
+              draft preview. Stacked vertically so the operator can
+              scroll the right side independently of the drafts list. */}
+          <div className="overflow-y-auto p-5 space-y-4">
+            <div>
+              <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 flex items-center justify-between">
+                <span>Shipments included ({includedItems.length} / {group.items.length})</span>
+                {excludedIds.size > 0 ? (
+                  <button
+                    onClick={() => setExcludedIds(new Set())}
+                    className="text-[11px] font-medium text-sky-700 hover:text-sky-900 normal-case"
+                  >
+                    Restore all
+                  </button>
+                ) : null}
+              </div>
+              <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-40 overflow-y-auto">
+                <ul className="divide-y divide-slate-200">
+                  {group.items.map((it) => {
+                    const excluded = excludedIds.has(it.task.id);
+                    return (
+                      <li key={it.task.id} className={`px-3 py-2 text-xs flex items-start gap-2 ${excluded ? "opacity-50" : ""}`}>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2 min-w-0">
+                            <span className={`font-medium text-slate-900 truncate ${excluded ? "line-through" : ""}`}>
+                              {it.shipment.shipment_id || "(no shipment id)"}
+                            </span>
+                            <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                              {it.shipment.tracking_number || ""}
+                            </span>
+                          </div>
+                          <div className="text-slate-500 truncate">
+                            {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
+                          </div>
+                          <div className="text-slate-700 mt-0.5">{it.task.title}</div>
+                        </div>
+                        <button
+                          onClick={() => toggleExclude(it.task.id)}
+                          className={
+                            "shrink-0 p-1 rounded transition " +
+                            (excluded
+                              ? "text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50"
+                              : "text-slate-400 hover:text-rose-600 hover:bg-rose-50")
+                          }
+                          title={excluded ? "Re-include this shipment" : "Exclude this shipment from the next Generate"}
+                          aria-label={excluded ? "Include shipment" : "Exclude shipment"}
+                        >
+                          {excluded ? <Plus className="h-3.5 w-3.5" /> : <X className="h-3.5 w-3.5" />}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
             </div>
-          </div>
 
-          <div>
-            <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
-              Operator notes (optional)
-            </label>
-            <textarea
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="Anything the model should emphasize across the whole batch (e.g. 'all of these have been silent for 48h, ask for ETAs and POD where applicable')"
-              className="w-full text-sm px-3 py-2 rounded-lg ring-1 ring-slate-200 focus:ring-sky-400 focus:outline-none min-h-[60px]"
-            />
-          </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 block">
+                Operator notes (optional, applied to next Generate)
+              </label>
+              <textarea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="Anything the model should emphasize across the whole batch."
+                className="w-full text-sm px-3 py-2 rounded-lg ring-1 ring-slate-200 focus:ring-sky-400 focus:outline-none min-h-[50px]"
+              />
+            </div>
 
-          {err ? (
-            <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-3 py-2 text-sm text-rose-800">{err}</div>
-          ) : null}
+            {err ? (
+              <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 px-3 py-2 text-sm text-rose-800">{err}</div>
+            ) : null}
 
-          {draft ? (
-            <div className="space-y-3">
-              <div>
-                <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Subject</div>
-                <div className="text-sm font-medium text-slate-900 px-3 py-2 rounded-lg bg-slate-50 ring-1 ring-slate-200">
-                  {draft.subject}
+            {selected ? (
+              <div className="space-y-3">
+                <div>
+                  <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Subject</div>
+                  <div className="text-sm font-medium text-slate-900 px-3 py-2 rounded-lg bg-slate-50 ring-1 ring-slate-200">
+                    {selected.subject || "(no subject — model returned non-JSON)"}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Body</div>
+                  <pre className="text-sm whitespace-pre-wrap text-slate-800 px-3 py-3 rounded-lg bg-slate-50 ring-1 ring-slate-200 leading-relaxed">{selected.body || selected.raw || "(empty)"}</pre>
+                </div>
+                <div className="text-[11px] text-slate-500 flex items-center gap-3 flex-wrap">
+                  <span>Generated {fmtRelative(selected.created_at)}</span>
+                  {selected.model ? <span>· <span className="font-mono">{selected.model}</span></span> : null}
+                  {selected.cost_usd ? <span>· cost ${Number(selected.cost_usd).toFixed(4)}</span> : null}
+                </div>
+                {/* Prompt-quality rating. Reps mark drafts 👍 / 👎 so
+                    the team can iterate. Clicking the active thumb
+                    clears the rating. Both icon + label so the
+                    affordance is unambiguous. */}
+                <div className="flex items-center justify-between gap-3 flex-wrap rounded-lg ring-1 ring-slate-200 bg-slate-50 px-3 py-2">
+                  <div className="text-[11px] text-slate-500 leading-snug">
+                    <span className="font-semibold text-slate-700">Was this draft useful?</span>
+                    <span> Your feedback helps us tune the prompts.</span>
+                    {selected.rated_by ? (
+                      <span className="block text-slate-400 mt-0.5">
+                        Last rated by {selected.rated_by} {selected.rated_at ? fmtRelative(selected.rated_at) : ""}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => rateDraft("up")}
+                      disabled={rateBusy}
+                      className={
+                        "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
+                        (selected.rating === "up"
+                          ? "bg-emerald-600 text-white ring-emerald-700"
+                          : "bg-white text-slate-700 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
+                      }
+                      aria-pressed={selected.rating === "up"}
+                      title={selected.rating === "up" ? "Click again to clear" : "Mark this draft as useful"}
+                    >
+                      <ThumbsUp className="h-3.5 w-3.5" /> Good
+                    </button>
+                    <button
+                      onClick={() => rateDraft("down")}
+                      disabled={rateBusy}
+                      className={
+                        "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
+                        (selected.rating === "down"
+                          ? "bg-rose-600 text-white ring-rose-700"
+                          : "bg-white text-slate-700 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
+                      }
+                      aria-pressed={selected.rating === "down"}
+                      title={selected.rating === "down" ? "Click again to clear" : "Mark this draft as not useful"}
+                    >
+                      <ThumbsDown className="h-3.5 w-3.5" /> Needs work
+                    </button>
+                  </div>
                 </div>
               </div>
-              <div>
-                <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Body</div>
-                <pre className="text-sm whitespace-pre-wrap text-slate-800 px-3 py-3 rounded-lg bg-slate-50 ring-1 ring-slate-200 leading-relaxed">{draft.body}</pre>
+            ) : !loadingDrafts && !busy ? (
+              <div className="text-sm text-slate-500">
+                No draft selected. Click <span className="font-semibold">Generate</span> below to write the first one for this {cfg.groupNoun}.
               </div>
-              {draft.model ? (
-                <div className="text-[11px] text-slate-500">Generated by <span className="font-mono">{draft.model}</span></div>
-              ) : null}
-            </div>
-          ) : !busy ? (
-            <div className="text-sm text-slate-500">
-              Click <span className="font-semibold">Generate</span> to draft one email covering every shipment above. The
-              system + audience prompts and the model are all editable in <span className="font-mono">Settings → prompt.email_draft.carrier_group.*</span>.
-            </div>
-          ) : null}
+            ) : null}
+          </div>
         </div>
 
         <div className="px-5 py-4 border-t border-slate-200 flex items-center justify-between gap-3">
           <button
             onClick={generate}
             disabled={busy}
-            className="px-4 py-2 rounded-lg bg-violet-600 text-white text-sm font-semibold hover:bg-violet-700 disabled:opacity-50 inline-flex items-center gap-2"
+            className={`px-4 py-2 rounded-lg text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-50 ${cfg.buttonTone}`}
           >
             {busy ? (
               <><RefreshCw className="h-4 w-4 animate-spin" /> Drafting…</>
-            ) : draft ? (
-              <><RefreshCw className="h-4 w-4" /> Regenerate</>
+            ) : drafts.length ? (
+              <><RefreshCw className="h-4 w-4" /> Generate new draft</>
             ) : (
               <><Send className="h-4 w-4" /> Generate</>
             )}
           </button>
-          {draft ? (
+          {selected ? (
             <div className="flex items-center gap-3">
               <a
-                href={`mailto:?subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`}
+                href={`mailto:?subject=${encodeURIComponent(selected.subject || "")}&body=${encodeURIComponent(selected.body || "")}`}
                 className="text-sm text-sky-700 hover:text-sky-900 font-medium"
               >Open in mail client →</a>
               <button

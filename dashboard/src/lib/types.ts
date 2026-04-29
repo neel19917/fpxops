@@ -65,6 +65,11 @@ export interface Shipment {
   spot_quote_fulfilled_by: string | null;
   // Free-form operator notes (drawer-only).
   notes: string | null;
+  // Most recent timestamp at which the bulk-upsert flow saw a non-
+  // empty material diff vs the prior scrape. Drives the "just
+  // changed" pill on the Tracking table — null = never changed
+  // since we started tracking, or first-ever scrape.
+  last_material_change_at: string | null;
   // Pre-existing optional fields used by some columns
   service: string | null;
   pickup_request_number: string | null;
@@ -115,6 +120,12 @@ export interface AiAnalysis {
   error: string | null;
   metadata: Record<string, unknown> | null;
   created_at: string;
+  // Rep-supplied prompt-quality rating. Null = unrated. Set via the
+  // 👍 / 👎 buttons on analysis cards / draft cards.
+  rating?: "up" | "down" | null;
+  rating_reason?: string | null;
+  rated_by?: string | null;
+  rated_at?: string | null;
 }
 
 export interface GpAudit {

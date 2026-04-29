@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, CheckCircle2, Mail, RefreshCw, Sparkles, TrendingUp, AlertTriangle } from "lucide-react";
+import { Activity, CheckCircle2, DollarSign, Mail, RefreshCw, Sparkles, TrendingUp, AlertTriangle } from "lucide-react";
 import { api, type OpsMetrics, type OpsDailyRow } from "../lib/api";
-import { fmtNum } from "../lib/format";
+import { fmtNum, fmtUsd } from "../lib/format";
 
 // Director-of-Ops dashboard. Three signals matter to FPX leadership:
 // shipments analyzed daily, tasks completed, emails generated. The
@@ -83,6 +83,8 @@ export function OpsPage() {
 
       <KpiStrip data={data} loading={loading} />
 
+      <CostBreakdownCard data={data} />
+
       <DailyTrendCard data={data} loading={loading} days={days} />
 
       <OperatorLeaderboard data={data} loading={loading} />
@@ -97,6 +99,8 @@ function KpiStrip({ data, loading }: { data: OpsMetrics | null; loading: boolean
   const cards = useMemo(() => {
     if (!data) return null;
     const dailyAvg7 = (n: number) => n / 7;
+    // The cost card uses USD formatting; the others count integers.
+    // Marking the format per-card keeps the renderer agnostic.
     return [
       {
         label: "Shipments analyzed",
@@ -106,6 +110,7 @@ function KpiStrip({ data, loading }: { data: OpsMetrics | null; loading: boolean
         last7: data.last7.shipments_analyzed,
         total: data.totals.shipments_analyzed,
         avg: dailyAvg7(data.last7.shipments_analyzed),
+        format: "count" as const,
       },
       {
         label: "Tasks completed",
@@ -115,6 +120,7 @@ function KpiStrip({ data, loading }: { data: OpsMetrics | null; loading: boolean
         last7: data.last7.tasks_completed,
         total: data.totals.tasks_completed,
         avg: dailyAvg7(data.last7.tasks_completed),
+        format: "count" as const,
       },
       {
         label: "Emails generated",
@@ -124,14 +130,25 @@ function KpiStrip({ data, loading }: { data: OpsMetrics | null; loading: boolean
         last7: data.last7.emails_generated,
         total: data.totals.emails_generated,
         avg: dailyAvg7(data.last7.emails_generated),
+        format: "count" as const,
+      },
+      {
+        label: "AI cost",
+        Icon: DollarSign,
+        tone: "text-amber-700 bg-amber-50 ring-amber-200",
+        today: data.today.cost_usd,
+        last7: data.last7.cost_usd,
+        total: data.totals.cost_usd,
+        avg: dailyAvg7(data.last7.cost_usd),
+        format: "usd" as const,
       },
     ];
   }, [data]);
 
   if (loading && !data) {
     return (
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        {[0, 1, 2].map((i) => (
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+        {[0, 1, 2, 3].map((i) => (
           <div key={i} className="rounded-xl ring-1 ring-slate-200 bg-white p-4">
             <div className="h-3 w-24 bg-slate-200 rounded mb-3 animate-pulse" />
             <div className="h-8 w-20 bg-slate-200 rounded mb-2 animate-pulse" />
@@ -143,8 +160,15 @@ function KpiStrip({ data, loading }: { data: OpsMetrics | null; loading: boolean
   }
   if (!cards) return null;
 
+  // Per-card formatter — counts get fmtNum, AI cost uses fmtUsd. Avg
+  // is always shown to 1 decimal for counts but to 2 for $ to match
+  // the precision the operator is reading.
+  function fmt(c: { format: "count" | "usd" }, v: number) {
+    return c.format === "usd" ? fmtUsd(v) : fmtNum(v);
+  }
+
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
       {cards.map((c) => {
         const onPace = c.avg > 0 ? c.today / c.avg : null;
         // Tone the "vs avg" strip green when today >= 7d avg, amber
@@ -163,22 +187,22 @@ function KpiStrip({ data, loading }: { data: OpsMetrics | null; loading: boolean
               <div className="text-sm font-semibold text-slate-700">{c.label}</div>
             </div>
             <div className="mt-3 flex items-baseline gap-2">
-              <div className="text-3xl font-bold text-slate-900 tabular-nums">{fmtNum(c.today)}</div>
+              <div className="text-3xl font-bold text-slate-900 tabular-nums">{fmt(c, c.today)}</div>
               <div className="text-xs text-slate-500">today</div>
             </div>
             <div className="mt-2 grid grid-cols-3 gap-3 text-[11px]">
               <div>
                 <div className="text-slate-500 uppercase tracking-wider font-semibold">7d</div>
-                <div className="text-slate-900 font-semibold tabular-nums">{fmtNum(c.last7)}</div>
+                <div className="text-slate-900 font-semibold tabular-nums">{fmt(c, c.last7)}</div>
               </div>
               <div>
                 <div className="text-slate-500 uppercase tracking-wider font-semibold">Window</div>
-                <div className="text-slate-900 font-semibold tabular-nums">{fmtNum(c.total)}</div>
+                <div className="text-slate-900 font-semibold tabular-nums">{fmt(c, c.total)}</div>
               </div>
               <div>
                 <div className="text-slate-500 uppercase tracking-wider font-semibold">7d avg/d</div>
                 <div className={"font-semibold tabular-nums " + trendTone}>
-                  {c.avg.toFixed(1)}
+                  {c.format === "usd" ? fmtUsd(c.avg) : c.avg.toFixed(1)}
                 </div>
               </div>
             </div>
@@ -347,6 +371,75 @@ function OperatorLeaderboard({ data, loading }: { data: OpsMetrics | null; loadi
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+// AI cost breakdown bar — shows the per-category split of the
+// "AI cost" total in the KPI strip so the director can see whether
+// the spend is going to per-shipment analysis (Haiku, cheap), per-
+// shipment email drafts (Haiku/Sonnet), or bulk group emails (Opus,
+// pricey but rare). Renders nothing when there's zero spend in the
+// window — no point showing an empty stack.
+function CostBreakdownCard({ data }: { data: OpsMetrics | null }) {
+  if (!data) return null;
+  const { cost_usd, cost_breakdown } = data.totals;
+  if (!cost_usd || cost_usd <= 0) return null;
+  // Each category gets its own segment in the bar. We render in
+  // order of typical magnitude (per-shipment is highest count;
+  // group emails most expensive per call) so the colors stay
+  // consistent across windows.
+  const segments: { label: string; value: number; tone: string; bar: string }[] = [
+    { label: "Per-shipment analysis", value: cost_breakdown.per_shipment_analysis, tone: "text-sky-700", bar: "bg-sky-500" },
+    { label: "Per-shipment email",    value: cost_breakdown.email_single,          tone: "text-violet-700", bar: "bg-violet-500" },
+    { label: "Bulk group email",      value: cost_breakdown.email_group,           tone: "text-amber-700", bar: "bg-amber-500" },
+    { label: "Other (audits, ad-hoc)", value: cost_breakdown.other,                 tone: "text-slate-700", bar: "bg-slate-400" },
+  ];
+  const total = segments.reduce((s, x) => s + x.value, 0) || cost_usd;
+  return (
+    <div className="rounded-xl ring-1 ring-slate-200 bg-white p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold flex items-center gap-1.5">
+          <DollarSign className="h-4 w-4 text-amber-600" /> AI cost breakdown
+        </h3>
+        <span className="text-[11px] text-slate-500">
+          window total {fmtUsd(cost_usd)}
+        </span>
+      </div>
+      {/* Stacked bar — proportions only, not to absolute scale across
+          dashboards. Mainly an at-a-glance "where does the spend go"
+          read; the table below has the dollar values. */}
+      <div className="h-2.5 rounded-full bg-slate-100 overflow-hidden flex">
+        {segments.map((s) => {
+          const pct = total > 0 ? (s.value / total) * 100 : 0;
+          if (pct < 0.1) return null;
+          return (
+            <div
+              key={s.label}
+              className={s.bar}
+              style={{ width: `${pct}%` }}
+              title={`${s.label}: ${fmtUsd(s.value)}`}
+            />
+          );
+        })}
+      </div>
+      <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-[11px]">
+        {segments.map((s) => {
+          const pct = total > 0 ? (s.value / total) * 100 : 0;
+          return (
+            <div key={s.label}>
+              <div className="flex items-center gap-1.5">
+                <span className={`h-2 w-2 rounded-full ${s.bar}`} />
+                <span className="text-slate-500 truncate">{s.label}</span>
+              </div>
+              <div className={`mt-0.5 font-semibold tabular-nums ${s.tone}`}>
+                {fmtUsd(s.value)}
+                <span className="text-[10px] text-slate-400 ml-1">({pct.toFixed(0)}%)</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
