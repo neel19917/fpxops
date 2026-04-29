@@ -131,9 +131,18 @@ tasksRouter.post("/carrier-email-draft", async (req, res) => {
   const { data: tasks, error: taskErr } = await supabase
     .from("fpx_shipment_tasks").select("*").in("id", taskIds);
   if (taskErr) return res.status(500).json({ error: taskErr.message });
-  const followupTasks = (tasks || []).filter((t) => isCarrierFollowupTitle(t.title));
+  // Match the /carrier-followups GET filter: only active (open or
+  // in_progress) tasks land in the email. Done / cancelled / blocked
+  // are excluded — they shouldn't get carrier follow-up emails.
+  // Defends against the race where the modal was opened with N
+  // active tasks, the operator marked some Done via the inline
+  // status button, and Generate fires with the now-stale id list.
+  const ACTIVE_STATUSES = new Set(["open", "in_progress"]);
+  const followupTasks = (tasks || []).filter(
+    (t) => isCarrierFollowupTitle(t.title) && ACTIVE_STATUSES.has(t.status),
+  );
   if (!followupTasks.length) {
-    return res.status(400).json({ error: "No carrier-followup tasks in supplied ids" });
+    return res.status(400).json({ error: "No active carrier-followup tasks in supplied ids" });
   }
   const shipIds = Array.from(new Set(followupTasks.map((t) => t.shipment_id).filter(Boolean)));
   if (!shipIds.length) return res.status(400).json({ error: "No shipments linked to supplied tasks" });
@@ -304,9 +313,14 @@ tasksRouter.post("/customer-email-draft", async (req, res) => {
   const { data: tasks, error: taskErr } = await supabase
     .from("fpx_shipment_tasks").select("*").in("id", taskIds);
   if (taskErr) return res.status(500).json({ error: taskErr.message });
-  const followupTasks = (tasks || []).filter((t) => isCustomerFollowupTitle(t.title));
+  // Same active-only filter as the carrier path — see the comment
+  // there. Done tasks shouldn't trigger customer status updates.
+  const ACTIVE_STATUSES = new Set(["open", "in_progress"]);
+  const followupTasks = (tasks || []).filter(
+    (t) => isCustomerFollowupTitle(t.title) && ACTIVE_STATUSES.has(t.status),
+  );
   if (!followupTasks.length) {
-    return res.status(400).json({ error: "No customer-followup tasks in supplied ids" });
+    return res.status(400).json({ error: "No active customer-followup tasks in supplied ids" });
   }
   const shipIds = Array.from(new Set(followupTasks.map((t) => t.shipment_id).filter(Boolean)));
   if (!shipIds.length) return res.status(400).json({ error: "No shipments linked to supplied tasks" });

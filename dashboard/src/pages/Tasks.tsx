@@ -1592,7 +1592,6 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
   // shipments don't get sent to the LLM. Excluding doesn't touch the
   // task itself; it only scopes this email round.
   const [excludedIds, setExcludedIds] = useState<Set<string>>(new Set());
-  const includedItems = group.items.filter((it) => !excludedIds.has(it.task.id));
   function toggleExclude(taskId: string) {
     setExcludedIds((prev) => {
       const next = new Set(prev);
@@ -1600,6 +1599,60 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
       return next;
     });
   }
+  // Sort + filter controls so the operator can scope a large group
+  // before generating. Sort options ordered by frequency-of-use
+  // (oldest-first wins for "follow up on the one that's been
+  // sitting longest"); status filter mostly used to hide blocked
+  // shipments; the search box scopes by free text against the
+  // shipment id / tracking / customer / origin / destination.
+  type SortKey = "task_oldest" | "task_newest" | "shipment_status" | "customer";
+  const [sortKey, setSortKey] = useState<SortKey>("task_oldest");
+  const [search, setSearch] = useState("");
+  const visibleItems = useMemo(() => {
+    // First: drop tasks that have been marked Done since the modal
+    // opened. These can't be in the email anyway (server enforces
+    // the same filter) — hiding them up front matches the panel.
+    let list = group.items.filter((it) => it.task.status === "open" || it.task.status === "in_progress");
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter((it) => {
+        const hay = [
+          it.shipment.shipment_id,
+          it.shipment.tracking_number,
+          it.shipment.customer_name,
+          it.shipment.origin,
+          it.shipment.destination,
+          it.shipment.ship_from,
+          it.shipment.ship_to,
+          it.shipment.shipment_status,
+          it.task.title,
+        ].filter(Boolean).join(" ").toLowerCase();
+        return hay.includes(q);
+      });
+    }
+    const sorted = [...list];
+    switch (sortKey) {
+      case "task_newest":
+        sorted.sort((a, b) => +new Date(b.task.created_at) - +new Date(a.task.created_at));
+        break;
+      case "shipment_status":
+        sorted.sort((a, b) => (a.shipment.shipment_status || "").localeCompare(b.shipment.shipment_status || ""));
+        break;
+      case "customer":
+        sorted.sort((a, b) => (a.shipment.customer_name || "").localeCompare(b.shipment.customer_name || ""));
+        break;
+      case "task_oldest":
+      default:
+        sorted.sort((a, b) => +new Date(a.task.created_at) - +new Date(b.task.created_at));
+    }
+    return sorted;
+  }, [group.items, search, sortKey]);
+  // Items actually sent to the LLM = visible (status-active + filter-
+  // matching) minus the ones the operator X'd out individually.
+  const includedItems = visibleItems.filter((it) => !excludedIds.has(it.task.id));
+  // How many were dropped before the operator even saw them — surfaced
+  // in the header so they don't wonder where the count went.
+  const droppedDoneCount = group.items.length - group.items.filter((it) => it.task.status === "open" || it.task.status === "in_progress").length;
 
   // Fetch the prior drafts for this group on mount. We always render
   // them — even if the operator never clicks Generate inside this
@@ -1763,8 +1816,12 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
               scroll the right side independently of the drafts list. */}
           <div className="overflow-y-auto p-5 space-y-4">
             <div>
-              <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 flex items-center justify-between">
-                <span>Shipments included ({includedItems.length} / {group.items.length})</span>
+              <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5 flex items-center justify-between gap-3 flex-wrap">
+                <span>
+                  Shipments included ({includedItems.length} / {visibleItems.length}
+                  {droppedDoneCount > 0 ? <> · {droppedDoneCount} done excluded</> : null}
+                  )
+                </span>
                 {excludedIds.size > 0 ? (
                   <button
                     onClick={() => setExcludedIds(new Set())}
@@ -1774,9 +1831,40 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
                   </button>
                 ) : null}
               </div>
-              <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-40 overflow-y-auto">
+              {/* Sort + filter controls — keep this row terse so the
+                  Shipments list directly below stays the focal point. */}
+              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                <div className="relative flex-1 min-w-[180px]">
+                  <Search className="h-3.5 w-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                  <input
+                    type="search"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Filter by id, tracking, customer, status…"
+                    className="w-full text-xs pl-7 pr-2 py-1.5 rounded ring-1 ring-slate-200 focus:ring-sky-400 focus:outline-none"
+                    aria-label="Filter included shipments"
+                  />
+                </div>
+                <select
+                  value={sortKey}
+                  onChange={(e) => setSortKey(e.target.value as typeof sortKey)}
+                  className="text-xs px-2 py-1.5 rounded ring-1 ring-slate-200 bg-white"
+                  title="Sort the included shipments"
+                >
+                  <option value="task_oldest">Oldest first</option>
+                  <option value="task_newest">Newest first</option>
+                  <option value="shipment_status">By shipment status</option>
+                  <option value="customer">By customer</option>
+                </select>
+              </div>
+              <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-44 overflow-y-auto">
+                {visibleItems.length === 0 ? (
+                  <div className="px-3 py-4 text-xs text-slate-500 text-center">
+                    {search.trim() ? "No shipments match your filter." : "No active shipments left in this group."}
+                  </div>
+                ) : (
                 <ul className="divide-y divide-slate-200">
-                  {group.items.map((it) => {
+                  {visibleItems.map((it) => {
                     const excluded = excludedIds.has(it.task.id);
                     return (
                       <li key={it.task.id} className={`px-3 py-2 text-xs flex items-start gap-2 ${excluded ? "opacity-50" : ""}`}>
@@ -1811,6 +1899,7 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
                     );
                   })}
                 </ul>
+                )}
               </div>
             </div>
 
