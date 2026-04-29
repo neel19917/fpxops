@@ -3058,6 +3058,10 @@ function fpxIsTrustedParentOrigin(origin) {
 // Returns true if the filter was applied, false otherwise. Times out at
 // 1.5s — if the page didn't answer by then, jQuery / Kendo wasn't
 // available and the bridge falls back to the column-filter UI path.
+// Most recent inject-script detail string — surfaced to the dashboard
+// in the fpxFilterAck so failures are debuggable from the parent's
+// console without DevTools-frame-switching.
+let fpxLastInjectDetail = "";
 function fpxFilterViaKendoApi(value, fieldCandidates) {
   return new Promise((resolve) => {
     const requestId = "fpx-filter-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
@@ -3068,6 +3072,7 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
       if (!d || d.type !== "fpx-kendo-filter-result" || d.requestId !== requestId) return;
       window.removeEventListener("message", onMessage);
       settled = true;
+      fpxLastInjectDetail = d.detail || "";
       console.log("[FPX] Inject filter result:", d.ok ? "ok" : "fail", "—", d.detail);
       resolve(!!d.ok);
     }
@@ -3210,10 +3215,20 @@ window.addEventListener("message", async (event) => {
     }
     if (applied) {
       console.log(`[FPX] Bridge filter ok via ${strategy}: ${col}="${val}"`);
-      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true, strategy }, event.origin); } catch {}
+      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true, strategy, injectDetail: fpxLastInjectDetail }, event.origin); } catch {}
     } else {
-      console.warn("[FPX] Bridge filter failed (all strategies):", lastErr);
-      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: false, error: String(lastErr?.message || lastErr || "no matching input") }, event.origin); } catch {}
+      console.warn("[FPX] Bridge filter failed (all strategies):", lastErr, "inject:", fpxLastInjectDetail);
+      try {
+        event.source && event.source.postMessage({
+          source: "fpx-extension",
+          type: "fpxFilterAck",
+          column: col,
+          value: val,
+          ok: false,
+          error: String(lastErr?.message || lastErr || "no matching input"),
+          injectDetail: fpxLastInjectDetail,
+        }, event.origin);
+      } catch {}
     }
   } else if (data.type === "fpxPing") {
     // Lets the dashboard detect whether the extension is installed +

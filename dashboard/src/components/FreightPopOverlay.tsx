@@ -86,6 +86,11 @@ export function FreightPopOverlay() {
   // Last column we asked the extension to filter on — used to flip the
   // button's icon between "apply" and "filtered".
   const [lastFilter, setLastFilter] = useState<{ column: string; value: string } | null>(null);
+  // Last filter ack detail. Populated whenever the extension reports
+  // back, success or failure. We surface failures in a small expandable
+  // panel under the header so debugging doesn't require DevTools frame
+  // switching.
+  const [lastAck, setLastAck] = useState<{ ok: boolean; strategy?: string; error?: string; injectDetail?: string } | null>(null);
 
   // Persist creds whenever the user edits them in the popover.
   useEffect(() => { saveCreds(creds); }, [creds]);
@@ -102,6 +107,12 @@ export function FreightPopOverlay() {
         setBridgeReady(true);
       } else if (d.type === "fpxFilterAck") {
         if (d.ok) setLastFilter({ column: String(d.column || ""), value: String(d.value || "") });
+        setLastAck({
+          ok: !!d.ok,
+          strategy: typeof d.strategy === "string" ? d.strategy : undefined,
+          error: typeof d.error === "string" ? d.error : undefined,
+          injectDetail: typeof d.injectDetail === "string" ? d.injectDetail : undefined,
+        });
       }
     }
     window.addEventListener("message", onMessage);
@@ -226,6 +237,19 @@ export function FreightPopOverlay() {
           </a>
         </div>
       </div>
+
+      {lastAck && !lastAck.ok ? (
+        <div className="px-3 py-2 bg-amber-50 ring-1 ring-amber-200 mx-3 mt-2 rounded-lg text-[11px] text-amber-900">
+          <div className="font-semibold">Filter didn't apply</div>
+          {lastAck.error ? <div className="mt-0.5">{lastAck.error}</div> : null}
+          {lastAck.injectDetail ? (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-amber-800 hover:text-amber-900">Details (Kendo inject)</summary>
+              <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[10px] leading-snug text-amber-900">{lastAck.injectDetail}</pre>
+            </details>
+          ) : null}
+        </div>
+      ) : null}
 
       {credsOpen ? (
         <div className="px-3 py-3 bg-sky-50 ring-1 ring-sky-200 mx-3 mt-2 rounded-lg space-y-2">
