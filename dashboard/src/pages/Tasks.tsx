@@ -500,19 +500,39 @@ export function TasksPage() {
           >
             <Rocket className="h-4 w-4" /> {bulkBusy ? "Starting…" : `Start all open (${counts.open})`}
           </button>
-          <button
-            onClick={() => {
-              const first = visibleTasks.find((t) => t.shipment_id);
-              if (!first) { setError("No task with a shipment to walk through."); return; }
-              setFocusedId(first.id);
-              nav.openTask(first.id);
-            }}
-            disabled={visibleTasks.length === 0}
-            className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
-            title="Open the first visible task and walk through them with n / p"
-          >
-            <ChevronRight className="h-4 w-4" /> Walk through ({visibleTasks.length})
-          </button>
+          {/* Walk-through scope: prefer the currently-visible filter, but
+              fall back to the "active" set (open + in_progress) when the
+              filter has nothing to walk. That way the button never goes
+              dead just because the user happens to be on a Done / Blocked
+              filter — they can always launch a review queue from here. */}
+          {(() => {
+            const activeTasks = tasks.filter((t) => t.status === "open" || t.status === "in_progress");
+            const walkScope = visibleTasks.length > 0 ? visibleTasks : activeTasks;
+            const walkCount = walkScope.length;
+            const fallbackHint = visibleTasks.length === 0 && activeTasks.length > 0;
+            return (
+              <button
+                onClick={() => {
+                  const first = walkScope.find((t) => t.shipment_id);
+                  if (!first) { setError("No task with a shipment to walk through."); return; }
+                  // If the current filter is empty and we fell back to
+                  // active, also flip the filter so the user sees the list
+                  // they're walking — keeps prev/next consistent with the
+                  // visible chip in the header.
+                  if (fallbackHint) setStatusFilter("active");
+                  setFocusedId(first.id);
+                  nav.openTask(first.id);
+                }}
+                disabled={walkCount === 0}
+                className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                title={fallbackHint
+                  ? `Current filter has no tasks — walking the ${walkCount} active task${walkCount === 1 ? "" : "s"} instead`
+                  : "Open the first visible task and walk through them with n / p"}
+              >
+                <ChevronRight className="h-4 w-4" /> Walk through ({walkCount})
+              </button>
+            );
+          })()}
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
