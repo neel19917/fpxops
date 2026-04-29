@@ -838,6 +838,39 @@ async function run(filterCol, filterVal) {
   }
 
   let pageNum = 1;
+  // Index into logRows that's already been streamed to background.
+  // After each page completes we slice [uploadedSoFar..logRows.length)
+  // and ship those rows; the persistent queue in background.js
+  // handles concurrent pushes + survives a worker restart, so we
+  // can fire-and-forget without blocking the next page's scrape.
+  let uploadedSoFar = 0;
+  // How many rows we've actually CONFIRMED landed (server returned
+  // ok). Used in the final status line so the rep knows the true
+  // delivered count (vs queued-but-pending).
+  let confirmedRows = 0;
+
+  // Helper: stream whatever's been added to logRows since the last
+  // call. Returns { count, ok }; non-blocking by design — caller
+  // fire-and-forgets via the .catch() at the call site.
+  function streamNewRowsToDashboard(label) {
+    const slice = logRows.slice(uploadedSoFar);
+    if (!slice.length) return Promise.resolve({ count: 0, ok: true });
+    uploadedSoFar = logRows.length;
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: slice }, (r) => {
+        if (r && r.ok) {
+          confirmedRows += r.count || slice.length;
+          console.log(`[FPX] ${label}: streamed ${slice.length} row(s) to dashboard (${r.count} confirmed)`);
+        } else if (r && r.error) {
+          // Background queues the chunk on failure — it'll retry on
+          // the next page's stream call AND on worker boot. We just
+          // log; the side-panel queue chip surfaces pending state.
+          console.warn(`[FPX] ${label}: upsert returned error (will retry from queue):`, r.error);
+        }
+        resolve(r || { ok: false, error: "no response" });
+      });
+    });
+  }
 
   while (true) {
     if (stopRequested) {
@@ -849,9 +882,22 @@ async function run(filterCol, filterVal) {
     await processPage();
 
     if (stopRequested) {
+      // Even on stop, flush whatever was scraped on this page so the
+      // rep doesn't lose work. Awaited so the upload reaches the
+      // queue before the side panel disappears.
+      await streamNewRowsToDashboard(`page ${pageNum} (stopped)`);
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
+
+    // Stream this page's rows to the dashboard. Don't await — the
+    // upload runs in parallel with the next page's scrape so the
+    // dashboard fills in real time and total wall-clock time
+    // shrinks. The persistent queue absorbs partial failures.
+    sendStatus(`Page ${pageNum} done — uploading ${logRows.length - uploadedSoFar} row(s)…`);
+    streamNewRowsToDashboard(`page ${pageNum}`).catch((e) => {
+      console.warn(`[FPX] streamNewRowsToDashboard threw on page ${pageNum}:`, e.message);
+    });
 
     sendStatus(`Page ${pageNum} done. Checking for next page...`);
     const advanced = goToNextPage();
@@ -861,37 +907,22 @@ async function run(filterCol, filterVal) {
     await waitForGridReady(3000);
   }
 
-  // Push to dashboard. Server analyzes new rows in the background and creates
-  // any necessary tasks / drafts; this extension just hands off raw data.
-  if (logRows.length > 0) {
-    sendStatus(`Uploading ${logRows.length} shipment(s) to the dashboard...`);
-    let uploadOk = false;
-    try {
-      const uploadResp = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: logRows }, (r) => resolve(r));
-      });
-      if (uploadResp && uploadResp.ok) {
-        uploadOk = true;
-        console.log(`[FPX] Pushed ${uploadResp.count} shipments to dashboard`);
-      } else if (uploadResp && uploadResp.error) {
-        console.warn("[FPX] Dashboard upsert error:", uploadResp.error);
-        sendStatus(`Upload error: ${uploadResp.error}`);
-      }
-    } catch (e) {
-      console.warn("[FPX] Dashboard push failed:", e.message);
-      sendStatus(`Upload failed: ${e.message}`);
-    }
-    if (uploadOk) {
-      sendStatus(`Uploaded ${logRows.length} shipment(s). The dashboard is analyzing them now.`);
-    }
+  // Final flush — catches anything that landed in logRows after the
+  // last per-page stream call (e.g. the last page's rows if the
+  // streaming call was still in flight). Awaited so the "Done"
+  // status reflects the true confirmed count.
+  if (logRows.length > uploadedSoFar) {
+    sendStatus(`Finalizing upload of ${logRows.length - uploadedSoFar} remaining row(s)…`);
+    await streamNewRowsToDashboard("final flush");
   }
 
   try { chrome.storage.local.remove("_fpxCheckpoint"); } catch {}
 
   // No AI summary in the extension anymore — clear any stale summary in the UI.
   try { chrome.runtime.sendMessage({ type: "aiSummary", text: "" }); } catch {}
+  const queuedButUnconfirmed = logRows.length - confirmedRows;
   sendComplete(
-    `Done — ${pageNum} page(s), ${logRows.length} shipment(s) uploaded. Open the dashboard to see analysis.`
+    `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}. Open the dashboard to see analysis.`
   );
 }
 
