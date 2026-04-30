@@ -17,6 +17,37 @@ function isCarrierFollowupTitle(title: string | null | undefined): boolean {
   return t.includes("carrier") && t.includes("follow");
 }
 
+// Color-coded chip for shipment_status. Buckets free-text statuses
+// (FreightPOP emits a long tail) into 5 visual categories so the
+// followup panels and group-email modal share one rendering rule and
+// operators can scan a list in one glance.
+function shipmentStatusTone(status: string | null | undefined): { label: string; cls: string } {
+  const raw = (status || "").trim();
+  const s = raw.toLowerCase();
+  if (!s) return { label: "no status", cls: "bg-slate-100 text-slate-500 ring-slate-200" };
+  if (s.includes("deliver")) return { label: raw, cls: "bg-emerald-50 text-emerald-800 ring-emerald-200" };
+  if (s.includes("out for")) return { label: raw, cls: "bg-teal-50 text-teal-800 ring-teal-200" };
+  if (s.includes("transit") || s.includes("en route") || s.includes("moving"))
+    return { label: raw, cls: "bg-sky-50 text-sky-800 ring-sky-200" };
+  if (s.includes("issue") || s.includes("exception") || s.includes("problem") || s.includes("delay"))
+    return { label: raw, cls: "bg-rose-50 text-rose-800 ring-rose-200" };
+  if (s.includes("pickup") || s.includes("booked") || s.includes("scheduled") || s.includes("dispatch"))
+    return { label: raw, cls: "bg-amber-50 text-amber-800 ring-amber-200" };
+  return { label: raw, cls: "bg-slate-100 text-slate-700 ring-slate-200" };
+}
+
+function ShipmentStatusPill({ status, className = "" }: { status: string | null | undefined; className?: string }) {
+  const { label, cls } = shipmentStatusTone(status);
+  return (
+    <span
+      className={`inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded ring-1 whitespace-nowrap ${cls} ${className}`}
+      title={label}
+    >
+      {label}
+    </span>
+  );
+}
+
 // Keyboard shortcut catalog — kept here so the help modal renders the same
 // thing the handler implements. Order matters; this is the help-modal order.
 const SHORTCUTS: { keys: string[]; label: string }[] = [
@@ -1466,14 +1497,18 @@ function FollowupGroupCard({ group, kind, onTaskClick, onEmail, onSetStatus }: {
   // before the server responds. Keyed on task.id so simultaneous
   // actions on different rows still work.
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
-  // Pick the next-step action for a task based on its current status.
-  // Mirrors KanbanCard's logic so the buttons feel identical to what
-  // the operator sees on the regular Kanban view.
+  // Defense-in-depth: server already filters /carrier-followups and
+  // /customer-followups to active statuses, but we double-filter here
+  // so the panel collapses a row instantly when the user marks Done
+  // without waiting for the cache-bust + refetch round-trip.
+  const activeItems = useMemo(
+    () => group.items.filter((it) => it.task.status === "open" || it.task.status === "in_progress"),
+    [group.items],
+  );
   function nextAction(t: ShipmentTask): { label: string; status: TaskStatus; tone: string } | null {
     if (t.status === "open") return { label: "Start", status: "in_progress", tone: "bg-indigo-600 text-white hover:bg-indigo-700" };
-    if (t.status === "in_progress") return { label: "Done", status: "done", tone: "bg-emerald-600 text-white hover:bg-emerald-700" };
+    if (t.status === "in_progress") return { label: "Complete", status: "done", tone: "bg-emerald-600 text-white hover:bg-emerald-700" };
     if (t.status === "blocked") return { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" };
-    if (t.status === "done") return { label: "Reopen", status: "open", tone: "bg-white text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50" };
     return null;
   }
   const groupNounCap = cfg.groupNoun.charAt(0).toUpperCase() + cfg.groupNoun.slice(1);
@@ -1487,11 +1522,11 @@ function FollowupGroupCard({ group, kind, onTaskClick, onEmail, onSetStatus }: {
           </div>
         </div>
         <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${cfg.chipTone} shrink-0`}>
-          {group.items.length}
+          {activeItems.length}
         </span>
       </div>
       <ul className={`px-3 py-2 space-y-1.5 max-h-80 overflow-y-auto`}>
-        {group.items.map((it) => {
+        {activeItems.map((it) => {
           const action = nextAction(it.task);
           const rowBusy = busyTaskId === it.task.id;
           return (
@@ -1517,8 +1552,11 @@ function FollowupGroupCard({ group, kind, onTaskClick, onEmail, onSetStatus }: {
                       {it.shipment.tracking_number || ""}
                     </span>
                   </div>
-                  <div className="text-[11px] text-slate-600 truncate mt-0.5">
-                    {it.shipment.customer_name || "—"} · {it.shipment.shipment_status || "no status"}
+                  <div className="flex items-center gap-1.5 mt-0.5 min-w-0">
+                    <ShipmentStatusPill status={it.shipment.shipment_status} />
+                    <span className="text-[11px] text-slate-600 truncate">
+                      {it.shipment.customer_name || "—"}
+                    </span>
                   </div>
                   <div className="text-[11px] text-slate-500 truncate mt-0.5">
                     {it.task.title}
@@ -1753,7 +1791,9 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
               Group email · {group.name}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              {group.items.length} shipment{group.items.length === 1 ? "" : "s"} · prior drafts shown on the left · prompts editable in Settings
+              {includedItems.length} of {visibleItems.length} active shipment{visibleItems.length === 1 ? "" : "s"} included
+              {droppedDoneCount > 0 ? <> · {droppedDoneCount} done excluded server-side</> : null}
+              {" · "}prior drafts on the left · prompts editable in Settings
             </p>
           </div>
           <button onClick={onClose} className="text-slate-500 hover:text-slate-900 p-2 rounded-lg hover:bg-slate-100">
@@ -1857,7 +1897,7 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
                   <option value="customer">By customer</option>
                 </select>
               </div>
-              <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-44 overflow-y-auto">
+              <div className="rounded-lg ring-1 ring-slate-200 bg-slate-50 max-h-64 overflow-y-auto">
                 {visibleItems.length === 0 ? (
                   <div className="px-3 py-4 text-xs text-slate-500 text-center">
                     {search.trim() ? "No shipments match your filter." : "No active shipments left in this group."}
@@ -1866,21 +1906,28 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
                 <ul className="divide-y divide-slate-200">
                   {visibleItems.map((it) => {
                     const excluded = excludedIds.has(it.task.id);
+                    const route = `${(it.shipment.origin || it.shipment.ship_from) || "?"} → ${(it.shipment.destination || it.shipment.ship_to) || "?"}`;
                     return (
                       <li key={it.task.id} className={`px-3 py-2 text-xs flex items-start gap-2 ${excluded ? "opacity-50" : ""}`}>
                         <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between gap-2 min-w-0">
-                            <span className={`font-medium text-slate-900 truncate ${excluded ? "line-through" : ""}`}>
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className={`font-medium text-slate-900 shrink-0 ${excluded ? "line-through" : ""}`}>
                               {it.shipment.shipment_id || "(no shipment id)"}
                             </span>
-                            <span className="text-slate-600 shrink-0 font-mono text-[11px]">
+                            <ShipmentStatusPill status={it.shipment.shipment_status} />
+                            <span className="text-slate-600 ml-auto shrink-0 font-mono text-[11px]">
                               {it.shipment.tracking_number || ""}
                             </span>
                           </div>
-                          <div className="text-slate-500 truncate">
-                            {it.shipment.customer_name || "—"} · {(it.shipment.origin || it.shipment.ship_from) || "?"} → {(it.shipment.destination || it.shipment.ship_to) || "?"} · {it.shipment.shipment_status || "no status"}
+                          <div className="text-slate-500 truncate mt-0.5">
+                            {it.shipment.customer_name || "—"} · {route}
                           </div>
-                          <div className="text-slate-700 mt-0.5">{it.task.title}</div>
+                          <div className="text-slate-700 truncate mt-0.5 flex items-center gap-2">
+                            <span className="truncate">{it.task.title}</span>
+                            <span className="shrink-0 text-[10px] text-slate-400" title={`Task created ${new Date(it.task.created_at).toLocaleString()}`}>
+                              {fmtRelative(it.task.created_at)}
+                            </span>
+                          </div>
                         </div>
                         <button
                           onClick={() => toggleExclude(it.task.id)}

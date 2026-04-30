@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings as SettingsIcon, Save, RotateCcw, Sliders, Sparkles, Mail, Cpu, Search, FileText, ReceiptText, Box, Send, X, ChevronDown, ChevronRight as ChevronRightIcon, AlertTriangle } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { Settings as SettingsIcon, Save, RotateCcw, Sliders, Sparkles, Mail, Cpu, Search, FileText, ReceiptText, Box, Send, X, ChevronDown, ChevronRight as ChevronRightIcon, AlertTriangle, Power } from "lucide-react";
 import { api, type SettingRow } from "../lib/api";
 import { fmtRelative } from "../lib/format";
 
 // Setting groups. Order matters — first match wins. Each entry's `id`
-// doubles as the in-page anchor target for the left rail.
+// doubles as the URL slug for /admin/settings/<id>.
 const GROUPS: {
   id: string;
   label: string;
@@ -141,6 +142,28 @@ function valueShape(v: unknown): "string" | "number" | "boolean" | "json" {
 type StateFilter = "all" | "customized" | "default" | "unsaved";
 
 export function SettingsPage() {
+  // The active sub-tab is now route-driven: /admin/settings/<id>. The
+  // legacy "all groups stacked" rendering was a wall of textareas; one
+  // group at a time keeps each tab focused and lets admins deep-link
+  // to a specific section.
+  const { section: routeSection } = useParams<{ section?: string }>();
+  const navigate = useNavigate();
+  // Default to the first group when the URL is /admin/settings (no
+  // section). Falling back via redirect rather than rendering "All"
+  // because the wall-of-textareas behavior is exactly what we just
+  // moved away from.
+  const activeGroup = useMemo(() => {
+    if (routeSection && GROUPS.some((g) => g.id === routeSection)) return routeSection;
+    return GROUPS[0].id;
+  }, [routeSection]);
+  // Redirect /admin/settings (no slug) and unknown slugs to the first
+  // group's URL so deep-link sharing works and the rail's active state
+  // matches the URL.
+  useEffect(() => {
+    if (!routeSection) navigate(`/admin/settings/${GROUPS[0].id}`, { replace: true });
+    else if (!GROUPS.some((g) => g.id === routeSection)) navigate(`/admin/settings/${GROUPS[0].id}`, { replace: true });
+  }, [routeSection, navigate]);
+
   const [rows, setRows] = useState<SettingRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -152,9 +175,6 @@ export function SettingsPage() {
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState("");
   const [stateFilter, setStateFilter] = useState<StateFilter>("all");
-  // Currently-visible section, driven by IntersectionObserver, used
-  // to highlight the active rail entry.
-  const [activeGroup, setActiveGroup] = useState<string>("");
   // Modal state for the Reset confirm + Discard confirm flows. Replaces
   // window.confirm() with the same in-page modal pattern other admin
   // surfaces use (z-50, backdrop, esc-to-close).
@@ -254,59 +274,40 @@ export function SettingsPage() {
     });
   }
 
+  // grouped = all rows bucketed by group, BEFORE state/text filters.
+  // Used for rail counts (so the rail reflects every group's true
+  // size, not the filtered slice).
   const grouped = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    const matchesText = (r: SettingRow) => {
-      if (!q) return true;
-      const friendly = (FRIENDLY_LABEL[r.key] || "").toLowerCase();
-      const desc = (r.description || "").toLowerCase();
-      const valStr = typeof r.value === "string" ? r.value.toLowerCase() : "";
-      return r.key.toLowerCase().includes(q)
-        || friendly.includes(q)
-        || desc.includes(q)
-        || valStr.includes(q);
-    };
-    const matchesState = (r: SettingRow) => {
-      if (stateFilter === "all") return true;
-      if (stateFilter === "customized") return !r.isDefault;
-      if (stateFilter === "default") return r.isDefault;
-      if (stateFilter === "unsaved") return r.key in edits;
-      return true;
-    };
     const out: Record<string, SettingRow[]> = {};
     for (const r of rows) {
-      if (!matchesText(r) || !matchesState(r)) continue;
       const g = GROUPS.find((g) => g.match(r.key));
       const id = g ? g.id : "other";
       (out[id] = out[id] || []).push(r);
     }
     for (const arr of Object.values(out)) arr.sort((a, b) => a.key.localeCompare(b.key));
     return out;
-  }, [rows, filter, stateFilter, edits]);
+  }, [rows]);
 
-  // Active-group tracking for the rail. The IntersectionObserver fires
-  // when a section's top edge crosses the viewport's top 1/3 — keeps
-  // the rail in sync with where the operator is reading without
-  // flicker on small movements.
-  const sectionRefs = useRef<Record<string, HTMLElement | null>>({});
-  useEffect(() => {
-    if (loading) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) {
-            const id = (e.target as HTMLElement).dataset.groupId;
-            if (id) setActiveGroup(id);
-          }
-        }
-      },
-      { rootMargin: "-30% 0px -60% 0px", threshold: 0 },
-    );
-    for (const el of Object.values(sectionRefs.current)) {
-      if (el) observer.observe(el);
-    }
-    return () => observer.disconnect();
-  }, [loading, grouped]);
+  // The single active group's filtered rows. State + text filters apply
+  // here — outside this list there's nothing else on the page so the
+  // operator never wonders "is this the full list?".
+  const activeRows = useMemo(() => {
+    const list = grouped[activeGroup] || [];
+    const q = filter.trim().toLowerCase();
+    return list.filter((r) => {
+      if (q) {
+        const friendly = (FRIENDLY_LABEL[r.key] || "").toLowerCase();
+        const desc = (r.description || "").toLowerCase();
+        const valStr = typeof r.value === "string" ? r.value.toLowerCase() : "";
+        const ok = r.key.toLowerCase().includes(q) || friendly.includes(q) || desc.includes(q) || valStr.includes(q);
+        if (!ok) return false;
+      }
+      if (stateFilter === "customized") return !r.isDefault;
+      if (stateFilter === "default") return r.isDefault;
+      if (stateFilter === "unsaved") return r.key in edits;
+      return true;
+    });
+  }, [grouped, activeGroup, filter, stateFilter, edits]);
 
   // esc-to-close the confirm modal — same pattern as drawers elsewhere.
   useEffect(() => {
@@ -320,20 +321,19 @@ export function SettingsPage() {
   const editedKeys = rows.filter((r) => !r.isDefault).length;
   const dirtyCount = Object.keys(edits).length;
 
-  // Visible groups (after filters) — used for the rail counts so
-  // entries match what the user sees.
-  const visibleGroupCounts = useMemo(() => {
+  // Per-group dirty counts so the rail can show "this group has unsaved
+  // edits" indicators — surfaces a small amber dot next to the count.
+  const groupDirtyCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    for (const g of GROUPS) counts[g.id] = (grouped[g.id] || []).length;
+    for (const k of Object.keys(edits)) {
+      const g = GROUPS.find((g) => g.match(k));
+      const id = g ? g.id : "other";
+      counts[id] = (counts[id] || 0) + 1;
+    }
     return counts;
-  }, [grouped]);
+  }, [edits]);
 
-  function scrollToGroup(id: string) {
-    const el = sectionRefs.current[id];
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
-    setActiveGroup(id);
-  }
+  const activeGroupCfg = GROUPS.find((g) => g.id === activeGroup) || GROUPS[0];
 
   return (
     <div className="space-y-5">
@@ -449,32 +449,39 @@ export function SettingsPage() {
         {loading ? <div className="p-8 text-center text-slate-500">Loading…</div> : null}
       </div>
 
-      {/* Two-column layout: sticky rail (lg+) + section list */}
+      {/* Two-column layout: route-driven rail (lg+) + active section's
+          rows. Rail collapses to a horizontal pill nav on smaller
+          widths so the operator still has navigation. */}
       {!loading ? (
         <div className="lg:grid lg:grid-cols-[220px_1fr] lg:gap-5">
-          {/* Section rail. Sticky on lg+; collapses to a horizontal
-              scroller on smaller widths so the operator still has
-              navigation. */}
           <aside className="lg:sticky lg:top-4 lg:self-start mb-3 lg:mb-0">
             <div className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm p-2 lg:p-3 overflow-x-auto lg:overflow-visible">
               <ul className="flex lg:flex-col gap-1 min-w-max lg:min-w-0">
                 {GROUPS.map(({ id, label, Icon }) => {
-                  const count = visibleGroupCounts[id] || 0;
+                  const count = (grouped[id] || []).length;
                   if (count === 0) return null;
                   const active = activeGroup === id;
+                  const dirtyHere = groupDirtyCounts[id] || 0;
                   return (
                     <li key={id} className="shrink-0 lg:shrink">
                       <button
-                        onClick={() => scrollToGroup(id)}
+                        onClick={() => navigate(`/admin/settings/${id}`)}
                         className={
                           "w-full text-left px-3 py-2 rounded-lg text-xs font-medium transition inline-flex items-center gap-2 whitespace-nowrap " +
                           (active
                             ? "bg-sky-50 text-sky-700 ring-1 ring-sky-200"
                             : "text-slate-600 hover:text-slate-900 hover:bg-slate-50")
                         }
+                        aria-current={active ? "page" : undefined}
                       >
                         <Icon className="h-3.5 w-3.5 shrink-0" />
                         <span className="truncate">{label}</span>
+                        {dirtyHere > 0 ? (
+                          <span
+                            className="h-1.5 w-1.5 rounded-full bg-amber-500 shrink-0"
+                            title={`${dirtyHere} unsaved change${dirtyHere === 1 ? "" : "s"} in this group`}
+                          />
+                        ) : null}
                         <span className={"ml-auto text-[10px] font-semibold px-1.5 py-0.5 rounded-full " + (active ? "bg-sky-100 text-sky-700" : "bg-slate-100 text-slate-600")}>
                           {count}
                         </span>
@@ -486,50 +493,55 @@ export function SettingsPage() {
             </div>
           </aside>
 
-          {/* Section content */}
           <div className="space-y-5">
-            {GROUPS.map(({ id, label, description, Icon }) => {
-              const list = grouped[id];
-              if (!list?.length) return null;
-              return (
-                <section
-                  key={id}
-                  id={`group-${id}`}
-                  data-group-id={id}
-                  ref={(el) => { sectionRefs.current[id] = el; }}
-                  className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm scroll-mt-24"
-                >
-                  <button
-                    type="button"
-                    onClick={() => scrollToGroup(id)}
-                    className="w-full text-left p-5 border-b border-slate-100 hover:bg-slate-50/50 transition"
-                  >
-                    <h3 className="text-base font-semibold flex items-center gap-2 text-slate-900">
-                      <Icon className="h-5 w-5 text-sky-600" /> {label}
-                      <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 ml-1">
-                        {list.length}
-                      </span>
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">{description}</p>
-                  </button>
-                  <ul className="divide-y divide-slate-100">
-                    {list.map((row) => (
-                      <SettingRowItem
-                        key={row.key}
-                        row={row}
-                        edits={edits}
-                        savingKey={savingKey}
-                        expandedKeys={expandedKeys}
-                        onEdit={setEdit}
-                        onToggleExpanded={toggleExpanded}
-                        onSave={save}
-                        onReset={resetToDefault}
-                      />
-                    ))}
-                  </ul>
-                </section>
-              );
-            })}
+            {/* Embed tab gets a hero on/off panel above the row list — the
+                enabled toggle is the most consequential setting on the
+                page (gates the whole iframe surface) and deserves more
+                visual weight than a regular row. */}
+            {activeGroup === "embed" ? (
+              <EmbedHero
+                row={rows.find((r) => r.key === "embed.freightpop.enabled") || null}
+                edits={edits}
+                savingKey={savingKey}
+                onEdit={setEdit}
+                onSave={save}
+              />
+            ) : null}
+
+            <section className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm">
+              <div className="p-5 border-b border-slate-100">
+                <h3 className="text-base font-semibold flex items-center gap-2 text-slate-900">
+                  <activeGroupCfg.Icon className="h-5 w-5 text-sky-600" /> {activeGroupCfg.label}
+                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 ml-1">
+                    {activeRows.length}{activeRows.length !== (grouped[activeGroup]?.length || 0) ? ` / ${(grouped[activeGroup] || []).length}` : ""}
+                  </span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-1 leading-relaxed">{activeGroupCfg.description}</p>
+              </div>
+              {activeRows.length === 0 ? (
+                <div className="px-5 py-8 text-center text-sm text-slate-500">
+                  {filter.trim() || stateFilter !== "all"
+                    ? "No settings match your current filter."
+                    : "No settings in this group yet."}
+                </div>
+              ) : (
+                <ul className="divide-y divide-slate-100">
+                  {activeRows.map((row) => (
+                    <SettingRowItem
+                      key={row.key}
+                      row={row}
+                      edits={edits}
+                      savingKey={savingKey}
+                      expandedKeys={expandedKeys}
+                      onEdit={setEdit}
+                      onToggleExpanded={toggleExpanded}
+                      onSave={save}
+                      onReset={resetToDefault}
+                    />
+                  ))}
+                </ul>
+              )}
+            </section>
           </div>
         </div>
       ) : null}
@@ -545,6 +557,80 @@ export function SettingsPage() {
         />
       ) : null}
     </div>
+  );
+}
+
+// Hero on/off panel for the embed sub-tab. The
+// embed.freightpop.enabled key gates whether the FreightPOP iframe
+// renders anywhere in the dashboard (drawer split-view + share page),
+// so it deserves more visual weight than a regular row buried in a
+// list. Operators can toggle it at-a-glance and immediately see what
+// the current state is and what each state means.
+function EmbedHero({ row, edits, savingKey, onEdit, onSave }: {
+  row: SettingRow | null;
+  edits: Record<string, unknown>;
+  savingKey: string | null;
+  onEdit: (key: string, value: unknown) => void;
+  onSave: (row: SettingRow) => void;
+}) {
+  if (!row) return null;
+  const dirty = row.key in edits;
+  const current = dirty ? Boolean(edits[row.key]) : Boolean(row.value);
+  return (
+    <section className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm overflow-hidden">
+      <div className={"px-5 py-4 flex items-start justify-between gap-4 flex-wrap " + (current ? "bg-emerald-50/40" : "bg-slate-50/60")}>
+        <div className="flex items-start gap-3 min-w-0 flex-1">
+          <div className={"shrink-0 h-10 w-10 rounded-xl flex items-center justify-center " + (current ? "bg-emerald-600 text-white" : "bg-slate-300 text-white")}>
+            <Power className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="text-base font-semibold text-slate-900">FreightPOP embed</h3>
+              <span className={"text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded ring-1 " + (current ? "bg-emerald-100 text-emerald-800 ring-emerald-200" : "bg-slate-200 text-slate-700 ring-slate-300")}>
+                {current ? "On" : "Off"}
+              </span>
+              {dirty ? (
+                <span className="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 ring-1 ring-amber-200">
+                  Unsaved
+                </span>
+              ) : null}
+            </div>
+            <p className="text-xs text-slate-600 mt-1 max-w-xl leading-relaxed">
+              {current
+                ? <>The FreightPOP iframe is <strong>active</strong> — the drawer split-view and share page render the embedded app. Reps can act on shipments without leaving the dashboard.</>
+                : <>The FreightPOP iframe is <strong>disabled</strong> — drawer split-view and share page won't render it. Use this to suppress the embed during a FreightPOP outage or when reps should work directly in app.freightpop.com.</>}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={current}
+            onClick={() => onEdit(row.key, !current)}
+            className={
+              "relative h-7 w-12 rounded-full transition focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-emerald-500 " +
+              (current ? "bg-emerald-600" : "bg-slate-300")
+            }
+            aria-label={current ? "Disable FreightPOP embed" : "Enable FreightPOP embed"}
+          >
+            <span
+              className={
+                "absolute top-0.5 left-0.5 h-6 w-6 rounded-full bg-white shadow-sm transition-transform " +
+                (current ? "translate-x-5" : "translate-x-0")
+              }
+            />
+          </button>
+          <button
+            onClick={() => onSave(row)}
+            disabled={!dirty || savingKey === row.key}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sky-600 text-white hover:bg-sky-700 inline-flex items-center gap-1.5 disabled:bg-slate-200 disabled:text-slate-400"
+          >
+            <Save className="h-3.5 w-3.5" /> {savingKey === row.key ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }
 

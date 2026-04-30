@@ -166,6 +166,7 @@ function AuthedApp() {
                 <Route path="/admin/keys" element={<ApiKeysPage />} />
                 <Route path="/admin/audit" element={<AuditLogPage />} />
                 <Route path="/admin/settings" element={<SettingsPage />} />
+                <Route path="/admin/settings/:section" element={<SettingsPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tracking" replace />} />
