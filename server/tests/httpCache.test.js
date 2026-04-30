@@ -2,8 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { sendCachedJson } from "../lib/httpCache.js";
 
-// sendCachedJson sets a `private` Cache-Control header and writes the body
-// via res.json(). We mock the Express res just enough to capture the calls.
+// sendCachedJson sets a Cache-Control header and writes the body via res.json().
+// We mock the Express res just enough to capture the calls.
 function makeRes() {
   const calls = { setKey: null, setVal: null, jsonBody: null, jsonCount: 0, setCount: 0 };
   return {
@@ -14,11 +14,14 @@ function makeRes() {
 }
 
 describe("sendCachedJson", () => {
-  it("sets a Cache-Control header with default 15s max-age + 60s SWR", () => {
+  it("sets Cache-Control to private, no-store so browsers always revalidate", () => {
+    // We removed the max-age window in 2026-04 because it caused a
+    // 'refresh twice to see my change' bug across admin pages: after a
+    // server cache bust, the browser still had cached responses on disk.
     const res = makeRes();
     sendCachedJson({}, res, { ok: true });
     assert.equal(res._calls.setKey, "Cache-Control");
-    assert.equal(res._calls.setVal, "private, max-age=15, stale-while-revalidate=60");
+    assert.equal(res._calls.setVal, "private, no-store");
   });
 
   it("ALWAYS uses `private` — never `public` (would leak across users on shared CDNs)", () => {
@@ -28,22 +31,17 @@ describe("sendCachedJson", () => {
     assert.ok(!res._calls.setVal.includes("public"));
   });
 
-  it("respects a custom maxAge", () => {
+  it("ALWAYS includes no-store so the browser never serves a stale response", () => {
     const res = makeRes();
-    sendCachedJson({}, res, { ok: true }, { maxAge: 120 });
-    assert.equal(res._calls.setVal, "private, max-age=120, stale-while-revalidate=60");
+    sendCachedJson({}, res, { ok: true });
+    assert.ok(res._calls.setVal.includes("no-store"));
   });
 
-  it("respects a custom swr", () => {
+  it("ignores any opts argument (kept for backwards compatibility with old call sites)", () => {
+    // Old signature accepted { maxAge, swr } — those are now no-ops.
     const res = makeRes();
-    sendCachedJson({}, res, { ok: true }, { swr: 300 });
-    assert.equal(res._calls.setVal, "private, max-age=15, stale-while-revalidate=300");
-  });
-
-  it("respects both maxAge and swr together", () => {
-    const res = makeRes();
-    sendCachedJson({}, res, { ok: true }, { maxAge: 30, swr: 90 });
-    assert.equal(res._calls.setVal, "private, max-age=30, stale-while-revalidate=90");
+    sendCachedJson({}, res, { ok: true }, { maxAge: 120, swr: 300 });
+    assert.equal(res._calls.setVal, "private, no-store");
   });
 
   it("forwards the body unchanged to res.json()", () => {

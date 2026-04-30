@@ -248,10 +248,12 @@ describe("sendCachedJson — body-passthrough edges", () => {
     assert.equal(res._calls.jsonBody, "hello");
   });
 
-  it("zero values for maxAge / swr render correctly (edge: explicit no-cache)", () => {
+  it("ignores legacy maxAge/swr opts (kept for back-compat with old call sites)", () => {
+    // sendCachedJson dropped its caching window in 2026-04 — opts are
+    // now no-ops. Header is always private, no-store regardless of args.
     const res = makeRes();
     sendCachedJson({}, res, {}, { maxAge: 0, swr: 0 });
-    assert.equal(res._calls.setVal, "private, max-age=0, stale-while-revalidate=0");
+    assert.equal(res._calls.setVal, "private, no-store");
   });
 });
 
