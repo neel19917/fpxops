@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Check, ExternalLink, Filter } from "lucide-react";
+import { Copy, Check, ExternalLink, Filter, X as XIcon } from "lucide-react";
 import { useFrameState } from "../lib/freightpopFrame";
 import { useAuth } from "../lib/auth";
+import { ErrorBlock } from "./ErrorBlock";
 
 // postMessage bridge to the FPXpress Chrome extension. The extension's
 // content script runs inside the FreightPOP iframe (its host permissions
@@ -75,7 +76,16 @@ export function FreightPopOverlay() {
   const cfg = clientConfig?.embed_freightpop;
   const frame = useFrameState();
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  // Separate copy-state per source so the tracking-number copy doesn't
+  // share a flash variable with the email-copy button (the previous
+  // setCopied("email") reuse made the two affordances visually identical
+  // on click, which was confusing to debug).
   const [copied, setCopied] = useState<"email" | "password" | null>(null);
+  const [trackingCopied, setTrackingCopied] = useState(false);
+  // Last filter ack the operator dismissed — once the user closes the
+  // warning it stays dismissed for that ack identity so a stuck failure
+  // doesn't bury the iframe forever.
+  const [ackDismissed, setAckDismissed] = useState(false);
   const [credsOpen, setCredsOpen] = useState(false);
   const [creds, setCreds] = useState<SavedCreds>(() => loadCreds());
   // Tracks whether the FPXpress Chrome extension has greeted us from
@@ -113,6 +123,9 @@ export function FreightPopOverlay() {
           error: typeof d.error === "string" ? d.error : undefined,
           injectDetail: typeof d.injectDetail === "string" ? d.injectDetail : undefined,
         });
+        // New ack — re-show the warning so a fresh failure isn't
+        // hidden by an earlier dismissal.
+        setAckDismissed(false);
       }
     }
     window.addEventListener("message", onMessage);
@@ -183,15 +196,25 @@ export function FreightPopOverlay() {
               secondary (mono, smaller) and customer name caps the line. */}
           <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 shrink-0">FreightPOP · Shipment</span>
           <span className="text-sm font-semibold text-slate-900 truncate">{frame.shipmentLabel || "—"}</span>
-          {/* Bridge presence dot: green when the extension's content script
+          {/* Bridge presence pill: green when the extension's content script
               has greeted us (auto-filter works), amber when still pinging
-              (extension may not be installed/reloaded). Hovers explain. */}
+              (extension may not be installed/reloaded). The visible "Ext"
+              label means operators don't need a hover to know what the
+              dot represents. */}
           <span
-            className={"inline-block h-2 w-2 rounded-full shrink-0 " + (bridgeReady ? "bg-emerald-500" : "bg-amber-400")}
+            className={
+              "inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded ring-1 shrink-0 " +
+              (bridgeReady
+                ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                : "bg-amber-50 text-amber-800 ring-amber-200")
+            }
             title={bridgeReady
-              ? "Extension bridge connected — auto-filter works"
-              : "Extension bridge not detected — install/reload the FPXpress Chrome extension and refresh"}
-          />
+              ? "Chrome extension bridge connected — auto-filter works"
+              : "Chrome extension bridge not detected — install/reload the FPXpress extension and refresh"}
+          >
+            <span className={"h-1.5 w-1.5 rounded-full " + (bridgeReady ? "bg-emerald-500" : "bg-amber-500")} />
+            Ext {bridgeReady ? "ok" : "off"}
+          </span>
           {frame.trackingNumber ? (
             <span className="hidden sm:inline-flex items-center gap-1 text-[11px] text-slate-500 shrink-0 min-w-0">
               <span className="uppercase tracking-wider font-semibold">Tracking</span>
@@ -207,14 +230,15 @@ export function FreightPopOverlay() {
             <button
               onClick={() => {
                 navigator.clipboard.writeText(frame.trackingNumber || "").then(() => {
-                  setCopied("email"); // reuse the flash; keeps state simple
-                  setTimeout(() => setCopied(null), 1500);
+                  setTrackingCopied(true);
+                  setTimeout(() => setTrackingCopied(false), 1500);
                 }).catch(() => {});
               }}
               className="inline-flex items-center gap-1 text-[11px] text-sky-700 hover:text-sky-900 px-1.5 py-0.5 rounded hover:bg-sky-50 shrink-0"
               title="Copy tracking number"
             >
-              <Copy className="h-3.5 w-3.5" /> Copy
+              {trackingCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              {trackingCopied ? "Copied" : "Copy"}
             </button>
           ) : null}
         </div>
@@ -234,13 +258,18 @@ export function FreightPopOverlay() {
                     : `Apply Kendo filter: Tracking Number = ${frame.trackingNumber}`)
                 : "Install/enable the FPXpress Chrome extension to filter the embedded grid"}
             >
-              <Filter className="h-3.5 w-3.5" />
-              {isFilteredToCurrent ? "Loaded" : "Load shipment"}
+              {isFilteredToCurrent ? <Check className="h-3.5 w-3.5" /> : <Filter className="h-3.5 w-3.5" />}
+              {isFilteredToCurrent ? "Filtered" : "Filter shipment"}
             </button>
           ) : null}
           <button
             onClick={() => setCredsOpen((v) => !v)}
-            className="text-xs px-2 py-1 rounded ring-1 ring-slate-200 text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1"
+            className={
+              "text-xs px-2 py-1 rounded ring-1 inline-flex items-center gap-1 transition " +
+              (credsOpen
+                ? "bg-sky-50 text-sky-700 ring-sky-200"
+                : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")
+            }
             title="Saved login (stored only in this browser)"
             aria-pressed={credsOpen}
           >
@@ -257,16 +286,30 @@ export function FreightPopOverlay() {
         </div>
       </div>
 
-      {lastAck && !lastAck.ok ? (
-        <div className="px-3 py-2 bg-amber-50 ring-1 ring-amber-200 mx-3 mt-2 rounded-lg text-[11px] text-amber-900">
-          <div className="font-semibold">Filter didn't apply</div>
-          {lastAck.error ? <div className="mt-0.5">{lastAck.error}</div> : null}
-          {lastAck.injectDetail ? (
-            <details className="mt-1">
-              <summary className="cursor-pointer text-amber-800 hover:text-amber-900">Details (Kendo inject)</summary>
-              <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[10px] leading-snug text-amber-900">{lastAck.injectDetail}</pre>
-            </details>
-          ) : null}
+      {lastAck && !lastAck.ok && !ackDismissed ? (
+        <div className="mx-3 mt-2">
+          <ErrorBlock tone="warning" compact>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="font-semibold">Filter didn't apply</div>
+                {lastAck.error ? <div className="mt-0.5 text-[11px]">{lastAck.error}</div> : null}
+                {lastAck.injectDetail ? (
+                  <details className="mt-1">
+                    <summary className="cursor-pointer text-amber-800 hover:text-amber-900 text-[11px]">Details (Kendo inject)</summary>
+                    <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[10px] leading-snug text-amber-900">{lastAck.injectDetail}</pre>
+                  </details>
+                ) : null}
+              </div>
+              <button
+                onClick={() => setAckDismissed(true)}
+                className="shrink-0 p-0.5 rounded text-amber-700 hover:text-amber-900 hover:bg-amber-100"
+                aria-label="Dismiss filter warning"
+                title="Dismiss"
+              >
+                <XIcon className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </ErrorBlock>
         </div>
       ) : null}
 
