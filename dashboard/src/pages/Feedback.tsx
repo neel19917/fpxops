@@ -3,6 +3,7 @@ import { MessageSquare, Send, RefreshCw } from "lucide-react";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import type { Feedback, FeedbackCategory, FeedbackStatus } from "../lib/types";
+import { LoadingState } from "../components/LoadingState";
 
 const CATEGORY_LABELS: Record<FeedbackCategory, string> = {
   bug: "Bug",
@@ -89,7 +90,7 @@ export function FeedbackPage() {
 
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           {loading ? (
-            <div className="text-center text-slate-400 py-8">Loading…</div>
+            <LoadingState />
           ) : items.length === 0 ? (
             <div className="text-center text-slate-400 py-8">No feedback yet.</div>
           ) : (

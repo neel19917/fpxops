@@ -5,6 +5,8 @@ import { fmtDate, fmtDateTime, fmtNum, fmtPct } from "../lib/format";
 import type { GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditRow } from "../lib/types";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
+import { ErrorBlock } from "../components/ErrorBlock";
+import { LoadingState } from "../components/LoadingState";
 
 interface ReanalyzeButtonProps {
   busy: boolean;
@@ -81,7 +83,7 @@ export function GpAuditsPage() {
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
-          {loading ? <tr><td colSpan={7} className="p-8 text-center text-slate-500">Loading…</td></tr>
+          {loading ? <LoadingState variant="row" colSpan={7} />
             : rows.length === 0 ? <tr><td colSpan={7} className="p-8 text-center text-slate-500">No GP audits yet.</td></tr>
               : rows.map((r) => (
                 <tr key={r.id} className="hover:bg-sky-50/50 cursor-pointer" onClick={() => setOpenId(r.id)}>
@@ -104,7 +106,7 @@ export function GpAuditsPage() {
               <ReanalyzeButton busy={reanBusy} onClick={reanalyze} />
               <ShareButton resourceType="gp_audit" resourceId={detail.run.id} defaultLabel={`GP Audit ${fmtDate(detail.run.date_from)}–${fmtDate(detail.run.date_to)}`} />
             </div>
-            {reanError ? <div className="mb-3 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2">{reanError}</div> : null}
+            {reanError ? <div className="mb-3"><ErrorBlock compact>{reanError}</ErrorBlock></div> : null}
             <Section title="Run">
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Range">{fmtDate(detail.run.date_from)} → {fmtDate(detail.run.date_to)}</Field>
@@ -137,7 +139,7 @@ export function GpAuditsPage() {
               ))}
             </Section>
           </>
-        ) : <div className="text-sm text-slate-500">Loading…</div>}
+        ) : <LoadingState variant="inline" />}
       </Drawer>
     </div>
   );
@@ -190,7 +192,7 @@ export function InvoiceAuditsPage() {
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
-          {loading ? <tr><td colSpan={7} className="p-8 text-center text-slate-500">Loading…</td></tr>
+          {loading ? <LoadingState variant="row" colSpan={7} />
             : rows.length === 0 ? <tr><td colSpan={7} className="p-8 text-center text-slate-500">No invoice audits yet.</td></tr>
               : rows.map((r) => (
                 <tr key={r.id} className="hover:bg-sky-50/50 cursor-pointer" onClick={() => setOpenId(r.id)}>
@@ -213,7 +215,7 @@ export function InvoiceAuditsPage() {
               <ReanalyzeButton busy={reanBusy} onClick={reanalyze} />
               <ShareButton resourceType="invoice_audit" resourceId={detail.run.id} defaultLabel={`Invoice Audit ${fmtDate(detail.run.date_from)}–${fmtDate(detail.run.date_to)}`} />
             </div>
-            {reanError ? <div className="mb-3 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2">{reanError}</div> : null}
+            {reanError ? <div className="mb-3"><ErrorBlock compact>{reanError}</ErrorBlock></div> : null}
             <Section title="Run">
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Range">{fmtDate(detail.run.date_from)} → {fmtDate(detail.run.date_to)}</Field>
@@ -247,7 +249,7 @@ export function InvoiceAuditsPage() {
               ))}
             </Section>
           </>
-        ) : <div className="text-sm text-slate-500">Loading…</div>}
+        ) : <LoadingState variant="inline" />}
       </Drawer>
     </div>
   );

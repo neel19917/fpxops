@@ -3,6 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Settings as SettingsIcon, Save, RotateCcw, Sliders, Sparkles, Mail, Cpu, Search, FileText, ReceiptText, Box, Send, X, ChevronDown, ChevronRight as ChevronRightIcon, AlertTriangle, Power } from "lucide-react";
 import { api, type SettingRow } from "../lib/api";
 import { fmtRelative } from "../lib/format";
+import { ErrorBlock } from "../components/ErrorBlock";
 
 // Setting groups. Order matters — first match wins. Each entry's `id`
 // doubles as the URL slug for /admin/settings/<id>.
@@ -445,7 +446,7 @@ export function SettingsPage() {
           })}
         </div>
 
-        {err ? <div className="mx-5 mt-4 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-sm px-3 py-2">{err}</div> : null}
+        {err ? <div className="mx-5 mt-4"><ErrorBlock compact>{err}</ErrorBlock></div> : null}
         {loading ? <div className="p-8 text-center text-slate-500">Loading…</div> : null}
       </div>
 

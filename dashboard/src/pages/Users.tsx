@@ -4,6 +4,8 @@ import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
 import type { UserProfileRow } from "../lib/types";
 import { useAuth } from "../lib/auth";
+import { ErrorBlock } from "../components/ErrorBlock";
+import { LoadingState } from "../components/LoadingState";
 
 interface InlineNameProps {
   value: string | null;
@@ -117,8 +119,8 @@ export function UsersPage() {
           Everyone who's signed in with Microsoft is here. Flip <b>Enabled</b> to grant access.
         </p>
       </div>
-      {err ? <div className="mx-5 mt-4 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-sm px-3 py-2">{err}</div> : null}
-      {issueErr ? <div className="mx-5 mt-4 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-sm px-3 py-2">Issue failed: {issueErr}</div> : null}
+      {err ? <div className="mx-5 mt-4"><ErrorBlock compact>{err}</ErrorBlock></div> : null}
+      {issueErr ? <div className="mx-5 mt-4"><ErrorBlock compact>Issue failed: {issueErr}</ErrorBlock></div> : null}
       {issueResult ? (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full p-6">
@@ -146,7 +148,7 @@ export function UsersPage() {
             <div className="mt-5 flex justify-end">
               <button
                 onClick={() => setIssueResult(null)}
-                className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800"
+                className="px-4 py-2 text-sm font-medium rounded-lg bg-sky-600 text-white hover:bg-sky-700"
               >Done</button>
             </div>
           </div>
@@ -164,7 +166,7 @@ export function UsersPage() {
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
-          {loading ? <tr><td colSpan={6} className="p-8 text-center text-slate-500">Loading…</td></tr>
+          {loading ? <LoadingState variant="row" colSpan={6} />
           : rows.length === 0 ? <tr><td colSpan={6} className="p-8 text-center text-slate-500">No users yet.</td></tr>
           : rows.map((u) => {
             const isMe = profile?.id === u.id;

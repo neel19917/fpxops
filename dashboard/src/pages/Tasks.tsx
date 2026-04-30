@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus, ThumbsUp, ThumbsDown } from "lucide-react";
 import { api, type GroupEmailDraft } from "../lib/api";
 import type { CarrierFollowupShipment, Shipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
@@ -181,12 +182,22 @@ export function TasksPage() {
       return v === "kanban" ? "kanban" : "table";
     } catch { return "table"; }
   });
-  // Page-level sub-tab. Default = "all" so the existing flow is
-  // preserved (KPIs + bulk toolbar + Kanban/Table over the full task
-  // list). The followup tabs hide the all-tasks view to keep each
-  // section focused — operators on the carrier panel don't need to
-  // scroll past the entire Kanban to reach it.
-  const [pageTab, setPageTab] = useState<"all" | "carrier" | "customer">("all");
+  // Page-level sub-tab is route-driven so reps can deep-link / bookmark
+  // a specific view (carrier followups, customer followups, all tasks).
+  // /tasks                       → "all"
+  // /tasks/carrier-followups     → "carrier"
+  // /tasks/customer-followups    → "customer"
+  const location = useLocation();
+  const navigate = useNavigate();
+  const pageTab: "all" | "carrier" | "customer" =
+    location.pathname.startsWith("/tasks/carrier-followups") ? "carrier"
+    : location.pathname.startsWith("/tasks/customer-followups") ? "customer"
+    : "all";
+  function setPageTab(next: "all" | "carrier" | "customer") {
+    if (next === "carrier") navigate("/tasks/carrier-followups");
+    else if (next === "customer") navigate("/tasks/customer-followups");
+    else navigate("/tasks");
+  }
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     try { localStorage.setItem(FILTER_KEY, statusFilter); } catch {}

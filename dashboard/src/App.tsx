@@ -156,6 +156,11 @@ function AuthedApp() {
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
             <Route path="/tasks" element={<TasksPage />} />
+            {/* Static sub-routes win over /tasks/:taskId in react-router v6
+                ranking (static > dynamic). They render the same TasksPage
+                with a different sub-tab inferred from the URL. */}
+            <Route path="/tasks/carrier-followups" element={<TasksPage />} />
+            <Route path="/tasks/customer-followups" element={<TasksPage />} />
             <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
             <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
             <Route path="/ops" element={<OpsPage />} />
