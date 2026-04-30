@@ -28,6 +28,8 @@ const FeedbackPage    = lazy(() => import("./pages/Feedback").then((m) => ({ def
 const AuditLogPage    = lazy(() => import("./pages/AuditLog").then((m) => ({ default: m.AuditLogPage })));
 const SettingsPage    = lazy(() => import("./pages/Settings").then((m) => ({ default: m.SettingsPage })));
 const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default: m.OpsPage })));
+const ServicesPage    = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServicesPage })));
+const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServiceDetailPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
@@ -43,9 +45,10 @@ const TAB_PATH: Record<TabId, string> = {
   keys: "/admin/keys",
   audit: "/admin/audit",
   settings: "/admin/settings",
+  services: "/admin/services",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -54,6 +57,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/keys")) return "keys";
   if (pathname.startsWith("/admin/audit")) return "audit";
   if (pathname.startsWith("/admin/settings")) return "settings";
+  if (pathname.startsWith("/admin/services")) return "services";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
   if (pathname.startsWith("/tasks")) return "tasks";
@@ -167,6 +171,8 @@ function AuthedApp() {
                 <Route path="/admin/audit" element={<AuditLogPage />} />
                 <Route path="/admin/settings" element={<SettingsPage />} />
                 <Route path="/admin/settings/:section" element={<SettingsPage />} />
+                <Route path="/admin/services" element={<ServicesPage />} />
+                <Route path="/admin/services/:slug" element={<ServiceDetailPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tracking" replace />} />

@@ -1,11 +1,11 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "audit" | "settings";
+export type TabId = "tracking" | "tasks" | "ops" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "audit" | "settings" | "services";
 
 interface TabDef {
   id: TabId;
@@ -34,6 +34,7 @@ const ALL_TABS: TabDef[] = [
   { id: "keys",     label: "API Keys",       Icon: KeyRound,     group: "admin" },
   { id: "audit",    label: "Audit Log",      Icon: ScrollText,   group: "admin" },
   { id: "settings", label: "Settings",       Icon: SettingsIcon, group: "admin" },
+  { id: "services", label: "Services",       Icon: Database,     group: "admin" },
 ];
 
 interface Props {
