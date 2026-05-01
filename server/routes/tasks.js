@@ -48,28 +48,32 @@ tasksRouter.get("/", async (req, res) => {
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
 
-  // Attach the FreightPOP-side shipment_id (string) per task so the
-  // Tasks page can search/filter by it without an extra round trip. The
-  // task row only carries shipment_id (UUID) + tracking_number; the
-  // human-facing FreightPOP id lives on the shipment. We do this as a
-  // batch lookup against the unique shipment uuids — typically 100s of
-  // tasks → 10s of distinct shipments, well under the 1k cap.
+  // Attach the FreightPOP-side shipment_id (string) and mode per task so
+  // the Tasks page can search/filter by them without an extra round trip.
+  // The task row only carries shipment_id (UUID) + tracking_number; the
+  // human-facing FreightPOP id and the mode (LTL / Parcel / …) live on
+  // the shipment. Batch lookup against the unique shipment uuids —
+  // typically 100s of tasks → 10s of distinct shipments.
   const tasks = data || [];
   const shipmentUuids = Array.from(new Set(tasks.map((t) => t.shipment_id).filter(Boolean)));
-  let externalById = new Map();
+  let shipById = new Map();
   if (shipmentUuids.length) {
     const { data: ships, error: shipErr } = await supabase
       .from("fpx_shipments")
-      .select("id, shipment_id")
+      .select("id, shipment_id, mode")
       .in("id", shipmentUuids);
     if (!shipErr && ships) {
-      externalById = new Map(ships.map((s) => [s.id, s.shipment_id]));
+      shipById = new Map(ships.map((s) => [s.id, s]));
     }
   }
-  const enriched = tasks.map((t) => ({
-    ...t,
-    shipment_external_id: externalById.get(t.shipment_id) || null,
-  }));
+  const enriched = tasks.map((t) => {
+    const ship = shipById.get(t.shipment_id);
+    return {
+      ...t,
+      shipment_external_id: ship?.shipment_id || null,
+      shipment_mode: ship?.mode || null,
+    };
+  });
   res.json({ data: enriched });
 });
 
@@ -378,7 +382,7 @@ tasksRouter.get("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
   let walk = null;
   if (walkParam !== "off") {
     let q = supabase.from("fpx_shipment_tasks")
-      .select("id, shipment_id, tracking_number, title, status")
+      .select("id, shipment_id, tracking_number, title, status, created_at")
       .order("created_at", { ascending: false });
     if (walkParam === "active") q = q.in("status", ["open", "in_progress"]);
     else if (walkParam === "open" || walkParam === "in_progress" || walkParam === "blocked" || walkParam === "done")

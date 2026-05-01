@@ -219,8 +219,17 @@ export const api = {
       }),
   },
   analyses: {
-    list: (params?: { limit?: number; kind?: string; tracking_number?: string }) =>
-      request<{ data: AiAnalysis[] }>("/api/analyses", { params }),
+    list: (params?: {
+      limit?: number;
+      kind?: string;
+      tracking_number?: string;
+      model?: string;
+      user_email?: string;
+      source?: string;
+      from?: string;
+      to?: string;
+      rating?: "up" | "down" | "unrated";
+    }) => request<{ data: AiAnalysis[] }>("/api/analyses", { params }),
     // Reps rate AI generations 👍 / 👎 so the team can iterate on
     // prompts. Passing rating=null clears a prior rating (mistaken
     // click). Reason is optional but encouraged on 👎.

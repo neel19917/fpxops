@@ -21,6 +21,15 @@ function postFpxFilter(iframe: HTMLIFrameElement | null, column: FpxFilterColumn
   iframe.contentWindow.postMessage({ source: "fpxpress", type: "fpxFilter", column, value }, "*");
 }
 
+// Sibling to postFpxFilter — asks the extension to click the tracking
+// number link in the (already filtered) FP grid so FP's native modal
+// pops up inside the iframe. Extension waits ~400ms for the filter to
+// settle before clicking, so callers don't need to coordinate timing.
+function postFpxOpenTracking(iframe: HTMLIFrameElement | null, trackingNumber: string) {
+  if (!iframe || !iframe.contentWindow) return;
+  iframe.contentWindow.postMessage({ source: "fpxpress", type: "fpxOpenTracking", trackingNumber }, "*");
+}
+
 // Permissions-policy bundle for the FreightPOP iframe. Each entry corresponds
 // to a feature browsers default-deny for cross-origin frames; allowing them
 // here lets FreightPOP's login/session work the way it does in a normal tab:
@@ -158,6 +167,21 @@ export function FreightPopOverlay() {
     lastAutoFilteredKeyRef.current = key;
     postFpxFilter(iframeRef.current, "Tracking Number", frame.trackingNumber);
   }, [bridgeReady, frame.trackingNumber, frame.autoFilterTick]);
+
+  // Open-tracking-modal trigger. Same keying pattern as auto-filter so a
+  // tick bump fires exactly once. The "Open tracking #" button bumps
+  // openTrackingTick; we forward to the extension which filters first
+  // (so the row is on-screen) then clicks the tracking link.
+  const lastOpenTrackingKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!bridgeReady) return;
+    if (!frame.trackingNumber) return;
+    if (frame.openTrackingTick === 0) return; // skip on initial mount
+    const key = `${frame.trackingNumber}#${frame.openTrackingTick}`;
+    if (lastOpenTrackingKeyRef.current === key) return;
+    lastOpenTrackingKeyRef.current = key;
+    postFpxOpenTracking(iframeRef.current, frame.trackingNumber);
+  }, [bridgeReady, frame.trackingNumber, frame.openTrackingTick]);
 
   // If the embed is disabled OR the iframe has never been asked to load,
   // render nothing. Once it's loaded once we keep it in the DOM (just

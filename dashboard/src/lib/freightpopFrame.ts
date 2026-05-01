@@ -32,6 +32,11 @@ export interface FrameState {
   // in FreightPOP and wants to reload). Starts at 0 so first render is
   // a fresh key for the first non-null trackingNumber.
   autoFilterTick: number;
+  // Sister tick to autoFilterTick — bumps whenever a caller wants the
+  // overlay to ask the extension to open the FP-native tracking modal
+  // for the current trackingNumber. Same keying pattern: overlay fires
+  // exactly once per (trackingNumber, openTrackingTick) pair.
+  openTrackingTick: number;
 }
 
 const INITIAL: FrameState = {
@@ -42,6 +47,7 @@ const INITIAL: FrameState = {
   customerName: null,
   url: null,
   autoFilterTick: 0,
+  openTrackingTick: 0,
 };
 
 let state: FrameState = INITIAL;
@@ -84,6 +90,7 @@ export function showFrame(input: {
     // Only update url when it actually differs — preserves login session.
     url: state.url === input.url ? state.url : input.url,
     autoFilterTick: state.autoFilterTick,
+    openTrackingTick: state.openTrackingTick,
   };
   publish();
 }
@@ -102,6 +109,16 @@ export function hideFrame() {
 // order produces exactly one fire per (trackingNumber, tick) pair.
 export function requestAutoFilter() {
   state = { ...state, autoFilterTick: state.autoFilterTick + 1 };
+  publish();
+}
+
+// Drawer "Open tracking #" button calls this to ask the embedded
+// FreightPOP iframe (via the Chrome extension's content script) to open
+// FP's native tracking modal for the current trackingNumber. Bumps a
+// dedicated tick so the overlay can fire exactly once per request,
+// independent of the auto-filter tick.
+export function requestOpenTracking() {
+  state = { ...state, openTrackingTick: state.openTrackingTick + 1 };
   publish();
 }
 

@@ -238,6 +238,10 @@ export interface ShipmentTask {
   // shipment was deleted). The task's own shipment_id column above is
   // the internal UUID FK — different value, different purpose.
   shipment_external_id?: string | null;
+  // Joined from the parent shipment by /api/tasks so the dashboard can
+  // filter by mode (LTL, Parcel, etc.) without an extra round trip. Null
+  // for tasks whose shipment row is missing or whose mode wasn't scraped.
+  shipment_mode?: string | null;
   tracking_number: string | null;
   title: string;
   description: string | null;

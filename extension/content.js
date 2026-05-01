@@ -3378,6 +3378,48 @@ window.addEventListener("message", async (event) => {
         }, event.origin);
       } catch {}
     }
+  } else if (data.type === "fpxOpenTracking") {
+    // Open FreightPOP's native tracking modal for a specific tracking
+    // number — without leaving the embedded iframe. We first apply the
+    // tracking-number filter so the row is guaranteed to be visible,
+    // wait briefly for the grid to re-render, then simulate a click on
+    // the row's tracking link (the same UI path a rep takes manually).
+    const tn = String(data.trackingNumber || "").trim();
+    if (!tn) return;
+    sendStatus(`Bridge: opening modal for ${tn}`);
+    let openOk = false;
+    let openErr = null;
+    try {
+      // Filter first so the matching row is on-screen; ignore failure
+      // here because the row may already be visible from a prior filter.
+      try { await fpxFilterViaKendoApi(tn, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"]); } catch {}
+      // Give the grid a beat to re-render the filtered rowset before
+      // hunting for the link. 400ms covers slow Kendo redraws on rep
+      // laptops without making the click feel laggy.
+      await new Promise((r) => setTimeout(r, 400));
+      // Walk the visible rows and pick the link whose text matches the
+      // requested tracking number. Reuses collectShipmentJobs() so the
+      // selector heuristics stay in lockstep with the bulk scrape path.
+      const jobs = collectShipmentJobs();
+      const match = jobs.find((j) => (j.link?.textContent || "").trim() === tn);
+      if (match?.link) {
+        simulateClick(match.link);
+        openOk = true;
+      } else {
+        openErr = "Tracking link not found in the filtered grid";
+      }
+    } catch (e) {
+      openErr = String(e?.message || e || "Unknown error");
+    }
+    try {
+      event.source && event.source.postMessage({
+        source: "fpx-extension",
+        type: "fpxOpenTrackingAck",
+        trackingNumber: tn,
+        ok: openOk,
+        error: openErr,
+      }, event.origin);
+    } catch {}
   } else if (data.type === "fpxPing") {
     // Lets the dashboard detect whether the extension is installed +
     // running inside this iframe. No filter side effects.

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, ChevronRight, Truck, Mail, Copy, Check, Send, Search, Plus, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, Truck, Mail, Copy, Check, Send, Search, Plus, ThumbsUp, ThumbsDown } from "lucide-react";
 import { api, type GroupEmailDraft } from "../lib/api";
 import type { CarrierFollowupShipment, Shipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { fmtRelative } from "../lib/format";
@@ -176,12 +176,33 @@ export function TasksPage() {
   // intentionally NOT — search is a transient navigation tool, not a
   // saved view; resetting on reload matches what users expect.
   const [search, setSearch] = useState("");
+  // Shipment-mode filter (LTL / Parcel / etc.) joined into the task by
+  // /api/tasks. "" = all modes. Persisted across reloads alongside the
+  // status filter — operators tend to live in one mode for hours at a
+  // time, so the saved view sticks.
+  const [modeFilter, setModeFilter] = useState<string>(() => {
+    try { return localStorage.getItem("fpx.tasks.modeFilter") ?? ""; } catch { return ""; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fpx.tasks.modeFilter", modeFilter); } catch {}
+  }, [modeFilter]);
   const [viewMode, setViewMode] = useState<"table" | "kanban">(() => {
     try {
       const v = localStorage.getItem(VIEW_KEY);
       return v === "kanban" ? "kanban" : "table";
     } catch { return "table"; }
   });
+  // Whether to load the FreightPOP iframe alongside the task drawer when
+  // walking through tasks. Shares the `fpx.shipments.splitView` key so
+  // toggling here also flips the panel toggle on the Shipments page —
+  // operators have one mental "embed on/off" switch, not two.
+  const [embedEnabled, setEmbedEnabled] = useState<boolean>(() => {
+    try { return (localStorage.getItem("fpx.shipments.splitView") ?? "1") !== "0"; }
+    catch { return true; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fpx.shipments.splitView", embedEnabled ? "1" : "0"); } catch {}
+  }, [embedEnabled]);
   // Page-level sub-tab is route-driven so reps can deep-link / bookmark
   // a specific view (carrier followups, customer followups, all tasks).
   // /tasks                       → "all"
@@ -225,6 +246,14 @@ export function TasksPage() {
     let list = tasks;
     if (statusFilter === "active") list = list.filter((t) => t.status === "open" || t.status === "in_progress");
     else if (statusFilter) list = list.filter((t) => t.status === statusFilter);
+    if (modeFilter) {
+      const want = modeFilter.toLowerCase();
+      list = list.filter((t) => {
+        const m = (t.shipment_mode || "").trim().toLowerCase();
+        if (want === "__none__") return !m;
+        return m === want;
+      });
+    }
     const q = search.trim().toLowerCase();
     if (q) {
       list = list.filter((t) => {
@@ -234,7 +263,7 @@ export function TasksPage() {
       });
     }
     return list.map((t) => t.id);
-  }, [tasks, statusFilter, search]);
+  }, [tasks, statusFilter, modeFilter, search]);
   const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
   function toggle(id: string) {
     setSelected((prev) => {
@@ -298,29 +327,6 @@ export function TasksPage() {
     }
   }
 
-  // "Start all open" — one-click bulk-start of every currently visible
-  // open task. Acts on the local filtered list so it matches what the user
-  // sees on screen.
-  async function startAllOpen() {
-    if (bulkBusy) return;
-    const ids = tasks.filter((t) => t.status === "open").map((t) => t.id);
-    if (!ids.length) { setError("No open tasks to start."); return; }
-    if (!confirm(`Start ${ids.length} open task${ids.length === 1 ? "" : "s"}? Each moves to "In Progress".`)) return;
-    setBulkBusy(true);
-    setError(null);
-    try {
-      const r = await api.tasks.bulkUpdate({ ids, status: "in_progress" });
-      if (r.updated !== ids.length) {
-        setError(`Started ${r.updated} of ${ids.length} tasks.`);
-      }
-      await load(true);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBulkBusy(false);
-    }
-  }
-
   // `silent=true` skips the loading flag so a post-bulk-mutation reload
   // doesn't blank the entire task list to LoadingState. The previous rows
   // stay visible until the new data lands and the swap is invisible.
@@ -349,6 +355,14 @@ export function TasksPage() {
     let list = tasks;
     if (statusFilter === "active") list = list.filter((t) => t.status === "open" || t.status === "in_progress");
     else if (statusFilter) list = list.filter((t) => t.status === statusFilter);
+    if (modeFilter) {
+      const want = modeFilter.toLowerCase();
+      list = list.filter((t) => {
+        const m = (t.shipment_mode || "").trim().toLowerCase();
+        if (want === "__none__") return !m;
+        return m === want;
+      });
+    }
     const q = search.trim().toLowerCase();
     if (q) {
       list = list.filter((t) => {
@@ -363,7 +377,21 @@ export function TasksPage() {
       });
     }
     return list;
-  }, [tasks, statusFilter, search]);
+  }, [tasks, statusFilter, modeFilter, search]);
+
+  // Distinct shipment modes present in the current task list — drives the
+  // mode filter dropdown. Always includes LTL + Parcel even if empty so
+  // the operator's mental model matches what the dropdown shows; any
+  // additional modes (truckload, ocean, intermodal) appear dynamically.
+  const availableModes = useMemo(() => {
+    const set = new Set<string>(["LTL", "Parcel"]);
+    let hasNoMode = false;
+    for (const t of tasks) {
+      const m = (t.shipment_mode || "").trim();
+      if (m) set.add(m); else hasNoMode = true;
+    }
+    return { modes: Array.from(set).sort((a, b) => a.localeCompare(b)), hasNoMode };
+  }, [tasks]);
 
   // Filter changes are now client-side over the already-loaded list, so we
   // only fetch on mount + on explicit Refresh.
@@ -573,64 +601,94 @@ export function TasksPage() {
           <div className="inline-flex rounded-lg ring-1 ring-slate-200 bg-white overflow-hidden">
             <button
               onClick={() => setViewMode("table")}
-              className={"px-2.5 py-2 text-sm flex items-center gap-1.5 " + (viewMode === "table" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50")}
+              className={"px-3 py-2 text-sm inline-flex items-center gap-1.5 transition " + (viewMode === "table" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50")}
               title="Table view"
               aria-pressed={viewMode === "table"}
             >
-              <TableIcon className="h-4 w-4" />
+              <TableIcon className="h-4 w-4 shrink-0" />
+              <span>Table</span>
             </button>
             <button
               onClick={() => setViewMode("kanban")}
-              className={"px-2.5 py-2 text-sm flex items-center gap-1.5 " + (viewMode === "kanban" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50")}
+              className={"px-3 py-2 text-sm inline-flex items-center gap-1.5 border-l border-slate-200 transition " + (viewMode === "kanban" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50")}
               title="Kanban view"
               aria-pressed={viewMode === "kanban"}
             >
-              <LayoutGrid className="h-4 w-4" />
+              <LayoutGrid className="h-4 w-4 shrink-0" />
+              <span>Kanban</span>
             </button>
           </div>
-          <button
-            onClick={startAllOpen}
-            disabled={bulkBusy || counts.open === 0}
-            className="rounded-lg bg-sky-600 text-white text-sm px-3 py-2 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
-            title="Mark every open task as In Progress"
-          >
-            <Rocket className="h-4 w-4 shrink-0" />
-            <span>{bulkBusy ? "Starting…" : `Start all open (${counts.open})`}</span>
-          </button>
-          {/* Walk-through scope: prefer the currently-visible filter, but
-              fall back to the "active" set (open + in_progress) when the
-              filter has nothing to walk. That way the button never goes
-              dead just because the user happens to be on a Done / Blocked
-              filter — they can always launch a review queue from here. */}
+          {/* Combined "Start & walk through" — one click bulk-starts every
+              open task in the walk scope (moves them to In Progress) and
+              then opens the first task's drawer so the operator can step
+              through them with n / p. Walk scope mirrors what's visible
+              under the current filter, falling back to the active set
+              (open + in_progress) when the filter has nothing to walk so
+              the button is never dead from a Done / Blocked filter. */}
           {(() => {
             const activeTasks = tasks.filter((t) => t.status === "open" || t.status === "in_progress");
             const walkScope = visibleTasks.length > 0 ? visibleTasks : activeTasks;
             const walkCount = walkScope.length;
             const fallbackHint = visibleTasks.length === 0 && activeTasks.length > 0;
+            const openInScope = walkScope.filter((t) => t.status === "open").map((t) => t.id);
             return (
               <button
-                onClick={() => {
+                onClick={async () => {
+                  if (bulkBusy) return;
                   const first = walkScope.find((t) => t.shipment_id);
                   if (!first) { setError("No task with a shipment to walk through."); return; }
-                  // If the current filter is empty and we fell back to
-                  // active, also flip the filter so the user sees the list
-                  // they're walking — keeps prev/next consistent with the
-                  // visible chip in the header.
+                  // Bulk-start any open tasks in scope first so the walk
+                  // begins with everything already In Progress. Skipped
+                  // when the scope has no open tasks (e.g. walking the
+                  // Done filter as a review queue).
+                  if (openInScope.length > 0) {
+                    setBulkBusy(true);
+                    setError(null);
+                    try {
+                      const r = await api.tasks.bulkUpdate({ ids: openInScope, status: "in_progress" });
+                      if (r.updated !== openInScope.length) {
+                        setError(`Started ${r.updated} of ${openInScope.length} tasks.`);
+                      }
+                      await load(true);
+                    } catch (e) {
+                      setError((e as Error).message);
+                      setBulkBusy(false);
+                      return;
+                    }
+                    setBulkBusy(false);
+                  }
                   if (fallbackHint) setStatusFilter("active");
                   setFocusedId(first.id);
                   nav.openTask(first.id);
                 }}
-                disabled={walkCount === 0}
+                disabled={walkCount === 0 || bulkBusy}
                 className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                title={fallbackHint
-                  ? `Current filter has no tasks — walking the ${walkCount} active task${walkCount === 1 ? "" : "s"} instead`
-                  : "Open the first visible task and walk through them with n / p"}
+                title={openInScope.length > 0
+                  ? `Start ${openInScope.length} open task${openInScope.length === 1 ? "" : "s"} and walk through ${walkCount}`
+                  : fallbackHint
+                    ? `Current filter has no tasks — walking the ${walkCount} active task${walkCount === 1 ? "" : "s"} instead`
+                    : `Walk through ${walkCount} task${walkCount === 1 ? "" : "s"} with n / p`}
               >
-                <ChevronRight className="h-4 w-4 shrink-0" />
-                <span>Walk through ({walkCount})</span>
+                <Rocket className="h-4 w-4 shrink-0" />
+                <span>{bulkBusy ? "Starting…" : `Start & walk (${walkCount})`}</span>
               </button>
             );
           })()}
+          {/* Mini toggle: load the FreightPOP iframe alongside the task
+              drawer? Shared with the Shipments-page panel toggle via
+              localStorage so reps have one switch, not two. */}
+          <label
+            className="inline-flex items-center gap-1.5 text-xs text-slate-600 select-none cursor-pointer px-2 py-2 rounded-lg ring-1 ring-slate-200 bg-white hover:bg-slate-50"
+            title="Load the FreightPOP grid in the left pane while walking tasks"
+          >
+            <input
+              type="checkbox"
+              checked={embedEnabled}
+              onChange={(e) => setEmbedEnabled(e.target.checked)}
+              className="h-3.5 w-3.5 accent-violet-600 cursor-pointer"
+            />
+            <span>FreightPOP embed</span>
+          </label>
           {/* Free-text filter. Searches Shipment ID (FreightPOP), tracking
               number, title, description, and assignee in a single box. */}
           <div className="relative">
@@ -666,6 +724,18 @@ export function TasksPage() {
             <option value="blocked">Blocked</option>
             <option value="done">Done</option>
             <option value="cancelled">Cancelled</option>
+          </select>
+          <select
+            value={modeFilter}
+            onChange={(e) => setModeFilter(e.target.value)}
+            className="rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white"
+            title="Filter by shipment mode (LTL, Parcel, etc.)"
+          >
+            <option value="">All modes</option>
+            {availableModes.modes.map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+            {availableModes.hasNoMode ? <option value="__none__">(no mode)</option> : null}
           </select>
           <button
             onClick={() => setHelpOpen(true)}
@@ -1232,10 +1302,14 @@ function KanbanCard({ task, focused, onFocus, onSetStatus, onOpenTask, onDragSta
       className={
         "bg-white rounded-lg ring-1 p-2.5 cursor-grab active:cursor-grabbing transition " +
         (focused ? "ring-2 ring-sky-400 shadow-sm" : "ring-slate-200 hover:ring-slate-300") +
-        (dragging ? " opacity-50" : "")
+        (dragging ? " opacity-50" : "") +
+        (task.status === "done" ? " opacity-70" : "")
       }
     >
-      <div className="text-sm text-slate-900 font-medium leading-snug line-clamp-3">
+      <div className={
+        "text-sm font-medium leading-snug line-clamp-3 " +
+        (task.status === "done" ? "line-through text-slate-400" : "text-slate-900")
+      }>
         {task.title}
       </div>
       <div className="mt-2 flex items-center gap-2 flex-wrap">
@@ -1758,6 +1832,15 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
         task_ids: includedItems.map((it) => it.task.id),
         notes: notes.trim() || undefined,
       });
+      // Default-copy the freshly generated draft to the clipboard so
+      // the rep can paste straight into their mail client. The Copy
+      // button stays usable for re-copying after edits or when the
+      // initial write was blocked (focus loss, perms).
+      try {
+        await navigator.clipboard.writeText(`Subject: ${r.subject || ""}\n\n${r.body || ""}`);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } catch { /* clipboard blocked — manual Copy button remains */ }
       // Refetch the list — the server just inserted a new analyses
       // row and we want the modal to reflect it (new draft, accurate
       // timestamps, future drafts also pickable).
@@ -1787,14 +1870,39 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
   // already active clears the rating (mistaken click). Updates the
   // local list optimistically; on error, refetches from the server.
   const [rateBusy, setRateBusy] = useState(false);
+  // Local mirror of rating_reason for the selected draft. Synced when
+  // the user picks a different draft so the textarea reflects what's
+  // actually persisted on that row.
+  const [draftReason, setDraftReason] = useState<string>("");
+  const [draftReasonSaved, setDraftReasonSaved] = useState<string>("");
+  const [draftReasonSaving, setDraftReasonSaving] = useState(false);
+  useEffect(() => {
+    setDraftReason(selected?.rating_reason || "");
+    setDraftReasonSaved(selected?.rating_reason || "");
+  }, [selected?.id, selected?.rating, selected?.rating_reason]);
   async function rateDraft(rating: "up" | "down") {
     if (!selected || rateBusy) return;
     const next = selected.rating === rating ? null : rating;
+    const reasonForRequest = next ? (draftReason.trim() || undefined) : undefined;
     setRateBusy(true);
     // Optimistic local update so the click feels instant.
-    setDrafts((prev) => prev.map((d) => d.id === selected.id ? { ...d, rating: next, rated_by: d.rated_by, rated_at: next ? new Date().toISOString() : null } : d));
+    setDrafts((prev) => prev.map((d) => d.id === selected.id ? {
+      ...d,
+      rating: next,
+      rated_by: d.rated_by,
+      rated_at: next ? new Date().toISOString() : null,
+      rating_reason: next ? (draftReason.trim() || null) : null,
+    } : d));
     try {
-      await api.analyses.rate(selected.id, { rating: next });
+      const r = await api.analyses.rate(selected.id, { rating: next, reason: reasonForRequest });
+      setDrafts((prev) => prev.map((d) => d.id === selected.id ? {
+        ...d,
+        rating: r.analysis.rating,
+        rated_by: r.analysis.rated_by,
+        rated_at: r.analysis.rated_at,
+        rating_reason: r.analysis.rating_reason,
+      } : d));
+      setDraftReasonSaved(r.analysis.rating_reason || "");
     } catch (e) {
       setErr((e as Error).message);
       // Roll back by refetching the canonical list.
@@ -1804,6 +1912,30 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
       } catch { /* leave optimistic state in place */ }
     } finally {
       setRateBusy(false);
+    }
+  }
+  // Persist the reason on blur if the operator actually changed it.
+  // Server clears rating_reason whenever rating is null, so we don't
+  // bother sending a reason without an active rating.
+  async function saveDraftReason() {
+    if (!selected || !selected.rating) return;
+    const trimmed = draftReason.trim();
+    if (trimmed === (draftReasonSaved || "").trim()) return;
+    setDraftReasonSaving(true);
+    try {
+      const r = await api.analyses.rate(selected.id, { rating: selected.rating, reason: trimmed });
+      setDrafts((prev) => prev.map((d) => d.id === selected.id ? {
+        ...d,
+        rating: r.analysis.rating,
+        rated_by: r.analysis.rated_by,
+        rated_at: r.analysis.rated_at,
+        rating_reason: r.analysis.rating_reason,
+      } : d));
+      setDraftReasonSaved(r.analysis.rating_reason || "");
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setDraftReasonSaving(false);
     }
   }
 
@@ -2024,47 +2156,71 @@ function FollowupGroupEmailModal({ group, kind, onClose }: {
                 {/* Prompt-quality rating. Reps mark drafts 👍 / 👎 so
                     the team can iterate. Clicking the active thumb
                     clears the rating. Both icon + label so the
-                    affordance is unambiguous. */}
-                <div className="flex items-center justify-between gap-3 flex-wrap rounded-lg ring-1 ring-slate-200 bg-slate-50 px-3 py-2">
-                  <div className="text-[11px] text-slate-500 leading-snug">
-                    <span className="font-semibold text-slate-700">Was this draft useful?</span>
-                    <span> Your feedback helps us tune the prompts.</span>
-                    {selected.rated_by ? (
-                      <span className="block text-slate-400 mt-0.5">
-                        Last rated by {selected.rated_by} {selected.rated_at ? fmtRelative(selected.rated_at) : ""}
-                      </span>
-                    ) : null}
+                    affordance is unambiguous. The reason textarea is
+                    only shown once a rating is set — the server
+                    clears rating_reason whenever rating is null. */}
+                <div className="flex flex-col gap-2 rounded-lg ring-1 ring-slate-200 bg-slate-50 px-3 py-2">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="text-[11px] text-slate-500 leading-snug">
+                      <span className="font-semibold text-slate-700">Was this draft useful?</span>
+                      <span> Your feedback helps us tune the prompts.</span>
+                      {selected.rated_by ? (
+                        <span className="block text-slate-400 mt-0.5">
+                          Last rated by {selected.rated_by} {selected.rated_at ? fmtRelative(selected.rated_at) : ""}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => rateDraft("up")}
+                        disabled={rateBusy}
+                        className={
+                          "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
+                          (selected.rating === "up"
+                            ? "bg-emerald-600 text-white ring-emerald-700"
+                            : "bg-white text-slate-700 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
+                        }
+                        aria-pressed={selected.rating === "up"}
+                        title={selected.rating === "up" ? "Click again to clear" : "Mark this draft as useful"}
+                      >
+                        <ThumbsUp className="h-3.5 w-3.5" /> Good
+                      </button>
+                      <button
+                        onClick={() => rateDraft("down")}
+                        disabled={rateBusy}
+                        className={
+                          "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
+                          (selected.rating === "down"
+                            ? "bg-rose-600 text-white ring-rose-700"
+                            : "bg-white text-slate-700 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
+                        }
+                        aria-pressed={selected.rating === "down"}
+                        title={selected.rating === "down" ? "Click again to clear" : "Mark this draft as not useful"}
+                      >
+                        <ThumbsDown className="h-3.5 w-3.5" /> Needs work
+                      </button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      onClick={() => rateDraft("up")}
-                      disabled={rateBusy}
-                      className={
-                        "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
-                        (selected.rating === "up"
-                          ? "bg-emerald-600 text-white ring-emerald-700"
-                          : "bg-white text-slate-700 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
-                      }
-                      aria-pressed={selected.rating === "up"}
-                      title={selected.rating === "up" ? "Click again to clear" : "Mark this draft as useful"}
-                    >
-                      <ThumbsUp className="h-3.5 w-3.5" /> Good
-                    </button>
-                    <button
-                      onClick={() => rateDraft("down")}
-                      disabled={rateBusy}
-                      className={
-                        "inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2.5 py-1.5 ring-1 transition disabled:opacity-50 " +
-                        (selected.rating === "down"
-                          ? "bg-rose-600 text-white ring-rose-700"
-                          : "bg-white text-slate-700 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
-                      }
-                      aria-pressed={selected.rating === "down"}
-                      title={selected.rating === "down" ? "Click again to clear" : "Mark this draft as not useful"}
-                    >
-                      <ThumbsDown className="h-3.5 w-3.5" /> Needs work
-                    </button>
-                  </div>
+                  {selected.rating ? (
+                    <div className="flex items-start gap-2">
+                      <textarea
+                        value={draftReason}
+                        onChange={(e) => setDraftReason(e.target.value.slice(0, 500))}
+                        onBlur={saveDraftReason}
+                        disabled={rateBusy || draftReasonSaving}
+                        rows={2}
+                        placeholder={selected.rating === "up"
+                          ? "What worked? (optional) — feeds the next prompt iteration"
+                          : "What was wrong? (optional) — feeds the next prompt iteration"}
+                        className="w-full text-xs text-slate-700 rounded-md ring-1 ring-slate-200 bg-white px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-slate-400 disabled:opacity-50 resize-y"
+                      />
+                      {draftReasonSaving ? (
+                        <span className="text-[10px] text-slate-400 mt-1.5 shrink-0">Saving…</span>
+                      ) : draftReason.trim() && draftReason.trim() !== (draftReasonSaved || "").trim() ? (
+                        <span className="text-[10px] text-slate-400 mt-1.5 shrink-0">Unsaved</span>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               </div>
             ) : !loadingDrafts && !busy ? (

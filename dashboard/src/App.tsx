@@ -30,12 +30,14 @@ const SettingsPage    = lazy(() => import("./pages/Settings").then((m) => ({ def
 const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default: m.OpsPage })));
 const ServicesPage    = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServicesPage })));
 const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServiceDetailPage })));
+const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
   tracking: "/tracking",
   tasks: "/tasks",
   ops: "/ops",
+  notes: "/notes",
   analyses: "/analyses",
   gp: "/audits/gp",
   invoice: "/audits/invoice",
@@ -46,9 +48,10 @@ const TAB_PATH: Record<TabId, string> = {
   audit: "/admin/audit",
   settings: "/admin/settings",
   services: "/admin/services",
+  ai_export: "/admin/ai-export",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -58,10 +61,12 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/audit")) return "audit";
   if (pathname.startsWith("/admin/settings")) return "settings";
   if (pathname.startsWith("/admin/services")) return "services";
+  if (pathname.startsWith("/admin/ai-export")) return "ai_export";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
+  if (pathname.startsWith("/notes")) return "notes";
   if (pathname.startsWith("/analyses")) return "analyses";
   if (pathname.startsWith("/shares")) return "shares";
   if (pathname.startsWith("/feedback")) return "feedback";
@@ -216,6 +221,7 @@ function AuthedApp() {
             <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
             <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
             <Route path="/ops" element={<OpsPage />} />
+            <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
@@ -230,6 +236,7 @@ function AuthedApp() {
                 <Route path="/admin/settings/:section" element={<SettingsPage />} />
                 <Route path="/admin/services" element={<ServicesPage />} />
                 <Route path="/admin/services/:slug" element={<ServiceDetailPage />} />
+                <Route path="/admin/ai-export" element={<AiExportPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tracking" replace />} />
@@ -237,6 +244,25 @@ function AuthedApp() {
         </Suspense>
       </Layout>
     </NavCtx.Provider>
+  );
+}
+
+// /notes — same Shipments table, mounted with the "With notes" filter
+// pre-applied so the team has a one-click entry point to every shipment
+// that carries an operator note. The drawer + export still work as
+// usual; clicking a row pushes /tracking/:id (drawer follows the same
+// URL convention as the Tracking tab).
+function NotesRoute() {
+  const navigate = useNavigate();
+  return (
+    <ShipmentsPage
+      notesMode
+      onDrawerChange={(nextId, nextSection) => {
+        if (!nextId) navigate("/notes");
+        else if (nextSection) navigate(`/tracking/${nextId}/${nextSection}`);
+        else navigate(`/tracking/${nextId}`);
+      }}
+    />
   );
 }
 
@@ -298,6 +324,13 @@ function TaskWalkRoute() {
   // request all manifest as a hung fetch — the timeout gives the user a
   // way out.
   const [stalled, setStalled] = useState(false);
+  // Auto-skip when the task points at a shipment that's already
+  // delivered or has been soft-archived (= no longer in the FreightPOP
+  // grid). The walk would otherwise pin the operator on a row whose
+  // iframe filter returns zero rows, with no way to know whether the
+  // FP grid is just slow or the shipment is genuinely gone. A 5s
+  // countdown gives them time to override before we move on.
+  const [autoSkip, setAutoSkip] = useState<{ reason: string } | null>(null);
 
   useEffect(() => {
     if (!taskId) return;
@@ -329,6 +362,41 @@ function TaskWalkRoute() {
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; clearTimeout(stallTimer); };
   }, [taskId, reloadKey]);
+
+  // Probe the shipment for delivered / archived state in parallel with
+  // the task lookup. Fires whenever the focused shipment changes (i.e.
+  // every walk step). We deliberately don't tie this to onDrawerChange
+  // — the drawer's own fetch may not have happened yet by the time the
+  // operator wants to know "is this one even worth landing on?".
+  useEffect(() => {
+    setAutoSkip(null);
+    if (!resolved?.shipmentId) return;
+    let cancelled = false;
+    api.shipments.get(resolved.shipmentId).then((r) => {
+      if (cancelled) return;
+      const ship = r.shipment;
+      const archived = !!(ship as { archived_at?: string | null }).archived_at;
+      const status = (ship.shipment_status || "").toLowerCase();
+      const delivered = status.includes("delivered") || status.includes("complete");
+      if (archived) {
+        setAutoSkip({ reason: "This shipment is no longer in the FreightPOP grid (auto-archived)." });
+      } else if (delivered) {
+        setAutoSkip({ reason: "This shipment is marked delivered." });
+      }
+    }).catch(() => { /* non-fatal — leave the operator on the task */ });
+    return () => { cancelled = true; };
+  }, [resolved?.shipmentId]);
+
+  // 5s auto-advance once an auto-skip condition is detected. Cleared on
+  // taskId change so navigating manually disarms the timer.
+  useEffect(() => {
+    if (!autoSkip || !resolved) return;
+    const t = setTimeout(() => {
+      if (resolved.nextTaskId) navigate(`/tasks/${resolved.nextTaskId}`);
+      else navigate("/tasks");
+    }, 5000);
+    return () => clearTimeout(t);
+  }, [autoSkip, resolved, navigate]);
 
   if (error) {
     return (
@@ -381,7 +449,33 @@ function TaskWalkRoute() {
   void loading;
 
   return (
-    <ShipmentsPage
+    <>
+      {autoSkip ? (
+        <div className="sticky top-0 z-30 bg-amber-50 ring-1 ring-amber-200 px-4 py-2 text-amber-900 text-sm flex items-center justify-between gap-3">
+          <div>
+            <span className="font-medium">Skipping in 5s.</span>{" "}
+            <span className="text-amber-800">{autoSkip.reason}</span>
+          </div>
+          <div className="flex items-center gap-3 text-xs">
+            <button
+              onClick={() => {
+                if (resolved.nextTaskId) navigate(`/tasks/${resolved.nextTaskId}`);
+                else navigate("/tasks");
+              }}
+              className="px-2 py-1 rounded-md bg-amber-600 text-white hover:bg-amber-700"
+            >
+              Skip now
+            </button>
+            <button
+              onClick={() => setAutoSkip(null)}
+              className="text-amber-800 hover:text-amber-900 hover:underline"
+            >
+              Stay
+            </button>
+          </div>
+        </div>
+      ) : null}
+      <ShipmentsPage
       initialShipmentId={resolved.shipmentId}
       drawerSection={section || null}
       onShipmentConsumed={() => { /* URL already has the task id */ }}
@@ -409,6 +503,7 @@ function TaskWalkRoute() {
         onTaskStatusChanged: () => setReloadKey((k) => k + 1),
       }}
     />
+    </>
   );
 }
 

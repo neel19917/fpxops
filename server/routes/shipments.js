@@ -94,21 +94,114 @@ async function autoAnalyzeUpserted(req, upsertedIds, { materialChangedIds = new 
 // create one open task per shipment that doesn't already have one. The task
 // title comes from the AI recommendation (or issue) so the broker sees what
 // to do without clicking in. Returns the count created.
-async function autoCreateActionTasks(req, upsertedRows) {
+// Shared post-upsert pipeline used by both the single and bulk POST
+// branches. Records scrape history, flags stale manual overrides,
+// stamps last_material_change_at on materially-changed rows, and
+// kicks off the background analyze + auto-task + auto-draft pass.
+// Inputs are pre-built by the caller so both branches stay symmetric:
+//   mapped[]:       the rows we just upserted (shape from mapShipment*)
+//   data[]:         the upsert response — id + canonical columns
+//   rawByTracking:  raw extension payloads keyed by tracking_number
+//   priorByTracking: prior shipments keyed by tracking_number (pre-upsert)
+//   diffByTracking:  material diff keyed by tracking_number
+//   runnerName:     who scraped (header / api key name / email)
+// Returns { materialChangedIds: Set, staleTargets: string[] }.
+async function runPostUpsertFlow(req, {
+  mapped, data, rawByTracking, priorByTracking, diffByTracking, runnerName,
+}) {
+  const idByTracking = new Map(data.map((r) => [r.tracking_number, r.id]));
+  const materialChangedIds = new Set(
+    Array.from(diffByTracking.keys())
+      .map((t) => idByTracking.get(t))
+      .filter(Boolean),
+  );
+
+  // Persist one fpx_shipment_scrapes row per scraped item.
+  const scrapePayloads = mapped.map((m) => ({
+    shipmentId: idByTracking.get(m.tracking_number),
+    trackingNumber: m.tracking_number,
+    scrapedBy: runnerName,
+    raw: rawByTracking.get(m.tracking_number) || {},
+    diff: diffByTracking.get(m.tracking_number) || null,
+    triggeredReanalysis: false,
+  }));
+  const scrapeRecordPromise = recordScrapeBatch(scrapePayloads);
+
+  // Mark manual overrides as stale when new material data arrives.
+  const staleTargets = mapped
+    .filter((m) => diffByTracking.has(m.tracking_number) && priorByTracking.get(m.tracking_number)?.action_source === "manual")
+    .map((m) => idByTracking.get(m.tracking_number))
+    .filter(Boolean);
+  if (staleTargets.length) {
+    await supabase.from("fpx_shipments")
+      .update({ action_override_stale: true })
+      .in("id", staleTargets);
+  }
+
+  // Stamp last_material_change_at for every materially-changed shipment.
+  if (materialChangedIds.size) {
+    const stamp = new Date().toISOString();
+    await supabase.from("fpx_shipments")
+      .update({ last_material_change_at: stamp })
+      .in("id", Array.from(materialChangedIds));
+  }
+
+  // Background: re-analyze + tasks + drafts. The diffByTracking flows
+  // into auto-task creation so each task description ends with a Change
+  // log section showing what moved between scrapes.
+  const upsertedIds = data.map((r) => r.id);
+  const backgroundWork = (async () => {
+    const freshlyAnalyzed = await autoAnalyzeUpserted(req, upsertedIds, { materialChangedIds });
+    const byId = new Map(data.map((r) => [r.id, r]));
+    for (const r of freshlyAnalyzed) byId.set(r.id, r);
+    const settled = Array.from(byId.values());
+    const tasks = await autoCreateActionTasks(req, settled, { diffByTracking });
+    const drafts = await autoDraftEmails(settled);
+    if (tasks || drafts || freshlyAnalyzed.length) {
+      console.log(`[FPX] post-upload: ${freshlyAnalyzed.length} (re)analyzed, ${tasks} task(s), ${drafts} draft(s)`);
+    }
+  })().catch((e) => console.warn("[FPX] post-upload background failed:", e.message));
+  // Don't await — let scrape recording + background drain on their own.
+  void backgroundWork;
+  void scrapeRecordPromise;
+
+  return { materialChangedIds, staleTargets };
+}
+
+// Format a material-diff object as a human-readable change log block.
+// Returns "" when there's nothing to log so callers can safely concat
+// without an extra section header for unchanged shipments.
+function formatChangeLog(diff) {
+  if (!diff || typeof diff !== "object") return "";
+  const lines = [];
+  for (const [field, change] of Object.entries(diff)) {
+    if (!change || typeof change !== "object") continue;
+    const prev = change.prev == null || change.prev === "" ? "—" : String(change.prev);
+    const next = change.next == null || change.next === "" ? "—" : String(change.next);
+    lines.push(`- ${field}: ${prev} → ${next}`);
+  }
+  if (!lines.length) return "";
+  return ["Change log:", ...lines].join("\n");
+}
+
+async function autoCreateActionTasks(req, upsertedRows, { diffByTracking = new Map() } = {}) {
   const candidates = (upsertedRows || []).filter(
     (s) => String(s.action_required || "").toUpperCase() === "YES"
   );
   if (!candidates.length) return 0;
   const ids = candidates.map((s) => s.id);
-  // Find which of these already have an open task; skip those.
-  // Archived tasks (shipment was delivered/auto-archived) don't count —
-  // we want to create a fresh task if the shipment came back into the
-  // dashboard with a new issue.
+  // Skip shipments where the rep has already engaged with a task — open
+  // and in_progress are obviously dedup'd, but a *done* or *cancelled*
+  // task means the rep already worked it; we shouldn't re-spawn the
+  // same task on the next scrape and stomp their decision. Archived
+  // tasks (shipment was delivered/auto-archived) still don't count —
+  // a shipment that comes back into the dashboard with a new issue
+  // should get a fresh task.
   const { data: existing } = await supabase
     .from("fpx_shipment_tasks")
     .select("shipment_id")
     .in("shipment_id", ids)
-    .in("status", ["open", "in_progress"])
+    .in("status", ["open", "in_progress", "done", "cancelled"])
     .is("archived_at", null);
   const taken = new Set((existing || []).map((r) => r.shipment_id));
   const toCreate = candidates.filter((s) => !taken.has(s.id));
@@ -129,11 +222,18 @@ async function autoCreateActionTasks(req, upsertedRows) {
       tgt === "carrier" ? "Carrier followup: "
       : tgt === "customer" ? "Customer followup: "
       : "";
+    // Append the material diff (what moved between scrapes) so the rep
+    // sees exactly what changed without opening the drawer's history
+    // tab. First-sighting shipments have no diff and the section is
+    // omitted cleanly.
+    const changeLog = formatChangeLog(diffByTracking.get(s.tracking_number));
+    const description = [s.ai_issue, s.ai_recommendation, changeLog]
+      .filter(Boolean).join("\n\n");
     return {
       shipment_id: s.id,
       tracking_number: s.tracking_number,
       title: prefix + reasonLine,
-      description: [s.ai_issue, s.ai_recommendation].filter(Boolean).join("\n\n"),
+      description,
       status: "open",
       priority: "high",
       assigned_to: s.created_by || null,
@@ -304,12 +404,36 @@ shipmentsRouter.post("/", async (req, res) => {
   if (single) {
     const mapped = mapShipment(single, runnerName);
     if (!mapped || !mapped.tracking_number) return res.status(400).json({ error: "tracking_number required" });
+    preserveExistingAi([mapped]);
+
+    // Pull prior so the diff sees what moved before the upsert clobbers
+    // the row. Mirrors the bulk path so single-shipment scrapes get the
+    // same Change log + dedup + scrape history treatment.
+    const cols = ["id", "tracking_number", "action_source", ...MATERIAL_FIELDS].join(", ");
+    const { data: prior } = await supabase
+      .from("fpx_shipments").select(cols).eq("tracking_number", mapped.tracking_number).maybeSingle();
+    const priorByTracking = new Map();
+    if (prior) priorByTracking.set(mapped.tracking_number, prior);
+    const diff = computeMaterialDiff(prior, mapped);
+    const diffByTracking = new Map();
+    if (diff) diffByTracking.set(mapped.tracking_number, diff);
+
     const { data, error } = await supabase
       .from("fpx_shipments")
       .upsert(mapped, { onConflict: "tracking_number" })
       .select()
       .single();
     if (error) return res.status(500).json({ error: error.message });
+
+    const rawByTracking = new Map([[mapped.tracking_number, single]]);
+    await runPostUpsertFlow(req, {
+      mapped: [mapped],
+      data: [data],
+      rawByTracking,
+      priorByTracking,
+      diffByTracking,
+      runnerName,
+    });
     return res.json({ shipment: data });
   }
   if (Array.isArray(bulk)) {
@@ -347,69 +471,19 @@ shipmentsRouter.post("/", async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     const upsertedIds = data.map((r) => r.id);
-    const idByTracking = new Map(data.map((r) => [r.tracking_number, r.id]));
-    // Set of fpx_shipments.id whose latest scrape had material changes.
-    const materialChangedIds = new Set(
-      Array.from(diffByTracking.keys())
-        .map((t) => idByTracking.get(t))
-        .filter(Boolean),
-    );
 
-    // ---- Persist one fpx_shipment_scrapes row per scraped item ----------
-    const scrapePayloads = mapped.map((m, i) => ({
-      shipmentId: idByTracking.get(m.tracking_number),
-      trackingNumber: m.tracking_number,
-      scrapedBy: runnerName,
-      raw: bulk[i],                       // full raw extension payload, not the mapped row
-      diff: diffByTracking.get(m.tracking_number) || null,
-      triggeredReanalysis: false,         // flipped after we know which got re-analyzed
-    }));
-    // Fire off scrape recording in parallel with the rest of background work.
-    const scrapeRecordPromise = recordScrapeBatch(scrapePayloads);
-
-    // ---- Mark manual overrides as stale when new material data arrives -
-    // We don't change action_required (operator's choice still wins), but we
-    // raise a flag so the dashboard can prompt "this override may be out of
-    // date." Cleared back to false on next clean scrape (handled below).
-    const staleTargets = mapped
-      .filter((m) => diffByTracking.has(m.tracking_number) && priorByTracking.get(m.tracking_number)?.action_source === "manual")
-      .map((m) => idByTracking.get(m.tracking_number))
-      .filter(Boolean);
-    if (staleTargets.length) {
-      await supabase.from("fpx_shipments")
-        .update({ action_override_stale: true })
-        .in("id", staleTargets);
+    // Single shared post-upsert pipeline. Records scrape history,
+    // flags stale manual overrides, stamps last_material_change_at,
+    // and runs the background analyze + auto-task + auto-draft pass
+    // (with the diff plumbed through so each task description gets a
+    // Change log section).
+    const rawByTracking = new Map();
+    for (let i = 0; i < mapped.length; i += 1) {
+      rawByTracking.set(mapped[i].tracking_number, bulk[i]);
     }
-    // Conversely, if a manual override row scraped with no material change,
-    // and was previously marked stale, leave it as-is — only operator action
-    // clears stale once it's set. (Avoids flapping if the carrier flips a
-    // status field then flips it back.)
-
-    // Stamp last_material_change_at for every materially-changed
-    // shipment so the Tracking table can render a "just changed"
-    // pill on those rows. Same timestamp for the batch — operators
-    // think in scrape-events, not row-by-row instants. Skipped when
-    // no material changes happened so we don't churn the column on
-    // every unchanged scrape.
-    if (materialChangedIds.size) {
-      const stamp = new Date().toISOString();
-      await supabase.from("fpx_shipments")
-        .update({ last_material_change_at: stamp })
-        .in("id", Array.from(materialChangedIds));
-    }
-
-    // ---- Background: re-analyze + tasks + drafts -----------------------
-    const backgroundWork = (async () => {
-      const freshlyAnalyzed = await autoAnalyzeUpserted(req, upsertedIds, { materialChangedIds });
-      const byId = new Map(data.map((r) => [r.id, r]));
-      for (const r of freshlyAnalyzed) byId.set(r.id, r);
-      const settled = Array.from(byId.values());
-      const tasks = await autoCreateActionTasks(req, settled);
-      const drafts = await autoDraftEmails(settled);
-      if (tasks || drafts || freshlyAnalyzed.length) {
-        console.log(`[FPX] post-upload: ${freshlyAnalyzed.length} (re)analyzed, ${tasks} task(s), ${drafts} draft(s)`);
-      }
-    })().catch((e) => console.warn("[FPX] post-upload background failed:", e.message));
+    const { materialChangedIds, staleTargets } = await runPostUpsertFlow(req, {
+      mapped, data, rawByTracking, priorByTracking, diffByTracking, runnerName,
+    });
 
     logAudit(req, {
       action: "bulk_create",
@@ -422,9 +496,6 @@ shipmentsRouter.post("/", async (req, res) => {
         stale_overrides_flagged: staleTargets.length,
       },
     });
-    // Don't await background — let it drain. scrapeRecordPromise is logged-only.
-    void backgroundWork;
-    void scrapeRecordPromise;
     return res.json({
       count: data.length,
       ids: upsertedIds,

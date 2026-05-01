@@ -4,12 +4,25 @@ import { logAudit } from "../lib/audit.js";
 
 export const analysesRouter = Router();
 
-// GET /analyses?kind=&tracking_number=&limit=500
+// GET /analyses?kind=&tracking_number=&limit=500&from=&to=&model=&rating=&user_email=&source=
+// `from` / `to` are ISO timestamps. `rating` accepts "up", "down",
+// or "unrated" (the latter matches rows where rating IS NULL — useful
+// for the admin export page to slice ratings split).
 analysesRouter.get("/", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 500, 5000);
   let q = supabase.from("fpx_ai_analyses").select("*").order("created_at", { ascending: false }).limit(limit);
   if (req.query.kind) q = q.eq("kind", String(req.query.kind));
   if (req.query.tracking_number) q = q.eq("tracking_number", String(req.query.tracking_number));
+  if (req.query.model) q = q.eq("model", String(req.query.model));
+  if (req.query.user_email) q = q.eq("user_email", String(req.query.user_email));
+  if (req.query.source) q = q.eq("source", String(req.query.source));
+  if (req.query.from) q = q.gte("created_at", String(req.query.from));
+  if (req.query.to) q = q.lte("created_at", String(req.query.to));
+  if (req.query.rating === "up" || req.query.rating === "down") {
+    q = q.eq("rating", String(req.query.rating));
+  } else if (req.query.rating === "unrated") {
+    q = q.is("rating", null);
+  }
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json({ data: data || [] });
