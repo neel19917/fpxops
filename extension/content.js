@@ -5,13 +5,23 @@ let logRows = [];
 // on the next "View Shipment" click (one observer per shipment interaction).
 let activeDetailObserver = null;
 
+// Debug flag — flip to true while debugging to restore the verbose
+// console.log stream that used to fire on every scraped row, modal,
+// and Kendo inject. In production we run quiet so reps' DevTools
+// aren't drowned in [FPX] / [FPX-GP] / [FPX-INV] traffic during
+// 5-minute scrapes. Errors (console.warn) still surface unconditionally.
+const FPX_DEBUG = false;
+function dlog(...args) {
+  if (FPX_DEBUG) console.log(...args);
+}
+
 function sendStatus(text) {
-  console.log("[FPX]", text);
+  dlog("[FPX]", text);
   try { chrome.runtime.sendMessage({ type: "status", text }); } catch {}
 }
 
 function sendComplete(text) {
-  console.log("[FPX] COMPLETE:", text);
+  dlog("[FPX] COMPLETE:", text);
   try { chrome.runtime.sendMessage({ type: "complete", text }); } catch {}
 }
 
@@ -526,7 +536,7 @@ function scrapeModal() {
     }
   }
 
-  console.log("[FPX] Scraped modal data keys:", Object.keys(data).length);
+  dlog("[FPX] Scraped modal data keys:", Object.keys(data).length);
   return data;
 }
 
@@ -621,7 +631,7 @@ function collectShipmentJobs() {
   const trackingScrollIndex =
     trackingDataIndex >= 0 ? trackingDataIndex - lockedCount : -1;
 
-  console.log(
+  dlog(
     "[FPX] TrackingNumber data-index:",
     trackingDataIndex,
     "Pickup Response data-index:",
@@ -640,7 +650,7 @@ function collectShipmentJobs() {
       ? bodyRows
       : document.querySelectorAll(".k-grid tbody tr");
 
-  console.log("[FPX] Body rows found:", allRows.length);
+  dlog("[FPX] Body rows found:", allRows.length);
 
   const jobs = [];
 
@@ -686,7 +696,7 @@ function collectShipmentJobs() {
     }
   }
 
-  console.log("[FPX] Shipment jobs:", jobs.length);
+  dlog("[FPX] Shipment jobs:", jobs.length);
   sendStatus(
     `Found ${jobs.length} tracking link(s) on this page` +
       (pickupDataIndex >= 0
@@ -817,6 +827,13 @@ async function run(filterCol, filterVal) {
   // after upload (POST /api/shipments → background per-row Claude).
   stopRequested = false;
   logRows = [];
+  // Tracks every tracking number we see across the entire sweep (not just
+  // this page). On a clean unfiltered completion we ship this to the
+  // server so it can soft-archive shipments that have left the
+  // dashboard — FreightPOP hides delivered shipments, so absence here
+  // is the delivery signal. logRows is cleared per-page to bound memory,
+  // so we can't reconstruct the full set from it later.
+  const sweepTrackingNumbers = new Set();
 
   sendStatus("Checking server...");
   try {
@@ -862,6 +879,12 @@ async function run(filterCol, filterVal) {
     // round-trip to clear our reference.
     const slice = logRows;
     logRows = [];
+    // Memorize every tracking number leaving the page so we can compare
+    // against the DB at sweep-completion time.
+    for (const row of slice) {
+      const tn = row && row._trackingNumber;
+      if (tn) sweepTrackingNumbers.add(String(tn).trim());
+    }
     return new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: slice }, (r) => {
         if (r && r.ok) {
@@ -924,9 +947,32 @@ async function run(filterCol, filterVal) {
   // chrome.storage doesn't carry stale data into the next session.
   try { chrome.storage.local.remove("_fpxCheckpoint"); } catch {}
   try { chrome.runtime.sendMessage({ type: "aiSummary", text: "" }); } catch {}
+
+  // Auto-archive shipments that left the dashboard (i.e. delivered).
+  // Only when this was a clean unfiltered sweep — a filtered run can't
+  // tell delivered apart from filtered-out, and a stopped run hasn't
+  // visited every page so its set is incomplete.
+  let archiveSummary = "";
+  if (!filterCol && !filterVal && sweepTrackingNumbers.size > 0) {
+    sendStatus(`Reconciling delivered shipments (${sweepTrackingNumbers.size} seen)…`);
+    try {
+      const r = await chrome.runtime.sendMessage({
+        type: "sweepComplete",
+        trackingNumbers: Array.from(sweepTrackingNumbers),
+      });
+      if (r && r.ok && (r.archived_shipments > 0 || r.archived_tasks > 0)) {
+        archiveSummary = `, archived ${r.archived_shipments} delivered shipment${r.archived_shipments === 1 ? "" : "s"}` +
+          (r.archived_tasks > 0 ? ` and ${r.archived_tasks} task${r.archived_tasks === 1 ? "" : "s"}` : "");
+      }
+    } catch (e) {
+      // Best-effort — don't fail the sweep if archive RPC didn't land.
+      console.warn("[FPX] sweep-complete failed:", e?.message || e);
+    }
+  }
+
   const queuedButUnconfirmed = totalScraped - confirmedRows;
   sendComplete(
-    `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}. Open the dashboard to see analysis.`
+    `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}${archiveSummary}. Open the dashboard to see analysis.`
   );
 }
 
@@ -935,12 +981,12 @@ async function run(filterCol, filterVal) {
 // =====================================================================
 
 function sendGpStatus(text) {
-  console.log("[FPX-GP]", text);
+  dlog("[FPX-GP]", text);
   try { chrome.runtime.sendMessage({ type: "gpAuditStatus", text }); } catch {}
 }
 
 function sendGpComplete(text) {
-  console.log("[FPX-GP] COMPLETE:", text);
+  dlog("[FPX-GP] COMPLETE:", text);
   try { chrome.runtime.sendMessage({ type: "gpAuditComplete", text }); } catch {}
 }
 
@@ -1063,7 +1109,7 @@ function buildKendoFieldMap(kendoGrid) {
       fieldToTitle[col.field] = col.title;
     }
   }
-  console.log("[FPX-GP] Kendo column map:", JSON.stringify(fieldToTitle));
+  dlog("[FPX-GP] Kendo column map:", JSON.stringify(fieldToTitle));
   return fieldToTitle;
 }
 
@@ -1096,10 +1142,10 @@ async function fetchKendoRowMap() {
       ).trim();
       if (tn) map.set(tn, row);
     }
-    console.log("[FPX] Kendo row map: keyed", map.size, "of", rows.length);
+    dlog("[FPX] Kendo row map: keyed", map.size, "of", rows.length);
     return map;
   } catch (e) {
-    console.log("[FPX] Kendo prefetch failed:", e.message);
+    dlog("[FPX] Kendo prefetch failed:", e.message);
     return new Map();
   }
 }
@@ -1129,16 +1175,16 @@ function getKendoGridAllRows() {
         const result = event.data.payload;
 
         if (result.error) {
-          console.log("[FPX-GP] Kendo inject error:", result.error);
+          dlog("[FPX-GP] Kendo inject error:", result.error);
           resolve(null);
           return;
         }
 
-        console.log("[FPX-GP] Kendo inject: got", result.rows.length, "of", result.total, "total rows");
-        console.log("[FPX-GP] Field map:", JSON.stringify(result.fieldMap));
+        dlog("[FPX-GP] Kendo inject: got", result.rows.length, "of", result.total, "total rows");
+        dlog("[FPX-GP] Field map:", JSON.stringify(result.fieldMap));
         if (result.rows.length > 0) {
-          console.log("[FPX-GP] Sample keys:", Object.keys(result.rows[0]).join(", "));
-          console.log("[FPX-GP] Sample row:", JSON.stringify(result.rows[0]));
+          dlog("[FPX-GP] Sample keys:", Object.keys(result.rows[0]).join(", "));
+          dlog("[FPX-GP] Sample row:", JSON.stringify(result.rows[0]));
         }
         resolve(result.rows);
       }
@@ -1150,7 +1196,7 @@ function getKendoGridAllRows() {
     script.src = chrome.runtime.getURL("inject-kendo.js");
     script.onload = () => script.remove();
     script.onerror = () => {
-      console.log("[FPX-GP] Failed to load inject-kendo.js");
+      dlog("[FPX-GP] Failed to load inject-kendo.js");
       script.remove();
       if (!settled) {
         window.removeEventListener("message", onMessage);
@@ -1164,7 +1210,7 @@ function getKendoGridAllRows() {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.log("[FPX-GP] Kendo inject timed out after 3s");
+        dlog("[FPX-GP] Kendo inject timed out after 3s");
         resolve(null);
       }
     }, 3000);
@@ -1182,11 +1228,11 @@ function setDateInput(input, dateStr) {
     if (kendoWidget) {
       kendoWidget.value(dateObj);
       kendoWidget.trigger("change");
-      console.log("[FPX-GP] Set via Kendo API:", dateStr);
+      dlog("[FPX-GP] Set via Kendo API:", dateStr);
       return;
     }
   } catch (e) {
-    console.log("[FPX-GP] Kendo API failed, trying direct:", e.message);
+    dlog("[FPX-GP] Kendo API failed, trying direct:", e.message);
   }
 
   const valueToSet = input.type === "date" ? isoDate : dateStr;
@@ -1211,7 +1257,7 @@ function setDateInput(input, dateStr) {
     input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  console.log("[FPX-GP] setDateInput:", input.type, "value after:", input.value, "target:", valueToSet);
+  dlog("[FPX-GP] setDateInput:", input.type, "value after:", input.value, "target:", valueToSet);
 }
 
 function getNearbyLabelText(input) {
@@ -1261,13 +1307,13 @@ function findDateInputs() {
     candidates.push(input);
   }
 
-  console.log("[FPX-GP] findDateInputs: found", candidates.length, "date-like inputs");
+  dlog("[FPX-GP] findDateInputs: found", candidates.length, "date-like inputs");
 
   for (const input of candidates) {
     const label = getNearbyLabelText(input);
     const name = (input.name || "").toLowerCase();
     const id = (input.id || "").toLowerCase();
-    console.log("[FPX-GP]   candidate:", input.type, "id='" + input.id + "' name='" + input.name + "' nearby='" + label.slice(0, 60) + "'");
+    dlog("[FPX-GP]   candidate:", input.type, "id='" + input.id + "' name='" + input.name + "' nearby='" + label.slice(0, 60) + "'");
 
     if (!result.from && (label.includes("FROM") || name.includes("from") || id.includes("from") || name.includes("start"))) {
       result.from = input;
@@ -1277,7 +1323,7 @@ function findDateInputs() {
   }
 
   if ((!result.from || !result.to) && candidates.length >= 2) {
-    console.log("[FPX-GP] Using positional fallback for date inputs");
+    dlog("[FPX-GP] Using positional fallback for date inputs");
     if (!result.from) result.from = candidates[0];
     if (!result.to) result.to = candidates[1];
   } else if ((!result.from || !result.to) && candidates.length === 1) {
@@ -1285,7 +1331,7 @@ function findDateInputs() {
     if (!result.to) result.to = candidates[0];
   }
 
-  console.log("[FPX-GP] Final: from=", result.from?.id || result.from?.name || "?", "to=", result.to?.id || result.to?.name || "?");
+  dlog("[FPX-GP] Final: from=", result.from?.id || result.from?.name || "?", "to=", result.to?.id || result.to?.name || "?");
   return result;
 }
 
@@ -1421,7 +1467,7 @@ async function gpFinalize(allRows, bizDate, aiLevel, runMeta = {}) {
   for (let i = 0; i < allRows.length; i++) {
     allRows[i] = normalizeRowKeys(allRows[i]);
   }
-  console.log("[FPX-GP] Normalized", allRows.length, "rows. Sample keys:", Object.keys(allRows[0] || {}).join(", "));
+  dlog("[FPX-GP] Normalized", allRows.length, "rows. Sample keys:", Object.keys(allRows[0] || {}).join(", "));
 
   const stats = gpComputeStats(allRows);
   gpFlagOutliers(allRows, stats);
@@ -1586,7 +1632,7 @@ async function gpAuditSingleRun(fromDate, toDate, shipmentType, customerFilter) 
         }
       }
     } catch (e) {
-      console.log("[FPX-GP] Angular retry failed:", e.message);
+      dlog("[FPX-GP] Angular retry failed:", e.message);
     }
     input.value = valForType;
     input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1660,7 +1706,7 @@ async function gpAuditSingleRun(fromDate, toDate, shipmentType, customerFilter) 
           }
         }
       } catch (e) {
-        console.log("[FPX-GP] Kendo dropdown failed:", e.message);
+        dlog("[FPX-GP] Kendo dropdown failed:", e.message);
       }
       break;
     }
@@ -1748,12 +1794,12 @@ async function gpAuditSingleRun(fromDate, toDate, shipmentType, customerFilter) 
 // =====================================================================
 
 function sendInvStatus(text) {
-  console.log("[FPX-INV]", text);
+  dlog("[FPX-INV]", text);
   try { chrome.runtime.sendMessage({ type: "invoiceAuditStatus", text }); } catch {}
 }
 
 function sendInvComplete(text) {
-  console.log("[FPX-INV] COMPLETE:", text);
+  dlog("[FPX-INV] COMPLETE:", text);
   try { chrome.runtime.sendMessage({ type: "invoiceAuditComplete", text }); } catch {}
 }
 
@@ -1994,7 +2040,7 @@ async function invoiceSetPageSize(target) {
       return;
     }
   } catch (e) {
-    console.log("[FPX-INV] Kendo pageSize error:", e.message);
+    dlog("[FPX-INV] Kendo pageSize error:", e.message);
   }
 
   // Strategy 2: Native <select> dropdown — pick closest value >= target
@@ -2661,7 +2707,7 @@ function scrapeShipmentSaleAmount() {
   const byId = document.getElementById("ShipmentSale");
   if (byId) {
     const val = parseMoneyText(byId);
-    if (val !== null) { console.log("[FPX-INV] #ShipmentSale by ID:", val); return val; }
+    if (val !== null) { dlog("[FPX-INV] #ShipmentSale by ID:", val); return val; }
   }
 
   const allWindows = document.querySelectorAll(".k-window, .modal, [role='dialog']");
@@ -2670,7 +2716,7 @@ function scrapeShipmentSaleAmount() {
     const m = text.match(/Shipment\s*Sale[s]?\s*[:\s]*\$?\s*([\d,]+\.?\d*)/i);
     if (m) {
       const val = parseFloat(m[1].replace(/,/g, ""));
-      if (Number.isFinite(val)) { console.log("[FPX-INV] ShipmentSale from modal text:", val); return val; }
+      if (Number.isFinite(val)) { dlog("[FPX-INV] ShipmentSale from modal text:", val); return val; }
     }
   }
 
@@ -2678,10 +2724,10 @@ function scrapeShipmentSaleAmount() {
   const m2 = bodyText.match(/Shipment\s*Sale[s]?\s*[:\s]*\$?\s*([\d,]+\.?\d*)/i);
   if (m2) {
     const val = parseFloat(m2[1].replace(/,/g, ""));
-    if (Number.isFinite(val)) { console.log("[FPX-INV] ShipmentSale from body text:", val); return val; }
+    if (Number.isFinite(val)) { dlog("[FPX-INV] ShipmentSale from body text:", val); return val; }
   }
 
-  console.log("[FPX-INV] ShipmentSale NOT found. #ShipmentSale el:", byId, "modals found:", allWindows.length);
+  dlog("[FPX-INV] ShipmentSale NOT found. #ShipmentSale el:", byId, "modals found:", allWindows.length);
   return null;
 }
 
@@ -2689,7 +2735,7 @@ function scrapeShipmentCostAmount() {
   const byId = document.getElementById("ShipmentCost");
   if (byId) {
     const val = parseMoneyText(byId);
-    if (val !== null) { console.log("[FPX-INV] #ShipmentCost by ID:", val); return val; }
+    if (val !== null) { dlog("[FPX-INV] #ShipmentCost by ID:", val); return val; }
   }
 
   const allWindows = document.querySelectorAll(".k-window, .modal, [role='dialog']");
@@ -2698,7 +2744,7 @@ function scrapeShipmentCostAmount() {
     const m = text.match(/Shipment\s*Cost\s*[:\s]*\$?\s*([\d,]+\.?\d*)/i);
     if (m) {
       const val = parseFloat(m[1].replace(/,/g, ""));
-      if (Number.isFinite(val)) { console.log("[FPX-INV] ShipmentCost from modal text:", val); return val; }
+      if (Number.isFinite(val)) { dlog("[FPX-INV] ShipmentCost from modal text:", val); return val; }
     }
   }
 
@@ -3029,7 +3075,7 @@ async function invoiceFinalize(results, skippedRows, dateLabel, aiLevel) {
 // =====================================================================
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  console.log("[FPX] Message received:", msg);
+  dlog("[FPX] Message received:", msg);
   if (msg.action === "ping") {
     sendResponse({ ok: true });
   } else if (msg.action === "start") {
@@ -3116,7 +3162,7 @@ function fpxFilterViaKendoPopup(colName, value) {
       window.removeEventListener("message", onMessage);
       settled = true;
       fpxLastInjectDetail = d.detail || "";
-      console.log("[FPX] Inject popup result:", d.ok ? "ok" : "fail", "—", d.detail);
+      dlog("[FPX] Inject popup result:", d.ok ? "ok" : "fail", "—", d.detail);
       resolve(!!d.ok);
     }
     window.addEventListener("message", onMessage);
@@ -3162,7 +3208,7 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
       window.removeEventListener("message", onMessage);
       settled = true;
       fpxLastInjectDetail = d.detail || "";
-      console.log("[FPX] Inject filter result:", d.ok ? "ok" : "fail", "—", d.detail);
+      dlog("[FPX] Inject filter result:", d.ok ? "ok" : "fail", "—", d.detail);
       resolve(!!d.ok);
     }
     window.addEventListener("message", onMessage);
@@ -3316,7 +3362,7 @@ window.addEventListener("message", async (event) => {
       }
     }
     if (applied) {
-      console.log(`[FPX] Bridge filter ok via ${strategy}: ${col}="${val}"`);
+      dlog(`[FPX] Bridge filter ok via ${strategy}: ${col}="${val}"`);
       try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true, strategy, injectDetail: fpxLastInjectDetail }, event.origin); } catch {}
     } else {
       console.warn("[FPX] Bridge filter failed (all strategies):", lastErr, "inject:", fpxLastInjectDetail);
@@ -3332,6 +3378,48 @@ window.addEventListener("message", async (event) => {
         }, event.origin);
       } catch {}
     }
+  } else if (data.type === "fpxOpenTracking") {
+    // Open FreightPOP's native tracking modal for a specific tracking
+    // number — without leaving the embedded iframe. We first apply the
+    // tracking-number filter so the row is guaranteed to be visible,
+    // wait briefly for the grid to re-render, then simulate a click on
+    // the row's tracking link (the same UI path a rep takes manually).
+    const tn = String(data.trackingNumber || "").trim();
+    if (!tn) return;
+    sendStatus(`Bridge: opening modal for ${tn}`);
+    let openOk = false;
+    let openErr = null;
+    try {
+      // Filter first so the matching row is on-screen; ignore failure
+      // here because the row may already be visible from a prior filter.
+      try { await fpxFilterViaKendoApi(tn, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"]); } catch {}
+      // Give the grid a beat to re-render the filtered rowset before
+      // hunting for the link. 400ms covers slow Kendo redraws on rep
+      // laptops without making the click feel laggy.
+      await new Promise((r) => setTimeout(r, 400));
+      // Walk the visible rows and pick the link whose text matches the
+      // requested tracking number. Reuses collectShipmentJobs() so the
+      // selector heuristics stay in lockstep with the bulk scrape path.
+      const jobs = collectShipmentJobs();
+      const match = jobs.find((j) => (j.link?.textContent || "").trim() === tn);
+      if (match?.link) {
+        simulateClick(match.link);
+        openOk = true;
+      } else {
+        openErr = "Tracking link not found in the filtered grid";
+      }
+    } catch (e) {
+      openErr = String(e?.message || e || "Unknown error");
+    }
+    try {
+      event.source && event.source.postMessage({
+        source: "fpx-extension",
+        type: "fpxOpenTrackingAck",
+        trackingNumber: tn,
+        ok: openOk,
+        error: openErr,
+      }, event.origin);
+    } catch {}
   } else if (data.type === "fpxPing") {
     // Lets the dashboard detect whether the extension is installed +
     // running inside this iframe. No filter side effects.

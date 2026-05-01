@@ -3,6 +3,7 @@ import { MessageSquare, Send, RefreshCw } from "lucide-react";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import type { Feedback, FeedbackCategory, FeedbackStatus } from "../lib/types";
+import { LoadingState } from "../components/LoadingState";
 
 const CATEGORY_LABELS: Record<FeedbackCategory, string> = {
   bug: "Bug",
@@ -53,14 +54,17 @@ export function FeedbackPage() {
     if (!title.trim() || !body.trim()) return;
     setSubmitting(true);
     try {
-      await api.feedback.create({
+      // Use the returned row to prepend, rather than reloading the whole
+      // list — reloading would blank the panel to LoadingState even though
+      // we already have the prior items rendered.
+      const r = await api.feedback.create({
         category, title: title.trim(), body: body.trim(), source: "dashboard",
         context: { url: window.location.href, userAgent: navigator.userAgent },
       });
+      setItems((prev) => [r.feedback, ...prev]);
       setTitle(""); setBody(""); setCategory("bug");
       setJustSubmitted(true);
       setTimeout(() => setJustSubmitted(false), 2500);
-      await load();
     } catch (e) { setError((e as Error).message); }
     finally { setSubmitting(false); }
   }
@@ -89,7 +93,7 @@ export function FeedbackPage() {
 
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           {loading ? (
-            <div className="text-center text-slate-400 py-8">Loading…</div>
+            <LoadingState />
           ) : items.length === 0 ? (
             <div className="text-center text-slate-400 py-8">No feedback yet.</div>
           ) : (

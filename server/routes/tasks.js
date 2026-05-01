@@ -34,39 +34,46 @@ export function isCustomerFollowupTitle(title) {
   return true;
 }
 
-// GET /tasks?status=open&assigned_to=...&limit=200
-// Cross-shipment task list; defaults to open tasks.
+// GET /tasks?status=open&assigned_to=...&limit=200&include_archived=1
+// Cross-shipment task list; defaults to open tasks. Archived tasks (auto-set
+// when their shipment was soft-archived by sweep-complete) are hidden by
+// default — pass include_archived=1 to surface them in admin views.
 tasksRouter.get("/", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   let q = supabase.from("fpx_shipment_tasks").select("*").order("created_at", { ascending: false }).limit(limit);
   if (req.query.status) q = q.eq("status", String(req.query.status));
   if (req.query.assigned_to) q = q.eq("assigned_to", String(req.query.assigned_to));
   if (req.query.priority) q = q.eq("priority", String(req.query.priority));
+  if (!req.query.include_archived) q = q.is("archived_at", null);
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
 
-  // Attach the FreightPOP-side shipment_id (string) per task so the
-  // Tasks page can search/filter by it without an extra round trip. The
-  // task row only carries shipment_id (UUID) + tracking_number; the
-  // human-facing FreightPOP id lives on the shipment. We do this as a
-  // batch lookup against the unique shipment uuids — typically 100s of
-  // tasks → 10s of distinct shipments, well under the 1k cap.
+  // Attach the FreightPOP-side shipment_id (string) and mode per task so
+  // the Tasks page can search/filter by them without an extra round trip.
+  // The task row only carries shipment_id (UUID) + tracking_number; the
+  // human-facing FreightPOP id and the mode (LTL / Parcel / …) live on
+  // the shipment. Batch lookup against the unique shipment uuids —
+  // typically 100s of tasks → 10s of distinct shipments.
   const tasks = data || [];
   const shipmentUuids = Array.from(new Set(tasks.map((t) => t.shipment_id).filter(Boolean)));
-  let externalById = new Map();
+  let shipById = new Map();
   if (shipmentUuids.length) {
     const { data: ships, error: shipErr } = await supabase
       .from("fpx_shipments")
-      .select("id, shipment_id")
+      .select("id, shipment_id, mode")
       .in("id", shipmentUuids);
     if (!shipErr && ships) {
-      externalById = new Map(ships.map((s) => [s.id, s.shipment_id]));
+      shipById = new Map(ships.map((s) => [s.id, s]));
     }
   }
-  const enriched = tasks.map((t) => ({
-    ...t,
-    shipment_external_id: externalById.get(t.shipment_id) || null,
-  }));
+  const enriched = tasks.map((t) => {
+    const ship = shipById.get(t.shipment_id);
+    return {
+      ...t,
+      shipment_external_id: ship?.shipment_id || null,
+      shipment_mode: ship?.mode || null,
+    };
+  });
   res.json({ data: enriched });
 });
 
@@ -84,6 +91,7 @@ tasksRouter.get("/carrier-followups", async (req, res) => {
     .from("fpx_shipment_tasks")
     .select("*")
     .in("status", ["open", "in_progress"])
+    .is("archived_at", null)
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   const followups = (tasks || []).filter((t) => isCarrierFollowupTitle(t.title));
@@ -271,6 +279,7 @@ tasksRouter.get("/customer-followups", async (req, res) => {
     .from("fpx_shipment_tasks")
     .select("*")
     .in("status", ["open", "in_progress"])
+    .is("archived_at", null)
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   const followups = (tasks || []).filter((t) => isCustomerFollowupTitle(t.title));
@@ -373,12 +382,16 @@ tasksRouter.get("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
   let walk = null;
   if (walkParam !== "off") {
     let q = supabase.from("fpx_shipment_tasks")
-      .select("id, shipment_id, tracking_number, title, status")
+      .select("id, shipment_id, tracking_number, title, status, created_at")
       .order("created_at", { ascending: false });
     if (walkParam === "active") q = q.in("status", ["open", "in_progress"]);
     else if (walkParam === "open" || walkParam === "in_progress" || walkParam === "blocked" || walkParam === "done")
       q = q.eq("status", walkParam);
     // "all" → no status filter.
+    // Walk surfaces "neighbor" tasks the operator can step through; archived
+    // ones (auto-completed via shipment delivery) shouldn't pollute that
+    // navigation. Only the "all" walk includes archived for completeness.
+    if (walkParam !== "all") q = q.is("archived_at", null);
     const { data: list, error: listErr } = await q;
     if (!listErr && list) {
       // Pure resolver lives in lib/taskWalk.js so it's testable without

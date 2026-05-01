@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -9,7 +9,7 @@ import { ShareButton } from "../components/ShareButton";
 import { ColumnSelector } from "../components/ColumnSelector";
 import { UserPicker } from "../components/UserPicker";
 import { useAuth } from "../lib/auth";
-import { showFrame, hideFrame, requestAutoFilter } from "../lib/freightpopFrame";
+import { showFrame, hideFrame, requestAutoFilter, requestOpenTracking } from "../lib/freightpopFrame";
 import {
   SHIPMENT_COLUMNS,
   loadColumnPrefs,
@@ -69,6 +69,12 @@ interface ShipmentsPageProps {
   drawerSection?: string | null;
   onShipmentConsumed?: () => void;
   onDrawerChange?: (id: string | null, section: string | null) => void;
+  // When true, the page mounts pre-filtered to shipments that carry an
+  // operator note. Powers the dedicated /notes tab so the team has a
+  // direct entry point to "everything that has a note attached" without
+  // hunting for the toolbar toggle. The user can still toggle it off
+  // from the toolbar; the URL stays /notes either way.
+  notesMode?: boolean;
   // When the drawer was entered via a /tasks/:taskId URL, the task-walk
   // context drives prev/next instead of the local `filtered` shipments list.
   // taskId is the focused task; prev / next are sibling task ids resolved
@@ -87,13 +93,22 @@ interface ShipmentsPageProps {
   } | null;
 }
 
-const DRAWER_TABS = ["overview", "tasks", "email", "drafts", "history", "raw"] as const;
+// Drawer tabs collapsed from 6 → 4: drafts now lives under email (saved
+// drafts list rendered below the composer); raw scrape lives under
+// history as a collapsible section. Existing /tracking/:id/drafts and
+// /tracking/:id/raw URLs still resolve — asDrawerTab() rewrites them
+// to their new homes so old bookmarks don't dead-end.
+const DRAWER_TABS = ["overview", "tasks", "email", "history"] as const;
 type DrawerTabId = typeof DRAWER_TABS[number];
 function asDrawerTab(s: string | null | undefined): DrawerTabId {
+  // Map removed tabs to their new homes so legacy URLs / nav from
+  // outside the drawer keep working.
+  if (s === "drafts") return "email";
+  if (s === "raw") return "history";
   return DRAWER_TABS.includes(s as DrawerTabId) ? (s as DrawerTabId) : "overview";
 }
 
-export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk }: ShipmentsPageProps = {}) {
+export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk, notesMode = false }: ShipmentsPageProps = {}) {
   const { clientConfig } = useAuth();
   const embedCfg = clientConfig?.embed_freightpop;
   const [rows, setRows] = useState<Shipment[]>([]);
@@ -105,6 +120,11 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [customerFilter, setCustomerFilter] = useState<string>("");
   const [sourceFilter, setSourceFilter] = useState<string>("");
   const [pillFilter, setPillFilter] = useState<PillId>("all");
+  // "With notes" toggle — narrows the table to shipments that carry an
+  // operator note. The note column itself stays available in the column
+  // selector; this filter is just the cross-shipment notes view the team
+  // wanted as a one-click navigable + exportable surface.
+  const [notesOnly, setNotesOnly] = useState<boolean>(notesMode);
 
   const [columnPrefs, setColumnPrefs] = useState<ColumnPrefs>(() => loadColumnPrefs());
   useEffect(() => { saveColumnPrefs(columnPrefs); }, [columnPrefs]);
@@ -182,11 +202,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [reanalyzing, setReanalyzing] = useState(false);
 
   // Task-walk: tracks whether the focused task's status update is in flight,
-  // and whether the user has opted in to inline action overrides on the
-  // shipment. Default off — clicking the checkbox reveals YES / NO / Resolved
-  // quick buttons next to the existing "Override" link.
+  // Tracks whether an action-disposition mutation is in flight. Drives
+  // the disabled state on the popover buttons inside ActionDispositionControl.
   const [taskBusy, setTaskBusy] = useState(false);
-  const [actionEditOptIn, setActionEditOptIn] = useState(false);
   const [actionEditBusy, setActionEditBusy] = useState(false);
 
   // Split-view: render the FreightPOP iframe in the left "gray screen" area
@@ -324,14 +342,20 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       setNotesSaved(false);
       return;
     }
+    // Cancel guard so a slower response for the previous shipment can't
+    // overwrite drawerData after the user has walked to a different one.
+    // Especially important during task-walk prev/next on a slow connection.
+    let cancelled = false;
     api.shipments.get(drawerId)
       .then((d) => {
+        if (cancelled) return;
         setDrawerData(d);
         setDrawerTasks(d.tasks || []);
         setNotesDraft(d.shipment.notes || "");
         setNotesSaved(false);
       })
-      .catch(() => { setDrawerData(null); setDrawerTasks([]); });
+      .catch(() => { if (!cancelled) { setDrawerData(null); setDrawerTasks([]); } });
+    return () => { cancelled = true; };
   }, [drawerId]);
 
   // Re-fetch the focused shipment and mirror the result into the
@@ -411,7 +435,20 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     setEmailModal({ audience, data: null, loading: true, copied: false });
     try {
       const draft = await api.emailDraft.generate(drawerId, audience, notes);
-      setEmailModal({ audience, data: draft, loading: false, copied: false });
+      // Default-copy to clipboard so the rep can paste straight into
+      // their mail client without an extra click. clipboard.writeText
+      // rejects if the document isn't transient-activated or perms
+      // are blocked — fall back to the manual Copy button in that
+      // case (still rendered in the footer).
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(`Subject: ${draft.subject}\n\n${draft.body}`);
+        copied = true;
+      } catch { /* clipboard blocked — manual Copy button remains */ }
+      setEmailModal({ audience, data: draft, loading: false, copied });
+      if (copied) {
+        setTimeout(() => setEmailModal((m) => (m ? { ...m, copied: false } : m)), 2000);
+      }
     } catch (e) {
       setEmailModal({ audience, data: { subject: "Error", body: (e as Error).message }, loading: false, copied: false });
     }
@@ -533,6 +570,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       if (actionFilter && String(r.action_required || "").toUpperCase() !== actionFilter) return false;
       if (customerFilter && r.customer_name !== customerFilter) return false;
       if (sourceFilter && r.action_source !== sourceFilter) return false;
+      if (notesOnly && !(r.notes && r.notes.trim())) return false;
       if (q) {
         // shipment_id is the FreightPOP-side unique id (e.g. "13583467")
         // and is the operator's primary handle; included alongside the
@@ -543,7 +581,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       }
       return true;
     });
-  }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter]);
+  }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter, notesOnly]);
+
+  const notesCount = useMemo(
+    () => rows.reduce((n, r) => n + (r.notes && r.notes.trim() ? 1 : 0), 0),
+    [rows],
+  );
 
   // Drawer position within the filtered list, used for "X of Y" + prev/next.
   // When taskWalk is active the position comes from the task list instead.
@@ -611,13 +654,13 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         return;
       }
       // Tab shortcuts — match the order in the drawer's tab bar.
+      // Drafts and raw are no longer tabs; they live under email/history
+      // respectively, so 4 is now Analysis.
       const tabMap: Record<string, DrawerTabId> = {
         "1": "overview",
         "2": "tasks",
         "3": "email",
-        "4": "drafts",
-        "5": "history",
-        "6": "raw",
+        "4": "history",
       };
       if (tabMap[e.key]) {
         e.preventDefault();
@@ -756,6 +799,22 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             <option value="ai">From AI</option>
             <option value="manual">Manual override</option>
           </select>
+          <button
+            onClick={() => setNotesOnly((v) => !v)}
+            title={notesOnly ? "Showing only shipments with operator notes" : "Show only shipments with operator notes"}
+            className={
+              "px-3 py-2 text-sm font-medium rounded-lg ring-1 inline-flex items-center gap-1.5 " +
+              (notesOnly
+                ? "bg-amber-50 text-amber-800 ring-amber-300 hover:bg-amber-100"
+                : "bg-white text-slate-700 ring-slate-300 hover:bg-slate-50")
+            }
+          >
+            <NotebookPen className="h-4 w-4" />
+            With notes
+            <span className={"ml-1 rounded-full px-1.5 text-[11px] font-semibold " + (notesOnly ? "bg-amber-200 text-amber-900" : "bg-slate-100 text-slate-600")}>
+              {notesCount}
+            </span>
+          </button>
           <ColumnSelector prefs={columnPrefs} onChange={setColumnPrefs} />
           <button
             onClick={exportAll}
@@ -1012,8 +1071,6 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   autoDraftEmail: false,
                 })
               }
-              actionEditOptIn={actionEditOptIn}
-              onActionEditOptInChange={setActionEditOptIn}
               actionEditBusy={actionEditBusy}
               onSetAction={async (v) => {
                 if (!drawerId) return;
@@ -1083,6 +1140,29 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                     <ExternalLink className="h-3.5 w-3.5" /> Load in FreightPOP
                   </button>
                 ) : null}
+                {/* Sibling option to "Load in FreightPOP": triggers FP's
+                    native tracking modal *inside* the embedded iframe.
+                    The overlay forwards a postMessage to the FPXpress
+                    extension which filters by tracking number then
+                    simulates a click on the row's tracking link — same
+                    UI path a rep takes manually, just one click. */}
+                {embedCfg?.enabled && drawerData?.shipment.tracking_number ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // Make sure the iframe is actually on-screen first;
+                      // overlay only forwards the message when the
+                      // bridge has greeted us, which only happens once
+                      // the iframe is mounted + visible.
+                      if (!splitView) setSplitView(true);
+                      requestOpenTracking();
+                    }}
+                    className="text-xs px-2.5 py-1.5 rounded-md ring-1 ring-slate-300 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1.5"
+                    title={`Open the FreightPOP tracking modal for ${drawerData.shipment.tracking_number} in the embedded panel`}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" /> Open tracking #
+                  </button>
+                ) : null}
                 {embedCfg?.enabled ? (
                   <button
                     type="button"
@@ -1115,10 +1195,14 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               {([
                 { id: "overview", label: "Overview", count: null },
                 { id: "tasks", label: "Tasks", count: drawerTasks.length },
-                { id: "email", label: "Email", count: null },
-                { id: "drafts", label: "Drafts", count: drawerData.analyses.filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_")).length },
+                {
+                  id: "email",
+                  label: "Email",
+                  // Show saved-draft count on the Email tab pill since
+                  // drafts now live underneath the composer.
+                  count: drawerData.analyses.filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_")).length,
+                },
                 { id: "history", label: "Analysis", count: drawerData.analyses.filter((a) => a.kind === "per_shipment" || a.kind === "summary").length },
-                { id: "raw", label: "Raw", count: null },
               ] as { id: typeof DRAWER_TABS[number]; label: string; count: number | null }[]).map((t) => (
                 <button
                   key={t.id}
@@ -1164,6 +1248,30 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
             {drawerTab === "overview" && (
               <>
+                {/* Notes hoisted to the top of Overview — it's the only
+                    field a rep edits during a shipment walk-through, so
+                    it earns the prime spot. Read-only fields and the AI
+                    summary stack below. */}
+                <Section title="Notes">
+                  <textarea
+                    value={notesDraft}
+                    onChange={(e) => { setNotesDraft(e.target.value); setNotesSaved(false); }}
+                    placeholder="Add operator notes for this shipment…"
+                    rows={3}
+                    maxLength={5000}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:ring-2 focus:ring-sky-400 focus:border-sky-400"
+                  />
+                  <div className="mt-2 flex items-center justify-end gap-3">
+                    {notesSaved ? <span className="text-xs text-emerald-600">Saved</span> : null}
+                    <button
+                      onClick={saveNotes}
+                      disabled={notesBusy || (notesDraft || "") === (drawerData.shipment.notes || "")}
+                      className="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {notesBusy ? "Saving…" : "Save notes"}
+                    </button>
+                  </div>
+                </Section>
                 <Section title="Shipment">
                   <div className="grid grid-cols-2 gap-4">
                     <Field label="Carrier">{drawerData.shipment.carrier_name || drawerData.shipment.carrier}</Field>
@@ -1171,84 +1279,29 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                     <Field label="Status">{drawerData.shipment.shipment_status}</Field>
                     <div className="flex flex-col gap-0.5">
                       <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Action</div>
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <ActionBadge action={drawerData.shipment.action_required} />
-                        <span className={
-                          "text-[10px] px-2 py-0.5 rounded-full font-medium " +
-                          (drawerData.shipment.action_source === "manual"
-                            ? "bg-amber-100 text-amber-800 ring-1 ring-amber-200"
-                            : "bg-slate-100 text-slate-600")
-                        } title={
-                          drawerData.shipment.action_source === "manual"
-                            ? `Overridden by ${drawerData.shipment.action_overridden_by || "?"}${drawerData.shipment.action_override_reason ? ` — ${drawerData.shipment.action_override_reason}` : ""}`
-                            : "Set by AI"
-                        }>
-                          {drawerData.shipment.action_source === "manual" ? "Manual" : "From AI"}
-                        </span>
-                        <button
-                          onClick={() => setOverrideModal({ value: drawerData.shipment.action_required === "YES" ? "NO" : "YES", reason: "", busy: false, createCarrierFollowup: false, createCustomerFollowup: false, autoDraftEmail: false })}
-                          className="text-[11px] text-sky-700 hover:text-sky-900 underline"
-                        >Override</button>
-                        {/* Opt-in to inline modify — keeps accidental clicks
-                            from flipping the action. Once ticked, three
-                            single-click quick actions appear below. */}
-                        <label className="inline-flex items-center gap-1 text-[11px] text-slate-500 cursor-pointer select-none ml-1">
-                          <input
-                            type="checkbox"
-                            checked={actionEditOptIn}
-                            onChange={(e) => setActionEditOptIn(e.target.checked)}
-                            className="h-3 w-3 rounded border-slate-300"
-                          />
-                          Modify
-                        </label>
-                      </div>
-                      {actionEditOptIn ? (
-                        <div className="mt-1.5 inline-flex items-center gap-1.5 flex-wrap">
-                          {(["YES", "NO", "RESOLVED"] as const).map((v) => {
-                            const active = drawerData.shipment.action_required === v;
-                            const tone = v === "YES"
-                              ? "bg-rose-50 text-rose-700 ring-rose-200 hover:bg-rose-100"
-                              : v === "NO"
-                              ? "bg-emerald-50 text-emerald-700 ring-emerald-200 hover:bg-emerald-100"
-                              : "bg-violet-50 text-violet-700 ring-violet-200 hover:bg-violet-100";
-                            return (
-                              <button
-                                key={v}
-                                disabled={actionEditBusy || active}
-                                onClick={async () => {
-                                  if (!drawerId) return;
-                                  setActionEditBusy(true);
-                                  try {
-                                    await api.shipments.overrideAction(drawerId, { action_required: v });
-                                    await refreshDrawer();
-                                  } catch (e) { setErr((e as Error).message); }
-                                  finally { setActionEditBusy(false); }
-                                }}
-                                className={`text-[11px] font-semibold rounded-md px-2 py-0.5 ring-1 transition ${tone} disabled:opacity-50 disabled:cursor-not-allowed`}
-                                title={active ? "Already set" : `Set action to ${v}`}
-                              >
-                                {v === "RESOLVED" ? "Resolved" : v}
-                              </button>
-                            );
-                          })}
-                          <button
-                            disabled={actionEditBusy || drawerData.shipment.action_source !== "manual"}
-                            onClick={async () => {
-                              if (!drawerId) return;
-                              setActionEditBusy(true);
-                              try {
-                                await api.shipments.overrideAction(drawerId, { action_required: null });
-                                await refreshDrawer();
-                              } catch (e) { setErr((e as Error).message); }
-                              finally { setActionEditBusy(false); }
-                            }}
-                            className="text-[11px] text-slate-600 hover:text-slate-900 underline disabled:opacity-40 disabled:no-underline"
-                            title="Clear override and let the AI value stand"
-                          >
-                            Revert to AI
-                          </button>
-                        </div>
-                      ) : null}
+                      <ActionDispositionControl
+                        shipment={drawerData.shipment}
+                        actionEditBusy={actionEditBusy}
+                        onSetAction={async (v) => {
+                          if (!drawerId) return;
+                          setActionEditBusy(true);
+                          try {
+                            await api.shipments.overrideAction(drawerId, { action_required: v });
+                            await refreshDrawer();
+                          } catch (e) { setErr((e as Error).message); }
+                          finally { setActionEditBusy(false); }
+                        }}
+                        onRevertToAi={async () => {
+                          if (!drawerId) return;
+                          setActionEditBusy(true);
+                          try {
+                            await api.shipments.overrideAction(drawerId, { action_required: null });
+                            await refreshDrawer();
+                          } catch (e) { setErr((e as Error).message); }
+                          finally { setActionEditBusy(false); }
+                        }}
+                        onOverrideClick={() => setOverrideModal({ value: drawerData.shipment.action_required === "YES" ? "NO" : "YES", reason: "", busy: false, createCarrierFollowup: false, createCustomerFollowup: false, autoDraftEmail: false })}
+                      />
                     </div>
                     <Field label="Pickup">{fmtDateTime(drawerData.shipment.pickup_date)}</Field>
                     <Field label="ETA">{fmtDateTime(drawerData.shipment.updated_eta)}</Field>
@@ -1277,33 +1330,13 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                       className="text-xs px-2.5 py-1 rounded-md bg-sky-50 text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
                       title="Run per-shipment AI analysis again"
                     >
-                      <span className={reanalyzing ? "inline-block animate-spin" : ""}>↻</span>
+                      <RefreshCw className={"h-3.5 w-3.5" + (reanalyzing ? " animate-spin" : "")} />
                       {reanalyzing ? "Analyzing…" : "Re-analyze"}
                     </button>
                   </div>
                   <Field label="Issue">{drawerData.shipment.ai_issue}</Field>
                   <div className="h-3" />
                   <Field label="Recommendation">{drawerData.shipment.ai_recommendation}</Field>
-                </Section>
-                <Section title="Notes">
-                  <textarea
-                    value={notesDraft}
-                    onChange={(e) => { setNotesDraft(e.target.value); setNotesSaved(false); }}
-                    placeholder="Add operator notes for this shipment…"
-                    rows={4}
-                    maxLength={5000}
-                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:ring-2 focus:ring-sky-400 focus:border-sky-400"
-                  />
-                  <div className="mt-2 flex items-center justify-end gap-3">
-                    {notesSaved ? <span className="text-xs text-emerald-600">Saved</span> : null}
-                    <button
-                      onClick={saveNotes}
-                      disabled={notesBusy || (notesDraft || "") === (drawerData.shipment.notes || "")}
-                      className="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {notesBusy ? "Saving…" : "Save notes"}
-                    </button>
-                  </div>
                 </Section>
               </>
             )}
@@ -1380,38 +1413,36 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               </Section>
             )}
 
-            {drawerTab === "email" && (
-              <Section title="Email drafts">
-                <p className="text-sm text-slate-500 mb-4">Generate a Claude-drafted follow-up email using this shipment's context.</p>
-                <div className="grid grid-cols-2 gap-3">
-                  <button
-                    onClick={() => openEmailDraft("carrier")}
-                    className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-slate-900 text-white text-sm font-medium hover:bg-slate-800"
-                  >
-                    <Mail className="h-4 w-4" /> Email carrier
-                  </button>
-                  <button
-                    onClick={() => openEmailDraft("customer")}
-                    className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-sky-600 text-white text-sm font-medium hover:bg-sky-700"
-                  >
-                    <Mail className="h-4 w-4" /> Email customer
-                  </button>
-                </div>
-                <div className="mt-4 text-xs text-slate-500">
-                  Drafts use the shipment status, dates, addresses, and AI issue context. You can copy or send via your default mail client after generation.
-                </div>
-              </Section>
-            )}
-
-            {drawerTab === "drafts" && (() => {
+            {drawerTab === "email" && (() => {
               const drafts = drawerData.analyses
                 .filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_"))
                 .map((a) => ({ a, parsed: parseAnalysis(a) }));
               return (
-                <Section title={`Saved email drafts (${drafts.length})`}>
-                  {drafts.length === 0 ? (
-                    <div className="text-sm text-slate-500">No saved drafts. Generate one from the Email tab.</div>
-                  ) : drafts.map(({ a, parsed }) => (
+                <>
+                  <Section title="Compose">
+                    <p className="text-sm text-slate-500 mb-4">Generate a Claude-drafted follow-up email using this shipment's context.</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <button
+                        onClick={() => openEmailDraft("carrier")}
+                        className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-slate-900 text-white text-sm font-medium hover:bg-slate-800"
+                      >
+                        <Mail className="h-4 w-4" /> Email carrier
+                      </button>
+                      <button
+                        onClick={() => openEmailDraft("customer")}
+                        className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-sky-600 text-white text-sm font-medium hover:bg-sky-700"
+                      >
+                        <Mail className="h-4 w-4" /> Email customer
+                      </button>
+                    </div>
+                    <div className="mt-4 text-xs text-slate-500">
+                      Drafts use the shipment status, dates, addresses, and AI issue context. You can copy or send via your default mail client after generation.
+                    </div>
+                  </Section>
+                  <Section title={`Saved drafts (${drafts.length})`}>
+                    {drafts.length === 0 ? (
+                      <div className="text-sm text-slate-500">No saved drafts yet. Generate one above.</div>
+                    ) : drafts.map(({ a, parsed }) => (
                     <div key={a.id} className="rounded-xl bg-white ring-1 ring-slate-200 p-4 mb-3">
                       <div className="flex items-center justify-between text-xs text-slate-500 mb-2">
                         <div className="flex items-center gap-2">
@@ -1448,7 +1479,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                       </div>
                     </div>
                   ))}
-                </Section>
+                  </Section>
+                </>
               );
             })()}
 
@@ -1516,17 +1548,20 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                     </div>
                     ))}
                   </Section>
+                  {/* Raw scrape collapsed under Analysis — was its own tab,
+                      now folded here behind a <details> so it stays out
+                      of the way for normal use. */}
+                  <details className="mb-6 rounded-xl ring-1 ring-slate-200 bg-white">
+                    <summary className="cursor-pointer text-sm font-semibold text-slate-900 px-4 py-3 select-none">
+                      Raw scrape
+                    </summary>
+                    <pre className="text-[11px] bg-slate-900 text-slate-100 p-3 rounded-b-xl whitespace-pre-wrap max-h-[60vh] overflow-auto">
+                      {JSON.stringify(drawerData.shipment.raw_data, null, 2)}
+                    </pre>
+                  </details>
                 </>
               );
             })()}
-
-            {drawerTab === "raw" && (
-              <Section title="Raw scrape">
-                <pre className="text-[11px] bg-slate-900 text-slate-100 p-3 rounded-lg whitespace-pre-wrap max-h-[60vh] overflow-auto">
-                  {JSON.stringify(drawerData.shipment.raw_data, null, 2)}
-                </pre>
-              </Section>
-            )}
           </>
         ) : <div className="text-sm text-slate-500">Loading…</div>}
       </Drawer>
@@ -1782,8 +1817,6 @@ const TASK_STATUS_LABEL: Record<string, string> = {
 interface ShipmentSummaryHeaderProps {
   shipment: Shipment;
   onOverrideClick: () => void;
-  actionEditOptIn: boolean;
-  onActionEditOptInChange: (v: boolean) => void;
   actionEditBusy: boolean;
   onSetAction: (v: "YES" | "NO" | "RESOLVED") => void | Promise<void>;
   onRevertToAi: () => void | Promise<void>;
@@ -1857,9 +1890,21 @@ function RecentChangeLog({ diff }: { diff: ShipmentRecentDiff | null }) {
 // =====================================================================
 function AnalysisThumbs({ analysis, onRated }: {
   analysis: AiAnalysis;
-  onRated: (next: { rating: "up" | "down" | null; rated_by: string | null; rated_at: string | null }) => void;
+  onRated: (next: Partial<AiAnalysis>) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  // Local mirror of rating_reason so the textarea stays editable
+  // without round-tripping every keystroke. Synced from the prop
+  // whenever the parent's analysis row changes (rating cleared,
+  // refetch, etc.).
+  const [reason, setReason] = useState<string>(analysis.rating_reason || "");
+  const [savedReason, setSavedReason] = useState<string>(analysis.rating_reason || "");
+  const [reasonSaving, setReasonSaving] = useState(false);
+  useEffect(() => {
+    setReason(analysis.rating_reason || "");
+    setSavedReason(analysis.rating_reason || "");
+  }, [analysis.id, analysis.rating, analysis.rating_reason]);
+
   async function rate(target: "up" | "down") {
     if (busy) return;
     const next = analysis.rating === target ? null : target;
@@ -1867,13 +1912,19 @@ function AnalysisThumbs({ analysis, onRated }: {
     // Optimistic local update — parent state mutates instantly so the
     // active thumb flips before the request returns. Roll back on
     // error by reverting to whatever the row had before.
-    onRated({ rating: next, rated_by: null, rated_at: next ? new Date().toISOString() : null });
+    onRated({
+      rating: next,
+      rated_by: null,
+      rated_at: next ? new Date().toISOString() : null,
+      rating_reason: next ? (reason || null) : null,
+    });
     try {
-      const r = await api.analyses.rate(analysis.id, { rating: next });
+      const r = await api.analyses.rate(analysis.id, { rating: next, reason: next ? (reason || undefined) : undefined });
       onRated({
         rating: r.analysis.rating,
         rated_by: r.analysis.rated_by,
         rated_at: r.analysis.rated_at,
+        rating_reason: r.analysis.rating_reason,
       });
     } catch {
       // Revert on failure.
@@ -1881,43 +1932,206 @@ function AnalysisThumbs({ analysis, onRated }: {
         rating: analysis.rating ?? null,
         rated_by: analysis.rated_by ?? null,
         rated_at: analysis.rated_at ?? null,
+        rating_reason: analysis.rating_reason ?? null,
       });
     } finally { setBusy(false); }
   }
+
+  // Save the reason on blur if it actually changed and there's a
+  // rating to attach it to. Server clears rating_reason when rating
+  // is null, so writing a reason without a rating is a no-op.
+  async function saveReason() {
+    if (!analysis.rating) return;
+    const trimmed = reason.trim();
+    if (trimmed === (savedReason || "").trim()) return;
+    setReasonSaving(true);
+    try {
+      const r = await api.analyses.rate(analysis.id, { rating: analysis.rating, reason: trimmed });
+      setSavedReason(r.analysis.rating_reason || "");
+      onRated({
+        rating: r.analysis.rating,
+        rated_by: r.analysis.rated_by,
+        rated_at: r.analysis.rated_at,
+        rating_reason: r.analysis.rating_reason,
+      });
+    } catch {
+      // Leave the textarea contents alone so the rep can retry.
+    } finally { setReasonSaving(false); }
+  }
+
   return (
-    <div className="inline-flex items-center gap-1.5">
-      <button
-        onClick={() => rate("up")}
-        disabled={busy}
-        className={
-          "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
-          (analysis.rating === "up"
-            ? "bg-emerald-600 text-white ring-emerald-700"
-            : "bg-white text-slate-600 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
-        }
-        aria-pressed={analysis.rating === "up"}
-        title={analysis.rating === "up" ? "Click again to clear" : "Mark this AI output as useful"}
-      >
-        <ThumbsUp className="h-3 w-3" /> Good
-      </button>
-      <button
-        onClick={() => rate("down")}
-        disabled={busy}
-        className={
-          "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
-          (analysis.rating === "down"
-            ? "bg-rose-600 text-white ring-rose-700"
-            : "bg-white text-slate-600 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
-        }
-        aria-pressed={analysis.rating === "down"}
-        title={analysis.rating === "down" ? "Click again to clear" : "Mark this AI output as not useful — feeds into the next analysis"}
-      >
-        <ThumbsDown className="h-3 w-3" /> Needs work
-      </button>
-      {analysis.rated_by ? (
-        <span className="text-[10px] text-slate-400 ml-1" title={`Rated ${analysis.rated_at ? fmtRelative(analysis.rated_at) : ""}`}>
-          by {analysis.rated_by}
-        </span>
+    <div className="flex flex-col gap-1.5 w-full">
+      <div className="inline-flex items-center gap-1.5 flex-wrap">
+        <button
+          onClick={() => rate("up")}
+          disabled={busy}
+          className={
+            "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
+            (analysis.rating === "up"
+              ? "bg-emerald-600 text-white ring-emerald-700"
+              : "bg-white text-slate-600 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-200")
+          }
+          aria-pressed={analysis.rating === "up"}
+          title={analysis.rating === "up" ? "Click again to clear" : "Mark this AI output as useful"}
+        >
+          <ThumbsUp className="h-3 w-3" /> Good
+        </button>
+        <button
+          onClick={() => rate("down")}
+          disabled={busy}
+          className={
+            "inline-flex items-center gap-1 text-[11px] font-semibold rounded-md px-2 py-1 ring-1 transition disabled:opacity-50 " +
+            (analysis.rating === "down"
+              ? "bg-rose-600 text-white ring-rose-700"
+              : "bg-white text-slate-600 ring-slate-200 hover:bg-rose-50 hover:text-rose-700 hover:ring-rose-200")
+          }
+          aria-pressed={analysis.rating === "down"}
+          title={analysis.rating === "down" ? "Click again to clear" : "Mark this AI output as not useful — feeds into the next analysis"}
+        >
+          <ThumbsDown className="h-3 w-3" /> Needs work
+        </button>
+        {analysis.rated_by ? (
+          <span className="text-[10px] text-slate-400 ml-1" title={`Rated ${analysis.rated_at ? fmtRelative(analysis.rated_at) : ""}`}>
+            by {analysis.rated_by}
+          </span>
+        ) : null}
+      </div>
+      {analysis.rating ? (
+        <div className="flex items-start gap-2">
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value.slice(0, 500))}
+            onBlur={saveReason}
+            disabled={busy || reasonSaving}
+            rows={2}
+            placeholder={analysis.rating === "up"
+              ? "What worked? (optional) — feeds the next analysis on this shipment"
+              : "What was wrong? (optional) — feeds the next analysis on this shipment"}
+            className="w-full text-[11px] text-slate-700 rounded-md ring-1 ring-slate-200 bg-white px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-slate-400 disabled:opacity-50 resize-y"
+          />
+          {reasonSaving ? (
+            <span className="text-[10px] text-slate-400 mt-1.5 shrink-0">Saving…</span>
+          ) : reason.trim() && reason.trim() !== (savedReason || "").trim() ? (
+            <span className="text-[10px] text-slate-400 mt-1.5 shrink-0">Unsaved</span>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// =====================================================================
+// ActionDispositionControl — clickable ActionBadge + popover. Replaces
+// the previous two-step "tick Modify, then click chip" flow with a
+// single click on the badge that opens a tiny menu of disposition
+// options (Action needed / On track / Resolved). Click-outside closes
+// it. The full Override modal (with reason + followup creation) is
+// still reachable via the "More options…" link inside the popover.
+// =====================================================================
+interface ActionDispositionControlProps {
+  shipment: Shipment;
+  actionEditBusy: boolean;
+  onSetAction: (v: "YES" | "NO" | "RESOLVED") => void | Promise<void>;
+  onRevertToAi: () => void | Promise<void>;
+  onOverrideClick: () => void;
+}
+
+function ActionDispositionControl({ shipment, actionEditBusy, onSetAction, onRevertToAi, onOverrideClick }: ActionDispositionControlProps) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  // Close on outside click + Escape. Both anchored to the wrapping div
+  // so clicks on the badge or inside the popover don't trip close.
+  useEffect(() => {
+    if (!open) return;
+    function onDocPointer(e: MouseEvent) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const isManual = shipment.action_source === "manual";
+
+  return (
+    <div ref={wrapRef} className="relative mt-0.5">
+      <div className="flex items-center gap-2 flex-wrap">
+        <ActionBadge
+          action={shipment.action_required}
+          onClick={() => setOpen((v) => !v)}
+          title="Click to disposition this shipment"
+        />
+        {isManual ? (
+          <span
+            className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-amber-100 text-amber-800 ring-1 ring-amber-200"
+            title={`Overridden by ${shipment.action_overridden_by || "?"}${shipment.action_override_reason ? ` — ${shipment.action_override_reason}` : ""}`}
+          >Manual</span>
+        ) : (
+          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-slate-100 text-slate-600" title="Set by AI">From AI</span>
+        )}
+      </div>
+
+      {open ? (
+        <div
+          role="menu"
+          className="absolute z-30 mt-1.5 left-0 min-w-[220px] rounded-lg ring-1 ring-slate-200 bg-white shadow-lg p-1.5"
+        >
+          <div className="px-2 pt-1 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+            Set disposition
+          </div>
+          {(["YES", "NO", "RESOLVED"] as const).map((v) => {
+            const active = shipment.action_required === v;
+            const tone =
+              v === "YES" ? "text-rose-700 hover:bg-rose-50"
+              : v === "NO" ? "text-emerald-700 hover:bg-emerald-50"
+              : "text-violet-700 hover:bg-violet-50";
+            const label = v === "YES" ? "Action needed" : v === "NO" ? "On track" : "Manually resolved";
+            return (
+              <button
+                key={v}
+                role="menuitem"
+                disabled={actionEditBusy || active}
+                onClick={async () => {
+                  await onSetAction(v);
+                  setOpen(false);
+                }}
+                className={`w-full text-left text-sm rounded-md px-2 py-1.5 inline-flex items-center justify-between gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed ${tone}`}
+                title={active ? "Already set" : `Set action to ${label}`}
+              >
+                <span className="font-medium">{label}</span>
+                {active ? <Check className="h-3.5 w-3.5 text-slate-400" /> : null}
+              </button>
+            );
+          })}
+          <div className="my-1 border-t border-slate-100" />
+          <button
+            role="menuitem"
+            disabled={actionEditBusy || !isManual}
+            onClick={async () => {
+              await onRevertToAi();
+              setOpen(false);
+            }}
+            className="w-full text-left text-xs rounded-md px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            title={isManual ? "Clear override and let the AI value stand" : "Already on the AI value"}
+          >
+            Revert to AI
+          </button>
+          <button
+            role="menuitem"
+            onClick={() => { setOpen(false); onOverrideClick(); }}
+            className="w-full text-left text-xs rounded-md px-2 py-1.5 text-sky-700 hover:bg-sky-50"
+            title="Open the full override dialog (add a reason, create followups, draft an email)"
+          >
+            More options…
+          </button>
+        </div>
       ) : null}
     </div>
   );
@@ -1926,8 +2140,6 @@ function AnalysisThumbs({ analysis, onRated }: {
 function ShipmentSummaryHeader({
   shipment,
   onOverrideClick,
-  actionEditOptIn,
-  onActionEditOptInChange,
   actionEditBusy,
   onSetAction,
   onRevertToAi,
@@ -1982,71 +2194,13 @@ function ShipmentSummaryHeader({
         </div>
         <div className="col-span-2 sm:col-span-1">
           <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Action</div>
-          <div className="mt-0.5 flex items-center gap-2 flex-wrap">
-            <ActionBadge action={shipment.action_required} />
-            <span
-              className={
-                "text-[10px] px-2 py-0.5 rounded-full font-medium " +
-                (shipment.action_source === "manual"
-                  ? "bg-amber-100 text-amber-800 ring-1 ring-amber-200"
-                  : "bg-slate-100 text-slate-600")
-              }
-              title={
-                shipment.action_source === "manual"
-                  ? `Overridden by ${shipment.action_overridden_by || "?"}${shipment.action_override_reason ? ` — ${shipment.action_override_reason}` : ""}`
-                  : "Set by AI"
-              }
-            >
-              {shipment.action_source === "manual" ? "Manual" : "From AI"}
-            </span>
-            <button
-              onClick={onOverrideClick}
-              className="text-[11px] text-sky-700 hover:text-sky-900 underline"
-            >
-              Override
-            </button>
-            <label className="inline-flex items-center gap-1 text-[11px] text-slate-500 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={actionEditOptIn}
-                onChange={(e) => onActionEditOptInChange(e.target.checked)}
-                className="h-3 w-3 rounded border-slate-300"
-              />
-              Modify
-            </label>
-          </div>
-          {actionEditOptIn ? (
-            <div className="mt-1.5 inline-flex items-center gap-1.5 flex-wrap">
-              {(["YES", "NO", "RESOLVED"] as const).map((v) => {
-                const active = shipment.action_required === v;
-                const tone =
-                  v === "YES"
-                    ? "bg-rose-50 text-rose-700 ring-rose-200 hover:bg-rose-100"
-                    : v === "NO"
-                    ? "bg-emerald-50 text-emerald-700 ring-emerald-200 hover:bg-emerald-100"
-                    : "bg-violet-50 text-violet-700 ring-violet-200 hover:bg-violet-100";
-                return (
-                  <button
-                    key={v}
-                    disabled={actionEditBusy || active}
-                    onClick={() => onSetAction(v)}
-                    className={`text-[11px] font-semibold rounded-md px-2 py-0.5 ring-1 transition ${tone} disabled:opacity-50 disabled:cursor-not-allowed`}
-                    title={active ? "Already set" : `Set action to ${v}`}
-                  >
-                    {v === "RESOLVED" ? "Resolved" : v}
-                  </button>
-                );
-              })}
-              <button
-                disabled={actionEditBusy || shipment.action_source !== "manual"}
-                onClick={onRevertToAi}
-                className="text-[11px] text-slate-600 hover:text-slate-900 underline disabled:opacity-40 disabled:no-underline"
-                title="Clear override and let the AI value stand"
-              >
-                Revert to AI
-              </button>
-            </div>
-          ) : null}
+          <ActionDispositionControl
+            shipment={shipment}
+            actionEditBusy={actionEditBusy}
+            onSetAction={onSetAction}
+            onRevertToAi={onRevertToAi}
+            onOverrideClick={onOverrideClick}
+          />
         </div>
       </div>
     </div>
@@ -2162,6 +2316,16 @@ function TaskBanner({ task, busy, onSetStatus, onCreateInverseFollowup }: {
               title={`Filter the embedded FreightPOP grid to ${task.tracking_number}`}
             >
               Load in FreightPOP
+            </button>
+          ) : null}
+          {task.tracking_number ? (
+            <button
+              type="button"
+              onClick={() => requestOpenTracking()}
+              className="text-xs font-semibold rounded-md px-2.5 py-1 ring-1 ring-slate-300 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1"
+              title={`Open the FreightPOP tracking modal for ${task.tracking_number} in the embedded panel`}
+            >
+              Open tracking #
             </button>
           ) : null}
           {actions.map((a) => (

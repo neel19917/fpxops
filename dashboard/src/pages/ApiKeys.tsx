@@ -3,6 +3,8 @@ import { KeyRound, Plus, Trash2, Copy, Download, Shield, ShieldAlert } from "luc
 import { api, apiUrl } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
 import type { ApiKey } from "../lib/types";
+import { ErrorBlock } from "../components/ErrorBlock";
+import { LoadingState } from "../components/LoadingState";
 
 // Build a config.js the teammate can drop straight into extension/config.js,
 // matching the shape extension/config.example.js expects.
@@ -92,7 +94,7 @@ export function ApiKeysPage() {
           </button>
         </div>
 
-        {err ? <div className="mx-5 mt-4 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-sm px-3 py-2">{err} — only admin-scoped keys can list other keys.</div> : null}
+        {err ? <div className="mx-5 mt-4"><ErrorBlock compact>{err} — only admin-scoped keys can list other keys.</ErrorBlock></div> : null}
 
         <div className="overflow-auto">
           <table className="w-full text-sm">
@@ -107,7 +109,7 @@ export function ApiKeysPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {loading ? <tr><td colSpan={6} className="p-8 text-center text-slate-500">Loading…</td></tr>
+              {loading ? <LoadingState variant="row" colSpan={6} />
                 : active.length === 0 ? <tr><td colSpan={6} className="p-8 text-center text-slate-500">No active keys yet.</td></tr>
                   : active.map((k) => (
                     <tr key={k.id}>

@@ -69,9 +69,10 @@ describe("computeWalkContext — focused-task placement in the list", () => {
 describe("computeWalkContext — focused task missing from list", () => {
   // This is the case where the user opened a task in walk-active mode,
   // marked it Done, and the new lookup happens against the active set
-  // which no longer contains them. We pin the focused task at the front
-  // so prev/next still navigate the active queue.
-  it("prepends the focused task when it isn't in the list", () => {
+  // which no longer contains them. With no created_at signal we fall
+  // back to prepending the focused task; with created_at we splice into
+  // the right slot so the operator's walking direction is preserved.
+  it("prepends the focused task when neither side has created_at", () => {
     const w = computeWalkContext(T("z"), [T("a"), T("b")]);
     assert.equal(w.index, 0);
     assert.equal(w.total, 3);
@@ -86,6 +87,52 @@ describe("computeWalkContext — focused task missing from list", () => {
     assert.equal(w.prev_id, null);
     assert.equal(w.next_id, null);
     assert.deepEqual(w.ids, ["z"]);
+  });
+
+  // Regression: completing a task mid-walk used to send the user back
+  // to the first active task (next_id = list[0]). The fix splices the
+  // focused task back into its created_at slot so next_id is the task
+  // they were *about* to walk to, not index 0 of whatever remains.
+  it("splices focused task into its created_at slot (DESC order)", () => {
+    // List sorted created_at DESC: c (newest) → b → a (oldest).
+    // Focused task `mid` was created between c and b, but its status
+    // changed so it's no longer in the active list.
+    const list = [
+      { id: "c", shipment_id: "s-c", created_at: "2026-04-30T12:00:00Z" },
+      { id: "b", shipment_id: "s-b", created_at: "2026-04-29T12:00:00Z" },
+      { id: "a", shipment_id: "s-a", created_at: "2026-04-28T12:00:00Z" },
+    ];
+    const focused = { id: "mid", shipment_id: "s-mid", created_at: "2026-04-30T06:00:00Z" };
+    const w = computeWalkContext(focused, list);
+    assert.equal(w.index, 1, "should slot between c and b");
+    assert.equal(w.total, 4);
+    assert.equal(w.prev_id, "c", "previous in DESC order is the newer task");
+    assert.equal(w.next_id, "b", "next in DESC order is the older task — what user was walking to");
+    assert.deepEqual(w.ids, ["c", "mid", "b", "a"]);
+  });
+
+  it("appends to the end when focused is older than every active task", () => {
+    const list = [
+      { id: "c", shipment_id: "s-c", created_at: "2026-04-30T12:00:00Z" },
+      { id: "b", shipment_id: "s-b", created_at: "2026-04-29T12:00:00Z" },
+    ];
+    const focused = { id: "old", shipment_id: "s-old", created_at: "2025-01-01T00:00:00Z" };
+    const w = computeWalkContext(focused, list);
+    assert.equal(w.index, 2);
+    assert.equal(w.prev_id, "b");
+    assert.equal(w.next_id, null, "nothing older to walk to");
+  });
+
+  it("prepends when focused is newer than every active task", () => {
+    const list = [
+      { id: "b", shipment_id: "s-b", created_at: "2026-04-29T12:00:00Z" },
+      { id: "a", shipment_id: "s-a", created_at: "2026-04-28T12:00:00Z" },
+    ];
+    const focused = { id: "new", shipment_id: "s-new", created_at: "2026-05-01T00:00:00Z" };
+    const w = computeWalkContext(focused, list);
+    assert.equal(w.index, 0);
+    assert.equal(w.prev_id, null);
+    assert.equal(w.next_id, "b");
   });
 });
 

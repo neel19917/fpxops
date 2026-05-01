@@ -166,6 +166,14 @@ export function mapShipment(raw, runnerName) {
     ai_recommendation: pick(raw, ["_aiRecommendation"]),
     raw_data: raw,
     scraped_at: new Date().toISOString(),
+    // Seeing a shipment in the upload means FreightPOP is showing it
+    // again — clear the soft-archive so a previously-archived row
+    // (mistakenly archived, or a carrier re-opened delivery, or the
+    // shipment came back from the "Delivered" tab) reappears in the
+    // dashboard. Sweep-complete will re-archive on the next clean run
+    // if it really is gone.
+    archived_at: null,
+    archived_reason: null,
   };
 }
 

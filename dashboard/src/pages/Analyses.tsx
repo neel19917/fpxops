@@ -7,6 +7,8 @@ import { KindBadge } from "../components/Badge";
 import { KPI } from "../components/KPI";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { useNav } from "../lib/nav";
+import { ErrorBlock } from "../components/ErrorBlock";
+import { LoadingState } from "../components/LoadingState";
 
 export function AnalysesPage() {
   const nav = useNav();
@@ -17,6 +19,9 @@ export function AnalysesPage() {
   const [q, setQ] = useState("");
   const [selected, setSelected] = useState<AiAnalysis | null>(null);
 
+  // Manual refresh — used by the Refresh button. Effect-driven loads
+  // (initial mount + kind change) are kept distinct so they can carry a
+  // cancel guard without going through this function.
   async function load() {
     setLoading(true); setErr(null);
     try {
@@ -25,7 +30,15 @@ export function AnalysesPage() {
     } catch (e) { setErr((e as Error).message); }
     setLoading(false);
   }
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [kind]);
+  useEffect(() => {
+    let cancelled = false;
+    setErr(null);
+    api.analyses.list({ limit: 2000, kind: kind || undefined })
+      .then((r) => { if (!cancelled) setRows(r.data); })
+      .catch((e) => { if (!cancelled) setErr((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [kind]);
 
   const filtered = useMemo(() => {
     if (!q) return rows;
@@ -74,7 +87,7 @@ export function AnalysesPage() {
           </select>
           <button onClick={load} className="px-3 py-2 text-sm rounded-lg bg-slate-900 text-white hover:bg-slate-800">Refresh</button>
         </div>
-        {err ? <div className="p-4 bg-rose-50 text-rose-800 border-b border-rose-200 text-sm">{err}</div> : null}
+        {err ? <div className="p-4 border-b border-rose-200"><ErrorBlock compact>{err}</ErrorBlock></div> : null}
         <div className="overflow-auto max-h-[calc(100vh-340px)]">
           <table className="w-full text-sm">
             <thead className="bg-slate-50/80 sticky top-0">
@@ -90,8 +103,8 @@ export function AnalysesPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {loading ? (
-                <tr><td colSpan={8} className="p-8 text-center text-slate-500">Loading…</td></tr>
+              {loading && rows.length === 0 ? (
+                <LoadingState variant="row" colSpan={8} />
               ) : filtered.length === 0 ? (
                 <tr><td colSpan={8} className="p-8 text-center text-slate-500">No analyses yet. Run the extension to populate.</td></tr>
               ) : filtered.map((a) => (
@@ -174,7 +187,7 @@ export function AnalysesPage() {
             </Section>
             {selected.error ? (
               <Section title="Error">
-                <div className="bg-rose-50 ring-1 ring-rose-200 text-rose-700 text-sm p-3 rounded-lg">{selected.error}</div>
+                <ErrorBlock compact>{selected.error}</ErrorBlock>
               </Section>
             ) : null}
           </>

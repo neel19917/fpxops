@@ -1,15 +1,21 @@
-// Send a JSON response with a private Cache-Control window. The browser
-// transparently caches within max-age and revalidates in the background
-// during the stale-while-revalidate window — no extra wiring on the client.
+// Send a JSON response with no browser-side caching. The previous
+// implementation set max-age=15 + stale-while-revalidate=60, which was
+// causing a "refresh twice to see my change" bug across admin pages:
+// after a save, the server's in-process cache was correctly busted, but
+// the browser still had up to 75s of cached response on disk. The first
+// refresh served stale data; only the second (after browser revalidation)
+// showed the change.
 //
-// `private` is intentional: every authenticated response is user-scoped via
-// Bearer JWT or API key, and must NEVER be cached by a shared/edge proxy.
+// Admin list endpoints (settings, users, api-keys, audit-log) are
+// low-traffic — the bytes saved by client caching weren't worth the bug.
+// Server-side TTL caches and Supabase connection pooling keep server
+// load reasonable without browser caching.
 //
-// We deliberately do NOT short-circuit If-None-Match → 304 here. Express
-// already issues weak ETags, and a hand-rolled 304 path tripped the
-// dashboard's fetch wrapper (treats 304 as not-ok with an empty body) —
-// pages stuck on "Loading…" on repeat visits.
-export function sendCachedJson(_req, res, body, { maxAge = 15, swr = 60 } = {}) {
-  res.set("Cache-Control", `private, max-age=${maxAge}, stale-while-revalidate=${swr}`);
+// `private` is kept as defense-in-depth so any future intermediate proxy
+// (CDN, reverse proxy) doesn't accidentally fan-out a user-scoped
+// response. `no-store` guarantees the browser never serves a cached
+// version, including on Back/Forward navigation.
+export function sendCachedJson(_req, res, body, _opts = {}) {
+  res.set("Cache-Control", "private, no-store");
   res.json(body);
 }

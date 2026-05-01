@@ -725,6 +725,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         : { ok: false, error: `${result.failed.length} of ${result.chunks} chunk(s) failed`, count: result.count, chunks: result.chunks, failed: result.failed });
     })();
     return true;
+  } else if (msg.type === "sweepComplete") {
+    (async () => {
+      // Drain the upload queue first so the server has the latest
+      // scrape before we tell it which tracking numbers were absent
+      // — otherwise a queued retry could land after the archive pass
+      // and "resurrect" a shipment we just archived.
+      try { await flushPendingUploads(); } catch { /* fall through */ }
+      const result = await callApi("/api/shipments/sweep-complete", {
+        tracking_numbers: msg.trackingNumbers || [],
+      });
+      sendResponse(result.error
+        ? { ok: false, error: result.error }
+        : { ok: true, archived_shipments: result.archived_shipments || 0, archived_tasks: result.archived_tasks || 0, scanned: result.scanned || 0 });
+    })();
+    return true;
   } else if (msg.type === "analyzeBatch") {
     (async () => {
       // Uses the LangGraph /analyze endpoint on the server.

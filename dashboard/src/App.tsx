@@ -28,12 +28,16 @@ const FeedbackPage    = lazy(() => import("./pages/Feedback").then((m) => ({ def
 const AuditLogPage    = lazy(() => import("./pages/AuditLog").then((m) => ({ default: m.AuditLogPage })));
 const SettingsPage    = lazy(() => import("./pages/Settings").then((m) => ({ default: m.SettingsPage })));
 const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default: m.OpsPage })));
+const ServicesPage    = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServicesPage })));
+const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServiceDetailPage })));
+const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
   tracking: "/tracking",
   tasks: "/tasks",
   ops: "/ops",
+  notes: "/notes",
   analyses: "/analyses",
   gp: "/audits/gp",
   invoice: "/audits/invoice",
@@ -43,9 +47,11 @@ const TAB_PATH: Record<TabId, string> = {
   keys: "/admin/keys",
   audit: "/admin/audit",
   settings: "/admin/settings",
+  services: "/admin/services",
+  ai_export: "/admin/ai-export",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -54,10 +60,13 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/keys")) return "keys";
   if (pathname.startsWith("/admin/audit")) return "audit";
   if (pathname.startsWith("/admin/settings")) return "settings";
+  if (pathname.startsWith("/admin/services")) return "services";
+  if (pathname.startsWith("/admin/ai-export")) return "ai_export";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
+  if (pathname.startsWith("/notes")) return "notes";
   if (pathname.startsWith("/analyses")) return "analyses";
   if (pathname.startsWith("/shares")) return "shares";
   if (pathname.startsWith("/feedback")) return "feedback";
@@ -97,9 +106,20 @@ function SharedViewRoute() {
 }
 
 function AuthedApp() {
-  const { session, profile, loading } = useAuth();
+  const { session, profile, loading, error, signOut } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
+  // Boot stall guard: bootSession() has its own 6s timeout, but if the
+  // *entire* auth provider is wedged (Supabase SDK lock contention, fetch
+  // hung in a service worker, an extension intercepting localStorage), the
+  // user would see an indefinite "Loading…". After 7s, surface a Retry +
+  // Sign-out path so they're not pinned to a blank screen.
+  const [bootStalled, setBootStalled] = useState(false);
+  useEffect(() => {
+    if (!loading) { setBootStalled(false); return; }
+    const t = setTimeout(() => setBootStalled(true), 7000);
+    return () => clearTimeout(t);
+  }, [loading]);
 
   // Clear Supabase's OAuth hash fragment once we're signed in.
   useEffect(() => {
@@ -119,12 +139,53 @@ function AuthedApp() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-slate-500 text-sm">
-        Loading…
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4 text-slate-500 text-sm">
+        <div>Loading…</div>
+        {bootStalled ? (
+          <div className="max-w-sm rounded-lg bg-amber-50 ring-1 ring-amber-200 px-4 py-3 text-amber-900 text-xs">
+            <div className="font-medium mb-1">Sign-in is taking longer than expected.</div>
+            <div className="text-amber-800">
+              Your session may be stuck. Reload, or sign out and try again.
+            </div>
+            <div className="mt-2 flex items-center gap-3">
+              <button
+                onClick={() => window.location.reload()}
+                className="text-sky-700 hover:text-sky-900 hover:underline"
+              >Reload</button>
+              <button
+                onClick={() => { signOut().finally(() => window.location.reload()); }}
+                className="text-slate-600 hover:text-slate-900 hover:underline"
+              >Sign out</button>
+            </div>
+          </div>
+        ) : null}
       </div>
     );
   }
   if (!session) return <SignInPage />;
+  // Profile fetch errored (RLS hiccup, network blip) AFTER session loaded.
+  // Without this, the user lands on PendingApproval with empty fields and
+  // no way to know what went wrong. Show the error + retry path instead.
+  if (session && !profile && error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6">
+        <div className="max-w-sm rounded-2xl bg-white ring-1 ring-rose-200 shadow-sm p-6 text-sm text-slate-700">
+          <div className="font-medium text-rose-700 mb-1">Couldn't load your profile</div>
+          <div className="text-slate-600 mb-4 break-words">{error}</div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => window.location.reload()}
+              className="px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800"
+            >Retry</button>
+            <button
+              onClick={() => { signOut().finally(() => window.location.reload()); }}
+              className="px-3 py-1.5 rounded-lg ring-1 ring-slate-300 hover:bg-slate-100 text-slate-700"
+            >Sign out</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
   if (!profile?.enabled) return <PendingApprovalPage />;
 
   const isAdmin = profile.role === "admin";
@@ -152,9 +213,15 @@ function AuthedApp() {
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
             <Route path="/tasks" element={<TasksPage />} />
+            {/* Static sub-routes win over /tasks/:taskId in react-router v6
+                ranking (static > dynamic). They render the same TasksPage
+                with a different sub-tab inferred from the URL. */}
+            <Route path="/tasks/carrier-followups" element={<TasksPage />} />
+            <Route path="/tasks/customer-followups" element={<TasksPage />} />
             <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
             <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
             <Route path="/ops" element={<OpsPage />} />
+            <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
@@ -166,6 +233,10 @@ function AuthedApp() {
                 <Route path="/admin/keys" element={<ApiKeysPage />} />
                 <Route path="/admin/audit" element={<AuditLogPage />} />
                 <Route path="/admin/settings" element={<SettingsPage />} />
+                <Route path="/admin/settings/:section" element={<SettingsPage />} />
+                <Route path="/admin/services" element={<ServicesPage />} />
+                <Route path="/admin/services/:slug" element={<ServiceDetailPage />} />
+                <Route path="/admin/ai-export" element={<AiExportPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tracking" replace />} />
@@ -173,6 +244,25 @@ function AuthedApp() {
         </Suspense>
       </Layout>
     </NavCtx.Provider>
+  );
+}
+
+// /notes — same Shipments table, mounted with the "With notes" filter
+// pre-applied so the team has a one-click entry point to every shipment
+// that carries an operator note. The drawer + export still work as
+// usual; clicking a row pushes /tracking/:id (drawer follows the same
+// URL convention as the Tracking tab).
+function NotesRoute() {
+  const navigate = useNavigate();
+  return (
+    <ShipmentsPage
+      notesMode
+      onDrawerChange={(nextId, nextSection) => {
+        if (!nextId) navigate("/notes");
+        else if (nextSection) navigate(`/tracking/${nextId}/${nextSection}`);
+        else navigate(`/tracking/${nextId}`);
+      }}
+    />
   );
 }
 
@@ -234,6 +324,13 @@ function TaskWalkRoute() {
   // request all manifest as a hung fetch — the timeout gives the user a
   // way out.
   const [stalled, setStalled] = useState(false);
+  // Auto-skip when the task points at a shipment that's already
+  // delivered or has been soft-archived (= no longer in the FreightPOP
+  // grid). The walk would otherwise pin the operator on a row whose
+  // iframe filter returns zero rows, with no way to know whether the
+  // FP grid is just slow or the shipment is genuinely gone. A 5s
+  // countdown gives them time to override before we move on.
+  const [autoSkip, setAutoSkip] = useState<{ reason: string } | null>(null);
 
   useEffect(() => {
     if (!taskId) return;
@@ -265,6 +362,41 @@ function TaskWalkRoute() {
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; clearTimeout(stallTimer); };
   }, [taskId, reloadKey]);
+
+  // Probe the shipment for delivered / archived state in parallel with
+  // the task lookup. Fires whenever the focused shipment changes (i.e.
+  // every walk step). We deliberately don't tie this to onDrawerChange
+  // — the drawer's own fetch may not have happened yet by the time the
+  // operator wants to know "is this one even worth landing on?".
+  useEffect(() => {
+    setAutoSkip(null);
+    if (!resolved?.shipmentId) return;
+    let cancelled = false;
+    api.shipments.get(resolved.shipmentId).then((r) => {
+      if (cancelled) return;
+      const ship = r.shipment;
+      const archived = !!(ship as { archived_at?: string | null }).archived_at;
+      const status = (ship.shipment_status || "").toLowerCase();
+      const delivered = status.includes("delivered") || status.includes("complete");
+      if (archived) {
+        setAutoSkip({ reason: "This shipment is no longer in the FreightPOP grid (auto-archived)." });
+      } else if (delivered) {
+        setAutoSkip({ reason: "This shipment is marked delivered." });
+      }
+    }).catch(() => { /* non-fatal — leave the operator on the task */ });
+    return () => { cancelled = true; };
+  }, [resolved?.shipmentId]);
+
+  // 5s auto-advance once an auto-skip condition is detected. Cleared on
+  // taskId change so navigating manually disarms the timer.
+  useEffect(() => {
+    if (!autoSkip || !resolved) return;
+    const t = setTimeout(() => {
+      if (resolved.nextTaskId) navigate(`/tasks/${resolved.nextTaskId}`);
+      else navigate("/tasks");
+    }, 5000);
+    return () => clearTimeout(t);
+  }, [autoSkip, resolved, navigate]);
 
   if (error) {
     return (
@@ -317,7 +449,33 @@ function TaskWalkRoute() {
   void loading;
 
   return (
-    <ShipmentsPage
+    <>
+      {autoSkip ? (
+        <div className="sticky top-0 z-30 bg-amber-50 ring-1 ring-amber-200 px-4 py-2 text-amber-900 text-sm flex items-center justify-between gap-3">
+          <div>
+            <span className="font-medium">Skipping in 5s.</span>{" "}
+            <span className="text-amber-800">{autoSkip.reason}</span>
+          </div>
+          <div className="flex items-center gap-3 text-xs">
+            <button
+              onClick={() => {
+                if (resolved.nextTaskId) navigate(`/tasks/${resolved.nextTaskId}`);
+                else navigate("/tasks");
+              }}
+              className="px-2 py-1 rounded-md bg-amber-600 text-white hover:bg-amber-700"
+            >
+              Skip now
+            </button>
+            <button
+              onClick={() => setAutoSkip(null)}
+              className="text-amber-800 hover:text-amber-900 hover:underline"
+            >
+              Stay
+            </button>
+          </div>
+        </div>
+      ) : null}
+      <ShipmentsPage
       initialShipmentId={resolved.shipmentId}
       drawerSection={section || null}
       onShipmentConsumed={() => { /* URL already has the task id */ }}
@@ -345,17 +503,18 @@ function TaskWalkRoute() {
         onTaskStatusChanged: () => setReloadKey((k) => k + 1),
       }}
     />
+    </>
   );
 }
 
 // Re-export Outlet to keep TS happy if other modules pull it in later.
 export { Outlet };
 
-// Suspense fallback for lazy-loaded routes. Intentionally minimal —
-// secondary chunks usually arrive in <500ms on a warm cache. Anything
-// fancier would itself be a load on the route swap.
+// Suspense fallback for lazy-loaded routes. Renders nothing so the page's
+// own LoadingState is the only loading surface the user sees during a cold
+// nav — otherwise we'd stack the chunk-loading "Loading…" on top of the
+// page-data "Loading…" and read as two flickers. Chunks usually arrive in
+// <500ms on a warm cache, so the brief blank is imperceptible.
 function RouteFallback() {
-  return (
-    <div className="p-6 text-sm text-slate-500">Loading…</div>
-  );
+  return null;
 }

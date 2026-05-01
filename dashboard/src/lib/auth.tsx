@@ -100,17 +100,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Fix: if the cached token is within 60s of expiry (or already past),
   // call refreshSession() before doing anything that depends on it.
   // Keeps the boot path single-loop without a 401 detour.
+  //
+  // Hard ceiling of BOOT_TIMEOUT_MS so a hung Supabase call (network blip,
+  // service incident, ad-blocker eating the request) can't pin the dashboard
+  // on "Loading…" forever. We fall through with whatever's cached; the api
+  // gate has its own retry loop and will surface a real error if needed.
   async function bootSession(): Promise<{ session: Session | null }> {
     const REFRESH_SKEW_S = 60;
-    const { data } = await sb.auth.getSession();
-    const sess = data.session;
+    const BOOT_TIMEOUT_MS = 6000;
+    const timeout = <T,>(p: Promise<T>): Promise<T | null> =>
+      Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), BOOT_TIMEOUT_MS))]);
+
+    const got = await timeout(sb.auth.getSession());
+    const sess = got?.data.session ?? null;
     if (!sess) return { session: null };
     const exp = sess.expires_at;
     const stale = exp ? Date.now() / 1000 > exp - REFRESH_SKEW_S : false;
     if (!stale || !sess.refresh_token) return { session: sess };
     try {
-      const { data: refreshed, error } = await sb.auth.refreshSession();
-      if (!error && refreshed.session) return { session: refreshed.session };
+      const refreshed = await timeout(sb.auth.refreshSession());
+      if (refreshed && !refreshed.error && refreshed.data.session) {
+        return { session: refreshed.data.session };
+      }
     } catch { /* fall through with the stale session */ }
     return { session: sess };
   }
