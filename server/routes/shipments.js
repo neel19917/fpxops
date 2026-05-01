@@ -27,7 +27,7 @@ const LIST_COLUMNS = [
   "ready_time", "cut_off_time",
   "shipper_spot_quote", "spot_quote_fulfilled_by", "pickup_tendered",
   "tracking_comments", "updated_via", "last_modified_at",
-  "signed_by",
+  "signed_by", "notes",
   "shipment_marked_up_rate", "shipment_rate_without_markup", "shipment_gross_profit",
   "reference_one", "reference_two", "reference_three",
   "reference_four", "reference_five", "reference_six",
@@ -101,11 +101,15 @@ async function autoCreateActionTasks(req, upsertedRows) {
   if (!candidates.length) return 0;
   const ids = candidates.map((s) => s.id);
   // Find which of these already have an open task; skip those.
+  // Archived tasks (shipment was delivered/auto-archived) don't count —
+  // we want to create a fresh task if the shipment came back into the
+  // dashboard with a new issue.
   const { data: existing } = await supabase
     .from("fpx_shipment_tasks")
     .select("shipment_id")
     .in("shipment_id", ids)
-    .in("status", ["open", "in_progress"]);
+    .in("status", ["open", "in_progress"])
+    .is("archived_at", null);
   const taken = new Set((existing || []).map((r) => r.shipment_id));
   const toCreate = candidates.filter((s) => !taken.has(s.id));
   if (!toCreate.length) return 0;
@@ -429,6 +433,109 @@ shipmentsRouter.post("/", async (req, res) => {
     });
   }
   res.status(400).json({ error: "Provide { shipment } or { shipments: [] }" });
+});
+
+// POST /shipments/sweep-complete
+//   body: { tracking_numbers: ["...", ...] }   // every TN seen during the sweep
+//   header: x-fpx-user-name (the runner)
+//
+// Called once at the end of an UNFILTERED full-grid scrape. FreightPOP hides
+// delivered shipments from the default Tracking grid, so any of the runner's
+// previously-scraped shipments whose tracking_number is NOT in the supplied
+// set were delivered between scrapes. Soft-archive them and their open tasks
+// so the dashboard stops showing stale "in transit" rows that 404 when
+// clicked.
+//
+// Safety:
+//   - Refuses an empty tracking_numbers list (would archive everything for
+//     this runner — that's almost always a broken scrape, not a real signal).
+//   - Scoped strictly to created_by = runner; never touches other reps' rows.
+//   - Soft-archive only (archived_at + archived_reason); reversible via SQL.
+//   - The extension only fires this on a clean unfiltered completion (the
+//     gate lives in content.js — server trusts that).
+shipmentsRouter.post("/sweep-complete", async (req, res) => {
+  const runner = (req.header("x-fpx-user-name") || req.user?.email || req.apiKey?.name || "").trim();
+  if (!runner) {
+    return res.status(400).json({ error: "x-fpx-user-name header required to scope sweep" });
+  }
+  const seen = Array.isArray(req.body?.tracking_numbers) ? req.body.tracking_numbers : null;
+  if (!seen) return res.status(400).json({ error: "body.tracking_numbers array required" });
+  const seenSet = new Set(seen.map((t) => String(t).trim()).filter(Boolean));
+  if (seenSet.size === 0) {
+    // Refuse: scraper saw nothing → almost certainly a broken run, not a
+    // signal that every previously-tracked shipment was delivered.
+    return res.status(400).json({ error: "tracking_numbers is empty — refusing to archive" });
+  }
+
+  // Pull this runner's currently-active shipments. Only id + tracking_number
+  // here — we'll only update the rows we actually need to archive.
+  const { data: active, error: fetchErr } = await supabase
+    .from("fpx_shipments")
+    .select("id, tracking_number")
+    .eq("created_by", runner)
+    .is("archived_at", null);
+  if (fetchErr) return res.status(500).json({ error: fetchErr.message });
+
+  const stale = (active || []).filter(
+    (r) => r.tracking_number && !seenSet.has(r.tracking_number),
+  );
+  if (!stale.length) {
+    return res.json({ archived_shipments: 0, archived_tasks: 0, runner, scanned: active?.length || 0 });
+  }
+
+  const staleIds = stale.map((r) => r.id);
+  const archivedAt = new Date().toISOString();
+
+  // Archive shipments — set archived_at + a reason so we can tell apart
+  // operator-deleted rows (hard delete) from auto-archived (soft).
+  const { error: shipErr } = await supabase
+    .from("fpx_shipments")
+    .update({ archived_at: archivedAt, archived_reason: "absent_from_dashboard" })
+    .in("id", staleIds);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+
+  // Archive open/in-progress/blocked tasks for those shipments. We mark the
+  // task done + completed_at + archived_at so it disappears from the open
+  // list AND the kanban "completed" lane shows when it landed and why.
+  // Tasks already in 'done' or 'cancelled' are left alone.
+  const { data: archivedTasks, error: taskErr } = await supabase
+    .from("fpx_shipment_tasks")
+    .update({
+      status: "done",
+      completed_at: archivedAt,
+      archived_at: archivedAt,
+      archived_reason: "shipment_delivered",
+    })
+    .in("shipment_id", staleIds)
+    .in("status", ["open", "in_progress", "blocked"])
+    .select("id");
+  if (taskErr) {
+    // Shipments are already archived — surface the task error but don't
+    // unwind. Operator can re-run the sweep and the task update will
+    // pick up where this one left off (idempotent on archived_at).
+    console.warn("[FPX] sweep-complete task archive failed:", taskErr.message);
+  }
+
+  logAudit(req, {
+    action: "sweep_archive",
+    entity_type: "shipment",
+    summary: `Auto-archived ${staleIds.length} shipment${staleIds.length === 1 ? "" : "s"} absent from dashboard for runner ${runner}` +
+      (archivedTasks?.length ? ` (${archivedTasks.length} task${archivedTasks.length === 1 ? "" : "s"})` : ""),
+    metadata: {
+      runner,
+      scanned: active.length,
+      archived_shipments: staleIds.length,
+      archived_tasks: archivedTasks?.length || 0,
+      sample_tracking: stale.slice(0, 10).map((r) => r.tracking_number),
+    },
+  });
+
+  res.json({
+    archived_shipments: staleIds.length,
+    archived_tasks: archivedTasks?.length || 0,
+    runner,
+    scanned: active.length,
+  });
 });
 
 // POST /shipments/bulk-delete  { ids: [uuid, ...] }

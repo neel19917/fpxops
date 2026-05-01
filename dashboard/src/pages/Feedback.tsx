@@ -54,14 +54,17 @@ export function FeedbackPage() {
     if (!title.trim() || !body.trim()) return;
     setSubmitting(true);
     try {
-      await api.feedback.create({
+      // Use the returned row to prepend, rather than reloading the whole
+      // list — reloading would blank the panel to LoadingState even though
+      // we already have the prior items rendered.
+      const r = await api.feedback.create({
         category, title: title.trim(), body: body.trim(), source: "dashboard",
         context: { url: window.location.href, userAgent: navigator.userAgent },
       });
+      setItems((prev) => [r.feedback, ...prev]);
       setTitle(""); setBody(""); setCategory("bug");
       setJustSubmitted(true);
       setTimeout(() => setJustSubmitted(false), 2500);
-      await load();
     } catch (e) { setError((e as Error).message); }
     finally { setSubmitting(false); }
   }

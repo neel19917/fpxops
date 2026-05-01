@@ -32,15 +32,23 @@ export function ShareLinksPage() {
   // disable the button so a double-click doesn't fire two postMessages.
   const [embedBusy, setEmbedBusy] = useState(false);
 
-  async function load() {
-    setLoading(true);
+  // `silent=true` swaps rows in place after a revoke without flipping the
+  // loading flag — otherwise the entire share-links table would blank to
+  // "Loading…" after every revoke despite the prior rows already being on
+  // screen.
+  async function load(silent = false) {
+    if (!silent) setLoading(true);
     try { setRows((await api.shareLinks.list()).data); } catch {}
-    setLoading(false);
+    if (!silent) setLoading(false);
   }
   useEffect(() => { load(); }, []);
   useEffect(() => {
     if (!openId) { setDetail(null); setShipmentMeta(null); return; }
-    api.shareLinks.get(openId).then(setDetail).catch(() => setDetail(null));
+    let cancelled = false;
+    api.shareLinks.get(openId)
+      .then((d) => { if (!cancelled) setDetail(d); })
+      .catch(() => { if (!cancelled) setDetail(null); });
+    return () => { cancelled = true; };
   }, [openId]);
 
   // When the opened share link points at a shipment, look the shipment up
@@ -101,7 +109,7 @@ export function ShareLinksPage() {
 
   async function revoke(id: string, label: string | null) {
     if (!confirm(`Revoke link "${label || id}"? Anyone with the link will get a 410 response.`)) return;
-    try { await api.shareLinks.revoke(id); load(); } catch (e) { alert((e as Error).message); }
+    try { await api.shareLinks.revoke(id); load(true); } catch (e) { alert((e as Error).message); }
   }
 
   return (

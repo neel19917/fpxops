@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Lock, Package, ReceiptText, Sparkles, TrendingUp, Copy, Check, ExternalLink } from "lucide-react";
 import { publicShare } from "../lib/api";
 import { fmtDate, fmtDateTime, fmtNum, fmtPct, fmtUsd } from "../lib/format";
@@ -35,15 +35,26 @@ export function SharedViewPage({ token }: Props) {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // Guard against React StrictMode firing the effect twice in dev — the
+  // peek is idempotent but `publicShare.view(token)` is a side-effecting
+  // POST that bumps the view counter, so we'd double-increment without
+  // this. Keyed by token so a different share link in the same session
+  // still records its first view.
+  const viewedRef = useRef<string | null>(null);
   useEffect(() => {
+    let cancelled = false;
     publicShare.peek(token).then((r) => {
+      if (cancelled) return;
       setMeta(r.meta);
       if (r.data) {
         setData(r.data);
-        // Separate call to record the view (peek doesn't count as a view).
-        publicShare.view(token).then(() => {}).catch(() => {});
+        if (viewedRef.current !== token) {
+          viewedRef.current = token;
+          publicShare.view(token).then(() => {}).catch(() => {});
+        }
       }
-    }).catch((e) => setError((e as Error).message));
+    }).catch((e) => { if (!cancelled) setError((e as Error).message); });
+    return () => { cancelled = true; };
   }, [token]);
 
   async function submitPassword() {

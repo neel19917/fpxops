@@ -19,6 +19,9 @@ export function AnalysesPage() {
   const [q, setQ] = useState("");
   const [selected, setSelected] = useState<AiAnalysis | null>(null);
 
+  // Manual refresh — used by the Refresh button. Effect-driven loads
+  // (initial mount + kind change) are kept distinct so they can carry a
+  // cancel guard without going through this function.
   async function load() {
     setLoading(true); setErr(null);
     try {
@@ -27,7 +30,15 @@ export function AnalysesPage() {
     } catch (e) { setErr((e as Error).message); }
     setLoading(false);
   }
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [kind]);
+  useEffect(() => {
+    let cancelled = false;
+    setErr(null);
+    api.analyses.list({ limit: 2000, kind: kind || undefined })
+      .then((r) => { if (!cancelled) setRows(r.data); })
+      .catch((e) => { if (!cancelled) setErr((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [kind]);
 
   const filtered = useMemo(() => {
     if (!q) return rows;
@@ -92,7 +103,7 @@ export function AnalysesPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {loading ? (
+              {loading && rows.length === 0 ? (
                 <LoadingState variant="row" colSpan={8} />
               ) : filtered.length === 0 ? (
                 <tr><td colSpan={8} className="p-8 text-center text-slate-500">No analyses yet. Run the extension to populate.</td></tr>

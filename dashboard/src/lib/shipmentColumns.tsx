@@ -99,6 +99,13 @@ export const SHIPMENT_COLUMNS: ShipmentColumn[] = [
     render: (r) => dash(r.pickup_tendered) },
   { id: "tracking_comments",     label: "Track. Comments", defaultVisible: false, tdClass: "max-w-[280px] truncate",
     title: (r) => r.tracking_comments || "", render: (r) => dash(r.tracking_comments) },
+  // Operator notes column. Off by default to keep the table compact, but
+  // available via the column selector and pre-filtered through the
+  // "With notes" toolbar toggle so a cross-shipment notes view is one
+  // click away. Title attr exposes the full text on hover since the
+  // cell is truncated.
+  { id: "notes",                 label: "Notes",           defaultVisible: false, tdClass: "max-w-[320px] truncate",
+    title: (r) => r.notes || "", render: (r) => dash(r.notes) },
   { id: "updated_via",           label: "Updated Via",     defaultVisible: false, tdClass: "whitespace-nowrap",
     render: (r) => dash(r.updated_via) },
   { id: "last_modified_at",      label: "Last Modified",   defaultVisible: false, tdClass: "whitespace-nowrap text-slate-600",

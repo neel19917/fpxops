@@ -31,9 +31,20 @@ export function AuditLogPage() {
   const [entityType, setEntityType] = useState("");
   const [action, setAction] = useState("");
   const [actorEmail, setActorEmail] = useState("");
+  // Debounced version of actorEmail — drives the actual fetch so typing
+  // doesn't fire one request per keystroke (which used to race + blink the
+  // entire list to LoadingState on every character).
+  const [debouncedActorEmail, setDebouncedActorEmail] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  async function load() {
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedActorEmail(actorEmail), 300);
+    return () => clearTimeout(t);
+  }, [actorEmail]);
+
+  // Stable refresh handler for the toolbar button — bypasses the debounced
+  // fetch path and forces an immediate reload using current filters.
+  async function refresh() {
     setLoading(true);
     setError(null);
     try {
@@ -50,7 +61,19 @@ export function AuditLogPage() {
     }
   }
 
-  useEffect(() => { load(); /* eslint-disable-line */ }, [entityType, action, actorEmail]);
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    const params: Record<string, string> = {};
+    if (entityType) params.entity_type = entityType;
+    if (action) params.action = action;
+    if (debouncedActorEmail) params.actor_email = debouncedActorEmail;
+    api.auditLog.list(params)
+      .then((r) => { if (!cancelled) setEntries(r.data); })
+      .catch((e) => { if (!cancelled) setError((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [entityType, action, debouncedActorEmail]);
 
   function toggle(id: string) {
     setExpanded((prev) => {
@@ -68,7 +91,7 @@ export function AuditLogPage() {
           <h1 className="text-2xl font-semibold flex items-center gap-2"><ScrollText className="h-6 w-6 text-slate-700" /> Audit log</h1>
           <p className="text-sm text-slate-500 mt-0.5">Every shipment upsert, task change, override, and admin action. Most recent first.</p>
         </div>
-        <button onClick={load} className="rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-sm font-medium px-3 py-2 flex items-center gap-1.5">
+        <button onClick={refresh} className="rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-sm font-medium px-3 py-2 flex items-center gap-1.5">
           <RefreshCw className="h-4 w-4" /> Refresh
         </button>
       </div>
@@ -113,7 +136,7 @@ export function AuditLogPage() {
       {error ? <div className="mb-4"><ErrorBlock>{error}</ErrorBlock></div> : null}
 
       <div className="bg-white ring-1 ring-slate-200 shadow-sm rounded-2xl overflow-hidden">
-        {loading ? (
+        {loading && entries.length === 0 ? (
           <LoadingState />
         ) : entries.length === 0 ? (
           <div className="text-center text-slate-400 py-10">No audit entries match your filters.</div>

@@ -31,6 +31,30 @@ function tokenStillFresh(s: { access_token?: string; expires_at?: number | null 
   return s.access_token;
 }
 
+// Single-flight guard for sb.auth.refreshSession(). With the no-op lock in
+// supabase.ts (deliberate: navigator.locks orphans under React Strict Mode),
+// the SDK no longer serializes refresh internally — so N parallel requests
+// hitting a 401 would each call the refresh endpoint. Coalesce them here:
+// the first call wins and every concurrent caller awaits the same promise.
+let _refreshInflight: Promise<string | null> | null = null;
+function refreshSessionOnce(): Promise<string | null> {
+  if (_refreshInflight) return _refreshInflight;
+  _refreshInflight = (async () => {
+    try {
+      const { data, error } = await sb.auth.refreshSession();
+      if (error || !data.session?.access_token) return null;
+      return data.session.access_token;
+    } catch {
+      return null;
+    } finally {
+      // Clear on the next tick so a follow-up burst that's already in flight
+      // can still ride along; subsequent requests get a fresh attempt.
+      setTimeout(() => { _refreshInflight = null; }, 0);
+    }
+  })();
+  return _refreshInflight;
+}
+
 async function getAccessTokenOrWait(): Promise<string> {
   // 1. Cached session, if still fresh.
   const cached = (await sb.auth.getSession()).data.session;
@@ -41,10 +65,8 @@ async function getAccessTokenOrWait(): Promise<string> {
   // token, this returns a brand-new access token without forcing a full
   // sign-in round-trip.
   if (cached?.refresh_token) {
-    try {
-      const { data, error } = await sb.auth.refreshSession();
-      if (!error && data.session?.access_token) return data.session.access_token;
-    } catch { /* fall through to the wait path */ }
+    const tok = await refreshSessionOnce();
+    if (tok) return tok;
   }
 
   // 3. Nothing usable yet — wait for onAuthStateChange to deliver one.
@@ -89,15 +111,15 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
   let resp = await fire(accessToken);
   // Belt + suspenders for the stale-token race: a 401 means the access token
   // the SDK handed us was no longer valid server-side. Force a refresh and
-  // retry exactly once before propagating the failure to the caller.
+  // retry exactly once before propagating the failure to the caller. Routes
+  // through the single-flight guard so a page firing 6 parallel requests on
+  // mount only triggers ONE refresh round-trip.
   if (resp.status === 401) {
-    try {
-      const { data } = await sb.auth.refreshSession();
-      if (data.session?.access_token) {
-        accessToken = data.session.access_token;
-        resp = await fire(accessToken);
-      }
-    } catch { /* retry not possible — fall through with the original 401 */ }
+    const refreshed = await refreshSessionOnce();
+    if (refreshed) {
+      accessToken = refreshed;
+      resp = await fire(accessToken);
+    }
   }
   if (!resp.ok) {
     const text = await resp.text();

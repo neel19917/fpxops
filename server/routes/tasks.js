@@ -34,14 +34,17 @@ export function isCustomerFollowupTitle(title) {
   return true;
 }
 
-// GET /tasks?status=open&assigned_to=...&limit=200
-// Cross-shipment task list; defaults to open tasks.
+// GET /tasks?status=open&assigned_to=...&limit=200&include_archived=1
+// Cross-shipment task list; defaults to open tasks. Archived tasks (auto-set
+// when their shipment was soft-archived by sweep-complete) are hidden by
+// default — pass include_archived=1 to surface them in admin views.
 tasksRouter.get("/", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   let q = supabase.from("fpx_shipment_tasks").select("*").order("created_at", { ascending: false }).limit(limit);
   if (req.query.status) q = q.eq("status", String(req.query.status));
   if (req.query.assigned_to) q = q.eq("assigned_to", String(req.query.assigned_to));
   if (req.query.priority) q = q.eq("priority", String(req.query.priority));
+  if (!req.query.include_archived) q = q.is("archived_at", null);
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
 
@@ -84,6 +87,7 @@ tasksRouter.get("/carrier-followups", async (req, res) => {
     .from("fpx_shipment_tasks")
     .select("*")
     .in("status", ["open", "in_progress"])
+    .is("archived_at", null)
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   const followups = (tasks || []).filter((t) => isCarrierFollowupTitle(t.title));
@@ -271,6 +275,7 @@ tasksRouter.get("/customer-followups", async (req, res) => {
     .from("fpx_shipment_tasks")
     .select("*")
     .in("status", ["open", "in_progress"])
+    .is("archived_at", null)
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   const followups = (tasks || []).filter((t) => isCustomerFollowupTitle(t.title));
@@ -379,6 +384,10 @@ tasksRouter.get("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
     else if (walkParam === "open" || walkParam === "in_progress" || walkParam === "blocked" || walkParam === "done")
       q = q.eq("status", walkParam);
     // "all" → no status filter.
+    // Walk surfaces "neighbor" tasks the operator can step through; archived
+    // ones (auto-completed via shipment delivery) shouldn't pollute that
+    // navigation. Only the "all" walk includes archived for completeness.
+    if (walkParam !== "all") q = q.is("archived_at", null);
     const { data: list, error: listErr } = await q;
     if (!listErr && list) {
       // Pure resolver lives in lib/taskWalk.js so it's testable without

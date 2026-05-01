@@ -45,11 +45,19 @@ export function GpAuditsPage() {
   const [reanError, setReanError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.audits.gp.list().then((r) => { setRows(r.data); setLoading(false); }).catch(() => setLoading(false));
+    let cancelled = false;
+    api.audits.gp.list()
+      .then((r) => { if (!cancelled) { setRows(r.data); setLoading(false); } })
+      .catch(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, []);
   useEffect(() => {
     if (!openId) { setDetail(null); setReanError(null); return; }
-    api.audits.gp.get(openId).then(setDetail).catch(() => setDetail(null));
+    let cancelled = false;
+    api.audits.gp.get(openId)
+      .then((d) => { if (!cancelled) setDetail(d); })
+      .catch(() => { if (!cancelled) setDetail(null); });
+    return () => { cancelled = true; };
   }, [openId]);
 
   async function reanalyze(level: "summary" | "full") {
@@ -154,11 +162,19 @@ export function InvoiceAuditsPage() {
   const [reanError, setReanError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.audits.invoice.list().then((r) => { setRows(r.data); setLoading(false); }).catch(() => setLoading(false));
+    let cancelled = false;
+    api.audits.invoice.list()
+      .then((r) => { if (!cancelled) { setRows(r.data); setLoading(false); } })
+      .catch(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, []);
   useEffect(() => {
     if (!openId) { setDetail(null); setReanError(null); return; }
-    api.audits.invoice.get(openId).then(setDetail).catch(() => setDetail(null));
+    let cancelled = false;
+    api.audits.invoice.get(openId)
+      .then((d) => { if (!cancelled) setDetail(d); })
+      .catch(() => { if (!cancelled) setDetail(null); });
+    return () => { cancelled = true; };
   }, [openId]);
 
   async function reanalyze(level: "summary" | "full") {

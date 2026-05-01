@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -105,6 +105,11 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [customerFilter, setCustomerFilter] = useState<string>("");
   const [sourceFilter, setSourceFilter] = useState<string>("");
   const [pillFilter, setPillFilter] = useState<PillId>("all");
+  // "With notes" toggle — narrows the table to shipments that carry an
+  // operator note. The note column itself stays available in the column
+  // selector; this filter is just the cross-shipment notes view the team
+  // wanted as a one-click navigable + exportable surface.
+  const [notesOnly, setNotesOnly] = useState<boolean>(false);
 
   const [columnPrefs, setColumnPrefs] = useState<ColumnPrefs>(() => loadColumnPrefs());
   useEffect(() => { saveColumnPrefs(columnPrefs); }, [columnPrefs]);
@@ -324,14 +329,20 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       setNotesSaved(false);
       return;
     }
+    // Cancel guard so a slower response for the previous shipment can't
+    // overwrite drawerData after the user has walked to a different one.
+    // Especially important during task-walk prev/next on a slow connection.
+    let cancelled = false;
     api.shipments.get(drawerId)
       .then((d) => {
+        if (cancelled) return;
         setDrawerData(d);
         setDrawerTasks(d.tasks || []);
         setNotesDraft(d.shipment.notes || "");
         setNotesSaved(false);
       })
-      .catch(() => { setDrawerData(null); setDrawerTasks([]); });
+      .catch(() => { if (!cancelled) { setDrawerData(null); setDrawerTasks([]); } });
+    return () => { cancelled = true; };
   }, [drawerId]);
 
   // Re-fetch the focused shipment and mirror the result into the
@@ -533,6 +544,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       if (actionFilter && String(r.action_required || "").toUpperCase() !== actionFilter) return false;
       if (customerFilter && r.customer_name !== customerFilter) return false;
       if (sourceFilter && r.action_source !== sourceFilter) return false;
+      if (notesOnly && !(r.notes && r.notes.trim())) return false;
       if (q) {
         // shipment_id is the FreightPOP-side unique id (e.g. "13583467")
         // and is the operator's primary handle; included alongside the
@@ -543,7 +555,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       }
       return true;
     });
-  }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter]);
+  }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter, notesOnly]);
+
+  const notesCount = useMemo(
+    () => rows.reduce((n, r) => n + (r.notes && r.notes.trim() ? 1 : 0), 0),
+    [rows],
+  );
 
   // Drawer position within the filtered list, used for "X of Y" + prev/next.
   // When taskWalk is active the position comes from the task list instead.
@@ -756,6 +773,22 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             <option value="ai">From AI</option>
             <option value="manual">Manual override</option>
           </select>
+          <button
+            onClick={() => setNotesOnly((v) => !v)}
+            title={notesOnly ? "Showing only shipments with operator notes" : "Show only shipments with operator notes"}
+            className={
+              "px-3 py-2 text-sm font-medium rounded-lg ring-1 inline-flex items-center gap-1.5 " +
+              (notesOnly
+                ? "bg-amber-50 text-amber-800 ring-amber-300 hover:bg-amber-100"
+                : "bg-white text-slate-700 ring-slate-300 hover:bg-slate-50")
+            }
+          >
+            <NotebookPen className="h-4 w-4" />
+            With notes
+            <span className={"ml-1 rounded-full px-1.5 text-[11px] font-semibold " + (notesOnly ? "bg-amber-200 text-amber-900" : "bg-slate-100 text-slate-600")}>
+              {notesCount}
+            </span>
+          </button>
           <ColumnSelector prefs={columnPrefs} onChange={setColumnPrefs} />
           <button
             onClick={exportAll}

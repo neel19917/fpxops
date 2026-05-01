@@ -271,7 +271,7 @@ export function TasksPage() {
       if (r.updated !== ids.length) {
         setError(`Assigned ${r.updated} of ${ids.length} tasks.`);
       }
-      await load();
+      await load(true);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -290,7 +290,7 @@ export function TasksPage() {
       if (r.updated !== ids.length) {
         setError(`Updated ${r.updated} of ${ids.length} tasks.`);
       }
-      await load();
+      await load(true);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -313,7 +313,7 @@ export function TasksPage() {
       if (r.updated !== ids.length) {
         setError(`Started ${r.updated} of ${ids.length} tasks.`);
       }
-      await load();
+      await load(true);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -321,8 +321,11 @@ export function TasksPage() {
     }
   }
 
-  async function load() {
-    setLoading(true);
+  // `silent=true` skips the loading flag so a post-bulk-mutation reload
+  // doesn't blank the entire task list to LoadingState. The previous rows
+  // stay visible until the new data lands and the swap is invisible.
+  async function load(silent = false) {
+    if (!silent) setLoading(true);
     setError(null);
     try {
       // Always pull the full set so the KPI strip can show real totals
@@ -332,7 +335,7 @@ export function TasksPage() {
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }
 
@@ -672,7 +675,7 @@ export function TasksPage() {
             <Keyboard className="h-4 w-4" /> Shortcuts
           </button>
           <button
-            onClick={load}
+            onClick={() => load()}
             className="rounded-lg bg-slate-900 text-white text-sm px-3 py-2 flex items-center gap-1.5 hover:bg-slate-800"
           >
             <RefreshCw className="h-4 w-4" /> Refresh
@@ -970,6 +973,15 @@ export function TasksPage() {
                       title="Open in task-walk mode"
                     >
                       <ExternalLink className="h-4 w-4" />
+                    </button>
+                  ) : null}
+                  {t.status !== "cancelled" ? (
+                    <button
+                      onClick={() => setStatus(t, "cancelled")}
+                      className="p-1.5 text-slate-400 hover:text-amber-700 hover:bg-amber-50 rounded-md mr-1"
+                      title="Clear (mark as cancelled — keeps history)"
+                    >
+                      <X className="h-4 w-4" />
                     </button>
                   ) : null}
                   <button onClick={() => remove(t)} className="text-slate-400 hover:text-red-600" title="Delete">
@@ -1390,9 +1402,24 @@ function FollowupsPanel({ kind, onTaskClick }: {
     } catch (e) { setErr((e as Error).message); }
     finally { setLoading(false); }
   }
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [kind]);
+  // Effect-driven load (initial + kind switch). Carries a cancel flag so a
+  // slow carrier-fetch landing after a switch to customer (or vice versa)
+  // doesn't overwrite the wrong panel's data.
+  useEffect(() => {
+    let cancelled = false;
+    setErr(null);
+    cfg.fetch()
+      .then((r) => { if (!cancelled) setGroups(r.groups); })
+      .catch((e) => { if (!cancelled) setErr((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [kind]);
 
-  if (loading) {
+  // Stale-while-revalidate: only show the loading banner on the first
+  // mount (groups still empty). Switching carrier↔customer keeps the
+  // previous panel visible until the new data lands.
+  if (loading && groups.length === 0) {
     return (
       <div className={`mb-4 rounded-xl ring-1 ${cfg.ringTone} ${cfg.bgTone} px-4 py-3 text-sm ${cfg.textTone}`}>
         Loading {cfg.groupNoun} follow-ups…

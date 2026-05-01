@@ -101,9 +101,20 @@ function SharedViewRoute() {
 }
 
 function AuthedApp() {
-  const { session, profile, loading } = useAuth();
+  const { session, profile, loading, error, signOut } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
+  // Boot stall guard: bootSession() has its own 6s timeout, but if the
+  // *entire* auth provider is wedged (Supabase SDK lock contention, fetch
+  // hung in a service worker, an extension intercepting localStorage), the
+  // user would see an indefinite "Loading…". After 7s, surface a Retry +
+  // Sign-out path so they're not pinned to a blank screen.
+  const [bootStalled, setBootStalled] = useState(false);
+  useEffect(() => {
+    if (!loading) { setBootStalled(false); return; }
+    const t = setTimeout(() => setBootStalled(true), 7000);
+    return () => clearTimeout(t);
+  }, [loading]);
 
   // Clear Supabase's OAuth hash fragment once we're signed in.
   useEffect(() => {
@@ -123,12 +134,53 @@ function AuthedApp() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-slate-500 text-sm">
-        Loading…
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4 text-slate-500 text-sm">
+        <div>Loading…</div>
+        {bootStalled ? (
+          <div className="max-w-sm rounded-lg bg-amber-50 ring-1 ring-amber-200 px-4 py-3 text-amber-900 text-xs">
+            <div className="font-medium mb-1">Sign-in is taking longer than expected.</div>
+            <div className="text-amber-800">
+              Your session may be stuck. Reload, or sign out and try again.
+            </div>
+            <div className="mt-2 flex items-center gap-3">
+              <button
+                onClick={() => window.location.reload()}
+                className="text-sky-700 hover:text-sky-900 hover:underline"
+              >Reload</button>
+              <button
+                onClick={() => { signOut().finally(() => window.location.reload()); }}
+                className="text-slate-600 hover:text-slate-900 hover:underline"
+              >Sign out</button>
+            </div>
+          </div>
+        ) : null}
       </div>
     );
   }
   if (!session) return <SignInPage />;
+  // Profile fetch errored (RLS hiccup, network blip) AFTER session loaded.
+  // Without this, the user lands on PendingApproval with empty fields and
+  // no way to know what went wrong. Show the error + retry path instead.
+  if (session && !profile && error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6">
+        <div className="max-w-sm rounded-2xl bg-white ring-1 ring-rose-200 shadow-sm p-6 text-sm text-slate-700">
+          <div className="font-medium text-rose-700 mb-1">Couldn't load your profile</div>
+          <div className="text-slate-600 mb-4 break-words">{error}</div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => window.location.reload()}
+              className="px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800"
+            >Retry</button>
+            <button
+              onClick={() => { signOut().finally(() => window.location.reload()); }}
+              className="px-3 py-1.5 rounded-lg ring-1 ring-slate-300 hover:bg-slate-100 text-slate-700"
+            >Sign out</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
   if (!profile?.enabled) return <PendingApprovalPage />;
 
   const isAdmin = profile.role === "admin";
@@ -363,11 +415,11 @@ function TaskWalkRoute() {
 // Re-export Outlet to keep TS happy if other modules pull it in later.
 export { Outlet };
 
-// Suspense fallback for lazy-loaded routes. Intentionally minimal —
-// secondary chunks usually arrive in <500ms on a warm cache. Anything
-// fancier would itself be a load on the route swap.
+// Suspense fallback for lazy-loaded routes. Renders nothing so the page's
+// own LoadingState is the only loading surface the user sees during a cold
+// nav — otherwise we'd stack the chunk-loading "Loading…" on top of the
+// page-data "Loading…" and read as two flickers. Chunks usually arrive in
+// <500ms on a warm cache, so the brief blank is imperceptible.
 function RouteFallback() {
-  return (
-    <div className="p-6 text-sm text-slate-500">Loading…</div>
-  );
+  return null;
 }

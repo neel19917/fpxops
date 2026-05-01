@@ -191,15 +191,19 @@ export function SettingsPage() {
   const [saveAllErrors, setSaveAllErrors] = useState<{ key: string; error: string }[]>([]);
   const [savingAll, setSavingAll] = useState(false);
 
-  async function load() {
-    setLoading(true); setErr(null);
+  // `silent=true` skips the loading flag so a post-save reload doesn't
+  // blank the entire settings page to LoadingState. The previous rows stay
+  // visible until the new data lands and the swap is invisible.
+  async function load(silent = false) {
+    if (!silent) setLoading(true);
+    setErr(null);
     try {
       const r = await api.settings.list();
       setRows(r.data);
       setEdits({});
       setSaveAllErrors([]);
     } catch (e) { setErr((e as Error).message); }
-    setLoading(false);
+    if (!silent) setLoading(false);
   }
   useEffect(() => { load(); }, []);
 
@@ -220,7 +224,7 @@ export function SettingsPage() {
     try {
       const v = row.key in edits ? edits[row.key] : row.value;
       await api.settings.update(row.key, v);
-      await load();
+      await load(true);
     } catch (e) {
       setSaveAllErrors([{ key: row.key, error: (e as Error).message }]);
     }
@@ -239,7 +243,7 @@ export function SettingsPage() {
     }
     setSavingAll(false);
     setSaveAllErrors(errors);
-    await load();
+    await load(true);
   }
 
   function resetToDefault(row: SettingRow) {
@@ -254,7 +258,7 @@ export function SettingsPage() {
         setSavingKey(row.key);
         try {
           await api.settings.update(row.key, row.default);
-          await load();
+          await load(true);
         } catch (e) { setSaveAllErrors([{ key: row.key, error: (e as Error).message }]); }
         setSavingKey(null);
       },
@@ -410,7 +414,7 @@ export function SettingsPage() {
               />
             </div>
             <button
-              onClick={() => api.settings.refresh().then(load).catch((e) => setSaveAllErrors([{ key: "(refresh)", error: (e as Error).message }]))}
+              onClick={() => api.settings.refresh().then(() => load()).catch((e) => setSaveAllErrors([{ key: "(refresh)", error: (e as Error).message }]))}
               className="px-3 py-2 text-sm font-medium rounded-lg bg-slate-100 text-slate-700 hover:bg-slate-200 flex items-center gap-1.5"
               title="Force the server cache to drop and reload from Supabase"
             >

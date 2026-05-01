@@ -827,6 +827,13 @@ async function run(filterCol, filterVal) {
   // after upload (POST /api/shipments → background per-row Claude).
   stopRequested = false;
   logRows = [];
+  // Tracks every tracking number we see across the entire sweep (not just
+  // this page). On a clean unfiltered completion we ship this to the
+  // server so it can soft-archive shipments that have left the
+  // dashboard — FreightPOP hides delivered shipments, so absence here
+  // is the delivery signal. logRows is cleared per-page to bound memory,
+  // so we can't reconstruct the full set from it later.
+  const sweepTrackingNumbers = new Set();
 
   sendStatus("Checking server...");
   try {
@@ -872,6 +879,12 @@ async function run(filterCol, filterVal) {
     // round-trip to clear our reference.
     const slice = logRows;
     logRows = [];
+    // Memorize every tracking number leaving the page so we can compare
+    // against the DB at sweep-completion time.
+    for (const row of slice) {
+      const tn = row && row._trackingNumber;
+      if (tn) sweepTrackingNumbers.add(String(tn).trim());
+    }
     return new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: slice }, (r) => {
         if (r && r.ok) {
@@ -934,9 +947,32 @@ async function run(filterCol, filterVal) {
   // chrome.storage doesn't carry stale data into the next session.
   try { chrome.storage.local.remove("_fpxCheckpoint"); } catch {}
   try { chrome.runtime.sendMessage({ type: "aiSummary", text: "" }); } catch {}
+
+  // Auto-archive shipments that left the dashboard (i.e. delivered).
+  // Only when this was a clean unfiltered sweep — a filtered run can't
+  // tell delivered apart from filtered-out, and a stopped run hasn't
+  // visited every page so its set is incomplete.
+  let archiveSummary = "";
+  if (!filterCol && !filterVal && sweepTrackingNumbers.size > 0) {
+    sendStatus(`Reconciling delivered shipments (${sweepTrackingNumbers.size} seen)…`);
+    try {
+      const r = await chrome.runtime.sendMessage({
+        type: "sweepComplete",
+        trackingNumbers: Array.from(sweepTrackingNumbers),
+      });
+      if (r && r.ok && (r.archived_shipments > 0 || r.archived_tasks > 0)) {
+        archiveSummary = `, archived ${r.archived_shipments} delivered shipment${r.archived_shipments === 1 ? "" : "s"}` +
+          (r.archived_tasks > 0 ? ` and ${r.archived_tasks} task${r.archived_tasks === 1 ? "" : "s"}` : "");
+      }
+    } catch (e) {
+      // Best-effort — don't fail the sweep if archive RPC didn't land.
+      console.warn("[FPX] sweep-complete failed:", e?.message || e);
+    }
+  }
+
   const queuedButUnconfirmed = totalScraped - confirmedRows;
   sendComplete(
-    `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}. Open the dashboard to see analysis.`
+    `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}${archiveSummary}. Open the dashboard to see analysis.`
   );
 }
 

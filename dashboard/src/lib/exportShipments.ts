@@ -47,6 +47,7 @@ const COLUMNS: ExportColumn[] = [
   { key: "shipment_gross_profit",      label: "Gross Profit",        width: 14, z: FMT.usd },
   { key: "signed_by",                  label: "Signed By",           width: 18 },
   { key: "tracking_comments",          label: "Tracking Comments",   width: 40 },
+  { key: "notes",                      label: "Operator Notes",      width: 50 },
   { key: "account_manager",            label: "Account Manager",     width: 22 },
   { key: "created_by",                 label: "Runner",              width: 18 },
   { key: "seen_count",                 label: "Seen Count",          width: 10 },

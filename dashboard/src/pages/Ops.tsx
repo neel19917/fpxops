@@ -35,7 +35,20 @@ export function OpsPage() {
     } catch (e) { setError((e as Error).message); }
     finally { setLoading(false); }
   }
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [days]);
+  // Effect-driven load (initial + window switch). Cancel guard prevents a
+  // slower 90d response from overwriting a newer 7d click on rapid range
+  // toggles. KPI / chart components already keep prior `data` visible
+  // while loading — no full-page blank on window change.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setError(null);
+    api.ops.metrics(days)
+      .then((r) => { if (!cancelled) setData(r); })
+      .catch((e) => { if (!cancelled) setError((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [days]);
 
   return (
     <div className="space-y-5">

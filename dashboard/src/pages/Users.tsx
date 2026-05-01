@@ -73,12 +73,16 @@ export function UsersPage() {
   useEffect(() => { load(); }, []);
 
   async function toggleEnabled(u: UserProfileRow) {
-    try { await api.users.update(u.id, { enabled: !u.enabled }); load(); }
-    catch (e) { alert((e as Error).message); }
+    try {
+      const r = await api.users.update(u.id, { enabled: !u.enabled });
+      setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
+    } catch (e) { alert((e as Error).message); }
   }
   async function setRole(u: UserProfileRow, role: string) {
-    try { await api.users.update(u.id, { role }); load(); }
-    catch (e) { alert((e as Error).message); }
+    try {
+      const r = await api.users.update(u.id, { role });
+      setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
+    } catch (e) { alert((e as Error).message); }
   }
   async function setName(u: UserProfileRow, full_name: string | null) {
     const r = await api.users.update(u.id, { full_name });
