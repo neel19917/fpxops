@@ -294,7 +294,7 @@ export const api = {
     revoke: (id: string) => request<{ ok: boolean }>(`/api/share-links/${id}`, { method: "DELETE" }),
   },
   tasks: {
-    list: (params?: { status?: string; assigned_to?: string; priority?: string; limit?: number }) =>
+    list: (params?: { status?: string; assigned_to?: string; priority?: string; limit?: number; include_archived?: 0 | 1 }) =>
       request<{ data: ShipmentTask[] }>("/api/tasks", { params }),
     // Single-task lookup with optional walk-through siblings. The server
     // resolves the prev / next task ids (and their shipment ids) within the
