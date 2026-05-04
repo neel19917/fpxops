@@ -356,7 +356,7 @@ export function TasksPage() {
     try {
       // Always pull the full set so the KPI strip can show real totals
       // regardless of which filter is active. Filtering happens below.
-      const r = await api.tasks.list({ limit: 1000 });
+      const r = await api.tasks.list({ limit: 1000, include_archived: 1 });
       setTasks(r.data);
     } catch (e) {
       setError((e as Error).message);
