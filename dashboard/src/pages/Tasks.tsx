@@ -327,6 +327,26 @@ export function TasksPage() {
     }
   }
 
+  async function bulkDelete() {
+    if (!selected.size || bulkBusy) return;
+    const ids = Array.from(selected);
+    if (!confirm(`Delete ${ids.length} task${ids.length === 1 ? "" : "s"}? This cannot be undone.`)) return;
+    setBulkBusy(true);
+    setError(null);
+    try {
+      const r = await api.tasks.bulkDelete({ ids });
+      clearSelection();
+      if (r.deleted !== ids.length) {
+        setError(`Deleted ${r.deleted} of ${ids.length} tasks.`);
+      }
+      await load(true);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   // `silent=true` skips the loading flag so a post-bulk-mutation reload
   // doesn't blank the entire task list to LoadingState. The previous rows
   // stay visible until the new data lands and the swap is invisible.
@@ -336,7 +356,7 @@ export function TasksPage() {
     try {
       // Always pull the full set so the KPI strip can show real totals
       // regardless of which filter is active. Filtering happens below.
-      const r = await api.tasks.list({});
+      const r = await api.tasks.list({ limit: 1000 });
       setTasks(r.data);
     } catch (e) {
       setError((e as Error).message);
@@ -879,6 +899,15 @@ export function TasksPage() {
               className="rounded-lg bg-white ring-1 ring-slate-200 text-slate-700 text-sm px-3 py-1.5 hover:bg-slate-50 disabled:opacity-50 inline-flex items-center gap-1.5"
             >
               <Circle className="h-3.5 w-3.5" /> Reopen
+            </button>
+            <span className="ml-auto" />
+            <button
+              onClick={bulkDelete}
+              disabled={bulkBusy}
+              className="rounded-lg bg-white ring-1 ring-rose-200 text-rose-700 text-sm px-3 py-1.5 hover:bg-rose-50 disabled:opacity-50 inline-flex items-center gap-1.5"
+              title="Delete selected tasks"
+            >
+              <Trash2 className="h-3.5 w-3.5" /> Delete
             </button>
           </div>
         </div>
