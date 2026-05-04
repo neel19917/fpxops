@@ -324,6 +324,8 @@ export const api = {
       request<{ created: number; missing: string[] }>("/api/tasks/bulk", { method: "POST", body: JSON.stringify(body) }),
     bulkUpdate: (body: { ids: string[]; status?: string; priority?: string; assigned_to?: string }) =>
       request<{ updated: number }>("/api/tasks/bulk-update", { method: "POST", body: JSON.stringify(body) }),
+    bulkDelete: (body: { ids: string[] }) =>
+      request<{ deleted: number }>("/api/tasks/bulk-delete", { method: "POST", body: JSON.stringify(body) }),
     // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
     // each task joined to its shipment so the Kanban panel can render
     // carrier/customer/ETA without further round trips.

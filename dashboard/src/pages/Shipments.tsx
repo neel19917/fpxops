@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, Pencil } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
@@ -119,6 +119,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [actionFilter, setActionFilter] = useState<string>("");
   const [customerFilter, setCustomerFilter] = useState<string>("");
   const [sourceFilter, setSourceFilter] = useState<string>("");
+  const [modeFilter, setModeFilter] = useState<string>(() => {
+    try { return localStorage.getItem("fpx.shipments.modeFilter") ?? ""; } catch { return ""; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fpx.shipments.modeFilter", modeFilter); } catch {}
+  }, [modeFilter]);
   const [pillFilter, setPillFilter] = useState<PillId>("all");
   // "With notes" toggle — narrows the table to shipments that carry an
   // operator note. The note column itself stays available in the column
@@ -564,12 +570,29 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     return Array.from(set).sort();
   }, [rows]);
 
+  const availableModes = useMemo(() => {
+    const set = new Set<string>(["LTL", "Parcel"]);
+    let hasNoMode = false;
+    for (const r of rows) {
+      const m = (r.mode || "").trim();
+      if (!m) { hasNoMode = true; continue; }
+      set.add(m);
+    }
+    return { modes: Array.from(set).sort((a, b) => a.localeCompare(b)), hasNoMode };
+  }, [rows]);
+
   const filtered = useMemo(() => {
     return rows.filter((r) => {
       if (!shipmentMatchesPill(r, pillFilter)) return false;
       if (actionFilter && String(r.action_required || "").toUpperCase() !== actionFilter) return false;
       if (customerFilter && r.customer_name !== customerFilter) return false;
       if (sourceFilter && r.action_source !== sourceFilter) return false;
+      if (modeFilter) {
+        const m = (r.mode || "").trim().toLowerCase();
+        if (modeFilter === "__none__") {
+          if (m) return false;
+        } else if (m !== modeFilter.toLowerCase()) return false;
+      }
       if (notesOnly && !(r.notes && r.notes.trim())) return false;
       if (q) {
         // shipment_id is the FreightPOP-side unique id (e.g. "13583467")
@@ -581,7 +604,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       }
       return true;
     });
-  }, [rows, q, actionFilter, customerFilter, sourceFilter, pillFilter, notesOnly]);
+  }, [rows, q, actionFilter, customerFilter, sourceFilter, modeFilter, pillFilter, notesOnly]);
 
   const notesCount = useMemo(
     () => rows.reduce((n, r) => n + (r.notes && r.notes.trim() ? 1 : 0), 0),
@@ -798,6 +821,18 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             <option value="">All sources</option>
             <option value="ai">From AI</option>
             <option value="manual">Manual override</option>
+          </select>
+          <select
+            className="px-3 py-2 rounded-lg border border-slate-300 text-sm"
+            value={modeFilter}
+            onChange={(e) => setModeFilter(e.target.value)}
+            title="Filter by shipment mode (LTL, Parcel, etc.)"
+          >
+            <option value="">All modes</option>
+            {availableModes.modes.map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+            {availableModes.hasNoMode ? <option value="__none__">(no mode)</option> : null}
           </select>
           <button
             onClick={() => setNotesOnly((v) => !v)}
@@ -1234,6 +1269,14 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                     taskWalk.onTaskStatusChanged?.(status);
                   } catch (e) { setErr((e as Error).message); }
                   finally { setTaskBusy(false); }
+                }}
+                onSaveDescription={async (description) => {
+                  if (!taskWalk?.task) return;
+                  await api.tasks.update(taskWalk.task.id, { description });
+                  // Reuse the status-change refresh hook so the banner
+                  // re-renders with the persisted description and any
+                  // server-side mutations (updated_at, etc.) settle.
+                  taskWalk.onTaskStatusChanged?.(taskWalk.task.status);
                 }}
                 onCreateInverseFollowup={async (kind) => {
                   // Add a parallel followup to the OTHER audience for the
@@ -2207,10 +2250,15 @@ function ShipmentSummaryHeader({
   );
 }
 
-function TaskBanner({ task, busy, onSetStatus, onCreateInverseFollowup }: {
+function TaskBanner({ task, busy, onSetStatus, onSaveDescription, onCreateInverseFollowup }: {
   task: ShipmentTask;
   busy: boolean;
   onSetStatus: (status: TaskStatus) => Promise<void> | void;
+  // Persists an edited description back to the server. Called from the
+  // inline pencil-edit affordance on the description block. Returns a
+  // promise so the banner can show its own busy / error state without
+  // having to plumb that through onSetStatus's `busy` flag.
+  onSaveDescription?: (description: string) => Promise<void> | void;
   // Hands a "create the inverse audience's followup" request back to
   // the parent so a carrier-followup walker can spawn a parallel
   // customer followup (and vice-versa) without leaving the drawer.
@@ -2232,6 +2280,38 @@ function TaskBanner({ task, busy, onSetStatus, onCreateInverseFollowup }: {
     : null;
   const [inverseBusy, setInverseBusy] = useState(false);
   const [inverseDone, setInverseDone] = useState(false);
+
+  // Inline description editor. Reset the draft whenever the focused
+  // task changes (drawer-walk forward, server-side reload) so we never
+  // ship one task's edits into another's body.
+  const [editingDesc, setEditingDesc] = useState(false);
+  const [descDraft, setDescDraft] = useState(task.description || "");
+  const [descBusy, setDescBusy] = useState(false);
+  const [descError, setDescError] = useState<string | null>(null);
+  useEffect(() => {
+    setEditingDesc(false);
+    setDescDraft(task.description || "");
+    setDescError(null);
+  }, [task.id, task.description]);
+
+  async function saveDescription() {
+    if (!onSaveDescription) return;
+    const next = descDraft.trim();
+    if (next === (task.description || "").trim()) {
+      setEditingDesc(false);
+      return;
+    }
+    setDescBusy(true);
+    setDescError(null);
+    try {
+      await onSaveDescription(next);
+      setEditingDesc(false);
+    } catch (e) {
+      setDescError((e as Error).message || "Couldn't save description.");
+    } finally {
+      setDescBusy(false);
+    }
+  }
 
   async function handleInverse() {
     if (!inverseAudience || !onCreateInverseFollowup) return;
@@ -2277,8 +2357,78 @@ function TaskBanner({ task, busy, onSetStatus, onCreateInverseFollowup }: {
         </div>
       </div>
       <div className="text-sm font-medium text-slate-900 leading-snug">{task.title}</div>
-      {task.description ? (
-        <div className="text-xs text-slate-600 mt-1 leading-snug whitespace-pre-wrap">{task.description}</div>
+      {editingDesc ? (
+        <div className="mt-1.5">
+          <textarea
+            value={descDraft}
+            onChange={(e) => setDescDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setEditingDesc(false);
+                setDescDraft(task.description || "");
+                setDescError(null);
+              } else if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                void saveDescription();
+              }
+            }}
+            rows={Math.min(8, Math.max(3, descDraft.split("\n").length + 1))}
+            maxLength={5000}
+            disabled={descBusy}
+            placeholder="Add task description…"
+            className="w-full text-xs rounded-md border border-violet-200 bg-white px-2 py-1.5 leading-snug focus:ring-2 focus:ring-violet-400 focus:border-violet-400 disabled:opacity-60"
+            autoFocus
+          />
+          {descError ? <div className="text-[11px] text-rose-700 mt-1">{descError}</div> : null}
+          <div className="mt-1.5 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={saveDescription}
+              disabled={descBusy}
+              className="text-[11px] font-semibold rounded-md px-2.5 py-1 bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {descBusy ? "Saving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setEditingDesc(false);
+                setDescDraft(task.description || "");
+                setDescError(null);
+              }}
+              disabled={descBusy}
+              className="text-[11px] font-semibold rounded-md px-2.5 py-1 ring-1 ring-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <span className="text-[10px] text-slate-500">⌘/Ctrl+Enter saves · Esc cancels</span>
+          </div>
+        </div>
+      ) : task.description ? (
+        <div className="group relative mt-1 flex items-start gap-1.5">
+          <div className="text-xs text-slate-600 leading-snug whitespace-pre-wrap flex-1 min-w-0">{task.description}</div>
+          {onSaveDescription ? (
+            <button
+              type="button"
+              onClick={() => setEditingDesc(true)}
+              className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition shrink-0 p-1 rounded text-slate-500 hover:text-violet-700 hover:bg-violet-100"
+              title="Edit description"
+              aria-label="Edit description"
+            >
+              <Pencil className="h-3 w-3" />
+            </button>
+          ) : null}
+        </div>
+      ) : onSaveDescription ? (
+        <button
+          type="button"
+          onClick={() => setEditingDesc(true)}
+          className="mt-1 text-[11px] text-violet-700 hover:text-violet-900 hover:underline inline-flex items-center gap-1"
+          title="Add a description for this task"
+        >
+          <Pencil className="h-3 w-3" /> Add description
+        </button>
       ) : null}
       <div className="flex items-center justify-between gap-2 mt-2.5 flex-wrap">
         <div className="text-[11px] text-slate-500">
