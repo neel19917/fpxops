@@ -953,9 +953,24 @@ export function TasksPage() {
               <tr><td colSpan={8} className="text-center text-slate-400 py-8">Loading…</td></tr>
             ) : visibleTasks.length === 0 ? (
               <tr><td colSpan={8} className="text-center text-slate-400 py-8">
-                {tasks.length === 0
-                  ? "No tasks yet. Open a shipment and add one."
-                  : `No ${statusFilter === "active" ? "active" : statusFilter || ""} tasks — try a different filter.`}
+                {tasks.length === 0 ? (
+                  "No tasks yet. Open a shipment and add one."
+                ) : (
+                  <div className="flex flex-col items-center gap-2">
+                    <div>
+                      No {statusFilter === "active" ? "active" : statusFilter || ""} tasks
+                      {modeFilter ? ` in ${modeFilter === "__none__" ? "(no mode)" : modeFilter}` : ""}
+                      {search.trim() ? ` matching "${search.trim()}"` : ""}
+                      {" "}— {tasks.length} total loaded.
+                    </div>
+                    <button
+                      onClick={() => { setStatusFilter(""); setModeFilter(""); setSearch(""); }}
+                      className="rounded-md bg-slate-900 text-white text-xs px-3 py-1.5 hover:bg-slate-800"
+                    >
+                      Clear all filters
+                    </button>
+                  </div>
+                )}
               </td></tr>
             ) : visibleTasks.map((t) => {
               // Status circle is the primary per-row action button:
