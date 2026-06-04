@@ -11,10 +11,20 @@ const ACTION_COLOR: Record<string, string> = {
   bulk_create: "bg-emerald-100 text-emerald-700",
   update: "bg-sky-100 text-sky-700",
   bulk_update: "bg-sky-100 text-sky-700",
+  update_notes: "bg-teal-100 text-teal-700",
+  shipment_note: "bg-teal-100 text-teal-700",
   delete: "bg-rose-100 text-rose-700",
   override: "bg-amber-100 text-amber-800",
   auto_task: "bg-violet-100 text-violet-700",
 };
+
+// Top-level tabs. Each scopes the log to a slice of activity by pinning the
+// action filter; "All activity" clears it. The Notes tab surfaces the
+// append-only operator notes log (action=shipment_note).
+const TABS: { id: string; label: string; action: string }[] = [
+  { id: "all", label: "All activity", action: "" },
+  { id: "notes", label: "Notes", action: "shipment_note" },
+];
 
 const ENTITY_COLOR: Record<string, string> = {
   shipment: "bg-slate-100 text-slate-700",
@@ -96,6 +106,26 @@ export function AuditLogPage() {
         </button>
       </div>
 
+      <div className="flex gap-1 border-b border-slate-200 mb-4">
+        {TABS.map((t) => {
+          const active = action === t.action;
+          return (
+            <button
+              key={t.id}
+              onClick={() => setAction(t.action)}
+              className={
+                "px-3 py-2 text-sm font-medium border-b-2 -mb-px transition " +
+                (active
+                  ? "border-sky-500 text-sky-700"
+                  : "border-transparent text-slate-500 hover:text-slate-900 hover:border-slate-300")
+              }
+            >
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+
       <div className="bg-white ring-1 ring-slate-200 shadow-sm rounded-2xl mb-4 p-3 flex items-center gap-3 flex-wrap">
         <Filter className="h-4 w-4 text-slate-400" />
         <select
@@ -120,6 +150,7 @@ export function AuditLogPage() {
           <option value="bulk_create">Bulk create</option>
           <option value="update">Update</option>
           <option value="bulk_update">Bulk update</option>
+          <option value="shipment_note">Note</option>
           <option value="delete">Delete</option>
           <option value="override">Override</option>
           <option value="auto_task">Auto task</option>

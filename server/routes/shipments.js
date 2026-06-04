@@ -185,15 +185,17 @@ function formatChangeLog(diff) {
 }
 
 async function autoCreateActionTasks(req, upsertedRows, { diffByTracking = new Map() } = {}) {
-  // Parcel shipments don't get auto-tasks — operators don't follow up on
-  // parcel exceptions the same way, so the noise was drowning out the
-  // LTL/truckload work that actually needs human action. Filter is here
-  // (server) rather than in the chrome extension so a single switch
-  // governs every scrape source. No audit row is emitted for the skip:
-  // the audit log only fires on successful inserts below.
+  // Parcel shipments don't get auto-tasks by default — operators don't
+  // follow up on parcel exceptions the same way, so the noise was drowning
+  // out the LTL/truckload work that actually needs human action. Gated on
+  // the ui.tracking.show_parcels admin switch (default OFF) so a single
+  // toggle governs both Tracking-page visibility and task spawn across
+  // every scrape source. No audit row is emitted for the skip: the audit
+  // log only fires on successful inserts below.
+  const { "ui.tracking.show_parcels": showParcels } = await getSettings("ui.tracking.show_parcels");
   const candidates = (upsertedRows || []).filter(
     (s) => String(s.action_required || "").toUpperCase() === "YES"
-        && String(s.mode || "").trim().toLowerCase() !== "parcel"
+        && (showParcels === true || String(s.mode || "").trim().toLowerCase() !== "parcel")
   );
   if (!candidates.length) return 0;
   const ids = candidates.map((s) => s.id);
@@ -365,7 +367,7 @@ shipmentsRouter.get("/:id", async (req, res) => {
   const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
-  const [analysesRes, historyRes, tasksRes, recentDiffRes] = await Promise.all([
+  const [analysesRes, historyRes, tasksRes, notesRes, recentDiffRes] = await Promise.all([
     supabase
       .from("fpx_ai_analyses").select("*")
       .or(`shipment_uuid.eq.${ship.id},tracking_number.eq.${ship.tracking_number || "__none__"}`)
@@ -376,6 +378,9 @@ shipmentsRouter.get("/:id", async (req, res) => {
           .order("scraped_at", { ascending: false }).limit(20)
       : Promise.resolve({ data: [] }),
     supabase.from("fpx_shipment_tasks").select("*").eq("shipment_id", ship.id).order("created_at", { ascending: false }),
+    // Append-only operator notes log, newest first. Drives the drawer's
+    // Notes section (a running log, not a single editable field).
+    supabase.from("fpx_shipment_notes").select("*").eq("shipment_id", ship.id).order("created_at", { ascending: false }),
     // Most recent material diff from fpx_shipment_scrapes — same row
     // the AI per-shipment prompt now sees as recent_changes. Surfacing
     // it on the drawer lets the rep eyeball "what moved since last
@@ -394,6 +399,7 @@ shipmentsRouter.get("/:id", async (req, res) => {
     analyses: analysesRes.data || [],
     history: historyRes.data || [],
     tasks: tasksRes.data || [],
+    notes_log: notesRes.data || [],
     recent_diff: recentDiffRes.data || null,
   });
 });
@@ -742,6 +748,41 @@ shipmentsRouter.patch("/:id/notes", async (req, res) => {
     after: { notes: data.notes },
   });
   res.json({ shipment: data });
+});
+
+// POST /shipments/:id/notes  { body }
+// Append a new entry to the shipment's notes log. Each entry is immutable —
+// this is a running log, not an editable field. We also denormalize the
+// latest entry onto fpx_shipments.notes so the Tracking "With notes" filter
+// and /notes cross-shipment view keep working off the single column, and we
+// write an fpx_audit_log row (action='shipment_note') that the Audit log
+// page's Notes tab surfaces.
+shipmentsRouter.post("/:id/notes", async (req, res) => {
+  const body = String(req.body?.body || "").trim().slice(0, 5000);
+  if (!body) return res.status(400).json({ error: "body required" });
+  const { data: ship, error: shipErr } = await supabase
+    .from("fpx_shipments").select("id, tracking_number").eq("id", req.params.id).maybeSingle();
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  if (!ship) return res.status(404).json({ error: "Shipment not found" });
+  const author = req.user?.email || req.apiKey?.name || req.header("x-fpx-user-name") || null;
+  const { data: note, error } = await supabase
+    .from("fpx_shipment_notes")
+    .insert({ shipment_id: ship.id, tracking_number: ship.tracking_number, body, created_by: author })
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  // Denormalize latest entry onto the shipment for the list-side filter/view.
+  const { data: shipUpdated } = await supabase
+    .from("fpx_shipments").update({ notes: body }).eq("id", ship.id).select().single();
+  logAudit(req, {
+    action: "shipment_note",
+    entity_type: "shipment",
+    entity_id: ship.id,
+    summary: `Note on ${ship.tracking_number || ship.id}: ${body.slice(0, 140)}`,
+    after: { body },
+    metadata: { note_id: note.id },
+  });
+  res.json({ note, shipment: shipUpdated || null });
 });
 
 // ----- Tasks scoped to a shipment -----

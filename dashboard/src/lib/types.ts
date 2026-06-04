@@ -95,6 +95,16 @@ export interface AuditLogEntry {
   created_at: string;
 }
 
+// One immutable entry in a shipment's append-only operator notes log.
+export interface ShipmentNote {
+  id: string;
+  shipment_id: string;
+  tracking_number: string | null;
+  body: string;
+  created_by: string | null;
+  created_at: string;
+}
+
 export type AnalysisKind = "per_shipment" | "summary" | "gp_audit" | "invoice_audit" | "other";
 
 export interface AiAnalysis {

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, Pencil } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
-import type { AiAnalysis, EmailDraft, Shipment, ShipmentTask, TaskStatus } from "../lib/types";
+import type { AiAnalysis, EmailDraft, Shipment, ShipmentNote, ShipmentTask, TaskStatus } from "../lib/types";
 import { ActionBadge } from "../components/Badge";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
@@ -111,6 +111,12 @@ function asDrawerTab(s: string | null | undefined): DrawerTabId {
 export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk, notesMode = false }: ShipmentsPageProps = {}) {
   const { clientConfig } = useAuth();
   const embedCfg = clientConfig?.embed_freightpop;
+  // Master parcel switch (admin, default OFF). When off, parcel-mode rows
+  // are hidden from the Tracking page across the board — the list, mode
+  // dropdown, and pill counts all derive from `baseRows` so the view stays
+  // internally consistent. The shipments still exist server-side; this is
+  // purely a view filter, mirrored by the server's auto-task gate.
+  const showParcels = clientConfig?.tracking_ui?.show_parcels ?? false;
   const [rows, setRows] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -169,10 +175,11 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskBusy, setNewTaskBusy] = useState(false);
 
-  // Drawer notes — local draft, saved on demand.
+  // Drawer notes — append-only log. notesDraft is the new-entry text;
+  // notesLog is the running history (newest first); notesBusy gates the add.
   const [notesDraft, setNotesDraft] = useState("");
   const [notesBusy, setNotesBusy] = useState(false);
-  const [notesSaved, setNotesSaved] = useState(false);
+  const [notesLog, setNotesLog] = useState<ShipmentNote[]>([]);
 
   // CRM-style drawer keyboard navigation.
   const [drawerHelpOpen, setDrawerHelpOpen] = useState(false);
@@ -345,7 +352,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       setEmailModal(null);
       setNewTaskTitle("");
       setNotesDraft("");
-      setNotesSaved(false);
+      setNotesLog([]);
       return;
     }
     // Cancel guard so a slower response for the previous shipment can't
@@ -357,8 +364,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         if (cancelled) return;
         setDrawerData(d);
         setDrawerTasks(d.tasks || []);
-        setNotesDraft(d.shipment.notes || "");
-        setNotesSaved(false);
+        setNotesLog(d.notes_log || []);
+        setNotesDraft("");
       })
       .catch(() => { if (!cancelled) { setDrawerData(null); setDrawerTasks([]); } });
     return () => { cancelled = true; };
@@ -392,16 +399,23 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     return r;
   }
 
-  async function saveNotes() {
-    if (!drawerId || notesBusy) return;
+  // Append a new entry to the notes log. Immutable — there's no edit/
+  // overwrite; each save is its own timestamped, attributed line.
+  async function addNote() {
+    const body = notesDraft.trim();
+    if (!drawerId || notesBusy || !body) return;
     setNotesBusy(true);
-    setNotesSaved(false);
     try {
-      const r = await api.shipments.updateNotes(drawerId, notesDraft.trim() ? notesDraft : null);
-      setDrawerData((p) => p ? { ...p, shipment: r.shipment } : p);
-      setRows((prev) => prev.map((row) => row.id === r.shipment.id ? { ...row, notes: r.shipment.notes } : row));
-      setNotesSaved(true);
-      setTimeout(() => setNotesSaved(false), 1800);
+      const r = await api.shipments.addNote(drawerId, body);
+      setNotesLog((prev) => [r.note, ...prev]);
+      setNotesDraft("");
+      // Mirror the denormalized latest-note onto the table row + drawer so
+      // the "With notes" filter/count and any list display stay in sync.
+      if (r.shipment) {
+        const ship = r.shipment;
+        setDrawerData((p) => p ? { ...p, shipment: ship } : p);
+        setRows((prev) => prev.map((row) => row.id === ship.id ? { ...row, notes: ship.notes } : row));
+      }
     } catch (e) { setErr((e as Error).message); }
     finally { setNotesBusy(false); }
   }
@@ -564,25 +578,35 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     }
   }
 
+  // Tracking-page view base: drops parcel-mode rows unless the admin has
+  // enabled parcel tracking. Everything the page renders (list, dropdown,
+  // counts) flows from here so parcels can't leak in via one path.
+  const baseRows = useMemo(
+    () => (showParcels ? rows : rows.filter((r) => String(r.mode || "").trim().toLowerCase() !== "parcel")),
+    [rows, showParcels]
+  );
+
   const customers = useMemo(() => {
     const set = new Set<string>();
-    for (const r of rows) if (r.customer_name) set.add(r.customer_name);
+    for (const r of baseRows) if (r.customer_name) set.add(r.customer_name);
     return Array.from(set).sort();
-  }, [rows]);
+  }, [baseRows]);
 
   const availableModes = useMemo(() => {
-    const set = new Set<string>(["LTL", "Parcel"]);
+    // Seed "Parcel" only when parcel tracking is on — otherwise the dropdown
+    // would offer a mode that can never match a (hidden) row.
+    const set = new Set<string>(showParcels ? ["LTL", "Parcel"] : ["LTL"]);
     let hasNoMode = false;
-    for (const r of rows) {
+    for (const r of baseRows) {
       const m = (r.mode || "").trim();
       if (!m) { hasNoMode = true; continue; }
       set.add(m);
     }
     return { modes: Array.from(set).sort((a, b) => a.localeCompare(b)), hasNoMode };
-  }, [rows]);
+  }, [baseRows, showParcels]);
 
   const filtered = useMemo(() => {
-    return rows.filter((r) => {
+    return baseRows.filter((r) => {
       if (!shipmentMatchesPill(r, pillFilter)) return false;
       if (actionFilter && String(r.action_required || "").toUpperCase() !== actionFilter) return false;
       if (customerFilter && r.customer_name !== customerFilter) return false;
@@ -604,7 +628,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       }
       return true;
     });
-  }, [rows, q, actionFilter, customerFilter, sourceFilter, modeFilter, pillFilter, notesOnly]);
+  }, [baseRows, q, actionFilter, customerFilter, sourceFilter, modeFilter, pillFilter, notesOnly]);
 
   const notesCount = useMemo(
     () => rows.reduce((n, r) => n + (r.notes && r.notes.trim() ? 1 : 0), 0),
@@ -764,13 +788,13 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }
 
   const pillCounts = useMemo(() => ({
-    total: rows.length,
-    booked: rows.filter((r) => shipmentMatchesPill(r, "booked")).length,
-    in_transit: rows.filter((r) => shipmentMatchesPill(r, "in_transit")).length,
-    issues: rows.filter((r) => shipmentMatchesPill(r, "issues")).length,
-    out_for_delivery: rows.filter((r) => shipmentMatchesPill(r, "out_for_delivery")).length,
-    delivered: rows.filter((r) => shipmentMatchesPill(r, "delivered")).length,
-  }), [rows]);
+    total: baseRows.length,
+    booked: baseRows.filter((r) => shipmentMatchesPill(r, "booked")).length,
+    in_transit: baseRows.filter((r) => shipmentMatchesPill(r, "in_transit")).length,
+    issues: baseRows.filter((r) => shipmentMatchesPill(r, "issues")).length,
+    out_for_delivery: baseRows.filter((r) => shipmentMatchesPill(r, "out_for_delivery")).length,
+    delivered: baseRows.filter((r) => shipmentMatchesPill(r, "delivered")).length,
+  }), [baseRows]);
 
   return (
     <div className="space-y-5">
@@ -953,8 +977,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             another 500. */}
         <div className="px-4 py-3 border-t border-slate-100 flex items-center justify-between gap-3 text-xs text-slate-500">
           <span>
-            Showing {rows.length} row{rows.length === 1 ? "" : "s"}
-            {rows.length !== filtered.length ? <> · {filtered.length} after filters</> : null}
+            Showing {baseRows.length} row{baseRows.length === 1 ? "" : "s"}
+            {baseRows.length !== filtered.length ? <> · {filtered.length} after filters</> : null}
           </span>
           {nextCursor ? (
             <button
@@ -1291,29 +1315,44 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
             {drawerTab === "overview" && (
               <>
-                {/* Notes hoisted to the top of Overview — it's the only
-                    field a rep edits during a shipment walk-through, so
-                    it earns the prime spot. Read-only fields and the AI
-                    summary stack below. */}
+                {/* Notes is an append-only log hoisted to the top of
+                    Overview — it's the field a rep touches most during a
+                    walk-through. Each save is an immutable, timestamped,
+                    attributed entry; the full history renders below the
+                    add box (newest first). Ctrl/⌘+Enter submits. */}
                 <Section title="Notes">
                   <textarea
                     value={notesDraft}
-                    onChange={(e) => { setNotesDraft(e.target.value); setNotesSaved(false); }}
-                    placeholder="Add operator notes for this shipment…"
+                    onChange={(e) => setNotesDraft(e.target.value)}
+                    onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); addNote(); } }}
+                    placeholder="Add a note… (⌘/Ctrl+Enter to save)"
                     rows={3}
                     maxLength={5000}
                     className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:ring-2 focus:ring-sky-400 focus:border-sky-400"
                   />
-                  <div className="mt-2 flex items-center justify-end gap-3">
-                    {notesSaved ? <span className="text-xs text-emerald-600">Saved</span> : null}
+                  <div className="mt-2 flex items-center justify-end">
                     <button
-                      onClick={saveNotes}
-                      disabled={notesBusy || (notesDraft || "") === (drawerData.shipment.notes || "")}
-                      className="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                      onClick={addNote}
+                      disabled={notesBusy || !notesDraft.trim()}
+                      className="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
                     >
-                      {notesBusy ? "Saving…" : "Save notes"}
+                      <Plus className="h-3.5 w-3.5" /> {notesBusy ? "Adding…" : "Add note"}
                     </button>
                   </div>
+                  {notesLog.length > 0 ? (
+                    <ul className="mt-3 space-y-2.5">
+                      {notesLog.map((n) => (
+                        <li key={n.id} className="rounded-lg bg-slate-50 ring-1 ring-slate-200 px-3 py-2">
+                          <div className="text-sm text-slate-800 whitespace-pre-wrap break-words">{n.body}</div>
+                          <div className="mt-1 text-[11px] text-slate-400">
+                            {n.created_by || "system"} · <span title={fmtDateTime(n.created_at)}>{fmtRelative(n.created_at)}</span>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-3 text-xs text-slate-400">No notes yet — add the first one above.</p>
+                  )}
                 </Section>
                 <Section title="Shipment">
                   <div className="grid grid-cols-2 gap-4">
