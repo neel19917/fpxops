@@ -185,8 +185,15 @@ function formatChangeLog(diff) {
 }
 
 async function autoCreateActionTasks(req, upsertedRows, { diffByTracking = new Map() } = {}) {
+  // Parcel shipments don't get auto-tasks — operators don't follow up on
+  // parcel exceptions the same way, so the noise was drowning out the
+  // LTL/truckload work that actually needs human action. Filter is here
+  // (server) rather than in the chrome extension so a single switch
+  // governs every scrape source. No audit row is emitted for the skip:
+  // the audit log only fires on successful inserts below.
   const candidates = (upsertedRows || []).filter(
     (s) => String(s.action_required || "").toUpperCase() === "YES"
+        && String(s.mode || "").trim().toLowerCase() !== "parcel"
   );
   if (!candidates.length) return 0;
   const ids = candidates.map((s) => s.id);
