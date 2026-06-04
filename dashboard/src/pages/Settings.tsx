@@ -114,6 +114,7 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "embed.freightpop.enabled": "FreightPOP embed — enabled",
   "embed.freightpop.url_template": "FreightPOP embed — URL template",
   "ui.tracking.recent_change_window_hours": "Tracking row \"Changed Xh ago\" pill window (hours)",
+  "ui.tracking.show_parcels": "Track parcel shipments (show on Tracking page + auto-create tasks)",
 };
 
 // Per-setting enum options. Keys without an entry render as free-text/JSON.
