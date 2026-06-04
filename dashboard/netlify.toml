@@ -6,6 +6,12 @@
 [build.environment]
   NODE_VERSION = "20"
 
+# Local `netlify dev` proxy port. Pinned to 8899 because the default (8888)
+# collides with another local app's dev server on this machine; without this,
+# Netlify shares the port and `localhost:8888` routes to the wrong app.
+[dev]
+  port = 8899
+
 # SPA fallback — every path falls through to index.html so the client-side router
 # handles it, including the public /share/:token viewer.
 [[redirects]]
