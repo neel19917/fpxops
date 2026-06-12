@@ -7,6 +7,7 @@ import { fmtRelative } from "../lib/format";
 import { useNav } from "../lib/nav";
 import { UserPicker } from "../components/UserPicker";
 import { requestAutoFilter } from "../lib/freightpopFrame";
+import { swrGet, swrSet } from "../lib/swrCache";
 
 // Convention-based detector: a task is a "Carrier Followup" when its
 // title contains both "carrier" and "follow" (case-insensitive). Mirrors
@@ -358,6 +359,7 @@ export function TasksPage() {
       // regardless of which filter is active. Filtering happens below.
       const r = await api.tasks.list({ limit: 1000, include_archived: 1 });
       setTasks(r.data);
+      swrSet("tasks.list", r.data);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -414,8 +416,20 @@ export function TasksPage() {
   }, [tasks]);
 
   // Filter changes are now client-side over the already-loaded list, so we
-  // only fetch on mount + on explicit Refresh.
-  useEffect(() => { load(); }, []);
+  // only fetch on mount + on explicit Refresh. Stale-while-revalidate:
+  // paint instantly from the last successful response (if any) and let
+  // the live fetch swap in silently — the table never blanks to
+  // "Loading…" when we already have something showable.
+  useEffect(() => {
+    const cached = swrGet<ShipmentTask[]>("tasks.list");
+    if (cached?.length) {
+      setTasks(cached);
+      setLoading(false);
+      load(true);
+    } else {
+      load();
+    }
+  }, []);
 
   async function setStatus(t: ShipmentTask, status: TaskStatus, opts: { openDrawer?: boolean } = {}) {
     try {
@@ -918,6 +932,12 @@ export function TasksPage() {
           Kanban / Table doesn't have to scroll past them every time. */}
 
       {viewMode === "kanban" ? (
+        // Same loading treatment as the table view below — without this,
+        // a still-pending (or hung) fetch renders four empty columns that
+        // read as "no tasks exist" instead of "still loading".
+        loading ? (
+          <div className="bg-white border border-slate-200 rounded-xl text-center text-slate-400 py-8 text-sm">Loading…</div>
+        ) : (
         <KanbanBoard
           tasks={tasks}
           focusedId={focusedId}
@@ -925,6 +945,7 @@ export function TasksPage() {
           onSetStatus={(t, s) => setStatus(t, s, { openDrawer: s === "in_progress" && t.status === "open" })}
           onOpenTask={(taskId) => nav.openTask(taskId)}
         />
+        )
       ) : (
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <table className="w-full text-sm">

@@ -13,21 +13,93 @@ export function generateApiKey() {
   return `fpx_live_${raw}`;
 }
 
+// ============================================================
+// Resolved-credential cache
+//
+// Every authenticated request used to pay two sequential Supabase round
+// trips (auth.getUser + profile select for JWTs; key lookup for API keys)
+// plus a fire-and-forget last_used/last_login write — ~100ms+ of latency
+// tax on EVERY API call and a DB write per request. Cache the resolved
+// identity per credential for a short TTL and throttle the "last seen"
+// touches to once per TOUCH_INTERVAL_MS.
+//
+// Tradeoff (deliberate, same shape as the settings cache): a revoked key
+// or freshly-disabled user keeps access for up to AUTH_CACHE_TTL_MS after
+// the change. Failed resolutions are NOT cached, so a just-enabled user
+// gets in immediately. Keys are sha256 of the credential so raw tokens
+// never sit in the map.
+// ============================================================
+const AUTH_CACHE_TTL_MS = 60_000;
+const TOUCH_INTERVAL_MS = 5 * 60_000;
+const AUTH_CACHE_MAX = 1000;
+const authCache = new Map(); // sha256(credential) -> { at, value, touchedAt }
+
+function authCacheGet(credential) {
+  const k = hashApiKey(credential);
+  const hit = authCache.get(k);
+  if (!hit || Date.now() - hit.at > AUTH_CACHE_TTL_MS) {
+    authCache.delete(k);
+    return null;
+  }
+  return hit;
+}
+
+function authCacheSet(credential, value) {
+  // Tokens rotate hourly, so the map self-renews; the cap is just a
+  // backstop against pathological churn. Wholesale clear keeps it O(1).
+  if (authCache.size >= AUTH_CACHE_MAX) authCache.clear();
+  const entry = { at: Date.now(), value, touchedAt: Date.now() };
+  authCache.set(hashApiKey(credential), entry);
+  return entry;
+}
+
+// Called by the admin mutation routes (revoke key, disable user, role
+// change) so those take effect immediately instead of after the TTL.
+// Wholesale clear: the cache is keyed by credential hash, so we can't
+// target one user's entries, and a 1000-entry rebuild is cheap.
+export function clearAuthCache() {
+  authCache.clear();
+}
+
+// True once per TOUCH_INTERVAL_MS per cache entry — gates the last_seen
+// writes so they happen on a cadence instead of every request.
+function shouldTouch(entry) {
+  if (!entry) return true;
+  if (Date.now() - entry.touchedAt < TOUCH_INTERVAL_MS) return false;
+  entry.touchedAt = Date.now();
+  return true;
+}
+
 async function resolveApiKey(key) {
+  const cached = authCacheGet(key);
+  // Copies, not the cached object itself — requireAuth hangs these off
+  // `req` where a route could mutate them and poison every later request.
+  if (cached) return { ...cached.value, scopes: [...cached.value.scopes] };
   const { data } = await supabase
     .from("fpx_api_keys")
     .select("id, name, scopes, revoked_at")
     .eq("key_hash", hashApiKey(key))
     .maybeSingle();
   if (!data || data.revoked_at) return null;
+  const value = { id: data.id, name: data.name, scopes: data.scopes || [] };
+  authCacheSet(key, value);
   supabase.from("fpx_api_keys").update({ last_used_at: new Date().toISOString() }).eq("id", data.id).then(() => {});
-  return { id: data.id, name: data.name, scopes: data.scopes || [] };
+  return value;
 }
 
 // ============================================================
 // Supabase JWT (dashboard users)
 // ============================================================
 async function resolveJwt(token) {
+  const cached = authCacheGet(token);
+  if (cached) {
+    if (shouldTouch(cached)) {
+      supabase.from("fpx_user_profiles").update({ last_login_at: new Date().toISOString() }).eq("id", cached.value.user.id).then(() => {});
+    }
+    // Copy — requireAuth hangs this off `req`, where a route could
+    // mutate it and poison every later request on the same token.
+    return { user: { ...cached.value.user } };
+  }
   const { data, error } = await supabase.auth.getUser(token);
   if (error || !data?.user) return null;
   const { data: profile } = await supabase
@@ -36,9 +108,7 @@ async function resolveJwt(token) {
     .eq("id", data.user.id)
     .maybeSingle();
   if (!profile) return null;
-  // Fire-and-forget last_login_at touch.
-  supabase.from("fpx_user_profiles").update({ last_login_at: new Date().toISOString() }).eq("id", profile.id).then(() => {});
-  return {
+  const value = {
     user: {
       id: profile.id,
       email: profile.email,
@@ -48,6 +118,11 @@ async function resolveJwt(token) {
       enabled: profile.enabled,
     },
   };
+  authCacheSet(token, value);
+  // Fire-and-forget last_login_at touch (throttled by the cache above —
+  // a fresh resolve only happens at most once per TTL per token).
+  supabase.from("fpx_user_profiles").update({ last_login_at: new Date().toISOString() }).eq("id", profile.id).then(() => {});
+  return value;
 }
 
 // ============================================================
