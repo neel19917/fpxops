@@ -10,6 +10,7 @@ import { ColumnSelector } from "../components/ColumnSelector";
 import { UserPicker } from "../components/UserPicker";
 import { useAuth } from "../lib/auth";
 import { showFrame, hideFrame, requestAutoFilter, requestOpenTracking } from "../lib/freightpopFrame";
+import { swrGet, swrSet } from "../lib/swrCache";
 import {
   SHIPMENT_COLUMNS,
   loadColumnPrefs,
@@ -131,6 +132,17 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   useEffect(() => {
     try { localStorage.setItem("fpx.shipments.modeFilter", modeFilter); } catch {}
   }, [modeFilter]);
+  // A "Parcel" filter persisted from before the parcel switch was turned
+  // off can only match rows that baseRows hides, so it silently empties
+  // the table. Clear it — but only once clientConfig has loaded: it
+  // arrives async, and until then showParcels reads its false default,
+  // which would wipe a legitimate Parcel filter on tenants that have
+  // parcels enabled.
+  useEffect(() => {
+    if (clientConfig && !showParcels && modeFilter.trim().toLowerCase() === "parcel") {
+      setModeFilter("");
+    }
+  }, [clientConfig, showParcels, modeFilter]);
   const [pillFilter, setPillFilter] = useState<PillId>("all");
   // "With notes" toggle — narrows the table to shipments that carry an
   // operator note. The note column itself stays available in the column
@@ -294,8 +306,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
 
-  async function load() {
-    setLoading(true); setErr(null);
+  async function load(silent = false) {
+    if (!silent) setLoading(true);
+    setErr(null);
     try {
       // Initial render is what users feel — keep it tight. Daily volume
       // typically sits around 200 rows; smaller initial fetch makes the
@@ -304,6 +317,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       const r = await api.shipments.list({ limit: 200 });
       setRows(r.data);
       setNextCursor(r.next_cursor);
+      swrSet("shipments.list", { data: r.data, next_cursor: r.next_cursor });
     } catch (e) { setErr((e as Error).message); }
     setLoading(false);
   }
@@ -319,7 +333,20 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     } catch (e) { setErr((e as Error).message); }
     finally { setLoadingMore(false); }
   }
-  useEffect(() => { load(); }, []);
+  // Stale-while-revalidate: paint instantly from the last successful
+  // response, then let the live fetch swap in silently instead of
+  // blanking the table to a spinner on every visit.
+  useEffect(() => {
+    const cached = swrGet<{ data: Shipment[]; next_cursor: string | null }>("shipments.list");
+    if (cached?.data?.length) {
+      setRows(cached.data);
+      setNextCursor(cached.next_cursor);
+      setLoading(false);
+      load(true);
+    } else {
+      load();
+    }
+  }, []);
 
   // When the URL says a shipment is open, mirror it into local state. The
   // initialShipmentId / drawerSection props are sourced from useParams in App.tsx.
@@ -885,7 +912,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             {exporting ? "Exporting…" : "Export all"}
           </button>
           <button
-            onClick={load}
+            onClick={() => load()}
             className="px-3 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800"
           >
             Refresh

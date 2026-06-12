@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
-import { requireAuth, hashApiKey, generateApiKey } from "../lib/auth.js";
+import { requireAuth, hashApiKey, generateApiKey, clearAuthCache } from "../lib/auth.js";
 import { sendCachedJson } from "../lib/httpCache.js";
 import { logAudit } from "../lib/audit.js";
 
@@ -77,5 +77,8 @@ apiKeysRouter.delete("/:id", async (req, res) => {
     after:  { name: data.name,   key_prefix: data.key_prefix,   scopes: data.scopes,   revoked_at: data.revoked_at },
     metadata: { name: data.name, key_prefix: data.key_prefix, scopes: data.scopes },
   });
+  // Revocation must bite immediately, not after the resolved-credential
+  // cache TTL.
+  clearAuthCache();
   res.json({ ok: true });
 });

@@ -23,6 +23,17 @@ const API_URL = (import.meta.env.VITE_FPX_API_URL || "http://localhost:3210").re
 // for clock drift between client + Supabase + Railway.
 const AUTH_GATE_TIMEOUT_MS = 2500;
 const REFRESH_SKEW_S = 60;
+// Hard deadlines on every network round-trip. Without these, a stalled
+// connection (laptop slept mid-request, dead proxy, Supabase hiccup in a
+// long-lived dev tab) left pages awaiting forever on an infinite
+// "Loading…" — the auth gate and the fetch itself had no timeout. A
+// stall now surfaces as a retryable error instead of a hang.
+const FETCH_TIMEOUT_MS = 20_000;
+const AUTH_CALL_TIMEOUT_MS = 6_000;
+
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
+}
 
 function tokenStillFresh(s: { access_token?: string; expires_at?: number | null } | null): string | null {
   if (!s?.access_token) return null;
@@ -41,9 +52,9 @@ function refreshSessionOnce(): Promise<string | null> {
   if (_refreshInflight) return _refreshInflight;
   _refreshInflight = (async () => {
     try {
-      const { data, error } = await sb.auth.refreshSession();
-      if (error || !data.session?.access_token) return null;
-      return data.session.access_token;
+      const res = await withDeadline(sb.auth.refreshSession(), AUTH_CALL_TIMEOUT_MS);
+      if (!res || res.error || !res.data.session?.access_token) return null;
+      return res.data.session.access_token;
     } catch {
       return null;
     } finally {
@@ -56,8 +67,11 @@ function refreshSessionOnce(): Promise<string | null> {
 }
 
 async function getAccessTokenOrWait(): Promise<string> {
-  // 1. Cached session, if still fresh.
-  const cached = (await sb.auth.getSession()).data.session;
+  // 1. Cached session, if still fresh. getSession() is usually a local
+  // read but can block on the SDK's internal initialize — same deadline
+  // treatment as the boot path in auth.tsx.
+  const got = await withDeadline(sb.auth.getSession(), AUTH_CALL_TIMEOUT_MS);
+  const cached = got?.data.session ?? null;
   const fresh = tokenStillFresh(cached);
   if (fresh) return fresh;
 
@@ -94,17 +108,25 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
   const full = `${API_URL}${path}${q ? `?${q}` : ""}`;
 
   async function fire(token: string) {
-    return fetch(full, {
-      ...init,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        // Impersonation headers are skipped on meta-operations (start/stop/toggle)
-        // so the request is attributed to the real admin server-side.
-        ...(init?.noImpersonate ? {} : impersonateHeaders()),
-        ...(init?.headers || {}),
-      },
-    });
+    try {
+      return await fetch(full, {
+        ...init,
+        signal: init?.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          // Impersonation headers are skipped on meta-operations (start/stop/toggle)
+          // so the request is attributed to the real admin server-side.
+          ...(init?.noImpersonate ? {} : impersonateHeaders()),
+          ...(init?.headers || {}),
+        },
+      });
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "TimeoutError") {
+        throw new Error(`Request timed out after ${FETCH_TIMEOUT_MS / 1000}s: ${path}`);
+      }
+      throw e;
+    }
   }
 
   let accessToken = await getAccessTokenOrWait();
@@ -137,6 +159,7 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
 async function publicRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(`${API_URL}${path}`, {
     ...init,
+    signal: init?.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
   });
   if (!resp.ok) {

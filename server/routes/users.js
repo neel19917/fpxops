@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
-import { requireAuth, generateApiKey, hashApiKey } from "../lib/auth.js";
+import { requireAuth, generateApiKey, hashApiKey, clearAuthCache } from "../lib/auth.js";
 import { sendCachedJson } from "../lib/httpCache.js";
 import { logAudit } from "../lib/audit.js";
 
@@ -44,6 +44,9 @@ usersRouter.patch("/:id", async (req, res) => {
     .maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: "User not found" });
+  // Role / enabled changes must bite immediately, not after the
+  // resolved-credential cache TTL.
+  clearAuthCache();
   res.json({ user: data });
 });
 
@@ -127,6 +130,10 @@ usersRouter.post("/:id/issue-key", async (req, res) => {
     after: { user_email: target.email, key_id: created.id, key_prefix },
     metadata: { key_id: created.id, key_prefix, scopes: created.scopes, expires_at: expiresAt },
   });
+
+  // Old keys were just revoked and the user's enabled flag changed —
+  // drop cached resolutions so both take effect immediately.
+  clearAuthCache();
 
   res.json({
     key: created,
