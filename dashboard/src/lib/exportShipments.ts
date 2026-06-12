@@ -91,12 +91,12 @@ export function exportShipmentsXlsx(rows: Shipment[]): void {
 
   // ---- Cover sheet ----
   const cover: (string | number)[][] = [
-    ["FreightPOP — FPXpress Shipment Export"],
+    ["FreightPOP — FPX Control Station Shipment Export"],
     [""],
     ["Generated", new Date().toLocaleString()],
     ["Total shipments", rows.length],
     [""],
-    ["Source", "FPXpress dashboard"],
+    ["Source", "FPX Control Station"],
     ["Sheet", "Shipments"],
   ];
   const wsCover = XLSX.utils.aoa_to_sheet(cover);

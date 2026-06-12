@@ -109,7 +109,7 @@ export function SharedViewPage({ token }: Props) {
           </div>
           <div>
             <div className="text-sm font-semibold">{meta.label || formatType(meta.resource_type)}</div>
-            <div className="text-xs text-slate-500">Shared via FPXpress · {fmtDateTime(meta.created_at)}</div>
+            <div className="text-xs text-slate-500">Shared via FPX Control Station · {fmtDateTime(meta.created_at)}</div>
           </div>
         </div>
       </header>

@@ -34,7 +34,7 @@ export function SignInPage() {
             <span className="text-[#2BA3E8]">at the speed of freight.</span>
           </h2>
           <p className="mt-4 text-slate-300/90 text-[15px] leading-relaxed">
-            FPXpress is the FreightPOP internal dashboard for refresh runs,
+            FPX Control Station is the FreightPOP internal hub for refresh runs,
             audits, and shipment analytics — built for the team, by the team.
           </p>
         </div>
@@ -60,7 +60,7 @@ export function SignInPage() {
           </div>
 
           <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-            Sign in to FPXpress
+            Sign in to FPX Control Station
           </h1>
           <p className="mt-2 text-sm text-slate-500">
             Use your FreightPOP Microsoft account. Access is granted by an admin.
