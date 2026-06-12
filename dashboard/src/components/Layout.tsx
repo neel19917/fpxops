@@ -87,7 +87,7 @@ export function Layout({ tab, onTab, children }: Props) {
               <Package className="h-[18px] w-[18px] text-white" />
             </div>
             <div>
-              <div className="text-sm font-semibold leading-tight">FPXpress</div>
+              <div className="text-sm font-semibold leading-tight">FPX Control Station</div>
               <div className="text-[11px] text-slate-500 leading-tight">Shipment intelligence</div>
             </div>
           </div>

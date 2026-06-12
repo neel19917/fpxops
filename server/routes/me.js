@@ -16,6 +16,7 @@ async function loadClientConfig() {
     "embed.freightpop.enabled",
     "embed.freightpop.url_template",
     "ui.tracking.recent_change_window_hours",
+    "ui.tracking.show_parcels",
   );
   // Coerce the change-window setting to a sane number — admins can
   // type anything in the Settings input. Clamp to [0, 720] (≈30 days)
@@ -29,6 +30,10 @@ async function loadClientConfig() {
     },
     tracking_ui: {
       recent_change_window_hours: changeWindowH,
+      // Master parcel switch. When false (default), the Tracking page
+      // hides parcel-mode rows; when true, parcels are listed like any
+      // other mode. Mirrors the server-side auto-task gate.
+      show_parcels: !!s["ui.tracking.show_parcels"],
     },
   };
 }

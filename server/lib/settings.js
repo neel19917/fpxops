@@ -64,6 +64,14 @@ const FALLBACKS = {
   // Setting to 0 hides the pill entirely without disabling the
   // last_material_change_at column itself.
   "ui.tracking.recent_change_window_hours": 24,
+  // Master switch for parcel shipments. OFF by default: parcel-mode rows
+  // are hidden from the Tracking page AND no auto-tasks spawn for them
+  // (operators don't follow the carrier/customer-followup playbook on
+  // parcel exceptions). Flip ON in /admin/settings to surface parcels in
+  // the Tracking list again and resume auto-task creation for them. The
+  // upsert itself is unaffected either way — parcel rows, counts, and
+  // metadata always persist; this only governs visibility + task spawn.
+  "ui.tracking.show_parcels": false,
 };
 
 const TTL_MS = 30_000;

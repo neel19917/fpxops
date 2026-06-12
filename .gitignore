@@ -12,3 +12,13 @@ dashboard/dist/
 *.xls
 
 .DS_Store
+
+# Local Netlify folder
+.netlify
+
+# extension-headless: downloaded Chrome + throwaway browser profiles
+extension-headless/chrome/
+extension-headless/.chrome-profile-*/
+
+# Deno lockfile from local Netlify tooling
+dashboard/deno.lock

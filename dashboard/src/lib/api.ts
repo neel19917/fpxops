@@ -1,6 +1,6 @@
 import type {
   AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
-  InvoiceAudit, InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentTask, UserProfileRow,
+  InvoiceAudit, InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
 } from "./types";
 import { sb } from "./supabase";
 import { impersonateHeaders } from "./impersonate";
@@ -163,6 +163,10 @@ export interface ClientConfig {
   // 0 hides the pill entirely (the column itself is unaffected).
   tracking_ui: {
     recent_change_window_hours: number;
+    // Master parcel switch. When false (default), the Tracking page hides
+    // parcel-mode rows and the server skips auto-tasks for parcels. Admin-
+    // tunable from Settings (key: ui.tracking.show_parcels).
+    show_parcels: boolean;
   };
 }
 
@@ -202,7 +206,7 @@ export const api = {
   shipments: {
     list: (params?: { limit?: number; customer?: string; action?: string; status?: string; q?: string; source?: string; before?: string }) =>
       request<{ data: Shipment[]; next_cursor: string | null }>("/api/shipments", { params }),
-    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[]; recent_diff: ShipmentRecentDiff | null }>(`/api/shipments/${id}`),
+    get: (id: string) => request<{ shipment: Shipment; analyses: AiAnalysis[]; history: Shipment[]; tasks: ShipmentTask[]; notes_log: ShipmentNote[]; recent_diff: ShipmentRecentDiff | null }>(`/api/shipments/${id}`),
     overrideAction: (id: string, body: { action_required: string | null; reason?: string }) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>
@@ -211,6 +215,14 @@ export const api = {
       request<{ shipment: Shipment }>(`/api/shipments/${id}/notes`, {
         method: "PATCH",
         body: JSON.stringify({ notes }),
+      }),
+    // Append one entry to the shipment's notes log (the editable single
+    // field has been replaced by this running log). Returns the new entry
+    // plus the shipment with its denormalized latest-note column updated.
+    addNote: (id: string, body: string) =>
+      request<{ note: ShipmentNote; shipment: Shipment | null }>(`/api/shipments/${id}/notes`, {
+        method: "POST",
+        body: JSON.stringify({ body }),
       }),
     bulkDelete: (ids: string[]) =>
       request<{ deleted: number }>(`/api/shipments/bulk-delete`, {
