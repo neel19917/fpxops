@@ -14,6 +14,7 @@ import { ChatAnthropic } from "@langchain/anthropic";
 import { buildGraph } from "./graph.js";
 import { requireAuth, bootstrapAdminKey, bootstrapAdminEmail } from "./lib/auth.js";
 import { isDbReady, supabase } from "./lib/supabase.js";
+import { getSettings } from "./lib/settings.js";
 import { shipmentsRouter } from "./routes/shipments.js";
 import { analysesRouter } from "./routes/analyses.js";
 import { analyzeRouter } from "./routes/analyze.js";
@@ -162,16 +163,31 @@ app.post("/analyze", requireAuth(), async (req, res) => {
   if (!Array.isArray(shipments) || shipments.length === 0) {
     return res.status(400).json({ error: "shipments array is required" });
   }
+  // LOUD on purpose: this legacy LangGraph batch endpoint is slated for
+  // removal (extension backwards-compat only). If a dormant client wakes up
+  // and hits it, we want it screaming in the logs, not silent. The
+  // delete-vs-shim decision depends on whether anything still calls this.
+  console.warn(
+    `[FPX][LEGACY /analyze] hit — ${shipments.length} shipment(s); caller=${req.user?.email || req.apiKey?.id || "unknown"}`,
+  );
   let model;
   try {
     model = getModel();
   } catch (e) {
     return res.status(503).json({ error: e.message });
   }
+  // Single-source the action threshold: fetch it here (this handler is async)
+  // and thread it into graph state so parse.js stops hardcoding 0.7. settings
+  // is the one source of truth (fpx_settings: action.threshold, default 0.7).
+  let threshold = 0.7;
+  try {
+    const s = await getSettings("action.threshold");
+    threshold = Number(s["action.threshold"]) || 0.7;
+  } catch {}
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; }, ANALYZE_TIMEOUT_MS);
   try {
-    const result = await graph.invoke({ shipments, _model: model });
+    const result = await graph.invoke({ shipments, _model: model, _threshold: threshold });
     clearTimeout(timer);
     const analyzed = (result.analyzed || []).map((r) => {
       const { _model, _classification, _parseError, _aiResults, ...rest } = r;

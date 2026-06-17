@@ -372,6 +372,43 @@ shipmentsRouter.get("/", async (req, res) => {
   res.json({ data: data || [], next_cursor: nextCursor });
 });
 
+// GET /shipments/stats?parcels=1 — TRUE counts over the whole latest view, not
+// just the page the grid happens to have loaded. The dashboard's status pills
+// were counting baseRows (default 200-row page), so "Total 200" was really
+// "first page", not the dataset. We return total + issues + a raw per-status
+// tally; the client folds the tally into pills with its own STATUS_MATCHERS so
+// the booked/in-transit/etc. logic stays single-sourced in one place.
+//
+// Registered BEFORE GET /:id so "stats" isn't captured as a shipment id.
+// Paginates in 1000-row pages to beat PostgREST's default max-rows cap.
+shipmentsRouter.get("/stats", async (req, res) => {
+  const includeParcels = req.query.parcels === "1" || req.query.parcels === "true";
+  const PAGE = 1000;
+  let from = 0;
+  let total = 0;
+  let issues = 0;
+  const statuses = {};
+  for (;;) {
+    const { data, error } = await supabase
+      .from("fpx_shipments_latest")
+      .select("shipment_status, action_required, mode")
+      .order("scraped_at", { ascending: false })
+      .range(from, from + PAGE - 1);
+    if (error) return res.status(500).json({ error: error.message });
+    const batch = data || [];
+    for (const r of batch) {
+      if (!includeParcels && String(r.mode || "").trim().toLowerCase() === "parcel") continue;
+      total++;
+      if (String(r.action_required || "").toUpperCase() === "YES") issues++;
+      const st = r.shipment_status || "";
+      statuses[st] = (statuses[st] || 0) + 1;
+    }
+    if (batch.length < PAGE) break;
+    from += PAGE;
+  }
+  res.json({ total, issues, statuses });
+});
+
 shipmentsRouter.get("/:id", async (req, res) => {
   const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
@@ -659,6 +696,76 @@ shipmentsRouter.post("/bulk-delete", async (req, res) => {
   });
 
   res.json({ deleted });
+});
+
+// POST /shipments/bulk-reanalyze  { ids: [uuid, ...] }
+// Re-runs per-shipment AI across the selection and REPLACES the stored verdict
+// on each row (analyzeExistingShipment respects manual overrides). Re-analysis
+// of N rows is N model calls — minutes + real cost for a big selection — so we
+// respond immediately with { queued } and process in the background with
+// bounded concurrency. The operator hits Refresh to see updated verdicts; each
+// run is logged to fpx_ai_analyses (incl. the calibration metadata).
+shipmentsRouter.post("/bulk-reanalyze", async (req, res) => {
+  const scope = req.body?.scope === "all" ? "all" : "ids";
+  let ids;
+  if (scope === "all") {
+    // "Re-analyze all": pull the latest row per tracking number from the view
+    // (not the base table, which holds full scrape history — that'd re-analyze
+    // stale duplicates). Paginated past PostgREST's 1000-row cap.
+    ids = [];
+    const PAGE = 1000;
+    let from = 0;
+    for (;;) {
+      const { data, error } = await supabase
+        .from("fpx_shipments_latest")
+        .select("id").order("scraped_at", { ascending: false }).range(from, from + PAGE - 1);
+      if (error) return res.status(500).json({ error: error.message });
+      const batch = data || [];
+      for (const r of batch) if (r.id) ids.push(r.id);
+      if (batch.length < PAGE) break;
+      from += PAGE;
+    }
+  } else {
+    ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : [];
+  }
+  if (!ids.length) return res.status(400).json({ error: "no shipments to re-analyze" });
+
+  // Safety ceiling so a runaway request can't fan out unbounded paid calls.
+  const MAX = 5000;
+  const slice = ids.slice(0, MAX);
+  // Respond before the work starts — this is fire-and-forget on purpose.
+  res.json({ queued: slice.length, capped: ids.length > MAX, scope });
+
+  const CONCURRENCY = 4;
+  let cursor = 0;
+  let done = 0;
+  let failed = 0;
+  async function worker() {
+    while (cursor < slice.length) {
+      const id = slice[cursor++];
+      try {
+        const { data: row } = await supabase.from("fpx_shipments").select("*").eq("id", id).maybeSingle();
+        if (row) {
+          await analyzeExistingShipment(row, { reqContext: req });
+          done++;
+        }
+      } catch (e) {
+        failed++;
+        console.warn("[FPX] bulk-reanalyze row failed:", id, e.message);
+      }
+    }
+  }
+  Promise.all(Array.from({ length: CONCURRENCY }, worker))
+    .then(() => {
+      console.log(`[FPX] bulk-reanalyze complete: ${done} ok, ${failed} failed of ${slice.length}`);
+      logAudit(req, {
+        action: "bulk_reanalyze",
+        entity_type: "shipment",
+        summary: `Bulk re-analyzed ${done} shipment${done === 1 ? "" : "s"} (${scope})`,
+        metadata: { scope, requested: ids.length, processed: done, failed, capped: ids.length > MAX },
+      });
+    })
+    .catch((e) => console.error("[FPX] bulk-reanalyze batch error:", e));
 });
 
 // POST /shipments/:id/reanalyze — manual trigger from the dashboard. Runs
