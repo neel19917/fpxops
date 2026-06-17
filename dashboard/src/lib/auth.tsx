@@ -128,18 +128,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let mounted = true;
+    // Absolute backstop: the "Loading…" gate must never pin. Both resolve
+    // paths below clear it in a finally, and the client now bounds every fetch
+    // (supabase.ts), but if anything still wedges past that ceiling we drop the
+    // spinner and let the app render its signed-out / error state — a reload is
+    // always better than an indefinite blank screen.
+    const hardStop = setTimeout(() => { if (mounted) setLoading(false); }, 14000);
     bootSession().then(async (data) => {
       if (!mounted) return;
       setSession(data.session);
       try { await loadProfile(data.session); } catch (e) { setError((e as Error).message); }
-      finally { if (mounted) setLoading(false); }
+      finally { if (mounted) { clearTimeout(hardStop); setLoading(false); } }
     });
     const { data: sub } = sb.auth.onAuthStateChange(async (_event, s) => {
       setSession(s);
       try { await loadProfile(s); } catch (e) { setError((e as Error).message); }
-      finally { setLoading(false); }
+      finally { clearTimeout(hardStop); setLoading(false); }
     });
-    return () => { mounted = false; sub.subscription.unsubscribe(); };
+    return () => { mounted = false; clearTimeout(hardStop); sub.subscription.unsubscribe(); };
   }, []);
 
   async function signInWithMicrosoft() {

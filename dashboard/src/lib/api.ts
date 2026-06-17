@@ -1,6 +1,6 @@
 import type {
   AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
-  InvoiceAudit, InvoiceAuditRow, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
+  InvoiceAudit, InvoiceAuditRow, ReanalyzeCurrent, ReanalyzePreview, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
 } from "./types";
 import { sb } from "./supabase";
 import { impersonateHeaders } from "./impersonate";
@@ -234,6 +234,20 @@ export const api = {
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/reanalyze`, { method: "POST" }),
+    // Run a fresh analysis on the chosen model and return the proposed
+    // verdict WITHOUT persisting it (powers the Re-analyze modal). The run is
+    // logged to fpx_ai_analyses; the shipment only changes on applyReanalysis.
+    reanalyzePreview: (id: string, model?: string) =>
+      request<{ preview: ReanalyzePreview; current: ReanalyzeCurrent }>(
+        `/api/shipments/${id}/reanalyze/preview`,
+        { method: "POST", body: JSON.stringify({ model }) },
+      ),
+    // Commit a previewed analysis onto the shipment (writes an audit entry).
+    applyReanalysis: (id: string, analysisId: string) =>
+      request<{ shipment: Shipment }>(`/api/shipments/${id}/reanalyze/apply`, {
+        method: "POST",
+        body: JSON.stringify({ analysis_id: analysisId }),
+      }),
     updateNotes: (id: string, notes: string | null) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/notes`, {
         method: "PATCH",
@@ -251,6 +265,26 @@ export const api = {
       request<{ deleted: number }>(`/api/shipments/bulk-delete`, {
         method: "POST",
         body: JSON.stringify({ ids }),
+      }),
+    // True counts over the whole dataset (not just the loaded page). The
+    // status pills fold `statuses` through the client's STATUS_MATCHERS.
+    stats: (parcels?: boolean) =>
+      request<{ total: number; issues: number; statuses: Record<string, number> }>(
+        "/api/shipments/stats",
+        { params: { parcels: parcels ? "1" : "0" } },
+      ),
+    // Background batch re-analysis — replaces stored verdicts for the selection.
+    bulkReanalyze: (ids: string[]) =>
+      request<{ queued: number; capped: boolean; scope?: string }>(`/api/shipments/bulk-reanalyze`, {
+        method: "POST",
+        body: JSON.stringify({ ids }),
+      }),
+    // Re-analyze every shipment (latest row per tracking). Server enumerates the
+    // ids; background-processed like bulkReanalyze.
+    reanalyzeAll: () =>
+      request<{ queued: number; capped: boolean; scope?: string }>(`/api/shipments/bulk-reanalyze`, {
+        method: "POST",
+        body: JSON.stringify({ scope: "all" }),
       }),
   },
   analyses: {
@@ -432,8 +466,29 @@ export const api = {
   ops: {
     metrics: (days = 30) =>
       request<OpsMetrics>("/api/ops/metrics", { params: { days } }),
+    // Enqueue a rescrape for the Chrome extension to fulfill on its next cycle.
+    requestRescrape: (body?: { scope?: "all" | "selected"; tracking_numbers?: string[] }) =>
+      request<{ request: ScrapeRequest; coalesced?: boolean }>("/api/ops/rescrape", {
+        method: "POST",
+        body: JSON.stringify(body || { scope: "all" }),
+      }),
+    rescrapeRecent: () =>
+      request<{ requests: ScrapeRequest[] }>("/api/ops/rescrape"),
   },
 };
+
+export interface ScrapeRequest {
+  id: string;
+  status: "pending" | "claimed" | "done" | "error";
+  scope: "all" | "selected";
+  tracking_numbers: string[] | null;
+  requested_by: string | null;
+  requested_at: string;
+  claimed_at: string | null;
+  completed_at: string | null;
+  result_count: number | null;
+  note: string | null;
+}
 
 // Recent material-diff for a shipment, returned by GET /api/shipments/:id.
 // Mirrors fpx_shipment_scrapes.diff which the AI prompt also sees as

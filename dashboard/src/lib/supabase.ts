@@ -23,6 +23,22 @@ const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY ||
 // holder, dead tab), steal it rather than hang.
 const LOCK_DEADLINE_MS = 3_000;
 
+// supabase-js calls fetch with no deadline by default. The boot path awaits a
+// profile query before it drops the "Loading…" gate (auth.tsx#loadProfile), so
+// a single stalled request — lock contention right after the OAuth token lands,
+// a dead socket, a service worker / extension intercepting the call — pins the
+// dashboard on "Loading…" forever. Mirror the server client: give every
+// PostgREST/auth fetch a hard ceiling so a stall becomes a fast error the boot
+// path can recover from instead of an indefinite hang.
+const FETCH_DEADLINE_MS = 12_000;
+function fetchWithDeadline(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const deadline = AbortSignal.timeout(FETCH_DEADLINE_MS);
+  const signal = init.signal
+    ? ("any" in AbortSignal ? AbortSignal.any([init.signal, deadline]) : init.signal)
+    : deadline;
+  return fetch(input, { ...init, signal });
+}
+
 async function deadlineLock<R>(name: string, _acquireTimeout: number, fn: () => Promise<R>): Promise<R> {
   if (typeof navigator === "undefined" || !navigator.locks) return fn();
   try {
@@ -49,6 +65,7 @@ export const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     detectSessionInUrl: true,
     lock: deadlineLock,
   },
+  global: { fetch: fetchWithDeadline },
 });
 
 export type { Session };

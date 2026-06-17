@@ -6,6 +6,7 @@ import type { AiAnalysis, EmailDraft, Shipment, ShipmentNote, ShipmentTask, Task
 import { ActionBadge } from "../components/Badge";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
+import { ReanalyzeModal } from "../components/ReanalyzeModal";
 import { ColumnSelector } from "../components/ColumnSelector";
 import { UserPicker } from "../components/UserPicker";
 import { useAuth } from "../lib/auth";
@@ -181,6 +182,54 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [bulkResult, setBulkResult] = useState<string | null>(null);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
   const [bulkDeleteBusy, setBulkDeleteBusy] = useState(false);
+  const [bulkReOpen, setBulkReOpen] = useState(false);
+  const [bulkReBusy, setBulkReBusy] = useState(false);
+  // True dataset-wide counts for the status pills (the loaded page is only a
+  // slice). statsNonce lets Refresh / bulk ops force a re-fetch.
+  const [stats, setStats] = useState<{ total: number; issues: number; statuses: Record<string, number> } | null>(null);
+  const [statsNonce, setStatsNonce] = useState(0);
+  const [rescrapeBusy, setRescrapeBusy] = useState(false);
+  const [reAllOpen, setReAllOpen] = useState(false);
+  const [reAllBusy, setReAllBusy] = useState(false);
+  // Transient success banner for fire-and-forget actions (rescrape, batch
+  // re-analyze) whose result lands later, not in the request response.
+  const [notice, setNotice] = useState<string | null>(null);
+  function flashNotice(msg: string) {
+    setNotice(msg);
+    setTimeout(() => setNotice(null), 6000);
+  }
+  async function requestRescrape() {
+    if (rescrapeBusy) return;
+    setRescrapeBusy(true); setErr(null);
+    try {
+      const r = await api.ops.requestRescrape({ scope: "all" });
+      flashNotice(r.coalesced
+        ? "Rescrape already queued — the extension will pick it up on its next run."
+        : "Rescrape requested — the extension will re-pull FreightPOP on its next run, then Refresh.");
+    } catch (e) { setErr((e as Error).message); }
+    finally { setRescrapeBusy(false); }
+  }
+  async function submitBulkReanalyze() {
+    if (bulkReBusy || selectedIds.size === 0) return;
+    setBulkReBusy(true); setErr(null);
+    try {
+      const r = await api.shipments.bulkReanalyze(Array.from(selectedIds));
+      setBulkReOpen(false);
+      clearSelection();
+      flashNotice(`Re-analyzing ${r.queued} shipment${r.queued === 1 ? "" : "s"} in the background — Refresh in a minute to see updated verdicts.`);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBulkReBusy(false); }
+  }
+  async function submitReanalyzeAll() {
+    if (reAllBusy) return;
+    setReAllBusy(true); setErr(null);
+    try {
+      const r = await api.shipments.reanalyzeAll();
+      setReAllOpen(false);
+      flashNotice(`Re-analyzing all ${r.queued} shipment${r.queued === 1 ? "" : "s"} in the background${r.capped ? " (capped at 5000)" : ""} — this runs for a while; Refresh periodically to see updated verdicts.`);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setReAllBusy(false); }
+  }
 
   // Per-shipment tasks shown inside the drawer.
   const [drawerTasks, setDrawerTasks] = useState<ShipmentTask[]>([]);
@@ -224,7 +273,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
   // Re-analyze button state — busy flag prevents double-click during a Claude
   // round-trip (typically 2-3s).
-  const [reanalyzing, setReanalyzing] = useState(false);
+  const [reanalyzeOpen, setReanalyzeOpen] = useState(false);
 
   // Task-walk: tracks whether the focused task's status update is in flight,
   // Tracks whether an action-disposition mutation is in flight. Drives
@@ -333,6 +382,14 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     } catch (e) { setErr((e as Error).message); }
     finally { setLoadingMore(false); }
   }
+  // True counts for the pills, fetched separately from the paged list. Keyed on
+  // parcel visibility (the count must match what the grid shows) and statsNonce
+  // (bumped by Refresh / bulk ops). Non-fatal — pills fall back to page counts.
+  useEffect(() => {
+    let alive = true;
+    api.shipments.stats(showParcels).then((s) => { if (alive) setStats(s); }).catch(() => {});
+    return () => { alive = false; };
+  }, [showParcels, statsNonce]);
   // Stale-while-revalidate: paint instantly from the last successful
   // response, then let the live fetch swap in silently instead of
   // blanking the table to a spinner on every visit.
@@ -758,22 +815,15 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       }
       if (e.key === "r") {
         e.preventDefault();
-        if (!drawerId || reanalyzing) return;
-        setReanalyzing(true);
-        api.shipments.reanalyze(drawerId)
-          .then((r) => {
-            setDrawerData((p) => p ? { ...p, shipment: r.shipment } : p);
-            setRows((prev) => prev.map((row) => row.id === r.shipment.id ? r.shipment : row));
-          })
-          .catch((err) => setErr((err as Error).message))
-          .finally(() => setReanalyzing(false));
+        if (!drawerId) return;
+        setReanalyzeOpen(true);
         return;
       }
     }
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawerId, drawerHelpOpen, drawerPrev, drawerNext, drawerData, reanalyzing, taskWalk]);
+  }, [drawerId, drawerHelpOpen, drawerPrev, drawerNext, drawerData, taskWalk]);
 
   const allFilteredSelected = filtered.length > 0 && filtered.every((r) => selectedIds.has(r.id));
   function toggleRow(id: string) {
@@ -814,14 +864,29 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     }
   }
 
-  const pillCounts = useMemo(() => ({
-    total: baseRows.length,
-    booked: baseRows.filter((r) => shipmentMatchesPill(r, "booked")).length,
-    in_transit: baseRows.filter((r) => shipmentMatchesPill(r, "in_transit")).length,
-    issues: baseRows.filter((r) => shipmentMatchesPill(r, "issues")).length,
-    out_for_delivery: baseRows.filter((r) => shipmentMatchesPill(r, "out_for_delivery")).length,
-    delivered: baseRows.filter((r) => shipmentMatchesPill(r, "delivered")).length,
-  }), [baseRows]);
+  const pillCounts = useMemo(() => {
+    // Prefer true dataset-wide counts. Fold the server's per-status tally
+    // through the SAME matchers the list uses, so the booked/in-transit/etc.
+    // logic is single-sourced. Fall back to page counts until stats arrive.
+    if (stats) {
+      let booked = 0, in_transit = 0, out_for_delivery = 0, delivered = 0;
+      for (const [st, n] of Object.entries(stats.statuses)) {
+        if (STATUS_MATCHERS.booked(st)) booked += n;
+        if (STATUS_MATCHERS.in_transit(st)) in_transit += n;
+        if (STATUS_MATCHERS.out_for_delivery(st)) out_for_delivery += n;
+        if (STATUS_MATCHERS.delivered(st)) delivered += n;
+      }
+      return { total: stats.total, booked, in_transit, issues: stats.issues, out_for_delivery, delivered };
+    }
+    return {
+      total: baseRows.length,
+      booked: baseRows.filter((r) => shipmentMatchesPill(r, "booked")).length,
+      in_transit: baseRows.filter((r) => shipmentMatchesPill(r, "in_transit")).length,
+      issues: baseRows.filter((r) => shipmentMatchesPill(r, "issues")).length,
+      out_for_delivery: baseRows.filter((r) => shipmentMatchesPill(r, "out_for_delivery")).length,
+      delivered: baseRows.filter((r) => shipmentMatchesPill(r, "delivered")).length,
+    };
+  }, [stats, baseRows]);
 
   return (
     <div className="space-y-5">
@@ -912,7 +977,25 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
             {exporting ? "Exporting…" : "Export all"}
           </button>
           <button
-            onClick={() => load()}
+            onClick={() => setReAllOpen(true)}
+            title="Re-run AI on every shipment and replace stored verdicts"
+            className="px-3 py-2 text-sm font-medium rounded-lg bg-white text-violet-700 ring-1 ring-violet-300 hover:bg-violet-50 inline-flex items-center gap-1.5"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Re-analyze all
+          </button>
+          <button
+            onClick={requestRescrape}
+            disabled={rescrapeBusy}
+            title="Ask the FreightPOP extension to re-pull fresh data on its next run (not an instant reload)"
+            className="px-3 py-2 text-sm font-medium rounded-lg bg-white text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50 disabled:opacity-60 inline-flex items-center gap-1.5"
+          >
+            <RefreshCw className={"h-4 w-4 " + (rescrapeBusy ? "animate-spin" : "")} />
+            {rescrapeBusy ? "Requesting…" : "Rescrape"}
+          </button>
+          <button
+            onClick={() => { load(); setStatsNonce((n) => n + 1); }}
+            title="Reload the latest data already in the database"
             className="px-3 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800"
           >
             Refresh
@@ -925,6 +1008,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           </div>
         ) : null}
 
+        {notice ? (
+          <div className="p-3 bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-sm">
+            {notice}
+          </div>
+        ) : null}
+
         {selectedIds.size > 0 ? (
           <div className="flex items-center gap-3 px-4 py-2.5 bg-sky-50 border-b border-sky-200 text-sm">
             <span className="font-medium text-sky-900">{selectedIds.size} selected</span>
@@ -933,6 +1022,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 flex items-center gap-1.5"
             >
               <ListChecks className="h-4 w-4" /> Bulk-create task
+            </button>
+            <button
+              onClick={() => setBulkReOpen(true)}
+              className="px-3 py-1.5 rounded-lg bg-violet-600 text-white text-xs font-medium hover:bg-violet-700 flex items-center gap-1.5"
+            >
+              <RefreshCw className="h-4 w-4" /> Bulk re-analyze
             </button>
             <button
               onClick={() => setBulkDeleteOpen(true)}
@@ -1114,6 +1209,62 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               >
                 <Trash2 className="h-4 w-4" />
                 {bulkDeleteBusy ? "Deleting…" : `Delete ${selectedIds.size}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {bulkReOpen ? (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm" onClick={() => !bulkReBusy && setBulkReOpen(false)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold mb-1 flex items-center gap-2 text-violet-700">
+              <RefreshCw className="h-5 w-5" /> Re-analyze {selectedIds.size} shipment{selectedIds.size === 1 ? "" : "s"}?
+            </h2>
+            <p className="text-sm text-slate-600 mb-4">
+              This re-runs the AI on each selected shipment and <strong>replaces</strong> the stored verdict (issue, recommendation, action). Manual overrides are kept. It runs in the background and costs one model call per shipment — Refresh in a minute to see the updated verdicts.
+            </p>
+            <div className="flex gap-2 justify-end pt-2">
+              <button
+                onClick={() => setBulkReOpen(false)}
+                disabled={bulkReBusy}
+                className="px-4 py-2 text-sm rounded-lg text-slate-600 hover:bg-slate-100"
+              >Cancel</button>
+              <button
+                onClick={submitBulkReanalyze}
+                disabled={bulkReBusy}
+                className="px-4 py-2 text-sm rounded-lg bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+              >
+                <RefreshCw className={"h-4 w-4 " + (bulkReBusy ? "animate-spin" : "")} />
+                {bulkReBusy ? "Queuing…" : `Re-analyze ${selectedIds.size}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {reAllOpen ? (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm" onClick={() => !reAllBusy && setReAllOpen(false)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold mb-1 flex items-center gap-2 text-violet-700">
+              <RefreshCw className="h-5 w-5" /> Re-analyze all {pillCounts.total.toLocaleString()} shipments?
+            </h2>
+            <p className="text-sm text-slate-600 mb-4">
+              This re-runs the AI on <strong>every</strong> shipment and <strong>replaces</strong> each stored verdict (issue, recommendation, action). Manual overrides are kept; analysis history is preserved. It runs in the background — roughly <strong>${Math.max(1, Math.round(pillCounts.total * 0.004))}</strong> and <strong>~{Math.max(1, Math.ceil(pillCounts.total * 2 / 4 / 60))} min</strong> — so Refresh periodically rather than waiting.
+            </p>
+            <div className="flex gap-2 justify-end pt-2">
+              <button
+                onClick={() => setReAllOpen(false)}
+                disabled={reAllBusy}
+                className="px-4 py-2 text-sm rounded-lg text-slate-600 hover:bg-slate-100"
+              >Cancel</button>
+              <button
+                onClick={submitReanalyzeAll}
+                disabled={reAllBusy}
+                className="px-4 py-2 text-sm rounded-lg bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+              >
+                <RefreshCw className={"h-4 w-4 " + (reAllBusy ? "animate-spin" : "")} />
+                {reAllBusy ? "Queuing…" : `Re-analyze all ${pillCounts.total.toLocaleString()}`}
               </button>
             </div>
           </div>
@@ -1425,22 +1576,13 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 <Section title="AI summary">
                   <div className="flex justify-end mb-2">
                     <button
-                      disabled={reanalyzing || !drawerId}
-                      onClick={async () => {
-                        if (!drawerId || reanalyzing) return;
-                        setReanalyzing(true);
-                        try {
-                          const r = await api.shipments.reanalyze(drawerId);
-                          setDrawerData((p) => p ? { ...p, shipment: r.shipment } : p);
-                          setRows((prev) => prev.map((row) => row.id === r.shipment.id ? r.shipment : row));
-                        } catch (e) { setErr((e as Error).message); }
-                        finally { setReanalyzing(false); }
-                      }}
+                      disabled={!drawerId}
+                      onClick={() => { if (drawerId) setReanalyzeOpen(true); }}
                       className="text-xs px-2.5 py-1 rounded-md bg-sky-50 text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
-                      title="Run per-shipment AI analysis again"
+                      title="Re-analyze on a chosen model and review before replacing"
                     >
-                      <RefreshCw className={"h-3.5 w-3.5" + (reanalyzing ? " animate-spin" : "")} />
-                      {reanalyzing ? "Analyzing…" : "Re-analyze"}
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Re-analyze
                     </button>
                   </div>
                   <Field label="Issue">{drawerData.shipment.ai_issue}</Field>
@@ -1600,6 +1742,17 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               return (
                 <>
                   <RecentChangeLog diff={drawerData.recent_diff} />
+                  <div className="flex justify-end mb-2">
+                    <button
+                      disabled={!drawerId}
+                      onClick={() => { if (drawerId) setReanalyzeOpen(true); }}
+                      className="text-xs px-2.5 py-1 rounded-md bg-sky-50 text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
+                      title="Re-analyze on a chosen model and review before replacing"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Re-analyze
+                    </button>
+                  </div>
                   <Section title={`Analysis history (${items.length})`}>
                     {items.length === 0 ? (
                       <div className="text-sm text-slate-500">No analyses yet. Run the extension on this shipment.</div>
@@ -1674,6 +1827,23 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           </>
         ) : <div className="text-sm text-slate-500">Loading…</div>}
       </Drawer>
+
+      {reanalyzeOpen && drawerId && drawerData ? (
+        <ReanalyzeModal
+          shipmentId={drawerId}
+          current={{
+            ai_issue: drawerData.shipment.ai_issue,
+            ai_recommendation: drawerData.shipment.ai_recommendation,
+            action_required: drawerData.shipment.action_required,
+            // action_confidence is a DB-only column, not on the Shipment type.
+            action_confidence: null,
+            action_source: drawerData.shipment.action_source,
+          }}
+          currentModel={drawerData.analyses.find((a) => a.kind === "per_shipment")?.model ?? null}
+          onClose={() => setReanalyzeOpen(false)}
+          onReplaced={() => { void refreshDrawer(drawerId); }}
+        />
+      ) : null}
 
       {drawerHelpOpen ? (
         <div
