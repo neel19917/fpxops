@@ -42,8 +42,7 @@ export const PER_SHIPMENT_LOGIC = `- If delivery_date is BEFORE the estimated de
 - These rules override generic "status looks bad" heuristics. If a rule above applies, follow it.
 
 Prior context (when present in the data):
-- "prior_ai_analysis" is the most recent AI verdict on THIS shipment (issue, recommendation, action_required, plus any operator rating). Use it as context: if the prior issue still applies, restate consistently; if the situation has resolved, say so explicitly in "issue" (e.g. "Previously flagged late delivery now confirmed delivered on <date>") and set actionConfidence low. If the operator rated the prior analysis 👎 (rating="down"), treat that recommendation skeptically and look for what it missed.
-- "recent_changes" is a change-log of which shipment fields moved between scrapes (status, dates, addresses, GP, etc.). Weight your verdict toward what's NEW since last analysis — if nothing material changed, you can confirm the prior verdict; if the change resolves the prior concern, mark it resolved; if a new concern shows up, flag it.`;
+- "recent_changes" is a change-log of which shipment fields moved between scrapes (status, dates, addresses, GP, etc.). Derive your verdict fresh from the current shipment facts, and use this log to weight toward what's NEW: if a change resolves a concern, say so in "issue" (e.g. "Previously late, now confirmed delivered on <date>") and set actionConfidence low; if a new concern shows up, flag it.`;
 
 export const PRIORITY_PROMPT = `URGENT SHIPMENT REVIEW — This shipment has been flagged as critical.
 

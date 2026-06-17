@@ -35,64 +35,40 @@ function buildPerShipmentUserMessage(template, logic, dataJson) {
 // (2) the dashboard's "Re-analyze" button.
 // Returns the updated shipment row (or the original row if Claude couldn't be
 // reached or returned no parseable result).
-export async function analyzeExistingShipment(row, { reqContext } = {}) {
+// Run per-shipment AI and RETURN the raw callClaude result (parsed verdict,
+// model, cost, analysis_id) WITHOUT persisting anything onto fpx_shipments.
+// The analysis itself is still logged to fpx_ai_analyses (every AI run is
+// auditable). `modelOverride` lets a caller force a specific model — used by
+// the dashboard's "Re-analyze" modal to preview Sonnet/Opus verdicts before
+// an operator decides whether to replace the stored one.
+export async function runShipmentAnalysis(row, { reqContext, modelOverride } = {}) {
   if (!row?.id) return null;
   const settings = await getSettings("prompt.system", "prompt.per_shipment", "prompt.per_shipment_logic");
 
-  // Build prior-context: previous analysis + recent change log so the
-  // model can reason about what's new vs already-handled. Two parallel
-  // queries — one against fpx_ai_analyses for the most recent
-  // per_shipment row, one against fpx_shipment_scrapes for the most
-  // recent material-diff. Both are best-effort; if either returns no
-  // rows the analysis just runs without that context.
-  const [priorAnalysis, recentScrape] = await Promise.all([
-    supabase
-      .from("fpx_ai_analyses")
-      .select("created_at, model, action_required, issue, recommendation, response_text, rating, rating_reason")
-      .eq("shipment_uuid", row.id)
-      .eq("kind", "per_shipment")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle()
-      .then((r) => r.data || null)
-      .catch(() => null),
-    supabase
-      .from("fpx_shipment_scrapes")
-      .select("scraped_at, diff")
-      .eq("shipment_id", row.id)
-      .not("diff", "is", null)
-      .order("scraped_at", { ascending: false })
-      .limit(1)
-      .maybeSingle()
-      .then((r) => r.data || null)
-      .catch(() => null),
-  ]);
+  // Build recent change-log context so the model can reason about what
+  // is new vs already on the record. Best-effort: if there's no recent
+  // material-diff the analysis just runs without it.
+  //
+  // We deliberately do NOT feed the prior AI analysis back in. Those
+  // fields (issue/recommendation/action_required/confidence) are the
+  // exact outputs this prompt produces — handing them back is label
+  // leakage that makes the model paraphrase its last verdict instead of
+  // re-deriving from the freight facts. Nothing downstream consumes a
+  // run-over-run drift signal today, so there's no reason to keep it.
+  const recentScrape = await supabase
+    .from("fpx_shipment_scrapes")
+    .select("scraped_at, diff")
+    .eq("shipment_id", row.id)
+    .not("diff", "is", null)
+    .order("scraped_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+    .then((r) => r.data || null)
+    .catch(() => null);
   const slim = slimShipment(row.raw_data || row);
-  // The prompt template only knows about a flat data object, so we
-  // tuck the prior context into reserved keys. The model picks them
-  // up out of the JSON and the editable prompt logic already says to
-  // weigh "what changed since last analysis" — a small prompt update
-  // in Settings can lean into these keys harder.
-  if (priorAnalysis) {
-    slim.prior_ai_analysis = JSON.stringify({
-      when: priorAnalysis.created_at,
-      model: priorAnalysis.model,
-      action_required: priorAnalysis.action_required,
-      issue: priorAnalysis.issue,
-      recommendation: priorAnalysis.recommendation,
-      // Operator's quality rating on that analysis. 👎 means the
-      // last verdict missed the mark; the model should treat that
-      // recommendation skeptically and consider revising.
-      rating: priorAnalysis.rating || null,
-      rating_reason: priorAnalysis.rating_reason || null,
-      // Truncated raw response so the model can see the prior
-      // reasoning, not just the parsed fields. Capped at 1500 chars
-      // so we don't bloat the prompt window.
-      prior_response_text: typeof priorAnalysis.response_text === "string"
-        ? priorAnalysis.response_text.slice(0, 1500)
-        : null,
-    });
-  }
+  // recent_changes is real-world field movement (status/dates/etc.),
+  // not the model's own prior verdict — legitimate grounding that the
+  // drawer's Analysis tab also surfaces to reps.
   if (recentScrape && recentScrape.diff && typeof recentScrape.diff === "object") {
     // Compact "field: prev → next" lines so the model has a quick
     // change-log to reason against without re-deriving from raw_data.
@@ -117,6 +93,7 @@ export async function analyzeExistingShipment(row, { reqContext } = {}) {
     systemPrompt: settings["prompt.system"],
     userMessage: userMsg,
     maxTokens: 512,
+    modelOverride,
     metadata: {
       kind: "per_shipment",
       tracking_number: row.tracking_number,
@@ -125,6 +102,18 @@ export async function analyzeExistingShipment(row, { reqContext } = {}) {
       user_email: reqContext?.user?.email,
     },
   });
+
+  return result;
+}
+
+// Run per-shipment AI and PERSIST the verdict onto the fpx_shipments row.
+// Wraps runShipmentAnalysis. Manual overrides (action_source === "manual")
+// still suppress action_* changes; ai_issue / ai_recommendation /
+// last_analyzed_at always update. This is the auto-analyze + "Re-analyze"
+// (no-modal) path; the modal flow uses runShipmentAnalysis directly.
+export async function analyzeExistingShipment(row, { reqContext, modelOverride } = {}) {
+  const result = await runShipmentAnalysis(row, { reqContext, modelOverride });
+  if (!result) return row?.id ? row : null;
 
   // Stamp last_analyzed_at + action_source so re-scrapes can skip already-
   // analyzed rows and the dashboard can render the "AI" badge correctly.
@@ -576,7 +565,15 @@ analyzeRouter.post("/vision", async (req, res) => {
 // Internal helper — strip internal keys and stringify leftovers compactly.
 function slimShipment(data) {
   const out = {};
-  const exclude = new Set(["_aiRawAnalysis", "_inputSummary", "_outputSummary", "_needsActionSheet"]);
+  // Strip the row's own stored AI verdict. These are the exact target
+  // variables this prompt produces (issue/recommendation/action_*), so
+  // feeding them back in is label leakage — the model anchors on its
+  // previous answer instead of re-deriving from the freight facts.
+  const exclude = new Set([
+    "_aiRawAnalysis", "_inputSummary", "_outputSummary", "_needsActionSheet",
+    "ai_issue", "ai_recommendation",
+    "action_required", "action_target", "action_confidence", "action_source",
+  ]);
   for (const [k, v] of Object.entries(data)) {
     if (exclude.has(k)) continue;
     if (k.startsWith("_") && k !== "_trackingNumber") continue;
