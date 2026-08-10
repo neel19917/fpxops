@@ -30,18 +30,30 @@ export function generateApiKey() {
 // never sit in the map.
 // ============================================================
 const AUTH_CACHE_TTL_MS = 60_000;
+// Grace window past the TTL during which an expired entry is still kept
+// around. It is NEVER served on the happy path — only as a fallback when
+// re-resolution fails because *our* upstream broke (see resolveJwt). Without
+// this, every 60s boundary that coincided with a Supabase blip turned into a
+// 401, which made the browser force a token refresh for a reason that had
+// nothing to do with its token — feeding the rotation race that was logging
+// people out. Bounded so a revoked/disabled user still loses access promptly.
+const AUTH_CACHE_STALE_MS = 10 * 60_000;
 const TOUCH_INTERVAL_MS = 5 * 60_000;
 const AUTH_CACHE_MAX = 1000;
 const authCache = new Map(); // sha256(credential) -> { at, value, touchedAt }
 
+// Returns null, or { entry, stale }. `stale` means past TTL but inside the
+// grace window — callers must opt in to using it.
 function authCacheGet(credential) {
   const k = hashApiKey(credential);
   const hit = authCache.get(k);
-  if (!hit || Date.now() - hit.at > AUTH_CACHE_TTL_MS) {
+  if (!hit) return null;
+  const age = Date.now() - hit.at;
+  if (age > AUTH_CACHE_TTL_MS + AUTH_CACHE_STALE_MS) {
     authCache.delete(k);
     return null;
   }
-  return hit;
+  return { entry: hit, stale: age > AUTH_CACHE_TTL_MS };
 }
 
 function authCacheSet(credential, value) {
@@ -72,9 +84,13 @@ function shouldTouch(entry) {
 
 async function resolveApiKey(key) {
   const cached = authCacheGet(key);
+  // Fresh entries only — the stale grace window is a JWT-path affordance.
+  // Serving a stale API key would extend the life of a revoked one.
   // Copies, not the cached object itself — requireAuth hangs these off
   // `req` where a route could mutate them and poison every later request.
-  if (cached) return { ...cached.value, scopes: [...cached.value.scopes] };
+  if (cached && !cached.stale) {
+    return { ...cached.entry.value, scopes: [...cached.entry.value.scopes] };
+  }
   const { data } = await supabase
     .from("fpx_api_keys")
     .select("id, name, scopes, revoked_at")
@@ -90,24 +106,98 @@ async function resolveApiKey(key) {
 // ============================================================
 // Supabase JWT (dashboard users)
 // ============================================================
+// Decode a JWT payload without verifying it — logging only, so we can say
+// *which* token failed instead of printing an anonymous "Invalid session".
+export function peekJwtClaims(token) {
+  try {
+    const part = String(token).split(".")[1];
+    if (!part) return {};
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8")) || {};
+  } catch {
+    return {};
+  }
+}
+
+// Was the token itself rejected, or did our call to Supabase fail?
+//
+// Only an explicit 401/403 from GoTrue means the credential is bad. A 0 or
+// undefined status is a transport failure (DNS, TLS, connection reset, an
+// aborted fetch); a 5xx is Supabase having a bad day. Both used to be reported
+// to the browser as 401 "Invalid session", which reads as "refresh your token"
+// — and a refresh provoked for no reason is what races the SDK's own rotation.
+//
+// Exported for testing: this one branch decides whether a blip logs a user out.
+export function classifyGetUserError(error) {
+  const status = error?.status;
+  if (status === 401 || status === 403) return "invalid_token";
+  return "upstream";
+}
+
+// resolveJwt returns a discriminated result rather than null-for-everything.
+//
+// It used to collapse four very different situations — an expired token, a
+// network failure talking to GoTrue, a timed-out profile select, and a
+// genuinely absent profile row — into `null`, which requireAuth turned into a
+// blanket 401 "Invalid session". The browser treats 401 as "your token is
+// stale, refresh it", so our own transient failures were provoking client
+// token refreshes, and concurrent refreshes are what strand a session with
+// "Invalid Refresh Token: Already Used".
+//
+//   { ok: true,  user }                 → authenticated
+//   { ok: false, reason: "invalid_token" }   → 401, refreshing might help
+//   { ok: false, reason: "profile_missing" } → 403, refreshing cannot help
+//   { ok: false, reason: "upstream" }        → 503, retry, do NOT refresh
 async function resolveJwt(token) {
   const cached = authCacheGet(token);
-  if (cached) {
-    if (shouldTouch(cached)) {
-      supabase.from("fpx_user_profiles").update({ last_login_at: new Date().toISOString() }).eq("id", cached.value.user.id).then(() => {});
+  if (cached && !cached.stale) {
+    if (shouldTouch(cached.entry)) {
+      supabase.from("fpx_user_profiles").update({ last_login_at: new Date().toISOString() }).eq("id", cached.entry.value.user.id).then(() => {});
     }
     // Copy — requireAuth hangs this off `req`, where a route could
     // mutate it and poison every later request on the same token.
-    return { user: { ...cached.value.user } };
+    return { ok: true, user: { ...cached.entry.value.user } };
   }
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  const { data: profile } = await supabase
+
+  // When our own upstream fails, prefer a stale-but-known identity over
+  // bouncing a user who did nothing wrong.
+  const upstream = (detail) => {
+    if (cached) {
+      const ageS = Math.round((Date.now() - cached.entry.at) / 1000);
+      console.warn(`[FPX-AUTH] upstream failed, serving identity ${ageS}s stale — ${detail}`);
+      return { ok: true, user: { ...cached.entry.value.user }, stale: true };
+    }
+    return { ok: false, reason: "upstream", detail };
+  };
+
+  let res;
+  try {
+    res = await supabase.auth.getUser(token);
+  } catch (e) {
+    // A thrown fetch error or a DB_TIMEOUT_MS abort. Previously this escaped
+    // requireAuth entirely and Express returned an unshaped 500.
+    return upstream(`getUser threw: ${e?.message || e}`);
+  }
+  const { data, error } = res;
+  if (error) {
+    if (classifyGetUserError(error) === "invalid_token") {
+      return { ok: false, reason: "invalid_token", detail: error.message };
+    }
+    return upstream(`getUser status=${error.status} ${error.message}`);
+  }
+  if (!data?.user) return { ok: false, reason: "invalid_token", detail: "no user on token" };
+
+  // The profile error was previously discarded, which made an RLS hiccup or a
+  // dropped connection indistinguishable from "this user has no profile row".
+  const { data: profile, error: profileError } = await supabase
     .from("fpx_user_profiles")
     .select("id, email, full_name, role, enabled, avatar_url")
     .eq("id", data.user.id)
     .maybeSingle();
-  if (!profile) return null;
+  if (profileError) return upstream(`profile select: ${profileError.message}`);
+  if (!profile) return { ok: false, reason: "profile_missing", detail: data.user.email || data.user.id };
+
   const value = {
     user: {
       id: profile.id,
@@ -122,7 +212,7 @@ async function resolveJwt(token) {
   // Fire-and-forget last_login_at touch (throttled by the cache above —
   // a fresh resolve only happens at most once per TTL per token).
   supabase.from("fpx_user_profiles").update({ last_login_at: new Date().toISOString() }).eq("id", profile.id).then(() => {});
-  return value;
+  return { ok: true, user: { ...value.user } };
 }
 
 // ============================================================
@@ -182,8 +272,29 @@ export function requireAuth(options = {}) {
     }
 
     if (bearer) {
-      const v = await resolveJwt(bearer);
-      if (!v) return res.status(401).json({ error: "Invalid session" });
+      const r = await resolveJwt(bearer);
+      if (!r.ok) {
+        const claims = peekJwtClaims(bearer);
+        const who = claims.sub || "unknown";
+        if (r.reason === "upstream") {
+          // 503, not 401. A 401 tells the client its token is stale and makes
+          // it refresh; this failure is ours, and refreshing here is what
+          // used to trigger the concurrent-refresh logout.
+          console.error(`[FPX-AUTH] 503 upstream sub=${who} — ${r.detail}`);
+          res.set("Retry-After", "2");
+          return res.status(503).json({ error: "Auth backend unavailable — retry.", code: "auth_upstream" });
+        }
+        if (r.reason === "profile_missing") {
+          console.warn(`[FPX-AUTH] 403 profile_missing sub=${who} (${r.detail})`);
+          return res.status(403).json({
+            error: "No profile exists for this account. An admin needs to add you.",
+            code: "profile_missing",
+          });
+        }
+        console.warn(`[FPX-AUTH] 401 invalid_token sub=${who} exp=${claims.exp} — ${r.detail}`);
+        return res.status(401).json({ error: "Invalid session", code: "invalid_token" });
+      }
+      const v = { user: r.user };
 
       // Impersonation handshake (admin-only, JWT-only). The real admin must
       // be enabled + admin-role to impersonate; the target's enabled flag is

@@ -109,11 +109,11 @@ function AuthedApp() {
   const { session, profile, loading, error, signOut } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
-  // Boot stall guard: bootSession() has its own 6s timeout, but if the
-  // *entire* auth provider is wedged (Supabase SDK lock contention, fetch
-  // hung in a service worker, an extension intercepting localStorage), the
-  // user would see an indefinite "Loading…". After 7s, surface a Retry +
-  // Sign-out path so they're not pinned to a blank screen.
+  // Boot stall guard: the auth provider's session bootstrap has its own 6s
+  // timeout, but if the *entire* provider is wedged (auth lock contention,
+  // fetch hung in a service worker, an extension intercepting localStorage),
+  // the user would see an indefinite "Loading…". After 7s, surface a Retry +
+  // Reset-session path so they're not pinned to a blank screen.
   const [bootStalled, setBootStalled] = useState(false);
   useEffect(() => {
     if (!loading) { setBootStalled(false); return; }
@@ -152,10 +152,15 @@ function AuthedApp() {
                 onClick={() => window.location.reload()}
                 className="text-sky-700 hover:text-sky-900 hover:underline"
               >Reload</button>
+              {/* "Reset session", not "Sign out": this clears THIS browser's
+                  session and reloads. It used to call a global-scope signOut,
+                  which revoked the user's session on every other tab and
+                  device (and the Chrome extension) just because one tab was
+                  slow to boot. */}
               <button
                 onClick={() => { signOut().finally(() => window.location.reload()); }}
                 className="text-slate-600 hover:text-slate-900 hover:underline"
-              >Sign out</button>
+              >Reset session</button>
             </div>
           </div>
         ) : null}
@@ -180,7 +185,7 @@ function AuthedApp() {
             <button
               onClick={() => { signOut().finally(() => window.location.reload()); }}
               className="px-3 py-1.5 rounded-lg ring-1 ring-slate-300 hover:bg-slate-100 text-slate-700"
-            >Sign out</button>
+            >Reset session</button>
           </div>
         </div>
       </div>

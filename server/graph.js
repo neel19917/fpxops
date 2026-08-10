@@ -17,6 +17,10 @@ const ShipmentState = Annotation.Root({
   _aiResults: Annotation({ reducer: (_, b) => b, default: () => [] }),
   _retryCount: Annotation({ reducer: (_, b) => b, default: () => 0 }),
   _model: Annotation({ reducer: (_, b) => b, default: () => null }),
+  // Action-required confidence cutoff, threaded from the /analyze route (read
+  // from fpx_settings: action.threshold). Declared so LangGraph keeps it in
+  // state; parse.js reads it instead of hardcoding 0.7.
+  _threshold: Annotation({ reducer: (_, b) => b, default: () => 0.7 }),
 });
 
 function markNoAction(state) {

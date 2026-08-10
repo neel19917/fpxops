@@ -33,14 +33,23 @@ page — an admin needs to flip your `enabled` flag in the **Users** tab.
 
 1. Connect the GitHub repo in Netlify → **Base directory**: `dashboard`
 2. Build command: `npm run build` · Publish directory: `dist`
-3. **Environment variables**:
+3. **Environment variables** — all three are required, and must be set for
+   every branch context you deploy (branch deploys don't inherit production
+   scope). `src/lib/supabase.ts` throws on a dev build if the Supabase pair is
+   missing and logs an error on a production build; there are no longer any
+   hardcoded fallbacks silently covering for a typo.
    - `VITE_FPX_API_URL`        = your Railway URL
    - `VITE_SUPABASE_URL`       = Supabase project URL
    - `VITE_SUPABASE_ANON_KEY`  = Supabase anon key
-4. After deploy, copy the Netlify URL (e.g. `https://fpxops.netlify.app`) and:
+4. After deploy, copy the Netlify URL (live site: `https://fpxpress.netlify.app`)
+   and:
    - Add it to Railway's `CORS_ORIGINS` env var
    - In Supabase → Authentication → URL Configuration: add it under
      **Site URL** and **Redirect URLs**
+
+   Keep that list tight — a stale origin left in **Redirect URLs** can receive
+   an OAuth callback, which presents to the user as a session that vanishes
+   immediately after sign-in.
 
 ### Microsoft OAuth (one-time)
 

@@ -3436,3 +3436,154 @@ try {
     window.parent.postMessage({ source: "fpx-extension", type: "fpxHello" }, "*");
   }
 } catch {}
+
+// =====================================================================
+// Third-party cookie recovery for the FPXpress embed.
+//
+// The dashboard is served from netlify.app; FreightPOP runs on
+// freightpop.com. Because netlify.app is on the Public Suffix List those
+// are different *sites*, so inside the FPXpress iframe FreightPOP's
+// session cookies are third-party and the browser refuses to send them.
+// FP therefore shows its login on every load, and the operator reads that
+// as "the embed keeps logging me out". Note the cookie is not missing —
+// the browser simply won't attach it in a third-party context, which is
+// why no amount of "saving the session" on the dashboard side can help.
+//
+// The Storage Access API is the sanctioned fix, and it can only be driven
+// from INSIDE the embedded frame: it needs transient activation from a
+// real user gesture *in that frame*, plus the storage-access permission
+// policy from the embedder (the dashboard already sets
+// allow="storage-access *"). The dashboard cannot call it on the frame's
+// behalf — a click in the parent does not confer activation on a
+// cross-origin child. This content script does run in the frame, so it
+// can: it renders its own one-click affordance inside the FP page and
+// calls requestStorageAccess() from that click.
+//
+// On a grant we reload the frame so FP's next request finally carries the
+// cookie. On a denial we report it, so the dashboard can stop guessing and
+// point the operator at "New tab" instead.
+// =====================================================================
+const FPX_SA_DISMISS_KEY = "fpx.storageAccess.dismissed";
+
+// Which origin is embedding us. ancestorOrigins is exact where supported;
+// document.referrer is the fallback (the dashboard's iframe sends a full
+// referrer for https→https).
+function fpxParentOrigin() {
+  try {
+    const ao = location.ancestorOrigins;
+    if (ao && ao.length) return ao[ao.length - 1];
+  } catch {}
+  try {
+    if (document.referrer) return new URL(document.referrer).origin;
+  } catch {}
+  return "";
+}
+
+function fpxTellParent(payload) {
+  try {
+    if (window.parent !== window) {
+      window.parent.postMessage({ source: "fpx-extension", ...payload }, "*");
+    }
+  } catch {}
+}
+
+async function fpxStorageAccessState() {
+  const supported = typeof document.hasStorageAccess === "function";
+  let hasAccess = null;
+  if (supported) {
+    try { hasAccess = await document.hasStorageAccess(); } catch { hasAccess = null; }
+  }
+  return {
+    supported,
+    hasAccess,
+    // Weak but useful corroboration: HttpOnly cookies never appear here, so
+    // an empty string doesn't prove blocking — but a non-empty one proves
+    // some cookie access exists.
+    cookiesVisible: (document.cookie || "").length > 0,
+  };
+}
+
+function fpxRenderStorageAccessPrompt() {
+  try { if (sessionStorage.getItem(FPX_SA_DISMISS_KEY) === "1") return; } catch {}
+  if (!document.body || document.getElementById("fpx-sa-bar")) return;
+
+  const bar = document.createElement("div");
+  bar.id = "fpx-sa-bar";
+  bar.style.cssText = [
+    "position:fixed", "top:0", "left:0", "right:0", "z-index:2147483647",
+    "display:flex", "align-items:center", "gap:12px",
+    "padding:10px 14px", "box-sizing:border-box",
+    "background:#fffbeb", "border-bottom:1px solid #fde68a",
+    "color:#78350f", "font:500 13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif",
+    "box-shadow:0 1px 3px rgba(0,0,0,.08)",
+  ].join(";");
+
+  const msg = document.createElement("div");
+  msg.style.cssText = "flex:1;min-width:0";
+  msg.textContent = "FreightPOP can't keep you signed in inside FPX Control Station — your browser is blocking its cookies here.";
+
+  const allow = document.createElement("button");
+  allow.type = "button";
+  allow.textContent = "Allow cookies";
+  allow.style.cssText = [
+    "flex:none", "cursor:pointer", "padding:6px 12px", "border-radius:6px",
+    "border:1px solid #b45309", "background:#b45309", "color:#fff",
+    "font:600 12px/1 system-ui,-apple-system,Segoe UI,sans-serif",
+  ].join(";");
+
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  dismiss.setAttribute("aria-label", "Dismiss");
+  dismiss.style.cssText = [
+    "flex:none", "cursor:pointer", "padding:6px 10px", "border-radius:6px",
+    "border:1px solid #fcd34d", "background:transparent", "color:#92400e",
+    "font:500 12px/1 system-ui,-apple-system,Segoe UI,sans-serif",
+  ].join(";");
+
+  allow.addEventListener("click", async () => {
+    // This handler IS the transient activation requestStorageAccess needs.
+    allow.disabled = true;
+    allow.textContent = "Requesting…";
+    try {
+      await document.requestStorageAccess();
+      fpxTellParent({ type: "fpxStorageAccess", supported: true, hasAccess: true, granted: true });
+      bar.remove();
+      // FP already rendered without its cookie; only a reload re-issues the
+      // request now that the cookie will be attached.
+      location.reload();
+    } catch (e) {
+      const detail = String((e && e.message) || e || "denied");
+      fpxTellParent({ type: "fpxStorageAccess", supported: true, hasAccess: false, granted: false, error: detail });
+      msg.textContent = "The browser denied cookie access for FreightPOP here. Use \"New tab\" in the FPX header — it isn't affected.";
+      allow.remove();
+    }
+  });
+
+  dismiss.addEventListener("click", () => {
+    try { sessionStorage.setItem(FPX_SA_DISMISS_KEY, "1"); } catch {}
+    bar.remove();
+  });
+
+  bar.appendChild(msg);
+  bar.appendChild(allow);
+  bar.appendChild(dismiss);
+  document.body.appendChild(bar);
+}
+
+(async function fpxInitStorageAccess() {
+  // Only inside the FPXpress embed. In a normal FreightPOP tab there is no
+  // third-party context and nothing to fix — never touch FP's own page there.
+  if (window.parent === window) return;
+  if (!fpxIsTrustedParentOrigin(fpxParentOrigin())) return;
+
+  const state = await fpxStorageAccessState();
+  fpxTellParent({ type: "fpxStorageAccess", ...state });
+
+  // Only prompt when the browser positively tells us access is absent.
+  // supported === false (older browser) or hasAccess === null (threw) are
+  // both "we don't know", and guessing is what makes these banners noise.
+  if (state.supported && state.hasAccess === false) {
+    fpxRenderStorageAccessPrompt();
+  }
+})();

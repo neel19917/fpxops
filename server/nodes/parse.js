@@ -82,7 +82,7 @@ function deriveActionRequired(coerced, issue) {
   return coerced;
 }
 
-function parseSingle(shipment) {
+function parseSingle(shipment, threshold = 0.7) {
   const aiText = shipment._aiRawAnalysis;
   if (!aiText) return { ...shipment, _parseError: true };
 
@@ -93,9 +93,9 @@ function parseSingle(shipment) {
   const recommendation = String(parsed.recommendation ?? parsed.Recommendation ?? "").trim();
 
   // New shape: actionConfidence (0–1) + actionTarget (customer | carrier | none).
-  // Threshold here matches the default in fpx_settings ('action.threshold' = 0.7).
-  // The LangGraph path doesn't have async access to settings, so we treat 0.7 as
-  // the contract — admins editing the setting need the per-shipment route.
+  // `threshold` is threaded from the /analyze route via graph state (read from
+  // fpx_settings: action.threshold), so this path honors the same admin-tuned
+  // cutoff as the direct callClaude path instead of a hardcoded literal.
   const confidenceRaw = parsed.actionConfidence ?? parsed.action_confidence;
   const targetRaw = parsed.actionTarget ?? parsed.action_target;
   let action = "";
@@ -111,7 +111,7 @@ function parseSingle(shipment) {
   }
 
   if (confidence !== null) {
-    action = (confidence >= 0.7 && target !== "none") ? "YES" : "NO";
+    action = (confidence >= threshold && target !== "none") ? "YES" : "NO";
   } else {
     // Legacy fallback: old `actionRequired: bool` shape.
     const actionRaw = parsed.actionRequired ?? parsed.ActionRequired ?? parsed.action_required;
@@ -135,13 +135,14 @@ export function parseResponse(state) {
   const analyzed = [...(state.analyzed || [])];
   const retryQueue = [];
   const retryCount = state._retryCount || 0;
+  const threshold = Number(state._threshold) || 0.7;
 
   for (const r of results) {
     if (r._actionRequired === "ERROR") {
       analyzed.push(r);
       continue;
     }
-    const parsed = parseSingle(r);
+    const parsed = parseSingle(r, threshold);
     if (parsed._parseError && retryCount < 1) {
       retryQueue.push(r);
     } else if (parsed._parseError) {

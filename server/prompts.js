@@ -13,11 +13,15 @@ export const PER_SHIPMENT_PROMPT = `Analyze the shipment data below and answer:
 4. What should FPX do next (one to two sentences)?
 
 Rules:
-- Use plain English. No jargon the customer wouldn't understand.
+- Write for a FreightPOP account manager. Be specific — name the dates, numbers, and status that drive your call (e.g. 'no scan since origin departure on 2024-06-12, now 3 days past as_of'). Standard freight terms (detention, last free day, tender, accessorial, BOL, customs hold) are fine; the reader is an ops professional, not the end customer.
 - Base your answer ONLY on the data provided. Do not assume or invent information.
 - The actor in the recommendation is always FPX (the broker).
+- Treat \`as_of\` as the present moment. Judge lateness and urgency only by comparing date fields to \`as_of\`.
 - "actionConfidence" is your probability (0.0–1.0) that this shipment requires action right now.
 - "actionTarget" must be one of: "customer", "carrier", "none". Use "none" only when no action is needed.
+- \`actionTarget\` is the party whose action is required to resolve the issue: \`carrier\` if the carrier must act (move freight, release equipment, update status), \`customer\` if the customer must act (provide documents, approve, pay, schedule appointment), \`none\` if nothing is required right now. FPX is always the one reaching out. If FPX only needs to notify a party about a problem the other party must fix, put that in \`recommendation\` — it does not change \`actionTarget\`.
+- The four output fields must be mutually consistent. If no action is required: actionTarget='none', issue='None - shipment is on track', actionConfidence <= 0.2, recommendation is a brief monitoring note. If action is required: actionTarget is the resolving party, issue names the problem, actionConfidence > 0.5, recommendation is FPX's next step.
+- Action is required if any temporal trigger is true, or the status/comments describe an exception (hold, damage, refusal, missing documents, detention). A null trigger means the data was unavailable — do not read it as 'fine.' If you can't evaluate a shipment for lack of data, say so and lower actionConfidence.
 
 Logic handling (apply BEFORE deciding actionConfidence):
 {{logic}}
@@ -42,8 +46,7 @@ export const PER_SHIPMENT_LOGIC = `- If delivery_date is BEFORE the estimated de
 - These rules override generic "status looks bad" heuristics. If a rule above applies, follow it.
 
 Prior context (when present in the data):
-- "prior_ai_analysis" is the most recent AI verdict on THIS shipment (issue, recommendation, action_required, plus any operator rating). Use it as context: if the prior issue still applies, restate consistently; if the situation has resolved, say so explicitly in "issue" (e.g. "Previously flagged late delivery now confirmed delivered on <date>") and set actionConfidence low. If the operator rated the prior analysis 👎 (rating="down"), treat that recommendation skeptically and look for what it missed.
-- "recent_changes" is a change-log of which shipment fields moved between scrapes (status, dates, addresses, GP, etc.). Weight your verdict toward what's NEW since last analysis — if nothing material changed, you can confirm the prior verdict; if the change resolves the prior concern, mark it resolved; if a new concern shows up, flag it.`;
+- "recent_changes" is a change-log of which shipment fields moved between scrapes (status, dates, addresses, GP, etc.). Derive your verdict fresh from the current shipment facts, and use this log to weight toward what's NEW: if a change resolves a concern, say so in "issue" (e.g. "Previously late, now confirmed delivered on <date>") and set actionConfidence low; if a new concern shows up, flag it.`;
 
 export const PRIORITY_PROMPT = `URGENT SHIPMENT REVIEW — This shipment has been flagged as critical.
 

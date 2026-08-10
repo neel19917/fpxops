@@ -1,8 +1,17 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { sb } from "./supabase";
 import type { Session } from "@supabase/supabase-js";
 import { getImpersonate, setImpersonate, subscribeImpersonate, type ImpersonateState } from "./impersonate";
 import { api, type ClientConfig } from "./api";
+import { swrClear } from "./swrCache";
+import { logAuth } from "./authLog";
+
+// Set for the duration of a user-initiated sign-out. supabase-js emits the
+// same SIGNED_OUT event whether the user clicked Sign out or whether a refresh
+// failed and GoTrue dropped the session itself — and those two deserve very
+// different treatment. Module-scoped rather than state because the SDK event
+// can arrive before React re-renders.
+let deliberateSignOut = false;
 
 export interface UserProfile {
   id: string;
@@ -26,6 +35,11 @@ interface AuthState {
   // Loaded from /api/me alongside the profile; null until the first fetch
   // resolves.
   clientConfig: ClientConfig | null;
+  // True while an OAuth redirect is being initiated. Lets the sign-in button
+  // disable itself — see signInWithMicrosoft.
+  signingIn: boolean;
+  // True when the session ended on its own rather than by the user's action.
+  unexpectedSignOut: boolean;
   startImpersonate: (s: ImpersonateState) => void;
   stopImpersonate: () => void;
   signInWithMicrosoft: () => Promise<void>;
@@ -38,14 +52,25 @@ const AuthCtx = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Two separate gates. `authLoading` is "do we know yet whether there's a
+  // session"; `profileLoading` is "are we still fetching the profile for the
+  // session we have". They used to be one flag because the profile fetch lived
+  // inside the onAuthStateChange callback — see the effect below for why that
+  // had to change.
+  const [authLoading, setAuthLoading] = useState(true);
+  const [profileLoading, setProfileLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [impersonate, setImpersonateState] = useState<ImpersonateState | null>(() => getImpersonate());
   const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
+  const [signingIn, setSigningIn] = useState(false);
+  // True when the session ended without the user asking. Drives the banner on
+  // the sign-in screen so an unexplained bounce reads as "something broke",
+  // not "you must have logged out".
+  const [unexpectedSignOut, setUnexpectedSignOut] = useState(false);
 
   useEffect(() => subscribeImpersonate(setImpersonateState), []);
 
-  async function loadProfile(sess: Session | null) {
+  const loadProfile = useCallback(async (sess: Session | null) => {
     if (!sess?.user) { setProfile(null); return; }
     const { data, error } = await sb
       .from("fpx_user_profiles")
@@ -72,6 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       return;
     }
+    setError(null);
     setProfile({
       id: data.id,
       email: data.email,
@@ -88,61 +114,86 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         .then((r) => { if (r.client_config) setClientConfig(r.client_config); })
         .catch(() => {});
     }
-  }
+  }, []);
 
-  // Boot path is the cause of the long-standing "click refresh twice" bug.
-  // sb.auth.getSession() returns whatever's cached in localStorage, which is
-  // sometimes a session whose access_token has already expired but whose
-  // refresh_token is still good. The first profile lookup (and every API
-  // call after) goes out with the stale token and 401s. The user reloads;
-  // by then the SDK's autoRefresh has rotated → second load works.
+  // Session bootstrap. getSession() returns whatever's in localStorage, and
+  // the SDK's autoRefreshToken refreshes it when it needs refreshing — this
+  // used to run its own expiry-skew check and call refreshSession() itself,
+  // making it one of three competing refresh drivers (see api.ts). It no
+  // longer refreshes anything; it just reads.
   //
-  // Fix: if the cached token is within 60s of expiry (or already past),
-  // call refreshSession() before doing anything that depends on it.
-  // Keeps the boot path single-loop without a 401 detour.
-  //
-  // Hard ceiling of BOOT_TIMEOUT_MS so a hung Supabase call (network blip,
-  // service incident, ad-blocker eating the request) can't pin the dashboard
-  // on "Loading…" forever. We fall through with whatever's cached; the api
-  // gate has its own retry loop and will surface a real error if needed.
-  async function bootSession(): Promise<{ session: Session | null }> {
-    const REFRESH_SKEW_S = 60;
-    const BOOT_TIMEOUT_MS = 6000;
-    const timeout = <T,>(p: Promise<T>): Promise<T | null> =>
-      Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), BOOT_TIMEOUT_MS))]);
-
-    const got = await timeout(sb.auth.getSession());
-    const sess = got?.data.session ?? null;
-    if (!sess) return { session: null };
-    const exp = sess.expires_at;
-    const stale = exp ? Date.now() / 1000 > exp - REFRESH_SKEW_S : false;
-    if (!stale || !sess.refresh_token) return { session: sess };
-    try {
-      const refreshed = await timeout(sb.auth.refreshSession());
-      if (refreshed && !refreshed.error && refreshed.data.session) {
-        return { session: refreshed.data.session };
-      }
-    } catch { /* fall through with the stale session */ }
-    return { session: sess };
-  }
-
+  // The timeout stays: if getSession() wedges (auth lock contention, a
+  // service worker eating the call) we must still drop the "Loading…" gate
+  // rather than pin the app on a blank screen.
   useEffect(() => {
     let mounted = true;
-    bootSession().then(async (data) => {
+    const BOOT_TIMEOUT_MS = 6000;
+
+    Promise.race([
+      sb.auth.getSession(),
+      new Promise<null>((r) => setTimeout(() => r(null), BOOT_TIMEOUT_MS)),
+    ]).then((got) => {
       if (!mounted) return;
-      setSession(data.session);
-      try { await loadProfile(data.session); } catch (e) { setError((e as Error).message); }
-      finally { if (mounted) setLoading(false); }
-    });
-    const { data: sub } = sb.auth.onAuthStateChange(async (_event, s) => {
+      const s = got?.data.session ?? null;
+      // Records the token's real remaining TTL at boot — the single most
+      // useful number when someone reports being logged out "after a minute".
+      logAuth("BOOT", s, got ? undefined : `getSession() timed out after ${BOOT_TIMEOUT_MS}ms`);
       setSession(s);
-      try { await loadProfile(s); } catch (e) { setError((e as Error).message); }
-      finally { setLoading(false); }
+    }).finally(() => {
+      if (mounted) setAuthLoading(false);
     });
+
+    // Session state is set SYNCHRONOUSLY here, and the profile fetch happens
+    // in the effect below. supabase-js invokes this callback while holding the
+    // auth lock, so awaiting a PostgREST round-trip inside it deadlocks any
+    // concurrent token refresh — that was the real cause of the long-standing
+    // "stuck on Loading…" symptom that a no-op lock was once used to paper
+    // over.
+    const { data: sub } = sb.auth.onAuthStateChange((event, s) => {
+      // A mid-session SIGNED_OUT is the whole reason this file was rewritten:
+      // it flips the UI straight to the sign-in screen. Distinguish the two
+      // causes, because only one of them is a bug.
+      if (event === "SIGNED_OUT" && !deliberateSignOut) {
+        logAuth(event, s, "UNEXPECTED — not user-initiated; GoTrue dropped the session (refresh failed)");
+        setUnexpectedSignOut(true);
+      } else {
+        logAuth(event, s, event === "SIGNED_OUT" ? "user-initiated" : undefined);
+      }
+      setSession(s);
+      setAuthLoading(false);
+    });
+
     return () => { mounted = false; sub.subscription.unsubscribe(); };
   }, []);
 
+  // Profile fetch, keyed on the user id rather than the session object. A
+  // TOKEN_REFRESHED event hands us a brand-new session object for the same
+  // user every hour; refetching the profile (plus /api/me) on each one was
+  // pure waste.
+  const userId = session?.user?.id ?? null;
+  useEffect(() => {
+    if (!userId) { setProfile(null); setProfileLoading(false); return; }
+    let cancelled = false;
+    setProfileLoading(true);
+    // Read the session off state at call time — loadProfile only needs the
+    // user id and metadata, both stable for a given userId.
+    loadProfile(session)
+      .catch((e) => { if (!cancelled) setError((e as Error).message); })
+      .finally(() => { if (!cancelled) setProfileLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, loadProfile]);
+
+  // Guard against a double-click minting two sessions. Supabase auth logs
+  // showed exactly that: two /authorize → two /callback → two sessions 346ms
+  // apart for one user. signInWithOAuth navigates the top-level document, so
+  // the second call races the first navigation instead of being cancelled by
+  // it. A ref (not state) because the guard has to hold within a single tick.
+  const signInFlight = useRef(false);
   async function signInWithMicrosoft() {
+    if (signInFlight.current) return;
+    signInFlight.current = true;
+    setSigningIn(true);
     setError(null);
     const { error } = await sb.auth.signInWithOAuth({
       provider: "azure",
@@ -151,14 +202,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         redirectTo: window.location.origin,
       },
     });
-    if (error) setError(error.message);
+    if (error) {
+      // Only release the guard on failure — on success the browser is already
+      // navigating away and re-enabling the button would just invite a second
+      // session.
+      signInFlight.current = false;
+      setSigningIn(false);
+      setError(error.message);
+    }
   }
 
+  // scope: 'local' clears THIS browser's session without revoking the user's
+  // refresh tokens server-side. The default ('global') revoked every session
+  // for the user — so signing out in one tab, or clicking the "Sign out"
+  // recovery button on a boot stall, silently killed every other tab, every
+  // other device, and the session relayed to the Chrome extension.
   async function signOut() {
     setImpersonate(null);
-    await sb.auth.signOut();
-    setSession(null);
-    setProfile(null);
+    deliberateSignOut = true;
+    setUnexpectedSignOut(false);
+    try {
+      await sb.auth.signOut({ scope: "local" });
+    } finally {
+      // Released on a later tick so the SDK's SIGNED_OUT event — which may
+      // arrive after this promise settles — is still attributed correctly.
+      setTimeout(() => { deliberateSignOut = false; }, 2000);
+      // Local React state and the SWR cache get cleared even if the network
+      // call failed — otherwise a signed-out user keeps seeing their data, and
+      // the next person on a shared machine sees it too.
+      swrClear();
+      setSession(null);
+      setProfile(null);
+    }
   }
 
   async function refreshProfile() {
@@ -187,8 +262,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clientConfig,
     startImpersonate,
     stopImpersonate,
-    loading,
+    // Hold the gate until we know about the session AND (if there is one) its
+    // profile has resolved — otherwise the app would flash PendingApproval in
+    // the window between the two.
+    loading: authLoading || (!!session && profileLoading && !profile),
     error,
+    signingIn,
+    unexpectedSignOut,
     signInWithMicrosoft,
     signOut,
     refreshProfile,

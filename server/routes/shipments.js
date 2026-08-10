@@ -4,8 +4,17 @@ import { mapShipment, mapShipmentsBulk } from "../lib/shipments.js";
 import { logAudit } from "../lib/audit.js";
 import { generateEmailDraft } from "../lib/emailDraft.js";
 import { getSettings } from "../lib/settings.js";
-import { analyzeExistingShipment } from "./analyze.js";
+import { analyzeExistingShipment, runShipmentAnalysis } from "./analyze.js";
+import { extractAiJsonFields } from "../lib/anthropic.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
+
+// Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
+// default; Sonnet/Opus are escalation options for ambiguous shipments.
+const REANALYZE_MODELS = new Set([
+  "claude-haiku-4-5",
+  "claude-sonnet-4-6",
+  "claude-opus-4-8",
+]);
 
 export const shipmentsRouter = Router();
 
@@ -363,6 +372,43 @@ shipmentsRouter.get("/", async (req, res) => {
   res.json({ data: data || [], next_cursor: nextCursor });
 });
 
+// GET /shipments/stats?parcels=1 — TRUE counts over the whole latest view, not
+// just the page the grid happens to have loaded. The dashboard's status pills
+// were counting baseRows (default 200-row page), so "Total 200" was really
+// "first page", not the dataset. We return total + issues + a raw per-status
+// tally; the client folds the tally into pills with its own STATUS_MATCHERS so
+// the booked/in-transit/etc. logic stays single-sourced in one place.
+//
+// Registered BEFORE GET /:id so "stats" isn't captured as a shipment id.
+// Paginates in 1000-row pages to beat PostgREST's default max-rows cap.
+shipmentsRouter.get("/stats", async (req, res) => {
+  const includeParcels = req.query.parcels === "1" || req.query.parcels === "true";
+  const PAGE = 1000;
+  let from = 0;
+  let total = 0;
+  let issues = 0;
+  const statuses = {};
+  for (;;) {
+    const { data, error } = await supabase
+      .from("fpx_shipments_latest")
+      .select("shipment_status, action_required, mode")
+      .order("scraped_at", { ascending: false })
+      .range(from, from + PAGE - 1);
+    if (error) return res.status(500).json({ error: error.message });
+    const batch = data || [];
+    for (const r of batch) {
+      if (!includeParcels && String(r.mode || "").trim().toLowerCase() === "parcel") continue;
+      total++;
+      if (String(r.action_required || "").toUpperCase() === "YES") issues++;
+      const st = r.shipment_status || "";
+      statuses[st] = (statuses[st] || 0) + 1;
+    }
+    if (batch.length < PAGE) break;
+    from += PAGE;
+  }
+  res.json({ total, issues, statuses });
+});
+
 shipmentsRouter.get("/:id", async (req, res) => {
   const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
@@ -652,6 +698,76 @@ shipmentsRouter.post("/bulk-delete", async (req, res) => {
   res.json({ deleted });
 });
 
+// POST /shipments/bulk-reanalyze  { ids: [uuid, ...] }
+// Re-runs per-shipment AI across the selection and REPLACES the stored verdict
+// on each row (analyzeExistingShipment respects manual overrides). Re-analysis
+// of N rows is N model calls — minutes + real cost for a big selection — so we
+// respond immediately with { queued } and process in the background with
+// bounded concurrency. The operator hits Refresh to see updated verdicts; each
+// run is logged to fpx_ai_analyses (incl. the calibration metadata).
+shipmentsRouter.post("/bulk-reanalyze", async (req, res) => {
+  const scope = req.body?.scope === "all" ? "all" : "ids";
+  let ids;
+  if (scope === "all") {
+    // "Re-analyze all": pull the latest row per tracking number from the view
+    // (not the base table, which holds full scrape history — that'd re-analyze
+    // stale duplicates). Paginated past PostgREST's 1000-row cap.
+    ids = [];
+    const PAGE = 1000;
+    let from = 0;
+    for (;;) {
+      const { data, error } = await supabase
+        .from("fpx_shipments_latest")
+        .select("id").order("scraped_at", { ascending: false }).range(from, from + PAGE - 1);
+      if (error) return res.status(500).json({ error: error.message });
+      const batch = data || [];
+      for (const r of batch) if (r.id) ids.push(r.id);
+      if (batch.length < PAGE) break;
+      from += PAGE;
+    }
+  } else {
+    ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : [];
+  }
+  if (!ids.length) return res.status(400).json({ error: "no shipments to re-analyze" });
+
+  // Safety ceiling so a runaway request can't fan out unbounded paid calls.
+  const MAX = 5000;
+  const slice = ids.slice(0, MAX);
+  // Respond before the work starts — this is fire-and-forget on purpose.
+  res.json({ queued: slice.length, capped: ids.length > MAX, scope });
+
+  const CONCURRENCY = 4;
+  let cursor = 0;
+  let done = 0;
+  let failed = 0;
+  async function worker() {
+    while (cursor < slice.length) {
+      const id = slice[cursor++];
+      try {
+        const { data: row } = await supabase.from("fpx_shipments").select("*").eq("id", id).maybeSingle();
+        if (row) {
+          await analyzeExistingShipment(row, { reqContext: req });
+          done++;
+        }
+      } catch (e) {
+        failed++;
+        console.warn("[FPX] bulk-reanalyze row failed:", id, e.message);
+      }
+    }
+  }
+  Promise.all(Array.from({ length: CONCURRENCY }, worker))
+    .then(() => {
+      console.log(`[FPX] bulk-reanalyze complete: ${done} ok, ${failed} failed of ${slice.length}`);
+      logAudit(req, {
+        action: "bulk_reanalyze",
+        entity_type: "shipment",
+        summary: `Bulk re-analyzed ${done} shipment${done === 1 ? "" : "s"} (${scope})`,
+        metadata: { scope, requested: ids.length, processed: done, failed, capped: ids.length > MAX },
+      });
+    })
+    .catch((e) => console.error("[FPX] bulk-reanalyze batch error:", e));
+});
+
 // POST /shipments/:id/reanalyze — manual trigger from the dashboard. Runs
 // per-shipment AI again (regardless of last_analyzed_at), updates the row,
 // and returns the fresh shipment + a one-row analysis result. Manual
@@ -671,6 +787,130 @@ shipmentsRouter.post("/:id/reanalyze", async (req, res) => {
     after:  { action_required: updated?.action_required, ai_issue: updated?.ai_issue },
   });
   res.json({ shipment: updated || row });
+});
+
+// POST /shipments/:id/reanalyze/preview  { model? }
+// Run per-shipment AI on the chosen model and return the proposed verdict
+// WITHOUT touching the shipment row. The run is still logged to
+// fpx_ai_analyses (so it shows in the Analysis history and is auditable),
+// but the shipment's action_*/ai_* fields only change if the operator later
+// confirms via /reanalyze/apply. Powers the "Re-analyze" modal.
+shipmentsRouter.post("/:id/reanalyze/preview", async (req, res) => {
+  const model = req.body?.model;
+  if (model && !REANALYZE_MODELS.has(model)) {
+    return res.status(400).json({ error: `Unsupported model: ${model}` });
+  }
+  const { data: row, error } = await supabase
+    .from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!row) return res.status(404).json({ error: "Shipment not found" });
+
+  const result = await runShipmentAnalysis(row, {
+    reqContext: req,
+    modelOverride: model || undefined,
+  });
+  if (!result || result.error) {
+    return res.status(502).json({ error: result?.error || "Analysis failed" });
+  }
+
+  res.json({
+    preview: {
+      analysis_id: result.analysis_id,
+      model: result.model,
+      issue: result.parsed?.issue ?? null,
+      recommendation: result.parsed?.recommendation ?? null,
+      action_required: result.parsed?.action_required ?? null,
+      action_target: result.parsed?.action_target ?? null,
+      action_confidence: result.parsed?.action_confidence ?? null,
+      cost_usd: result.cost_usd ?? null,
+      input_tokens: result.input_tokens ?? null,
+      output_tokens: result.output_tokens ?? null,
+    },
+    current: {
+      ai_issue: row.ai_issue,
+      ai_recommendation: row.ai_recommendation,
+      action_required: row.action_required,
+      action_target: row.action_target,
+      action_confidence: row.action_confidence,
+      action_source: row.action_source,
+      last_analyzed_at: row.last_analyzed_at,
+    },
+  });
+});
+
+// POST /shipments/:id/reanalyze/apply  { analysis_id }
+// Commit a previously-previewed analysis onto the shipment row: copies its
+// issue/recommendation + (unless a manual override is in force) the
+// action verdict, stamps last_analyzed_at, and writes an audit-log entry so
+// the replacement is traceable. analysis_id must be a per_shipment analysis
+// belonging to this shipment.
+shipmentsRouter.post("/:id/reanalyze/apply", async (req, res) => {
+  const analysisId = req.body?.analysis_id;
+  if (!analysisId) return res.status(400).json({ error: "analysis_id required" });
+
+  const { data: an } = await supabase
+    .from("fpx_ai_analyses")
+    .select("id, shipment_uuid, kind, model, issue, recommendation, action_required, response_text")
+    .eq("id", analysisId).maybeSingle();
+  if (!an) return res.status(404).json({ error: "Analysis not found" });
+  if (an.shipment_uuid !== req.params.id) {
+    return res.status(400).json({ error: "Analysis does not belong to this shipment" });
+  }
+
+  const { data: before } = await supabase
+    .from("fpx_shipments")
+    .select("id, tracking_number, action_required, action_source, action_target, action_confidence, ai_issue, ai_recommendation, last_analyzed_at")
+    .eq("id", req.params.id).maybeSingle();
+  if (!before) return res.status(404).json({ error: "Shipment not found" });
+
+  // action_target / action_confidence aren't columns on fpx_ai_analyses —
+  // re-derive them from the stored response JSON using the same threshold the
+  // live analyzer uses.
+  const { "action.threshold": threshold } = await getSettings("action.threshold");
+  const parsed = extractAiJsonFields(an.response_text || "", Number(threshold) || 0.7);
+
+  const patch = { last_analyzed_at: new Date().toISOString() };
+  const issue = an.issue || parsed.issue;
+  const recommendation = an.recommendation || parsed.recommendation;
+  if (issue) patch.ai_issue = issue;
+  if (recommendation) patch.ai_recommendation = recommendation;
+  // Respect a manual override: only the issue/recommendation text refreshes;
+  // the human's action decision stays pinned.
+  if (before.action_source !== "manual") {
+    const actionReq = an.action_required || parsed.action_required;
+    if (actionReq) {
+      patch.action_required = actionReq;
+      patch.action_source = "ai";
+    }
+    if (parsed.action_target) patch.action_target = parsed.action_target;
+    if (parsed.action_confidence !== null && parsed.action_confidence !== undefined) {
+      patch.action_confidence = parsed.action_confidence;
+    }
+  }
+
+  const { data: updated, error } = await supabase
+    .from("fpx_shipments").update(patch).eq("id", req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  logAudit(req, {
+    action: "reanalyze",
+    entity_type: "shipment",
+    entity_id: updated.id,
+    summary: `Replaced analysis on ${updated.tracking_number || updated.id} with ${an.model || "AI"} verdict`,
+    before: {
+      action_required: before.action_required,
+      action_confidence: before.action_confidence,
+      ai_issue: before.ai_issue,
+    },
+    after: {
+      action_required: updated.action_required,
+      action_confidence: updated.action_confidence,
+      ai_issue: updated.ai_issue,
+    },
+    metadata: { model: an.model, analysis_id: an.id, replaced: true },
+  });
+
+  res.json({ shipment: updated });
 });
 
 // PATCH /shipments/:id/action  { action_required, reason? }

@@ -49,25 +49,57 @@ const EMBED_ALLOW = [
   "fullscreen *",
 ].join("; ");
 
-// localStorage key for the user's saved FreightPOP credentials. They never
-// leave the browser — the dashboard server doesn't see or store them. Used
-// only to populate the "Copy email / Copy password" buttons next to the
-// embed so first-time login is one paste, not retyping.
-const FPX_CREDS_KEY = "fpx.freightpop.creds.v1";
+// The user's saved FreightPOP credentials, used only to populate the
+// "Copy email / Copy password" buttons next to the embed so login is one paste
+// rather than retyping. They never leave the browser — the dashboard server
+// doesn't see or store them.
+//
+// Email persists in localStorage. The PASSWORD deliberately does not: it used
+// to be written to localStorage in plaintext under a single combined key, where
+// it survived indefinitely on any shared, backed-up, or profile-synced machine
+// and was readable by any script running on this origin. sessionStorage keeps
+// the one-paste convenience for as long as the tab is open and discards it when
+// the tab closes.
+const FPX_EMAIL_KEY = "fpx.freightpop.email.v1";
+const FPX_PASSWORD_KEY = "fpx.freightpop.password.v1";
+// Superseded by the two keys above. Read once to carry the email forward, then
+// deleted so old plaintext passwords don't linger in anyone's localStorage.
+const LEGACY_CREDS_KEY = "fpx.freightpop.creds.v1";
 
 interface SavedCreds { email: string; password: string }
 
 function loadCreds(): SavedCreds {
+  let email = "";
+  let password = "";
   try {
-    const raw = localStorage.getItem(FPX_CREDS_KEY);
-    if (!raw) return { email: "", password: "" };
-    const parsed = JSON.parse(raw);
-    return { email: String(parsed.email || ""), password: String(parsed.password || "") };
-  } catch { return { email: "", password: "" }; }
+    const legacy = localStorage.getItem(LEGACY_CREDS_KEY);
+    if (legacy) {
+      const parsed = JSON.parse(legacy);
+      email = String(parsed?.email || "");
+      localStorage.removeItem(LEGACY_CREDS_KEY);
+      if (email) localStorage.setItem(FPX_EMAIL_KEY, email);
+    }
+    email = localStorage.getItem(FPX_EMAIL_KEY) || email;
+    password = sessionStorage.getItem(FPX_PASSWORD_KEY) || "";
+  } catch { /* storage unavailable — start empty */ }
+  return { email, password };
 }
 
 function saveCreds(c: SavedCreds) {
-  try { localStorage.setItem(FPX_CREDS_KEY, JSON.stringify(c)); } catch {}
+  try {
+    if (c.email) localStorage.setItem(FPX_EMAIL_KEY, c.email);
+    else localStorage.removeItem(FPX_EMAIL_KEY);
+    if (c.password) sessionStorage.setItem(FPX_PASSWORD_KEY, c.password);
+    else sessionStorage.removeItem(FPX_PASSWORD_KEY);
+  } catch { /* storage unavailable — copy buttons still work this session */ }
+}
+
+function forgetCreds() {
+  try {
+    localStorage.removeItem(FPX_EMAIL_KEY);
+    localStorage.removeItem(LEGACY_CREDS_KEY);
+    sessionStorage.removeItem(FPX_PASSWORD_KEY);
+  } catch { /* nothing to clear */ }
 }
 
 // Singleton FreightPOP iframe overlay. Mounted once inside <AuthedApp>; it
@@ -110,6 +142,16 @@ export function FreightPopOverlay() {
   // panel under the header so debugging doesn't require DevTools frame
   // switching.
   const [lastAck, setLastAck] = useState<{ ok: boolean; strategy?: string; error?: string; injectDetail?: string } | null>(null);
+  // Third-party-cookie status, reported by the extension's content script from
+  // INSIDE the iframe (the only place it can be measured). null = we haven't
+  // heard, which is different from "blocked" and must not render as a warning.
+  const [storageAccess, setStorageAccess] = useState<{
+    supported: boolean;
+    hasAccess: boolean | null;
+    granted: boolean | null;
+    error: string | null;
+  } | null>(null);
+  const cookiesBlocked = storageAccess?.supported === true && storageAccess.hasAccess === false;
 
   // Persist creds whenever the user edits them in the popover.
   useEffect(() => { saveCreds(creds); }, [creds]);
@@ -123,6 +165,17 @@ export function FreightPopOverlay() {
       if (!d || typeof d !== "object") return;
       if (d.source !== "fpx-extension") return;
       if (d.type === "fpxHello" || d.type === "fpxPong") {
+        setBridgeReady(true);
+      } else if (d.type === "fpxStorageAccess") {
+        // Only the content script can measure this — document.hasStorageAccess()
+        // has to be called inside the embedded frame.
+        setStorageAccess({
+          supported: !!d.supported,
+          hasAccess: typeof d.hasAccess === "boolean" ? d.hasAccess : null,
+          granted: typeof d.granted === "boolean" ? d.granted : null,
+          error: typeof d.error === "string" ? d.error : null,
+        });
+        // It reached us, so the bridge is demonstrably alive.
         setBridgeReady(true);
       } else if (d.type === "fpxFilterAck") {
         if (d.ok) setLastFilter({ column: String(d.column || ""), value: String(d.value || "") });
@@ -310,6 +363,32 @@ export function FreightPopOverlay() {
         </div>
       </div>
 
+      {/* Fact-based, not a guess: this only renders once the content script has
+          measured document.hasStorageAccess() inside the frame and told us it's
+          false. The "Allow cookies" affordance deliberately lives INSIDE the
+          iframe (rendered by the content script) — requestStorageAccess needs
+          transient activation in that frame, and a click out here wouldn't
+          confer it. */}
+      {cookiesBlocked ? (
+        <div className="mx-3 mt-2">
+          <ErrorBlock tone="warning" compact>
+            <div className="font-semibold">FreightPOP can't hold its session in this embed</div>
+            <div className="mt-0.5 text-[11px]">
+              Your browser blocks FreightPOP's cookies here because this dashboard is on a
+              different site (<code className="font-mono">netlify.app</code>) from{" "}
+              <code className="font-mono">freightpop.com</code>. Use the{" "}
+              <strong>Allow cookies</strong> button at the top of the FreightPOP panel below, or
+              open it in a <strong>New tab</strong> — that's never affected.
+              {storageAccess?.granted === false && storageAccess.error ? (
+                <span className="block mt-1 text-amber-800">
+                  Last attempt was denied by the browser: {storageAccess.error}
+                </span>
+              ) : null}
+            </div>
+          </ErrorBlock>
+        </div>
+      ) : null}
+
       {lastAck && !lastAck.ok && !ackDismissed ? (
         <div className="mx-3 mt-2">
           <ErrorBlock tone="warning" compact>
@@ -340,10 +419,11 @@ export function FreightPopOverlay() {
       {credsOpen ? (
         <div className="px-3 py-3 bg-sky-50 ring-1 ring-sky-200 mx-3 mt-2 rounded-lg space-y-2">
           <div className="text-[11px] text-slate-700 leading-snug">
-            Saved <strong>only in this browser</strong> (localStorage). The dashboard server
-            never sees these. Use the Copy buttons to one-click-paste into FreightPOP's login,
-            or let your browser's password manager autofill — both work because the iframe
-            has no sandbox restrictions.
+            Saved <strong>only in this browser</strong> — the dashboard server never sees these.
+            Your email is remembered; the <strong>password is kept only until you close this
+            tab</strong>. Use the Copy buttons to one-click-paste into FreightPOP's login, or let
+            your browser's password manager autofill — both work because the iframe has no
+            sandbox restrictions.
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             <div className="flex flex-col gap-1">
@@ -393,6 +473,28 @@ export function FreightPopOverlay() {
             After your first manual login, your browser's password manager can autofill on
             subsequent visits. Once you're signed in, the FreightPOP session survives every
             prev/next walk in this tab — the iframe no longer reloads on each shipment.
+          </div>
+          {/* Explains the repeated logins. Only shown when we haven't positively
+              measured cookie access — when we have, the header banner above says
+              it definitively and this would just be duplicate noise. */}
+          {!cookiesBlocked && storageAccess?.hasAccess !== true ? (
+            <div className="text-[11px] text-slate-600 bg-white ring-1 ring-slate-200 rounded px-2 py-1.5 leading-snug">
+              <strong>FreightPOP keeps asking you to sign in here?</strong> That's usually your
+              browser blocking third-party cookies — this dashboard is on{" "}
+              <code className="font-mono">netlify.app</code>, a different site from{" "}
+              <code className="font-mono">freightpop.com</code>. Install/reload the FPXpress
+              extension and it will offer a one-click fix inside the panel; otherwise use{" "}
+              <strong>New tab</strong> above, which isn't affected.
+            </div>
+          ) : null}
+          <div className="flex justify-end">
+            <button
+              onClick={() => { forgetCreds(); setCreds({ email: "", password: "" }); }}
+              disabled={!creds.email && !creds.password}
+              className="text-[11px] px-2 py-1 rounded ring-1 ring-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900 disabled:opacity-40"
+            >
+              Forget saved login
+            </button>
           </div>
         </div>
       ) : null}

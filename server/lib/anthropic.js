@@ -4,10 +4,12 @@ import { getSettings } from "./settings.js";
 // USD per 1M tokens. Keep this in sync with anthropic.com/pricing — falling
 // off the table downgrades the cost calc to Haiku defaults silently.
 const MODEL_PRICING = {
-  "claude-haiku-4-5-20251001":  { input: 0.80, output:  4.00 },
+  "claude-haiku-4-5":           { input: 1.00, output:  5.00 },
+  "claude-haiku-4-5-20251001":  { input: 1.00, output:  5.00 },
   "claude-sonnet-4-5-20250929": { input: 3.00, output: 15.00 },
   "claude-sonnet-4-6":          { input: 3.00, output: 15.00 },
-  "claude-opus-4-7":            { input: 15.00, output: 75.00 },
+  "claude-opus-4-7":            { input: 5.00, output: 25.00 },
+  "claude-opus-4-8":            { input: 5.00, output: 25.00 },
 };
 
 const LARGE_PROMPT_CHARS = 12000;
@@ -121,6 +123,17 @@ export async function callClaude({
   const pricing = MODEL_PRICING[model] || { input: 0.80, output: 4.00 };
   const costUsd = (inTok * pricing.input + outTok * pricing.output) / 1_000_000;
 
+  // Parse structured fields + resolve the threshold BEFORE logging so we can
+  // retain the prediction on the analysis row. Threshold comes from settings;
+  // missing-on-failure falls back to the default 0.7. extractAiJsonFields is
+  // regex-based and never throws, so no try/catch around the parse itself.
+  let threshold = 0.7;
+  try {
+    const s = await getSettings("action.threshold");
+    threshold = Number(s["action.threshold"]) || 0.7;
+  } catch {}
+  const parsed = extractAiJsonFields(text, threshold);
+
   const analysisId = await logAnalysis({
     ...metadata,
     model,
@@ -131,16 +144,20 @@ export async function callClaude({
     output_tokens: outTok,
     cost_usd: costUsd,
     duration_ms: durationMs,
+    // Calibration: the continuous score is overwritten on the shipment row
+    // every re-analysis, so this log row is the only durable per-run record of
+    // (confidence, target, threshold-in-effect). Retaining it is what lets
+    // action.threshold be re-tuned without re-prompting and a reliability curve
+    // be computed once outcome labels land. per_shipment verdicts only.
+    calibration: metadata.kind === "per_shipment"
+      ? {
+          action_confidence: parsed.action_confidence,
+          action_target: parsed.action_target,
+          threshold,
+          at: new Date().toISOString(),
+        }
+      : null,
   });
-
-  // Re-parse so callers can see the structured fields without parsing the
-  // response themselves. Threshold comes from settings; missing-on-failure
-  // falls back to the default 0.7.
-  let parsed = { action_required: null, action_confidence: null, action_target: null, issue: null, recommendation: null };
-  try {
-    const { "action.threshold": threshold } = await getSettings("action.threshold");
-    parsed = extractAiJsonFields(text, Number(threshold) || 0.7);
-  } catch {}
 
   return {
     text, model, input_tokens: inTok, output_tokens: outTok, cost_usd: costUsd, analysis_id: analysisId,
@@ -170,7 +187,11 @@ async function logAnalysis(entry) {
     source: "railway",
     user_email: entry.user_email || null,
     error: entry.error || null,
-    metadata: { api_key_id: entry.api_key_id, ...(entry.metadata || {}) },
+    metadata: {
+      api_key_id: entry.api_key_id,
+      ...(entry.metadata || {}),
+      ...(entry.calibration ? { calibration: entry.calibration } : {}),
+    },
   };
   const { data, error } = await supabase.from("fpx_ai_analyses").insert(row).select("id").single();
   if (error) {

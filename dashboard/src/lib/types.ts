@@ -318,3 +318,31 @@ export interface EmailDraft {
   body: string;
   raw?: string;
 }
+
+// Proposed verdict from POST /shipments/:id/reanalyze/preview — not yet
+// persisted onto the shipment. The Re-analyze modal shows this against
+// ReanalyzeCurrent and lets the operator confirm the replacement.
+export interface ReanalyzePreview {
+  analysis_id: string;
+  model: string | null;
+  issue: string | null;
+  recommendation: string | null;
+  action_required: string | null;
+  action_target: string | null;
+  action_confidence: number | null;
+  cost_usd: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+}
+
+// Snapshot of the shipment's currently-stored AI verdict, for side-by-side
+// comparison in the Re-analyze modal.
+export interface ReanalyzeCurrent {
+  ai_issue: string | null;
+  ai_recommendation: string | null;
+  action_required: string | null;
+  action_target: string | null;
+  action_confidence: number | null;
+  action_source: string | null;
+  last_analyzed_at: string | null;
+}

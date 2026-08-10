@@ -1,7 +1,99 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
+import { logAudit } from "../lib/audit.js";
 
 export const opsRouter = Router();
+
+// ---------- Rescrape command channel ----------
+// Scraping is push-only (the Chrome extension scrapes FreightPOP and POSTs to
+// /api/shipments). The server can't pull on demand, so the dashboard enqueues
+// a request here and the extension polls + fulfills it on its next cycle.
+// All routes are under the dual-auth /api router, so the extension authenticates
+// with its x-api-key just like it does for POST /api/shipments.
+
+// POST /ops/rescrape  { scope?: "all" | "selected", tracking_numbers?: string[] }
+// Operator clicks "Rescrape". Coalesces an existing pending full rescrape so we
+// don't stack duplicates the extension would run twice.
+opsRouter.post("/rescrape", async (req, res) => {
+  const scope = req.body?.scope === "selected" ? "selected" : "all";
+  const tns = Array.isArray(req.body?.tracking_numbers)
+    ? req.body.tracking_numbers.map(String).filter(Boolean)
+    : null;
+  if (scope === "selected" && (!tns || !tns.length)) {
+    return res.status(400).json({ error: "selected scope requires tracking_numbers" });
+  }
+  if (scope === "all") {
+    const { data: existing } = await supabase
+      .from("fpx_scrape_requests")
+      .select("*").eq("status", "pending").eq("scope", "all")
+      .order("requested_at", { ascending: false }).limit(1);
+    if (existing?.[0]) return res.json({ request: existing[0], coalesced: true });
+  }
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .insert({
+      scope,
+      tracking_numbers: tns,
+      requested_by: req.user?.email || req.apiKey?.name || null,
+    })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "rescrape_request",
+    entity_type: "scrape_request",
+    entity_id: data.id,
+    summary: `Requested ${scope} rescrape`,
+    metadata: { scope, count: tns?.length || null },
+  });
+  res.json({ request: data });
+});
+
+// GET /ops/rescrape — recent requests (dashboard reflects pending/done state).
+opsRouter.get("/rescrape", async (req, res) => {
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .select("*").order("requested_at", { ascending: false }).limit(10);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ requests: data || [] });
+});
+
+// GET /ops/rescrape/pending?claim=1&by=<name> — extension poll. With claim=1 it
+// atomically flips the oldest pending request to 'claimed' (guarded on
+// status='pending' so two pollers can't grab the same one).
+opsRouter.get("/rescrape/pending", async (req, res) => {
+  const claim = req.query.claim === "1" || req.query.claim === "true";
+  const by = req.query.by ? String(req.query.by) : (req.apiKey?.name || null);
+  const { data: rows, error } = await supabase
+    .from("fpx_scrape_requests")
+    .select("*").eq("status", "pending")
+    .order("requested_at", { ascending: true }).limit(1);
+  if (error) return res.status(500).json({ error: error.message });
+  const pending = rows?.[0] || null;
+  if (!pending) return res.json({ request: null });
+  if (!claim) return res.json({ request: pending });
+  const { data: claimed, error: cErr } = await supabase
+    .from("fpx_scrape_requests")
+    .update({ status: "claimed", claimed_at: new Date().toISOString(), claimed_by: by })
+    .eq("id", pending.id).eq("status", "pending")
+    .select().maybeSingle();
+  if (cErr) return res.status(500).json({ error: cErr.message });
+  res.json({ request: claimed || null });
+});
+
+// POST /ops/rescrape/:id/complete  { result_count?, note?, error? } — extension
+// reports back after fulfilling (or failing) a request.
+opsRouter.post("/rescrape/:id/complete", async (req, res) => {
+  const result_count = Number.isFinite(Number(req.body?.result_count)) ? Number(req.body.result_count) : null;
+  const note = req.body?.note ? String(req.body.note).slice(0, 500) : null;
+  const status = req.body?.error ? "error" : "done";
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .update({ status, completed_at: new Date().toISOString(), result_count, note })
+    .eq("id", req.params.id).select().maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: "request not found" });
+  res.json({ request: data });
+});
 
 // GET /api/ops/metrics?days=30  →  Director-of-Ops rollup.
 //
