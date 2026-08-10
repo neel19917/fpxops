@@ -1,7 +1,7 @@
 import { useAuth } from "../lib/auth";
 
 export function SignInPage() {
-  const { signInWithMicrosoft, error } = useAuth();
+  const { signInWithMicrosoft, signingIn, unexpectedSignOut, error } = useAuth();
   return (
     <div className="min-h-screen grid lg:grid-cols-2 bg-white">
       {/* Brand panel */}
@@ -66,12 +66,44 @@ export function SignInPage() {
             Use your FreightPOP Microsoft account. Access is granted by an admin.
           </p>
 
+          {/* Landing here without having clicked Sign out means the session
+              ended on its own. Say so — an unexplained bounce to this screen
+              is exactly what made this bug so hard to pin down, because
+              everyone assumed they'd simply been idle. */}
+          {unexpectedSignOut ? (
+            <div className="mt-4 rounded-lg bg-amber-50 ring-1 ring-amber-200 px-3 py-2.5 text-xs text-amber-900 leading-relaxed">
+              <div className="font-semibold">Your session ended unexpectedly.</div>
+              <div className="mt-0.5 text-amber-800">
+                You didn't sign out — the session was dropped. Signing back in will work.
+                If this keeps happening, open the browser console and run{" "}
+                <code className="font-mono bg-amber-100 px-1 rounded">fpxAuthLog()</code>, then
+                send the output to whoever's looking at this.
+              </div>
+            </div>
+          ) : null}
+
+          {/* disabled while redirecting: a double-click here used to mint two
+              independent Supabase sessions (two /authorize → two /callback),
+              because signInWithOAuth navigates the top-level document and the
+              second click races the first navigation rather than being
+              cancelled by it. */}
           <button
+            type="button"
             onClick={signInWithMicrosoft}
-            className="mt-8 w-full inline-flex items-center justify-center gap-3 px-4 py-3 rounded-xl bg-[#0E1A2B] hover:bg-[#16263d] text-white font-medium shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-[#2289C9] focus:ring-offset-2"
+            disabled={signingIn}
+            className="mt-8 w-full inline-flex items-center justify-center gap-3 px-4 py-3 rounded-xl bg-[#0E1A2B] hover:bg-[#16263d] text-white font-medium shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-[#2289C9] focus:ring-offset-2 disabled:opacity-60 disabled:pointer-events-none"
           >
-            <MicrosoftLogo />
-            Continue with Microsoft
+            {signingIn ? (
+              <>
+                <span className="h-4 w-4 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                Redirecting to Microsoft…
+              </>
+            ) : (
+              <>
+                <MicrosoftLogo />
+                Continue with Microsoft
+              </>
+            )}
           </button>
 
           {error ? (

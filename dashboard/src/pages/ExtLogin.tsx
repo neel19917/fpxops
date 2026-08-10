@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Box, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
 import { sb } from "../lib/supabase";
 
@@ -61,6 +61,13 @@ export function ExtLoginPage() {
     setExtId(id);
   }, []);
 
+  // Guards against relaying the same session more than once. The listener
+  // below used to fire on EVERY event carrying a session — including
+  // INITIAL_SESSION and the hourly TOKEN_REFRESHED — and could also race the
+  // getSession() call above, so a single visit could relay two or three times.
+  const relayed = useRef(false);
+  const signInFlight = useRef(false);
+
   // Once we know the ext id, check whether there's a Supabase session
   // already. If yes, jump to relay. If no, show the sign-in CTA.
   useEffect(() => {
@@ -68,8 +75,9 @@ export function ExtLoginPage() {
     let cancelled = false;
     (async () => {
       const { data } = await sb.auth.getSession();
-      if (cancelled) return;
+      if (cancelled || relayed.current) return;
       if (data.session?.access_token) {
+        relayed.current = true;
         relaySession(data.session, extId);
       } else {
         setPhase("needs_signin");
@@ -77,8 +85,11 @@ export function ExtLoginPage() {
     })();
     // Watch for sign-in completion (the Microsoft popup closes and
     // emits SIGNED_IN). When it lands, relay the session.
-    const { data: sub } = sb.auth.onAuthStateChange((_event, s) => {
-      if (s?.access_token) relaySession(s, extId);
+    const { data: sub } = sb.auth.onAuthStateChange((event, s) => {
+      if (event !== "SIGNED_IN" && event !== "INITIAL_SESSION") return;
+      if (relayed.current || !s?.access_token) return;
+      relayed.current = true;
+      relaySession(s, extId);
     });
     return () => {
       cancelled = true;
@@ -94,11 +105,24 @@ export function ExtLoginPage() {
       setPhase("error");
       return;
     }
+    // Deliberately NOT relaying refresh_token.
+    //
+    // A refresh token is single-use: Supabase rotates it on every use. Handing
+    // a copy to the extension put one rotating credential in two independent
+    // stores (localStorage here, chrome.storage.local there) that both believed
+    // they owned it — so whichever side refreshed first invalidated the other,
+    // and the loser's next refresh failed with "Already Used", which hard-kills
+    // the session.
+    //
+    // The extension doesn't need it: the /api/me call it makes right after this
+    // relay returns a `pending_api_key`, which it stores as fpxApiKey (see
+    // fetchProfileWithSession in extension/background.js). That key is
+    // long-lived and is the right credential shape for a background worker.
+    // The access_token below just gets it through that one bootstrap call.
     const payload = {
       type: "fpxOauthSession",
       session: {
         access_token: session.access_token,
-        refresh_token: session.refresh_token,
         expires_at: session.expires_at,
         expires_in: session.expires_in,
         email: session.user?.email || null,
@@ -128,6 +152,11 @@ export function ExtLoginPage() {
   }
 
   async function startSignIn() {
+    // Same double-click guard as SignIn.tsx — two clicks here mint two
+    // Supabase sessions, because signInWithOAuth navigates the top-level
+    // document rather than cancelling the prior navigation.
+    if (signInFlight.current) return;
+    signInFlight.current = true;
     setErrMsg("");
     // Stay on this page after auth — Supabase will redirect back here
     // with the same ?extId so the relay fires automatically.
@@ -140,6 +169,8 @@ export function ExtLoginPage() {
       },
     });
     if (error) {
+      // Release only on failure; on success we're already navigating away.
+      signInFlight.current = false;
       setErrMsg(error.message);
       setPhase("error");
     }
@@ -183,8 +214,9 @@ export function ExtLoginPage() {
               your extension's redirect URL to Supabase.
             </p>
             <button
+              type="button"
               onClick={startSignIn}
-              className="w-full px-4 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800"
+              className="w-full px-4 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800 disabled:opacity-60 disabled:pointer-events-none"
             >
               Sign in with Microsoft
             </button>

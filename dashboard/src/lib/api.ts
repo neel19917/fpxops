@@ -7,53 +7,57 @@ import { impersonateHeaders } from "./impersonate";
 
 const API_URL = (import.meta.env.VITE_FPX_API_URL || "http://localhost:3210").replace(/\/$/, "");
 
-// Auth gate. Three failure modes were causing a "load → blank → refresh fixes
-// it" loop on every page load:
-//   1. Page mounts before Supabase hydrates from localStorage / OAuth hash —
-//      first call to getSession() returns null until onAuthStateChange fires.
-//   2. Cached session in storage is *stale* (access token expired). getSession
-//      returns it anyway; the API server 401s; user refreshes; by then
-//      autoRefreshToken has rotated and the second load succeeds.
-//   3. (after #2) the same stale token gets sent on every subsequent request
-//      until something prompts a refresh.
+// Auth gate.
 //
-// Fix: when getSession returns nothing or returns a token within 60s of
-// expiry, call refreshSession() before resolving. If neither yields a
-// usable token, wait briefly on onAuthStateChange. The 60s skew is generous
-// for clock drift between client + Supabase + Railway.
-const AUTH_GATE_TIMEOUT_MS = 2500;
-const REFRESH_SKEW_S = 60;
+// There is exactly ONE proactive refresh driver in this app now: the SDK's
+// own autoRefreshToken ticker (30s tick, refreshes within ~90s of expiry,
+// plus a visibilitychange handler that recovers a backgrounded tab). This
+// file used to be a second driver and auth.tsx#bootSession a third, each
+// with its own 60s expiry skew. Three drivers racing to rotate a
+// single-use refresh token is how a session gets stranded with "Invalid
+// Refresh Token: Already Used" — a non-retryable error that makes GoTrue
+// drop the session and broadcast SIGNED_OUT to every tab.
+//
+// So: ask getSession() for a token and trust it. The SDK refreshes it when
+// it needs refreshing. The only refresh we initiate is the *reactive* one
+// below, after the server has actually rejected a token with a 401.
+//
+// The gate timeout only covers the cold-boot case where Supabase hasn't
+// finished hydrating from localStorage / the OAuth hash yet. 2500ms was far
+// too tight: it fired on any contended cold boot and rejected a perfectly
+// valid session with what read to the user as a logout.
+const AUTH_GATE_TIMEOUT_MS = 15_000;
 // Hard deadlines on every network round-trip. Without these, a stalled
 // connection (laptop slept mid-request, dead proxy, Supabase hiccup in a
 // long-lived dev tab) left pages awaiting forever on an infinite
 // "Loading…" — the auth gate and the fetch itself had no timeout. A
 // stall now surfaces as a retryable error instead of a hang.
 const FETCH_TIMEOUT_MS = 20_000;
-const AUTH_CALL_TIMEOUT_MS = 6_000;
+// Must exceed supabase.ts's `lockAcquireTimeout` (15s): getSession() acquires
+// the auth lock, so in the orphaned-holder case it legitimately blocks until
+// the SDK's steal-recovery kicks in. At 6s we bailed out mid-recovery and
+// treated a recoverable stall as "no session".
+const AUTH_CALL_TIMEOUT_MS = 18_000;
 
 function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
 }
 
-function tokenStillFresh(s: { access_token?: string; expires_at?: number | null } | null): string | null {
-  if (!s?.access_token) return null;
-  const exp = s.expires_at;
-  if (exp && Date.now() / 1000 > exp - REFRESH_SKEW_S) return null; // expiring soon
-  return s.access_token;
-}
-
-// Single-flight guard for sb.auth.refreshSession(). With the no-op lock in
-// supabase.ts (deliberate: navigator.locks orphans under React Strict Mode),
-// the SDK no longer serializes refresh internally — so N parallel requests
-// hitting a 401 would each call the refresh endpoint. Coalesce them here:
-// the first call wins and every concurrent caller awaits the same promise.
+// Single-flight guard for sb.auth.refreshSession(), so a page firing six
+// parallel requests that all 401 triggers ONE refresh round-trip.
+//
+// Deliberately NOT wrapped in withDeadline: that helper resolves null on
+// timeout without aborting the underlying promise, so a slow refresh went on
+// to rotate the token behind a caller that had already given up and fired a
+// second refresh — the same "Already Used" strand it was meant to avoid. The
+// refresh fetch carries its own generous ceiling in supabase.ts instead.
 let _refreshInflight: Promise<string | null> | null = null;
 function refreshSessionOnce(): Promise<string | null> {
   if (_refreshInflight) return _refreshInflight;
   _refreshInflight = (async () => {
     try {
-      const res = await withDeadline(sb.auth.refreshSession(), AUTH_CALL_TIMEOUT_MS);
-      if (!res || res.error || !res.data.session?.access_token) return null;
+      const res = await sb.auth.refreshSession();
+      if (res.error || !res.data.session?.access_token) return null;
       return res.data.session.access_token;
     } catch {
       return null;
@@ -67,23 +71,15 @@ function refreshSessionOnce(): Promise<string | null> {
 }
 
 async function getAccessTokenOrWait(): Promise<string> {
-  // 1. Cached session, if still fresh. getSession() is usually a local
-  // read but can block on the SDK's internal initialize — same deadline
-  // treatment as the boot path in auth.tsx.
+  // getSession() is usually a local read, but it can block on the SDK's
+  // internal initialize (and on the auth lock while a refresh is in flight) —
+  // same deadline treatment as the boot path in auth.tsx.
   const got = await withDeadline(sb.auth.getSession(), AUTH_CALL_TIMEOUT_MS);
-  const cached = got?.data.session ?? null;
-  const fresh = tokenStillFresh(cached);
-  if (fresh) return fresh;
+  const token = got?.data.session?.access_token;
+  if (token) return token;
 
-  // 2. Cached but stale → ask the SDK to refresh. If we have a refresh
-  // token, this returns a brand-new access token without forcing a full
-  // sign-in round-trip.
-  if (cached?.refresh_token) {
-    const tok = await refreshSessionOnce();
-    if (tok) return tok;
-  }
-
-  // 3. Nothing usable yet — wait for onAuthStateChange to deliver one.
+  // Nothing yet — we're mid-hydration. Wait for onAuthStateChange to deliver
+  // a session rather than trying to force one into existence ourselves.
   return new Promise<string>((resolve, reject) => {
     const { data: sub } = sb.auth.onAuthStateChange((_event, s) => {
       if (s?.access_token) {
@@ -94,7 +90,11 @@ async function getAccessTokenOrWait(): Promise<string> {
     });
     const timer = setTimeout(() => {
       sub.subscription.unsubscribe();
-      reject(new Error("Not signed in."));
+      // Deliberately not "Not signed in." — reaching this timer means the SDK
+      // never produced a session, which is far more often a stalled boot than
+      // an actually signed-out user, and the old wording sent people off to
+      // re-authenticate for no reason.
+      reject(new Error("Session is still initializing — retry in a moment."));
     }, AUTH_GATE_TIMEOUT_MS);
   });
 }
@@ -131,17 +131,25 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
 
   let accessToken = await getAccessTokenOrWait();
   let resp = await fire(accessToken);
-  // Belt + suspenders for the stale-token race: a 401 means the access token
-  // the SDK handed us was no longer valid server-side. Force a refresh and
-  // retry exactly once before propagating the failure to the caller. Routes
-  // through the single-flight guard so a page firing 6 parallel requests on
-  // mount only triggers ONE refresh round-trip.
+  // The one place we initiate a refresh: a 401 means the access token really
+  // was rejected server-side. Force a refresh and retry exactly once before
+  // propagating the failure. Routes through the single-flight guard so a page
+  // firing 6 parallel requests on mount only triggers ONE refresh round-trip.
   if (resp.status === 401) {
     const refreshed = await refreshSessionOnce();
     if (refreshed) {
       accessToken = refreshed;
       resp = await fire(accessToken);
     }
+  } else if (resp.status === 503) {
+    // The server couldn't verify our token because ITS upstream call failed
+    // (Supabase hiccup, profile query timeout) — our token is fine. Retry
+    // once WITHOUT refreshing. Refreshing here is what used to feed the
+    // rotation race: a transient server-side blip on the 60s auth-cache
+    // boundary would force a client refresh for reasons unrelated to the
+    // token's validity.
+    await new Promise((r) => setTimeout(r, 400));
+    resp = await fire(accessToken);
   }
   if (!resp.ok) {
     const text = await resp.text();
