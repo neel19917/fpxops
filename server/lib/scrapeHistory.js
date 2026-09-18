@@ -31,7 +31,7 @@ export const MATERIAL_FIELDS = [
 // change log (measured 2026-09-18: 154 of 184 recent auto-task change logs).
 // Canonicalize anything that looks like an ISO timestamp to epoch-derived ISO
 // so equal instants compare equal regardless of formatting.
-const ISO_TS_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([+-]\d{2}:?\d{2}|Z)?$/;
+const ISO_TS_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([+-]\d{2}(:?\d{2})?|Z)?$/;
 function normalize(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === "string") return v.trim() === "" ? null : v.trim();
