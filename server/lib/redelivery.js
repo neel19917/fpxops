@@ -51,8 +51,12 @@ export function isLtlMode(mode) {
 // /tasks search on "Redelivery" finds both and the task builder can tell
 // whether a shipment already has redelivery tasks.
 export const REDELIVERY_TAG = "Redelivery — ";
+// Match the structured tag only, not the word anywhere in the title. Older
+// free-text auto-tasks ("...arrange redelivery with the carrier") would
+// otherwise count as an existing redelivery task and suppress the pair.
+const REDELIVERY_TITLE_RE = /^(carrier|customer) followup:\s*redelivery — /i;
 export function isRedeliveryTitle(title) {
-  return typeof title === "string" && /redelivery/i.test(title);
+  return typeof title === "string" && REDELIVERY_TITLE_RE.test(title);
 }
 
 function ts(v) {

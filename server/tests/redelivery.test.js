@@ -75,6 +75,9 @@ test("isRedeliveryTitle matches both halves of the pair and nothing else", () =>
   assert.equal(isRedeliveryTitle(`Carrier followup: ${REDELIVERY_TAG}call carrier for re-attempt`), true);
   assert.equal(isRedeliveryTitle(`Customer followup: ${REDELIVERY_TAG}notify customer of failed delivery attempt`), true);
   assert.equal(isRedeliveryTitle("Carrier followup: missing POD"), false);
+  // Legacy free-text auto-task that merely mentions the word must NOT count
+  // as an existing redelivery task (it suppressed the pair on 69029807-0).
+  assert.equal(isRedeliveryTitle("Carrier followup: FPX should contact AAACooper to arrange redelivery"), false);
   assert.equal(isRedeliveryTitle(null), false);
 });
 
