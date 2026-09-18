@@ -113,3 +113,25 @@ describe("computeMaterialDiff — equality semantics", () => {
       "ai_recommendation drift is not a real-world change — must not trigger re-analysis");
   });
 });
+
+
+describe("computeMaterialDiff — timestamp formatting is not a change", () => {
+  it("PostgREST '+00:00' vs mapShipment '.000Z' for the same instant → no diff", () => {
+    const prev = { pickup_date: "2026-08-21T00:00:00+00:00", updated_eta: "2026-08-25T00:00:00+00:00", appointment_date: "2026-08-25T00:00:00+00:00" };
+    const next = { pickup_date: "2026-08-21T00:00:00.000Z", updated_eta: "2026-08-25T00:00:00.000Z", appointment_date: "2026-08-25T00:00:00.000Z" };
+    assert.equal(computeMaterialDiff(prev, next), null);
+  });
+  it("a real ETA move is still a diff, reported with the source strings", () => {
+    const prev = { updated_eta: "2026-08-25T00:00:00+00:00" };
+    const next = { updated_eta: "2026-08-27T00:00:00.000Z" };
+    const d = computeMaterialDiff(prev, next);
+    assert.deepEqual(d, { updated_eta: { prev: "2026-08-25T00:00:00+00:00", next: "2026-08-27T00:00:00.000Z" } });
+  });
+  it("postgres 'YYYY-MM-DD HH:MM:SS+00' form is canonicalized too", () => {
+    assert.equal(computeMaterialDiff({ pickup_date: "2026-08-21 00:00:00+00" }, { pickup_date: "2026-08-21T00:00:00.000Z" }), null);
+  });
+  it("non-date strings are untouched", () => {
+    const d = computeMaterialDiff({ tracking_comments: "Out for delivery" }, { tracking_comments: "Attempted Delivery in MIAMI, FL" });
+    assert.deepEqual(d, { tracking_comments: { prev: "Out for delivery", next: "Attempted Delivery in MIAMI, FL" } });
+  });
+});
