@@ -3,6 +3,7 @@ import { supabase } from "../lib/supabase.js";
 import { callClaude } from "../lib/anthropic.js";
 import { mapShipment } from "../lib/shipments.js";
 import { getSettings } from "../lib/settings.js";
+import { detectRedelivery } from "../lib/redelivery.js";
 // GP/Invoice prompt defaults — editable in the Settings tab via prompt.gp_* /
 // prompt.invoice_* keys (registered in FALLBACKS in lib/settings.js).
 import {
@@ -632,6 +633,10 @@ export function computeTemporalTriggers(src, asOfMs) {
       lastMod === null ? null : Math.floor((asOfMs - lastMod) / DAY),
     eta_slip_days:
       updatedEta === null || originalEta === null ? null : Math.round((updatedEta - originalEta) / DAY),
+    // Not temporal, but lives with the other deterministic triggers so the
+    // model sees one flat set of precomputed facts. LTL only; null for other
+    // modes or when there is no comment text. See lib/redelivery.js.
+    redelivery_needed: detectRedelivery(src),
   };
 }
 

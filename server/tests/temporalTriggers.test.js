@@ -70,6 +70,22 @@ test("eta_slip_days: only computed when BOTH etas present", () => {
   assert.equal(computeTemporalTriggers({ updated_eta: future }, AS_OF).eta_slip_days, null);
 });
 
+test("redelivery_needed: true for LTL attempted-delivery comment with no delivery_date", () => {
+  const t = computeTemporalTriggers(
+    { mode: "LTL", tracking_comments: "Attempted Delivery in MODESTO, CA", updated_eta: past },
+    AS_OF,
+  );
+  assert.equal(t.redelivery_needed, true);
+});
+
+test("redelivery_needed: null for Parcel (LTL-only scope) and null with no comment text", () => {
+  assert.equal(
+    computeTemporalTriggers({ mode: "Parcel", tracking_comments: "Your delivery will be rescheduled." }, AS_OF).redelivery_needed,
+    null,
+  );
+  assert.equal(computeTemporalTriggers({ mode: "LTL" }, AS_OF).redelivery_needed, null);
+});
+
 test("unparseable date reads as unknown (null), not as a wrong boolean", () => {
   assert.equal(computeTemporalTriggers({ updated_eta: "not-a-date" }, AS_OF).eta_passed_no_arrival, null);
 });

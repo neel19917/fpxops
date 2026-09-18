@@ -1,0 +1,104 @@
+// Deterministic redelivery detector. FPX Directory wants LTL deliveries that
+// must be re-attempted flagged explicitly, not left to whether the model
+// happens to read it out of the carrier's free-text tracking comment.
+//
+// The only place this signal exists in the scrape is tracking_comments /
+// comments ("Attempted Delivery in MODESTO, CA", "Your delivery will be
+// rescheduled", "We tried to deliver to the business, but it was closed").
+// There is no status value or date column for it, so we regex the text and
+// pair it with delivery_date being empty.
+//
+// Scope is LTL only (product decision 2026-09-18). Parcel exceptions follow
+// a different playbook and parcels are already excluded from the task flow
+// by ui.tracking.show_parcels.
+//
+// Refusals are deliberately NOT a redelivery: a refused shipment needs a
+// customer disposition decision (accept / return / claim), not another
+// delivery attempt. The generic exception rules in the prompt still catch
+// them.
+
+export const REDELIVERY_PATTERN = new RegExp(
+  [
+    "attempted\\s+deliver",          // "Attempted Delivery in HOUSTON, TX"
+    "delivery\\s+attempt",           // "Delivery attempt failed"
+    "re-?attempt",
+    "re-?deliver",
+    "resched",                       // "Your delivery will be rescheduled"
+    "tried\\s+to\\s+deliver",        // "We tried to deliver to the business, but it was closed"
+    "unable\\s+to\\s+deliver",
+    "could\\s+not\\s+(be\\s+)?deliver",
+    "missed\\s+deliver",
+    "(business|consignee|receiver|customer)\\s+(was\\s+|is\\s+)?(closed|not\\s+available|unavailable)",
+    "undeliverable",
+    "no\\s+one\\s+(was\\s+)?(available|present|home)",
+  ].join("|"),
+  "i",
+);
+
+export function isLtlMode(mode) {
+  return String(mode || "").trim().toLowerCase() === "ltl";
+}
+
+// Returns:
+//   true  — LTL, comments describe a failed/rescheduled delivery, not delivered
+//   false — LTL with comments present but no redelivery language, or already delivered
+//   null  — not LTL, or no comment text at all (could not evaluate)
+// `src` must carry normalized snake_case columns (fpx_shipments row or a
+// mapShipment() result).
+// Task-title convention for the redelivery pair. Both the carrier task
+// ("Carrier followup: Redelivery — ...") and the customer-notify task
+// ("Customer followup: Redelivery — notify customer ...") carry the word so
+// /tasks search on "Redelivery" finds both and the task builder can tell
+// whether a shipment already has redelivery tasks.
+export const REDELIVERY_TAG = "Redelivery — ";
+export function isRedeliveryTitle(title) {
+  return typeof title === "string" && /redelivery/i.test(title);
+}
+
+function ts(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? null : t;
+}
+
+function commentText(r) {
+  return [r?.tracking_comments, r?.comments]
+    .filter((v) => typeof v === "string" && v.trim())
+    .join(" / ")
+    .trim()
+    .toLowerCase();
+}
+
+// Did the redelivery fail AGAIN between the prior scrape (`prev`, the
+// fpx_shipments row before upsert) and this scrape (`next`, the mapShipment
+// result)? Only meaningful when the shipment already has redelivery tasks;
+// the caller checks that. A second failed attempt in the same city produces
+// the *identical* carrier comment ("Attempted Delivery in MODESTO, CA"), so
+// text change alone is not enough — we also treat a move in the carrier's
+// last-modified stamp or a new updated ETA while the comment still says
+// "attempted" as a new failure event. Re-entering the redelivery state
+// (prev comment was "Out for delivery", next is "Attempted" again) counts too.
+export function isNewFailureEvent(prev, next) {
+  if (!prev || !next) return false;
+  if (detectRedelivery(next) !== true) return false;
+  if (detectRedelivery(prev) !== true) return true;
+  if (commentText(prev) !== commentText(next)) return true;
+  const pm = ts(prev.last_modified_at);
+  const nm = ts(next.last_modified_at);
+  if (pm !== null && nm !== null && nm > pm) return true;
+  const pe = ts(prev.updated_eta);
+  const ne = ts(next.updated_eta);
+  if (pe !== null && ne !== null && ne !== pe) return true;
+  return false;
+}
+
+export function detectRedelivery(src) {
+  if (!src || !isLtlMode(src.mode)) return null;
+  const text = [src.tracking_comments, src.comments]
+    .filter((v) => typeof v === "string" && v.trim())
+    .join(" / ");
+  if (!text) return null;
+  const delivered = src.delivery_date !== null && src.delivery_date !== undefined && src.delivery_date !== "";
+  if (delivered) return false;
+  return REDELIVERY_PATTERN.test(text);
+}

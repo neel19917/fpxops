@@ -145,7 +145,7 @@ export function mapShipment(raw, runnerName) {
     tracking_comments: cleanField(pick(raw, ["Tracking Comments", "TRACKING COMMENTS", "TrackingComments"]), { maxLen: 500 }),
     shipper_spot_quote: pick(raw, ["Shipper Spot Quote", "Spot Quote", "SHIPPER SPOT QUOTE", "SpotQuote"]),
     pickup_tendered: pick(raw, ["Pickup Tendered", "PICKUP TENDERED", "PickupTendered"]),
-    last_modified_at: toIso(pick(raw, ["Last Modified", "Last Modified At", "LAST MODIFIED", "LastModified", "Modified Date", "Modified On"])),
+    last_modified_at: toIso(pick(raw, ["Last Modified", "Last Modified At", "Last Modified Date", "LAST MODIFIED", "LastModified", "Modified Date", "Modified On"])),
     updated_via: pick(raw, ["Updated Via", "UPDATED VIA", "UpdatedVia"]),
     original_eta: toIso(pick(raw, ["Original ETA", "ORIGINAL ETA", "OriginalETA"])),
     order_number: pick(raw, ["Order Number", "Order #", "Order#", "ORDER NUMBER", "OrderNumber"]),
