@@ -6,6 +6,7 @@ import { generateEmailDraft } from "../lib/emailDraft.js";
 import { getSettings } from "../lib/settings.js";
 import { analyzeExistingShipment, runShipmentAnalysis } from "./analyze.js";
 import { extractAiJsonFields } from "../lib/anthropic.js";
+import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG } from "../lib/redelivery.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
 
 // Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
@@ -70,9 +71,15 @@ const AUTO_ANALYZE_CONCURRENCY = 4;
 // from the prior scrape. The bulk POST flow builds it before calling this.
 async function autoAnalyzeUpserted(req, upsertedIds, { materialChangedIds = new Set() } = {}) {
   if (!upsertedIds.length) return [];
+  // Full row on purpose: runShipmentAnalysis -> computeTemporalTriggers /
+  // detectRedelivery read the normalized date + comment columns AND
+  // scraped_at (as_of anchor) off this row. The previous narrow select
+  // starved them, so every trigger came back null on the scrape path and
+  // as_of fell back to wall-clock. Manual re-analyze routes already
+  // select("*"); this makes the auto path match.
   const { data: rows, error } = await supabase
     .from("fpx_shipments")
-    .select("id, tracking_number, action_required, action_source, action_target, raw_data, ai_issue, ai_recommendation, created_by")
+    .select("*")
     .in("id", upsertedIds);
   if (error) {
     console.warn("[FPX] auto-analyze fetch failed:", error.message);
@@ -164,7 +171,8 @@ async function runPostUpsertFlow(req, {
     const byId = new Map(data.map((r) => [r.id, r]));
     for (const r of freshlyAnalyzed) byId.set(r.id, r);
     const settled = Array.from(byId.values());
-    const tasks = await autoCreateActionTasks(req, settled, { diffByTracking });
+    const mappedByTracking = new Map(mapped.map((m) => [m.tracking_number, m]));
+    const tasks = await autoCreateActionTasks(req, settled, { diffByTracking, priorByTracking, mappedByTracking });
     const drafts = await autoDraftEmails(settled);
     if (tasks || drafts || freshlyAnalyzed.length) {
       console.log(`[FPX] post-upload: ${freshlyAnalyzed.length} (re)analyzed, ${tasks} task(s), ${drafts} draft(s)`);
@@ -193,7 +201,84 @@ function formatChangeLog(diff) {
   return ["Change log:", ...lines].join("\n");
 }
 
-async function autoCreateActionTasks(req, upsertedRows, { diffByTracking = new Map() } = {}) {
+// First sentence of the AI recommendation (or the issue) as a task title.
+function reasonLineFor(s) {
+  return s.ai_recommendation
+    ? String(s.ai_recommendation).split(/[.!?]\s/)[0].slice(0, 140)
+    : (s.ai_issue ? String(s.ai_issue).slice(0, 140) : "Action needed on this shipment");
+}
+
+function buildStandardTask(s, changeLog) {
+  // When the AI knows who to chase (action_target), prefix the task
+  // title with the matching followup convention so the task lands
+  // in the Carrier Followups or Customer Followups panel on /tasks.
+  // Without this prefix, auto-created tasks were "stranded" in the
+  // generic Kanban — the operator had to hand-tag every one to
+  // surface it in the grouped view.
+  const tgt = String(s.action_target || "").toLowerCase();
+  const prefix =
+    tgt === "carrier" ? "Carrier followup: "
+    : tgt === "customer" ? "Customer followup: "
+    : "";
+  // Append the material diff (what moved between scrapes) so the rep
+  // sees exactly what changed without opening the drawer's history
+  // tab. First-sighting shipments have no diff and the section is
+  // omitted cleanly.
+  const description = [s.ai_issue, s.ai_recommendation, changeLog].filter(Boolean).join("\n\n");
+  return {
+    shipment_id: s.id,
+    tracking_number: s.tracking_number,
+    title: prefix + reasonLineFor(s),
+    description,
+    status: "open",
+    priority: "high",
+    assigned_to: s.created_by || null,
+    created_by: "system (auto-flag)",
+  };
+}
+
+// LTL redelivery pair (FPX Directory ask, 2026-09): one carrier task to
+// get the freight re-delivered, one customer task to tell the customer
+// the attempt failed. Both carry "Redelivery — " so /tasks search finds
+// them, and each lands in its Carrier/Customer Followups panel via the
+// prefix. `attempt` > 1 means the redelivery itself failed again.
+function buildRedeliveryTasks(s, changeLog, attempt) {
+  const suffix = attempt > 1 ? ` (attempt ${attempt})` : "";
+  const repeatNote = attempt > 1
+    ? `Redelivery failed again — this is failed attempt #${attempt} on this shipment. Earlier redelivery tasks exist; check them before calling the carrier.`
+    : null;
+  const base = {
+    shipment_id: s.id,
+    tracking_number: s.tracking_number,
+    status: "open",
+    priority: "high",
+    assigned_to: s.created_by || null,
+    created_by: "system (auto-flag)",
+  };
+  return [
+    {
+      ...base,
+      title: `Carrier followup: ${REDELIVERY_TAG}${reasonLineFor(s)}${suffix}`,
+      description: [repeatNote, s.ai_issue, s.ai_recommendation, changeLog].filter(Boolean).join("\n\n"),
+    },
+    {
+      ...base,
+      title: `Customer followup: ${REDELIVERY_TAG}notify customer of failed delivery attempt${suffix}`,
+      description: [
+        repeatNote,
+        "Let the customer know the carrier attempted delivery and could not complete it, and that FPX is arranging a redelivery. Confirm receiving hours, on-site contact, and whether a delivery appointment is required.",
+        s.ai_issue,
+        changeLog,
+      ].filter(Boolean).join("\n\n"),
+    },
+  ];
+}
+
+async function autoCreateActionTasks(
+  req,
+  upsertedRows,
+  { diffByTracking = new Map(), priorByTracking = new Map(), mappedByTracking = new Map() } = {},
+) {
   // Parcel shipments don't get auto-tasks by default — operators don't
   // follow up on parcel exceptions the same way, so the noise was drowning
   // out the LTL/truckload work that actually needs human action. Gated on
@@ -215,49 +300,55 @@ async function autoCreateActionTasks(req, upsertedRows, { diffByTracking = new M
   // tasks (shipment was delivered/auto-archived) still don't count —
   // a shipment that comes back into the dashboard with a new issue
   // should get a fresh task.
+  //
+  // Redelivery is the one exception to "one task per shipment, ever":
+  // a failed delivery attempt is a discrete event, and FPX Directory
+  // wants each one worked. So a redelivery shipment gets a PAIR of
+  // tasks (carrier re-attempt + notify customer) the first time, and a
+  // fresh pair every time the redelivery fails again — detected from
+  // the prior-vs-current scrape, not from the model's wording.
   const { data: existing } = await supabase
     .from("fpx_shipment_tasks")
-    .select("shipment_id")
+    .select("shipment_id, title, status")
     .in("shipment_id", ids)
     .in("status", ["open", "in_progress", "done", "cancelled"])
     .is("archived_at", null);
-  const taken = new Set((existing || []).map((r) => r.shipment_id));
-  const toCreate = candidates.filter((s) => !taken.has(s.id));
-  if (!toCreate.length) return 0;
+  const existingByShipment = new Map();
+  for (const t of existing || []) {
+    if (!existingByShipment.has(t.shipment_id)) existingByShipment.set(t.shipment_id, []);
+    existingByShipment.get(t.shipment_id).push(t);
+  }
 
-  const rows = toCreate.map((s) => {
-    const reasonLine = s.ai_recommendation
-      ? String(s.ai_recommendation).split(/[.!?]\s/)[0].slice(0, 140)
-      : (s.ai_issue ? String(s.ai_issue).slice(0, 140) : "Action needed on this shipment");
-    // When the AI knows who to chase (action_target), prefix the task
-    // title with the matching followup convention so the task lands
-    // in the Carrier Followups or Customer Followups panel on /tasks.
-    // Without this prefix, auto-created tasks were "stranded" in the
-    // generic Kanban — the operator had to hand-tag every one to
-    // surface it in the grouped view.
-    const tgt = String(s.action_target || "").toLowerCase();
-    const prefix =
-      tgt === "carrier" ? "Carrier followup: "
-      : tgt === "customer" ? "Customer followup: "
-      : "";
-    // Append the material diff (what moved between scrapes) so the rep
-    // sees exactly what changed without opening the drawer's history
-    // tab. First-sighting shipments have no diff and the section is
-    // omitted cleanly.
+  const rows = [];
+  for (const s of candidates) {
+    const prior = existingByShipment.get(s.id) || [];
     const changeLog = formatChangeLog(diffByTracking.get(s.tracking_number));
-    const description = [s.ai_issue, s.ai_recommendation, changeLog]
-      .filter(Boolean).join("\n\n");
-    return {
-      shipment_id: s.id,
-      tracking_number: s.tracking_number,
-      title: prefix + reasonLine,
-      description,
-      status: "open",
-      priority: "high",
-      assigned_to: s.created_by || null,
-      created_by: "system (auto-flag)",
-    };
-  });
+    // Detect off the freshly mapped row when we have it (most complete),
+    // falling back to the upserted/analyzed row.
+    const current = mappedByTracking.get(s.tracking_number) || s;
+    const redelivery = detectRedelivery({ ...s, ...current }) === true;
+
+    if (!redelivery) {
+      if (prior.length) continue;
+      rows.push(buildStandardTask(s, changeLog));
+      continue;
+    }
+
+    const priorRedelivery = prior.filter((t) => isRedeliveryTitle(t.title));
+    let attempt;
+    if (!priorRedelivery.length) {
+      attempt = 1;
+    } else if (isNewFailureEvent(priorByTracking.get(s.tracking_number), current)) {
+      // Count prior carrier-side redelivery tasks so the title reads
+      // "(attempt 3)" on the third failure, not "(attempt 2)" forever.
+      attempt = priorRedelivery.filter((t) => /carrier/i.test(t.title)).length + 1;
+    } else {
+      continue;
+    }
+    rows.push(...buildRedeliveryTasks(s, changeLog, attempt));
+  }
+  if (!rows.length) return 0;
+
   const { data, error } = await supabase
     .from("fpx_shipment_tasks").insert(rows).select("id, shipment_id, tracking_number, title");
   if (error) {
@@ -468,7 +559,7 @@ shipmentsRouter.post("/", async (req, res) => {
     // Pull prior so the diff sees what moved before the upsert clobbers
     // the row. Mirrors the bulk path so single-shipment scrapes get the
     // same Change log + dedup + scrape history treatment.
-    const cols = ["id", "tracking_number", "action_source", ...MATERIAL_FIELDS].join(", ");
+    const cols = ["id", "tracking_number", "action_source", "mode", "last_modified_at", ...MATERIAL_FIELDS].join(", ");
     const { data: prior } = await supabase
       .from("fpx_shipments").select(cols).eq("tracking_number", mapped.tracking_number).maybeSingle();
     const priorByTracking = new Map();
@@ -510,7 +601,7 @@ shipmentsRouter.post("/", async (req, res) => {
     const trackingNumbers = mapped.map((m) => m.tracking_number).filter(Boolean);
     const priorByTracking = new Map();
     if (trackingNumbers.length) {
-      const cols = ["id", "tracking_number", "action_source", ...MATERIAL_FIELDS].join(", ");
+      const cols = ["id", "tracking_number", "action_source", "mode", "last_modified_at", ...MATERIAL_FIELDS].join(", ");
       const { data: priors } = await supabase
         .from("fpx_shipments").select(cols).in("tracking_number", trackingNumbers);
       for (const p of priors || []) priorByTracking.set(p.tracking_number, p);
@@ -526,7 +617,7 @@ shipmentsRouter.post("/", async (req, res) => {
     const { data, error } = await supabase
       .from("fpx_shipments")
       .upsert(mapped, { onConflict: "tracking_number" })
-      .select("id,tracking_number,seen_count,created_by,action_required,action_source,action_target,ai_issue,ai_recommendation");
+      .select("id,tracking_number,seen_count,created_by,mode,tracking_comments,comments,delivery_date,action_required,action_source,action_target,ai_issue,ai_recommendation");
     if (error) return res.status(500).json({ error: error.message });
 
     const upsertedIds = data.map((r) => r.id);
