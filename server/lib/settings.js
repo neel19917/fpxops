@@ -67,7 +67,7 @@ const FALLBACKS = {
     '3. batches — groups of 2+ tasks that should be worked in ONE call or email (same consignee location, same carrier terminal, same customer). Give a label and reason.\n' +
     '4. risks — up to 5 short observations the lead should know (e.g. "3 Modesto redeliveries for the same consignee — likely a receiving-hours problem").\n' +
     '5. summary — 2-3 plain sentences for the standup.\n\n' +
-    'Rules: only reference task_id values that appear in the input. Do not invent shipments. Never put the same task_id in both priority_queue and close_candidates. Output strict JSON only, no prose before or after, with keys: summary, priority_queue [{task_id, reason, first_action}], close_candidates [{task_id, disposition, reason}], batches [{label, reason, task_ids}], risks [string].',
+    'Rules: only reference task_id values that appear in the input. Do not invent shipments. Never put the same task_id in both priority_queue and close_candidates. Be terse: every reason and first_action is ONE sentence under 25 words; at most 15 priority_queue items, 30 close_candidates (the clearest cases first), 8 batches, 5 risks. Output strict JSON only, no prose before or after, with keys: summary, priority_queue [{task_id, reason, first_action}], close_candidates [{task_id, disposition, reason}], batches [{label, reason, task_ids}], risks [string].',
   // Days without a scrape before a task's shipment data counts as stale on
   // the Tasks v2 board. 7 = "not seen this week"; the scraper normally hits
   // every live shipment daily, so anything past that has dropped off the
