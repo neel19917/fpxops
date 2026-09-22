@@ -234,3 +234,79 @@ Saved to `chrome.storage.local`. Reset button restores the hardcoded defaults de
 | `.k-animation-container`, `.k-filter-menu` | Kendo filter popup containers |
 | `.k-pager-nav[title="Go to the next page"]` | Kendo pagination next-page button |
 | `waitForCloseButton(15000)` | 15 s timeout polling for a visible CLOSE button in the modal |
+
+---
+
+## LTL Redelivery Flagging (server)
+
+Server-side logic (`server/`), added 2026-09-18 at FPX Directory's request: LTL deliveries that must be re-attempted are flagged deterministically, not left to whether the model happens to read it out of the carrier's free-text comment.
+
+### Scope
+
+| Rule | Decision |
+|---|---|
+| Modes | **LTL only** (`mode` = "LTL", case-insensitive). Parcel is excluded, and parcels never spawn tasks anyway (`ui.tracking.show_parcels`, default off). |
+| Refusals | **Not** a redelivery. A refused shipment needs a customer disposition (accept / return / claim), not another attempt. The generic exception rules still catch it. |
+| "Attempting to schedule a delivery appointment" | Not a redelivery. |
+
+### Detection (`detectRedelivery` in `server/lib/redelivery.js`)
+
+The signal only exists in free text. There is no status value or date column for it. The detector reads `tracking_comments` + `comments` and checks `delivery_date`:
+
+| Returns | When |
+|---|---|
+| `true` | LTL, no `delivery_date`, and the comment text matches `REDELIVERY_PATTERN` |
+| `false` | LTL with comment text but no match, **or** a `delivery_date` is present |
+| `null` | Not LTL, or no comment text at all (could not evaluate) |
+
+`REDELIVERY_PATTERN` matches: *attempted deliver*, *delivery attempt*, *re-attempt*, *redeliver*, *resched*, *tried to deliver*, *unable to deliver*, *could not (be) deliver*, *missed deliver*, *business / consignee / receiver / customer (was / is) closed / unavailable*, *undeliverable*, *no one (was) available / present / home*.
+
+Note: AAA Cooper's event history (`raw_data.Details`) labels a failed attempt "Returned - not delivered". That means back to the terminal, **not** returned to the shipper.
+
+### Where the flag is used
+
+1. **Temporal trigger.** `computeTemporalTriggers` (`routes/analyze.js`) exposes `redelivery_needed` (true / false / null) to the per-shipment prompt.
+2. **Prompt rule** (`PER_SHIPMENT_LOGIC` in `prompts.js`). If `redelivery_needed` is true, or the comments describe a failed or rescheduled attempt or a closed consignee with no `delivery_date`, the model must flag it: `issue` starts with "Redelivery needed:", `actionConfidence` ≥ 0.85, and `actionTarget` = carrier (customer if the consignee must schedule). "Out For Delivery" alone does **not** resolve a redelivery; only a `delivery_date`, or a status or comment that explicitly confirms delivery, does.
+3. **Auto-tasks** (`autoCreateActionTasks` in `routes/shipments.js`). These run after every scrape upload (`POST /api/shipments`) for every upserted row with `action_required = YES`.
+
+### Task pair
+
+A redelivery gets **two** tasks, where a standard action-required shipment gets one:
+
+| Task | Title |
+|---|---|
+| Carrier | `Carrier followup: Redelivery — <first sentence of AI recommendation>` |
+| Customer | `Customer followup: Redelivery — notify customer of failed delivery attempt` |
+
+The `Redelivery — ` tag (`REDELIVERY_TAG`) is what /tasks search finds. It is also how the task builder recognises existing redelivery tasks: `isRedeliveryTitle` matches the structured tag `^(Carrier|Customer) followup: Redelivery — ` only, never the word anywhere in the title (a legacy free-text title once suppressed a pair). The Carrier/Customer prefix places each task in its Followups panel.
+
+### Dedup and repeat failures
+
+Existing tasks are looked up per shipment with status `open`, `in_progress`, `done` or `cancelled` and `archived_at` null.
+
+| Situation | Result |
+|---|---|
+| Not a redelivery, shipment already has any task | Skip (one task per shipment, ever) |
+| Not a redelivery, no tasks | One standard task |
+| Redelivery, no prior redelivery-tagged task | Pair, attempt 1 |
+| Redelivery, prior pair exists, `isNewFailureEvent(prev, next)` true | New pair titled `(attempt N)`, N = prior carrier redelivery tasks + 1, with a "failed again" note |
+| Redelivery, prior pair exists, no new failure event | Skip |
+
+`isNewFailureEvent(prev, next)` compares the pre-upsert row (`priorByTracking`) with the freshly mapped scrape. It is true when `next` is a redelivery **and** any of these hold:
+
+- `prev` was not in the redelivery state (the shipment re-entered it)
+- the comment text changed
+- `shipment_status` moved **off** "Out For Delivery" with no delivery date (the out-for-delivery run came back undelivered)
+- `updated_eta` changed
+
+**Changed 2026-09-22 (commit `e0992ed`):** a `last_modified_at` tick alone no longer counts. The carrier's "Last Modified Date" is date-only and ticks on any edit to the record. On 373410034 it ticked as the shipment went back **out** for delivery and spawned a bogus "(attempt 2)" pair before anything had failed. `last_modified_at` is also deliberately not in `MATERIAL_FIELDS`, so a stamp tick never triggers a paid re-analysis.
+
+### Known gaps
+
+| Gap | Effect |
+|---|---|
+| **Hard-deleted tasks respawn.** Dedup only sees tasks that still exist. | Deleting a task on a shipment that is still `action_required = YES` recreates it on the next scrape. To clear one for good, mark it `done` or `cancelled`. (2026-09-22: 45 of 68 tasks deleted in a /tasks clean-up were on still-flagged shipments.) |
+| **No ageing.** Detection ignores how old the attempt is. | A 99-day-old "Attempted Delivery" still spawns a pair (the 2026-09-18 backfill included May–July attempts). Shipments that drop off the scraped grid are never re-scraped, never get a `delivery_date`, and their tasks never auto-archive. |
+| **Return to shipper is invisible.** | The carrier comment keeps saying "Attempted Delivery…" after the freight is returned, so the shipment still reads as a redelivery. Only an operator note records it (373410034, 2026-09-22). Close the redelivery tasks by hand and track the return separately. |
+| **Missed Out For Delivery window.** | If no scrape catches the shipment while it is "Out For Delivery", a second failure in the same city with the same comment is only detected if `updated_eta` moves. |
+| **No scrape history.** `fpx_shipment_scrapes` is empty in prod. | Repeat-failure decisions can't be reconstructed after the fact. |
