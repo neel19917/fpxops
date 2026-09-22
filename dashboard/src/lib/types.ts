@@ -291,6 +291,95 @@ export interface CarrierFollowupShipment {
   action_required: ActionStatus;
 }
 
+// ---------------------------------------------------------------------------
+// Tasks v2 board (/api/tasks/v2/*). Mirrors server/lib/taskSegments.js.
+// ---------------------------------------------------------------------------
+export type TaskSegment = "redelivery" | "return_claim" | "carrier" | "customer" | "other";
+export type TaskFlag = "resolved_upstream" | "stale" | "duplicate" | "repeat" | "aging" | "unassigned" | "blocked";
+
+export interface TaskBoardShipment {
+  id: string;
+  tracking_number: string | null;
+  shipment_id: string | null;
+  customer_name: string | null;
+  carrier: string | null;
+  carrier_name: string | null;
+  mode: string | null;
+  shipment_status: string | null;
+  updated_eta: string | null;
+  delivery_date: string | null;
+  scraped_at: string | null;
+  last_modified_at: string | null;
+  archived_at: string | null;
+  action_required: string | null;
+  action_target: string | null;
+  action_confidence: number | string | null;
+  ai_issue: string | null;
+  ai_recommendation: string | null;
+  tracking_comments: string | null;
+  origin: string | null;
+  destination: string | null;
+}
+
+export interface TaskClassification {
+  segment: TaskSegment;
+  attempt: number | null;
+  flags: TaskFlag[];
+  age_days: number | null;
+  days_since_scrape: number | null;
+  health: string | null;
+}
+
+export interface TaskBoardRow {
+  task: ShipmentTask;
+  shipment: TaskBoardShipment | null;
+  seg: TaskClassification;
+}
+
+export interface TaskBoardSummary {
+  total: number;
+  active: number;
+  needs_attention: number;
+  by_status: Record<string, number>;
+  by_segment: Record<string, number>;
+  by_flag: Record<string, number>;
+  by_assignee: Record<string, number>;
+  by_carrier: Record<string, number>;
+  by_customer: Record<string, number>;
+}
+
+export interface TaskBoard {
+  rows: TaskBoardRow[];
+  summary: TaskBoardSummary;
+  stale_days: number;
+  segments: { id: TaskSegment; label: string; description: string }[];
+  flags: { id: TaskFlag; label: string; tone: string; description: string }[];
+  generated_at: string;
+}
+
+export interface TaskTriage {
+  summary: string;
+  priority_queue: { task_id: string; rank: number; reason: string; first_action: string }[];
+  close_candidates: { task_id: string; disposition: "resolved" | "stale" | "duplicate" | "superseded" | "not_actionable"; reason: string }[];
+  batches: { label: string; reason: string; task_ids: string[] }[];
+  risks: string[];
+  dropped_ids?: number;
+}
+
+export interface TaskTriageResult {
+  triage: TaskTriage | null;
+  analysis_id: string | null;
+  created_at: string | null;
+  model: string | null;
+  cost_usd: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  count: number | null;
+  scope: string | null;
+  user_email?: string | null;
+  truncated?: boolean;
+}
+
 export type FeedbackCategory = "bug" | "feature" | "support" | "other";
 export type FeedbackStatus = "open" | "triaged" | "in_progress" | "resolved" | "wont_fix";
 export type FeedbackSeverity = "low" | "normal" | "high" | "urgent";

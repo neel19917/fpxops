@@ -3,6 +3,9 @@ import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { computeWalkContext } from "../lib/taskWalk.js";
 import { generateCarrierGroupEmail, generateCustomerGroupEmail } from "../lib/emailDraft.js";
+import { buildBoard, TASK_SEGMENTS, TASK_FLAGS } from "../lib/taskSegments.js";
+import { runTaskTriage, extractJson, normalizeTriage, TRIAGE_MAX_ROWS } from "../lib/taskTriage.js";
+import { getSettings } from "../lib/settings.js";
 
 export const tasksRouter = Router();
 
@@ -357,6 +360,194 @@ tasksRouter.post("/customer-email-draft", async (req, res) => {
     metadata: { customer, task_ids: taskIds, count: items.length, model: result.model || null },
   });
   res.json({ subject: result.subject, body: result.body, count: items.length, model: result.model || null });
+});
+
+// ---------------------------------------------------------------------------
+// Tasks v2 board
+// ---------------------------------------------------------------------------
+// The v2 page needs every active task joined to its shipment in one shot,
+// plus a segment + health classification per task (lib/taskSegments.js).
+// Static /v2/* paths sit above the UUID-constrained /:id routes; the regex
+// on those would reject "v2" anyway, but keep the ordering obvious.
+
+const BOARD_SHIPMENT_COLS = [
+  "id", "tracking_number", "shipment_id", "customer_name", "carrier", "carrier_name", "mode",
+  "shipment_status", "updated_eta", "delivery_date", "scraped_at", "last_modified_at", "archived_at",
+  "action_required", "action_target", "action_confidence", "ai_issue", "ai_recommendation",
+  "tracking_comments", "origin", "destination", "ship_from", "ship_to",
+].join(", ");
+
+// Load tasks + shipments and classify. `statuses` defaults to the active
+// set; pass include_closed to add done/cancelled from the last N days so
+// the board can show what was just cleared (and so triage can see that a
+// shipment already had a worked task).
+async function loadBoard({ includeClosed = false, closedDays = 7, staleDays } = {}) {
+  const ACTIVE = ["open", "in_progress", "blocked"];
+  let q = supabase.from("fpx_shipment_tasks").select("*").is("archived_at", null)
+    .order("created_at", { ascending: false }).limit(2000);
+  if (includeClosed) {
+    const since = new Date(Date.now() - closedDays * 86400000).toISOString();
+    q = q.or(`status.in.(${ACTIVE.join(",")}),and(status.in.(done,cancelled),updated_at.gte.${since})`);
+  } else {
+    q = q.in("status", ACTIVE);
+  }
+  const { data: tasks, error } = await q;
+  if (error) throw new Error(error.message);
+
+  const shipIds = Array.from(new Set((tasks || []).map((t) => t.shipment_id).filter(Boolean)));
+  const byId = new Map();
+  // .in() with ~1000 uuids is fine for PostgREST; chunk anyway to stay
+  // under URL-length limits on the widest boards.
+  for (let i = 0; i < shipIds.length; i += 400) {
+    const chunk = shipIds.slice(i, i + 400);
+    const { data: ships, error: shipErr } = await supabase
+      .from("fpx_shipments").select(BOARD_SHIPMENT_COLS).in("id", chunk);
+    if (shipErr) throw new Error(shipErr.message);
+    for (const s of ships || []) byId.set(s.id, s);
+  }
+
+  let stale = staleDays;
+  if (!Number.isFinite(stale)) {
+    const s = await getSettings("ui.tasks.stale_days");
+    stale = Number(s["ui.tasks.stale_days"]) || 7;
+  }
+  const board = buildBoard(tasks || [], byId, { staleDays: stale });
+  return { ...board, stale_days: stale };
+}
+
+// GET /tasks/v2/board?include_closed=1&stale_days=7
+tasksRouter.get("/v2/board", async (req, res) => {
+  try {
+    const includeClosed = req.query.include_closed === "1" || req.query.include_closed === "true";
+    const staleDays = req.query.stale_days ? Number(req.query.stale_days) : undefined;
+    const board = await loadBoard({ includeClosed, staleDays });
+    res.json({
+      ...board,
+      segments: TASK_SEGMENTS,
+      flags: TASK_FLAGS,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /tasks/v2/triage  { ids?: string[], segment?: string, notes?: string }
+// Heavy-model pass over the active board (or the supplied subset). Returns
+// the normalized triage plus cost; the raw call is on fpx_ai_analyses with
+// metadata.subkind = task_triage so /v2/triage/latest can replay it.
+tasksRouter.post("/v2/triage", async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? new Set(req.body.ids.filter((x) => typeof x === "string")) : null;
+    const segment = typeof req.body?.segment === "string" && req.body.segment ? req.body.segment : null;
+    const notes = typeof req.body?.notes === "string" ? req.body.notes : null;
+
+    const board = await loadBoard({ includeClosed: false });
+    let rows = board.rows;
+    if (ids && ids.size) rows = rows.filter((r) => ids.has(r.task.id));
+    else if (segment) rows = rows.filter((r) => r.seg.segment === segment);
+    if (!rows.length) return res.status(400).json({ error: "No active tasks in scope" });
+
+    const scopeLabel = ids && ids.size ? `${rows.length} selected tasks` : segment ? `segment: ${segment}` : "all active tasks";
+    const result = await runTaskTriage({
+      rows,
+      notes,
+      scopeLabel,
+      callMeta: { api_key_id: req.apiKey?.id, user_email: req.user?.email },
+    });
+    if (result.error) return res.status(500).json({ error: result.error });
+
+    logAudit(req, {
+      action: "create", entity_type: "task_triage", entity_id: result.analysis_id || null,
+      summary: `Ran AI task triage over ${result.count} task(s) (${scopeLabel})`,
+      metadata: {
+        scope: scopeLabel, count: result.count, model: result.model, cost_usd: result.cost_usd,
+        priority: result.triage.priority_queue.length, close: result.triage.close_candidates.length,
+        batches: result.triage.batches.length, truncated: result.truncated, max_rows: TRIAGE_MAX_ROWS,
+      },
+    });
+    res.json({
+      ...result,
+      analysis_id: result.analysis_id,
+      created_at: new Date().toISOString(),
+      scope: scopeLabel,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /tasks/v2/triage/latest — most recent triage run, re-normalized
+// against the CURRENT active task ids so tasks closed since the run drop
+// out of the queue instead of showing as ghosts.
+tasksRouter.get("/v2/triage/latest", async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("fpx_ai_analyses")
+      .select("id, created_at, model, response_text, cost_usd, input_tokens, output_tokens, user_email, metadata")
+      .contains("metadata", { subkind: "task_triage" })
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (error) return res.status(500).json({ error: error.message });
+    const row = data?.[0];
+    if (!row) return res.json({ triage: null });
+
+    const { data: active } = await supabase
+      .from("fpx_shipment_tasks").select("id").in("status", ["open", "in_progress", "blocked"]).is("archived_at", null).limit(3000);
+    const knownIds = new Set((active || []).map((t) => t.id));
+    const triage = normalizeTriage(extractJson(row.response_text), knownIds);
+    res.json({
+      triage,
+      analysis_id: row.id,
+      created_at: row.created_at,
+      model: row.model,
+      cost_usd: row.cost_usd,
+      input_tokens: row.input_tokens,
+      output_tokens: row.output_tokens,
+      count: row.metadata?.count ?? null,
+      scope: row.metadata?.scope ?? null,
+      user_email: row.user_email || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /tasks/v2/dismiss  { ids: string[], reason?: string, disposition?: string }
+// The v2 board's replacement for bulk-delete. Sets status=cancelled and
+// stamps the reason on the description, so the row stays as a dedup
+// tombstone (auto-tasks won't respawn on the next scrape — the exact
+// problem the 2026-09-22 hard-deletes caused) and the audit trail says why.
+tasksRouter.post("/v2/dismiss", async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((x) => typeof x === "string") : [];
+  if (!ids.length) return res.status(400).json({ error: "ids required" });
+  const reason = String(req.body?.reason || "").trim().slice(0, 300);
+  const disposition = String(req.body?.disposition || "dismissed").trim().slice(0, 40);
+  const who = req.user?.email || req.apiKey?.name || "operator";
+  const stamp = new Date().toISOString().slice(0, 10);
+  const note = `[${stamp} ${disposition} by ${who}]${reason ? ` ${reason}` : ""}`;
+
+  const { data: before, error: readErr } = await supabase
+    .from("fpx_shipment_tasks").select("id, title, status, description").in("id", ids);
+  if (readErr) return res.status(500).json({ error: readErr.message });
+  const rows = (before || []).filter((t) => t.status !== "done" && t.status !== "cancelled");
+  if (!rows.length) return res.json({ dismissed: 0, skipped: ids.length });
+
+  // Per-row update so each description gets its own appended note.
+  let dismissed = 0;
+  for (const t of rows) {
+    const description = [t.description, note].filter(Boolean).join("\n\n");
+    const { error } = await supabase.from("fpx_shipment_tasks")
+      .update({ status: "cancelled", description, completed_at: null })
+      .eq("id", t.id);
+    if (!error) dismissed++;
+  }
+  logAudit(req, {
+    action: "bulk_update", entity_type: "task",
+    summary: `Dismissed ${dismissed} task(s) (${disposition})${reason ? `: ${reason.slice(0, 80)}` : ""}`,
+    metadata: { count: dismissed, ids: rows.map((r) => r.id), disposition, reason, titles: rows.map((r) => r.title) },
+  });
+  res.json({ dismissed, skipped: ids.length - dismissed });
 });
 
 // GET /tasks/:id  — task lookup by id, with optional walk-through context.

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, Truck, Mail, Copy, Check, Send, Search, Plus, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Keyboard, ListChecks, Pencil, RefreshCw, Trash2, CheckCircle2, Circle, ExternalLink, UserPlus, X, Play, Ban, Rocket, LayoutGrid, Table as TableIcon, Truck, Mail, Copy, Check, Send, Search, Plus, ThumbsUp, ThumbsDown, Sparkles } from "lucide-react";
 import { api, type GroupEmailDraft } from "../lib/api";
 import type { CarrierFollowupShipment, Shipment, ShipmentTask, TaskStatus, TaskPriority } from "../lib/types";
 import { fmtRelative } from "../lib/format";
@@ -632,6 +632,14 @@ export function TasksPage() {
           <p className="text-sm text-slate-500 mt-0.5">Follow-ups across shipments. Auto-assigned to whoever scraped the shipment.</p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => navigate("/tasks/v2")}
+            className="rounded-lg ring-1 ring-violet-200 bg-violet-50 text-violet-800 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-violet-100"
+            title="Segmented board with health flags and AI triage"
+          >
+            <Sparkles className="h-4 w-4 shrink-0" />
+            <span>Try Tasks v2</span>
+          </button>
           <div className="inline-flex rounded-lg ring-1 ring-slate-200 bg-white overflow-hidden">
             <button
               onClick={() => setViewMode("table")}

@@ -10,6 +10,9 @@ const MODEL_PRICING = {
   "claude-sonnet-4-6":          { input: 3.00, output: 15.00 },
   "claude-opus-4-7":            { input: 5.00, output: 25.00 },
   "claude-opus-4-8":            { input: 5.00, output: 25.00 },
+  "claude-sonnet-5":            { input: 2.00, output: 10.00 },
+  "claude-opus-5":              { input: 5.00, output: 25.00 },
+  "claude-fable-5-1":           { input: 10.00, output: 50.00 },
 };
 
 const LARGE_PROMPT_CHARS = 12000;
