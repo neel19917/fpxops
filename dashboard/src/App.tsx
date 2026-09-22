@@ -16,6 +16,7 @@ import { PendingApprovalPage } from "./pages/PendingApproval";
 // Vite splits each named-export wrapper into its own chunk.
 const ShipmentsPage   = lazy(() => import("./pages/Shipments").then((m) => ({ default: m.ShipmentsPage })));
 const TasksPage       = lazy(() => import("./pages/Tasks").then((m) => ({ default: m.TasksPage })));
+const TasksV2Page     = lazy(() => import("./pages/TasksV2").then((m) => ({ default: m.TasksV2Page })));
 const SharedViewPage  = lazy(() => import("./pages/SharedView").then((m) => ({ default: m.SharedViewPage })));
 const ExtLoginPage    = lazy(() => import("./pages/ExtLogin").then((m) => ({ default: m.ExtLoginPage })));
 const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
@@ -218,6 +219,9 @@ function AuthedApp() {
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
             <Route path="/tasks" element={<TasksPage />} />
+            {/* Tasks v2: segmented board + heavy-model triage. Static path,
+                so it must be declared before /tasks/:taskId below. */}
+            <Route path="/tasks/v2" element={<TasksV2Page />} />
             {/* Static sub-routes win over /tasks/:taskId in react-router v6
                 ranking (static > dynamic). They render the same TasksPage
                 with a different sub-tab inferred from the URL. */}

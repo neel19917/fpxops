@@ -310,3 +310,44 @@ Existing tasks are looked up per shipment with status `open`, `in_progress`, `do
 | **Return to shipper is invisible.** | The carrier comment keeps saying "Attempted Delivery…" after the freight is returned, so the shipment still reads as a redelivery. Only an operator note records it (373410034, 2026-09-22). Close the redelivery tasks by hand and track the return separately. |
 | **Missed Out For Delivery window.** | If no scrape catches the shipment while it is "Out For Delivery", a second failure in the same city with the same comment is only detected if `updated_eta` moves. |
 | **No scrape history.** `fpx_shipment_scrapes` is empty in prod. | Repeat-failure decisions can't be reconstructed after the fact. |
+
+---
+
+## Tasks v2 board (server + dashboard)
+
+Added 2026-09-22 after operators reported "duplicate" and stale tasks on /tasks. Lives at `/tasks/v2` (dashboard `pages/TasksV2.tsx`); the classic page is unchanged and links to it.
+
+### Segmentation (`server/lib/taskSegments.js`)
+
+Every task gets exactly one **segment** from its title and zero or more **health flags** from its shipment row:
+
+| Segment | Rule |
+|---|---|
+| `redelivery` | `isRedeliveryTitle` (structured `Redelivery — ` tag) |
+| `return_claim` | `^(Carrier|Customer) followup: Return/claim — ` |
+| `carrier` / `customer` | Carrier/Customer followup prefix (same convention as `/tasks/carrier-followups`) |
+| `other` | Anything else |
+
+| Flag | Rule |
+|---|---|
+| `resolved_upstream` | shipment has `delivery_date`, or `archived_at`, or `action_required` is NO / RESOLVED |
+| `stale` | `scraped_at` null or older than `ui.tasks.stale_days` (default 7) |
+| `duplicate` | 2+ active tasks on the same shipment |
+| `repeat` | title ends in `(attempt N)`, N > 1 |
+| `aging` | active and created 5+ days ago |
+| `unassigned` / `blocked` | literal |
+
+`buildBoard()` also returns a summary (counts by segment / flag / assignee / carrier / customer, plus `needs_attention` = active redelivery + return/claim + repeat, minus resolved).
+
+### Endpoints (`server/routes/tasks.js`)
+
+| Route | Purpose |
+|---|---|
+| `GET /api/tasks/v2/board?include_closed=1` | Active tasks (+ done/cancelled from the last 7 days when asked) joined to a slim shipment, classified |
+| `POST /api/tasks/v2/triage { ids? \| segment?, notes? }` | Heavy-model pass (setting `prompt.task_triage.model`, default `claude-opus-5`) over the board or a subset, capped at 150 rows. Returns `priority_queue`, `close_candidates`, `batches`, `risks`, `summary`; ids are validated against the input set. Logged to `fpx_ai_analyses` with `metadata.subkind = task_triage` |
+| `GET /api/tasks/v2/triage/latest` | Last triage, re-validated against the current active ids so closed tasks drop out |
+| `POST /api/tasks/v2/dismiss { ids, disposition?, reason? }` | Cancel-with-reason. Replaces delete on the v2 board: the cancelled row is the dedup tombstone that stops the auto-task builder from respawning the task |
+
+### Models
+
+`model.large` default moved from Sonnet 4.6 to `claude-opus-5`; triage defaults to `claude-opus-5`. Both are admin-editable under Settings → *Tasks v2 — AI triage* / *Models*. Pricing rows for `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5-1` were added to `MODEL_PRICING`.

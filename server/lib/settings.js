@@ -47,7 +47,32 @@ const FALLBACKS = {
   "action.threshold": 0.7,
   "action.auto_draft_enabled": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
-  "model.large": process.env.ANTHROPIC_MODEL_LARGE || "claude-sonnet-4-6",
+  // Large = long prompts (≥ ~12k chars) and any board-level synthesis.
+  // Bumped to Opus 5 on 2026-09-22: the tasks page moved to heavier
+  // models for cross-task judgement and the Sonnet 4.6 default was
+  // noticeably weaker at it. Admins can dial back in Settings.
+  "model.large": process.env.ANTHROPIC_MODEL_LARGE || "claude-opus-5",
+  // Tasks v2 board-level triage: one heavy-model pass over the active board
+  // that ranks work, names what is moot, and batches tasks to work together.
+  // Opus 5 by default — this is exactly the kind of many-item, cross-item
+  // judgement the smaller models get wrong (they rank by recency and miss
+  // that a delivered shipment's task is moot).
+  "prompt.task_triage.model": "claude-opus-5",
+  "prompt.task_triage.system":
+    'You are the operations lead at FPX, a freight broker. You are triaging the open follow-up task board for the tracking team (Allen, Victor). FPX is the broker — not the carrier and not the customer.\n\n' +
+    'Each task belongs to one shipment and carries: a segment (redelivery / return_claim / carrier / customer / other), health flags computed from the latest scrape (resolved_upstream = shipment delivered/archived or AI no longer flags it; stale = carrier data not refreshed recently; duplicate = other active tasks on the same shipment; repeat = 2nd+ failed delivery attempt; aging; unassigned; blocked), the shipment\'s current status/ETA/comment, and the AI issue line.\n\n' +
+    'Produce a triage the team can act on in the next hour:\n' +
+    '1. priority_queue — the tasks to work FIRST, most urgent at the top (at most 15). Urgent means: customer-visible failure right now (failed delivery, refusal, return), money at risk (claims, charges), or a hard deadline (appointment today/tomorrow). For each give a one-sentence reason and the concrete first_action (who to call/email and what to ask).\n' +
+    '2. close_candidates — tasks that are probably moot and should be dismissed, with disposition: resolved (shipment delivered / no longer flagged), stale (no fresh data for a long time; likely delivered months ago), duplicate (another active task covers it), superseded (a newer attempt/pair replaces it), not_actionable. Be decisive but do not close a task just because it is old if the shipment still shows a live problem.\n' +
+    '3. batches — groups of 2+ tasks that should be worked in ONE call or email (same consignee location, same carrier terminal, same customer). Give a label and reason.\n' +
+    '4. risks — up to 5 short observations the lead should know (e.g. "3 Modesto redeliveries for the same consignee — likely a receiving-hours problem").\n' +
+    '5. summary — 2-3 plain sentences for the standup.\n\n' +
+    'Rules: only reference task_id values that appear in the input. Do not invent shipments. Never put the same task_id in both priority_queue and close_candidates. Output strict JSON only, no prose before or after, with keys: summary, priority_queue [{task_id, reason, first_action}], close_candidates [{task_id, disposition, reason}], batches [{label, reason, task_ids}], risks [string].',
+  // Days without a scrape before a task's shipment data counts as stale on
+  // the Tasks v2 board. 7 = "not seen this week"; the scraper normally hits
+  // every live shipment daily, so anything past that has dropped off the
+  // FreightPOP grid.
+  "ui.tasks.stale_days": 7,
   // FreightPOP iframe embed in the shipment drawer. On by default; admins
   // can flip off in /admin/settings if iframe embedding is blocked for
   // their tenant. The url_template is normally the base FreightPOP URL —

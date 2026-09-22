@@ -57,6 +57,13 @@ const GROUPS: {
     match: (k) => k.startsWith("prompt.invoice_"),
   },
   {
+    id: "task_triage",
+    label: "Tasks v2 — AI triage",
+    description: "Board-level triage on the Tasks v2 page: the heavy model ranks work, flags moot tasks, and batches related tasks. Plus the stale-data threshold for health flags.",
+    Icon: Sparkles,
+    match: (k) => k.startsWith("prompt.task_triage") || k.startsWith("ui.tasks."),
+  },
+  {
     id: "model",
     label: "Models",
     description: "Anthropic model selection. Default = short prompts. Large = long prompts (≥ 12k chars) and bulk email synthesis.",
@@ -111,6 +118,9 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "prompt.invoice_row_review": "Invoice Audit — per-row review prompt",
   "model.default": "Default model (short prompts)",
   "model.large": "Large model (long prompts ≥ ~12k chars)",
+  "prompt.task_triage.model": "Tasks v2 triage — model",
+  "prompt.task_triage.system": "Tasks v2 triage — system prompt",
+  "ui.tasks.stale_days": "Tasks v2 — days without a scrape before shipment data counts as stale",
   "embed.freightpop.enabled": "FreightPOP embed — enabled",
   "embed.freightpop.url_template": "FreightPOP embed — URL template",
   "ui.tracking.recent_change_window_hours": "Tracking row \"Changed Xh ago\" pill window (hours)",
@@ -121,16 +131,19 @@ const FRIENDLY_LABEL: Record<string, string> = {
 // Model list mirrors MODEL_PRICING in server/lib/anthropic.js — keep in sync,
 // otherwise selecting an unpriced model logs analyses with the wrong cost.
 const MODEL_OPTIONS = [
-  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5 (fast, cheap — $0.80 / $4.00 per 1M)" },
-  { value: "claude-sonnet-4-6",          label: "Sonnet 4.6 (balanced — $3.00 / $15.00 per 1M)" },
-  { value: "claude-sonnet-4-5-20250929", label: "Sonnet 4.5 (legacy — $3.00 / $15.00 per 1M)" },
-  { value: "claude-opus-4-7",            label: "Opus 4.7 (most capable — $15.00 / $75.00 per 1M)" },
+  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5 (fast, cheap — $1.00 / $5.00 per 1M)" },
+  { value: "claude-sonnet-5",            label: "Sonnet 5 (balanced — $2.00 / $10.00 per 1M)" },
+  { value: "claude-sonnet-4-6",          label: "Sonnet 4.6 (previous gen — $3.00 / $15.00 per 1M)" },
+  { value: "claude-opus-5",              label: "Opus 5 (heavy — $5.00 / $25.00 per 1M)" },
+  { value: "claude-opus-4-7",            label: "Opus 4.7 (previous gen — $5.00 / $25.00 per 1M)" },
+  { value: "claude-fable-5-1",           label: "Fable 5.1 (most capable — $10.00 / $50.00 per 1M)" },
 ];
 const ENUM_OPTIONS: Record<string, { value: string; label: string }[]> = {
   "model.default": MODEL_OPTIONS,
   "model.large": MODEL_OPTIONS,
   "prompt.email_draft.carrier_group.model": MODEL_OPTIONS,
   "prompt.email_draft.customer_group.model": MODEL_OPTIONS,
+  "prompt.task_triage.model": MODEL_OPTIONS,
 };
 
 function valueShape(v: unknown): "string" | "number" | "boolean" | "json" {

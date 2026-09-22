@@ -1,6 +1,7 @@
 import type {
   AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
   InvoiceAudit, InvoiceAuditRow, ReanalyzeCurrent, ReanalyzePreview, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
+  TaskBoard, TaskTriageResult,
 } from "./types";
 import { sb } from "./supabase";
 import { impersonateHeaders } from "./impersonate";
@@ -99,19 +100,23 @@ async function getAccessTokenOrWait(): Promise<string> {
   });
 }
 
-async function request<T>(path: string, init?: RequestInit & { params?: Record<string, string | number | undefined>; noImpersonate?: boolean }): Promise<T> {
+async function request<T>(path: string, init?: RequestInit & { params?: Record<string, string | number | undefined>; noImpersonate?: boolean; timeoutMs?: number }): Promise<T> {
   const search = new URLSearchParams();
   for (const [k, v] of Object.entries(init?.params || {})) {
     if (v !== undefined && v !== "") search.set(k, String(v));
   }
   const q = search.toString();
   const full = `${API_URL}${path}${q ? `?${q}` : ""}`;
+  // Per-call override for the few endpoints that legitimately run long
+  // (heavy-model synthesis over a whole board). Everything else keeps the
+  // 20s deadline so a stalled connection still surfaces as an error.
+  const timeoutMs = init?.timeoutMs ?? FETCH_TIMEOUT_MS;
 
   async function fire(token: string) {
     try {
       return await fetch(full, {
         ...init,
-        signal: init?.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        signal: init?.signal ?? AbortSignal.timeout(timeoutMs),
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
@@ -123,7 +128,7 @@ async function request<T>(path: string, init?: RequestInit & { params?: Record<s
       });
     } catch (e) {
       if (e instanceof DOMException && e.name === "TimeoutError") {
-        throw new Error(`Request timed out after ${FETCH_TIMEOUT_MS / 1000}s: ${path}`);
+        throw new Error(`Request timed out after ${timeoutMs / 1000}s: ${path}`);
       }
       throw e;
     }
@@ -403,6 +408,21 @@ export const api = {
       request<{ updated: number }>("/api/tasks/bulk-update", { method: "POST", body: JSON.stringify(body) }),
     bulkDelete: (body: { ids: string[] }) =>
       request<{ deleted: number }>("/api/tasks/bulk-delete", { method: "POST", body: JSON.stringify(body) }),
+    // ---- Tasks v2 board ------------------------------------------------
+    // Every active task joined to its shipment + segment/health
+    // classification in one round trip. See server/lib/taskSegments.js.
+    v2Board: (params?: { include_closed?: 0 | 1; stale_days?: number }) =>
+      request<TaskBoard>("/api/tasks/v2/board", { params }),
+    // Heavy-model triage over the active board (or a subset). Runs Opus by
+    // default and can take a minute on a 100+ task board, hence the long
+    // per-call deadline.
+    v2Triage: (body: { ids?: string[]; segment?: string; notes?: string }) =>
+      request<TaskTriageResult>("/api/tasks/v2/triage", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
+    v2TriageLatest: () => request<TaskTriageResult>("/api/tasks/v2/triage/latest"),
+    // Cancel-with-reason. The board's replacement for delete: the row stays
+    // as a dedup tombstone so the auto-task builder doesn't respawn it.
+    v2Dismiss: (body: { ids: string[]; reason?: string; disposition?: string }) =>
+      request<{ dismissed: number; skipped: number }>("/api/tasks/v2/dismiss", { method: "POST", body: JSON.stringify(body) }),
     // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
     // each task joined to its shipment so the Kanban panel can render
     // carrier/customer/ETA without further round trips.
