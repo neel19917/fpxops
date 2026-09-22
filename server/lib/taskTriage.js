@@ -124,11 +124,16 @@ export async function runTaskTriage({ rows, notes, scopeLabel, callMeta }) {
     "Return the triage JSON now.",
   ].filter(Boolean).join("\n\n");
 
+  // max_tokens covers thinking AND output on Opus 5 (thinking is on by
+  // default). The first prod run at 8000 spent it all and truncated the
+  // JSON, so: a big ceiling, medium effort (the ranking doesn't need deep
+  // deliberation per row), and the prompt bounds the output size.
   const result = await callClaude({
     systemPrompt,
     userMessage,
-    maxTokens: 8000,
+    maxTokens: 24000,
     modelOverride: model,
+    extraBody: { output_config: { effort: "medium" } },
     metadata: {
       kind: "other",
       ...(callMeta || {}),
@@ -139,7 +144,11 @@ export async function runTaskTriage({ rows, notes, scopeLabel, callMeta }) {
 
   const parsed = extractJson(result.text);
   const triage = normalizeTriage(parsed, knownIds);
-  if (!parsed) triage.summary = triage.summary || "Model response was not valid JSON; raw text kept on the analysis row.";
+  if (!parsed) {
+    triage.summary = result.stop_reason === "max_tokens"
+      ? `Model output was cut off at the token limit (${result.output_tokens} tokens) before the JSON completed. Narrow to a segment or selection and run again.`
+      : "Model response was not valid JSON; raw text kept on the analysis row.";
+  }
   return {
     triage,
     model: result.model,
@@ -147,6 +156,7 @@ export async function runTaskTriage({ rows, notes, scopeLabel, callMeta }) {
     input_tokens: result.input_tokens,
     output_tokens: result.output_tokens,
     analysis_id: result.analysis_id,
+    stop_reason: result.stop_reason || null,
     count: slim.length,
     truncated: (Array.isArray(rows) ? rows.length : 0) > TRIAGE_MAX_ROWS,
   };

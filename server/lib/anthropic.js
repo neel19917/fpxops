@@ -71,6 +71,10 @@ export async function callClaude({
   maxTokens = 1024,
   modelOverride,
   metadata = {}, // { kind, tracking_number, shipment_uuid, gp_audit_id, invoice_audit_id, api_key_id }
+  // Extra top-level Messages API fields merged into the request body, e.g.
+  // { output_config: { effort: "medium" } } to trade thinking depth for
+  // output room on the 4.6+/5 models. Keep it to documented fields.
+  extraBody = null,
 }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return { error: "ANTHROPIC_API_KEY not configured" };
@@ -91,6 +95,7 @@ export async function callClaude({
         max_tokens: maxTokens,
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }],
+        ...(extraBody && typeof extraBody === "object" ? extraBody : {}),
       }),
     });
   } catch (e) {
@@ -120,7 +125,12 @@ export async function callClaude({
   }
 
   const json = await resp.json();
-  const text = json.content?.[0]?.text || "";
+  // Models with thinking on return a thinking block first; take the text
+  // block(s), not content[0]. Thinking tokens also count toward max_tokens,
+  // so callers that need long JSON must budget for both — surfaced via
+  // stop_reason below.
+  const text = (json.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join("") || "";
+  const stopReason = json.stop_reason || null;
   const inTok = json.usage?.input_tokens || 0;
   const outTok = json.usage?.output_tokens || 0;
   const pricing = MODEL_PRICING[model] || { input: 0.80, output: 4.00 };
@@ -164,7 +174,7 @@ export async function callClaude({
 
   return {
     text, model, input_tokens: inTok, output_tokens: outTok, cost_usd: costUsd, analysis_id: analysisId,
-    parsed,
+    parsed, stop_reason: stopReason,
   };
 }
 
