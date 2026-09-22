@@ -78,18 +78,26 @@ function commentText(r) {
 // result)? Only meaningful when the shipment already has redelivery tasks;
 // the caller checks that. A second failed attempt in the same city produces
 // the *identical* carrier comment ("Attempted Delivery in MODESTO, CA"), so
-// text change alone is not enough — we also treat a move in the carrier's
-// last-modified stamp or a new updated ETA while the comment still says
-// "attempted" as a new failure event. Re-entering the redelivery state
-// (prev comment was "Out for delivery", next is "Attempted" again) counts too.
+// text change alone is not enough — we also treat the shipment coming back
+// off "Out For Delivery" without a delivery date, or a new updated ETA,
+// while the comment still says "attempted" as a new failure event.
+// Re-entering the redelivery state (prev comment was "Out for delivery",
+// next is "Attempted" again) counts too.
+//
+// The carrier's last-modified stamp alone is NOT a failure signal: it is
+// date-only and ticks on any edit to the record. On 373410034 (2026-09-21)
+// it ticked as the shipment went back OUT for delivery and spawned an
+// "(attempt 2)" pair before anything had failed.
+function isOutForDelivery(r) {
+  return /out\s+for\s+delivery/i.test(String(r?.shipment_status || ""));
+}
+
 export function isNewFailureEvent(prev, next) {
   if (!prev || !next) return false;
   if (detectRedelivery(next) !== true) return false;
   if (detectRedelivery(prev) !== true) return true;
   if (commentText(prev) !== commentText(next)) return true;
-  const pm = ts(prev.last_modified_at);
-  const nm = ts(next.last_modified_at);
-  if (pm !== null && nm !== null && nm > pm) return true;
+  if (isOutForDelivery(prev) && !isOutForDelivery(next)) return true;
   const pe = ts(prev.updated_eta);
   const ne = ts(next.updated_eta);
   if (pe !== null && ne !== null && ne !== pe) return true;

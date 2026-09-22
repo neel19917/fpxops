@@ -85,8 +85,23 @@ test("isNewFailureEvent: false when nothing moved (same comment, same stamps)", 
   assert.equal(isNewFailureEvent(ATTEMPTED, { ...ATTEMPTED }), false);
 });
 
-test("isNewFailureEvent: true when the carrier's last-modified stamp advances with the comment still 'attempted' (identical text on 2nd attempt)", () => {
-  assert.equal(isNewFailureEvent(ATTEMPTED, { ...ATTEMPTED, last_modified_at: "2026-09-12T00:00:00Z" }), true);
+test("isNewFailureEvent: false when only the carrier's last-modified stamp advances (it ticks on any record edit)", () => {
+  assert.equal(isNewFailureEvent(ATTEMPTED, { ...ATTEMPTED, last_modified_at: "2026-09-12T00:00:00Z" }), false);
+});
+
+// 373410034, 2026-09-21: stamp ticked as the shipment went back out for
+// delivery — nothing had failed yet, but an "(attempt 2)" pair was spawned.
+test("isNewFailureEvent: false when the shipment goes back OUT for delivery with the same comment", () => {
+  const inTransit = { ...ATTEMPTED, shipment_status: "In Transit" };
+  const ofd = { ...ATTEMPTED, shipment_status: "Out For Delivery", last_modified_at: "2026-09-21T00:00:00Z" };
+  assert.equal(isNewFailureEvent(inTransit, ofd), false);
+});
+
+// 373410034, 2026-09-22: the out-for-delivery run came back undelivered.
+test("isNewFailureEvent: true when the shipment comes back off Out For Delivery undelivered (identical text on 2nd attempt)", () => {
+  const ofd = { ...ATTEMPTED, shipment_status: "Out For Delivery" };
+  const back = { ...ATTEMPTED, shipment_status: "In Transit", last_modified_at: "2026-09-22T00:00:00Z" };
+  assert.equal(isNewFailureEvent(ofd, back), true);
 });
 
 test("isNewFailureEvent: true when updated ETA moves while still in redelivery state", () => {
