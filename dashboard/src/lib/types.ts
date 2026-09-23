@@ -352,6 +352,9 @@ export interface TaskBoard {
   rows: TaskBoardRow[];
   summary: TaskBoardSummary;
   stale_days: number;
+  // email → display name for every known user. Task assigned_to values on
+  // the board are canonicalised to the email server-side.
+  people?: Record<string, string>;
   segments: { id: TaskSegment; label: string; description: string }[];
   flags: { id: TaskFlag; label: string; tone: string; description: string }[];
   generated_at: string;

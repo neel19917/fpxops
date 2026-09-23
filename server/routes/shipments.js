@@ -8,6 +8,7 @@ import { analyzeExistingShipment, runShipmentAnalysis } from "./analyze.js";
 import { extractAiJsonFields } from "../lib/anthropic.js";
 import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG } from "../lib/redelivery.js";
 import { detectStorageRisk, isStorageRiskTitle, STORAGE_TAG } from "../lib/storageRisk.js";
+import { peopleIndex, resolveWithIndex } from "../lib/people.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
 
 // Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
@@ -301,6 +302,11 @@ async function autoCreateActionTasks(
     "storage.assignee": storageAssignee,
   } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers", "storage.assignee");
   const storageOpts = { asOfMs: Date.now(), holdHours: storageHoldHours, carriers: storageCarriers };
+  // Owners are stored as the profile email. created_by is the runner's
+  // display name from the extension ("Victor Zarate"); resolve it here so
+  // one person never shows up under two strings on the board.
+  const people = await peopleIndex();
+  const owner = (raw) => resolveWithIndex(people, raw);
   const candidates = (upsertedRows || []).filter(
     (s) => String(s.action_required || "").toUpperCase() === "YES"
         && (showParcels === true || String(s.mode || "").trim().toLowerCase() !== "parcel")
@@ -355,11 +361,11 @@ async function autoCreateActionTasks(
       const storage = detectStorageRisk({ ...s, ...current }, storageOpts).storage_risk === true;
       if (storage) {
         if (prior.some((t) => isStorageRiskTitle(t.title))) continue;
-        rows.push(buildStandardTask(s, changeLog, { tag: STORAGE_TAG, assignee: storageAssignee }));
+        rows.push(buildStandardTask(s, changeLog, { tag: STORAGE_TAG, assignee: owner(storageAssignee) || owner(s.created_by) }));
         continue;
       }
       if (prior.length) continue;
-      rows.push(buildStandardTask(s, changeLog));
+      rows.push(buildStandardTask(s, changeLog, { assignee: owner(s.created_by) }));
       continue;
     }
 
@@ -374,7 +380,7 @@ async function autoCreateActionTasks(
     } else {
       continue;
     }
-    rows.push(...buildRedeliveryTasks(s, changeLog, attempt));
+    rows.push(...buildRedeliveryTasks(s, changeLog, attempt).map((t) => ({ ...t, assigned_to: owner(t.assigned_to) })));
   }
   if (!rows.length) return 0;
 

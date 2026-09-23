@@ -5,6 +5,7 @@
 import { supabase } from "./supabase.js";
 import { getSettings } from "./settings.js";
 import { buildBoard } from "./taskSegments.js";
+import { peopleIndex, resolveWithIndex } from "./people.js";
 
 export const BOARD_SHIPMENT_COLS = [
   "id", "tracking_number", "shipment_id", "customer_name", "carrier", "carrier_name", "mode",
@@ -30,7 +31,18 @@ export async function loadBoard({ includeClosed = false, closedDays = 7, staleDa
   const { data: tasks, error } = await q;
   if (error) throw new Error(error.message);
 
-  const shipIds = Array.from(new Set((tasks || []).map((t) => t.shipment_id).filter(Boolean)));
+  // Canonicalise owners onto the profile email so "Victor Zarate" and
+  // "victorz@freightpop.com" are one bucket. The raw value is kept on
+  // assigned_to_raw for the audit-minded; `people` maps email → name for
+  // display.
+  const idx = await peopleIndex();
+  const normalized = (tasks || []).map((t) => ({
+    ...t,
+    assigned_to_raw: t.assigned_to,
+    assigned_to: resolveWithIndex(idx, t.assigned_to),
+  }));
+
+  const shipIds = Array.from(new Set(normalized.map((t) => t.shipment_id).filter(Boolean)));
   const byId = await loadShipmentsById(shipIds);
 
   let stale = staleDays;
@@ -38,8 +50,8 @@ export async function loadBoard({ includeClosed = false, closedDays = 7, staleDa
     const s = await getSettings("ui.tasks.stale_days");
     stale = Number(s["ui.tasks.stale_days"]) || 7;
   }
-  const board = buildBoard(tasks || [], byId, { staleDays: stale });
-  return { ...board, stale_days: stale };
+  const board = buildBoard(normalized, byId, { staleDays: stale });
+  return { ...board, stale_days: stale, people: Object.fromEntries(idx.names) };
 }
 
 // Chunked .in() so the widest boards stay under URL-length limits.
