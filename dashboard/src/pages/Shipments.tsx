@@ -1461,23 +1461,34 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
             {taskWalk?.task ? (
               <TaskBanner
-                task={taskWalk.task}
+                // Prefer the copy in drawerTasks: it comes from the fresh
+                // /api/shipments/:id fetch for THIS drawer open and is
+                // patched in place on every save below. taskWalk.task is
+                // the snapshot the route resolved on entry and only
+                // refreshes after a full sibling re-lookup — reading it
+                // here is why an inline edit kept showing the old text.
+                task={drawerTasks.find((t) => t.id === taskWalk.taskId) ?? taskWalk.task}
+                shipment={drawerData?.shipment ?? null}
+                latestNote={notesLog[0] ?? null}
+                siblings={drawerTasks.filter((t) => t.id !== taskWalk.taskId && (t.status === "open" || t.status === "in_progress" || t.status === "blocked"))}
+                onOpenTask={(id) => taskWalk.onWalk(id)}
                 busy={taskBusy}
                 onSetStatus={async (status) => {
                   if (!taskWalk?.task) return;
                   setTaskBusy(true);
                   try {
-                    await api.tasks.update(taskWalk.task.id, { status });
+                    const { task } = await api.tasks.update(taskWalk.task.id, { status });
+                    setDrawerTasks((p) => p.map((x) => (x.id === task.id ? task : x)));
                     taskWalk.onTaskStatusChanged?.(status);
                   } catch (e) { setErr((e as Error).message); }
                   finally { setTaskBusy(false); }
                 }}
                 onSaveDescription={async (description) => {
                   if (!taskWalk?.task) return;
-                  await api.tasks.update(taskWalk.task.id, { description });
-                  // Reuse the status-change refresh hook so the banner
-                  // re-renders with the persisted description and any
-                  // server-side mutations (updated_at, etc.) settle.
+                  const { task } = await api.tasks.update(taskWalk.task.id, { description });
+                  // Patch the live copy immediately so the banner shows
+                  // the saved text without waiting on the route refetch.
+                  setDrawerTasks((p) => p.map((x) => (x.id === task.id ? task : x)));
                   taskWalk.onTaskStatusChanged?.(taskWalk.task.status);
                 }}
                 onCreateInverseFollowup={async (kind) => {
@@ -2486,8 +2497,19 @@ function ShipmentSummaryHeader({
   );
 }
 
-function TaskBanner({ task, busy, onSetStatus, onSaveDescription, onCreateInverseFollowup }: {
+function TaskBanner({ task, shipment, latestNote, siblings = [], onOpenTask, busy, onSetStatus, onSaveDescription, onCreateInverseFollowup }: {
   task: ShipmentTask;
+  // The shipment as of the latest scrape/analysis. The task's own title +
+  // description are frozen at creation (AI wording from that day), so the
+  // banner shows the CURRENT read next to it and offers to refresh the
+  // description from it — "the card is still pulling an old one" was the
+  // complaint that prompted this.
+  shipment?: Shipment | null;
+  latestNote?: ShipmentNote | null;
+  // Other active tasks on the same shipment (newest first) so the operator
+  // can see they're on one of several and hop between them.
+  siblings?: ShipmentTask[];
+  onOpenTask?: (taskId: string) => void;
   busy: boolean;
   onSetStatus: (status: TaskStatus) => Promise<void> | void;
   // Persists an edited description back to the server. Called from the
@@ -2546,6 +2568,29 @@ function TaskBanner({ task, busy, onSetStatus, onSaveDescription, onCreateInvers
       setDescError((e as Error).message || "Couldn't save description.");
     } finally {
       setDescBusy(false);
+    }
+  }
+
+  // Is the task's text older than the shipment's latest analysis? Then the
+  // AI has re-read the shipment since this task was written and the card
+  // may be describing yesterday's problem.
+  const analyzedAt = shipment?.last_analyzed_at ? Date.parse(shipment.last_analyzed_at) : NaN;
+  const taskAt = Date.parse(task.updated_at || task.created_at);
+  const textIsStale = Number.isFinite(analyzedAt) && Number.isFinite(taskAt) && analyzedAt - taskAt > 6 * 3_600_000;
+  const currentRead = [shipment?.ai_issue, shipment?.ai_recommendation].filter(Boolean).join("\n\n");
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  async function refreshFromAnalysis() {
+    if (!onSaveDescription || !currentRead) return;
+    setRefreshBusy(true);
+    setDescError(null);
+    try {
+      const stamp = new Date().toISOString().slice(0, 10);
+      await onSaveDescription(`${currentRead}\n\n[${stamp} refreshed from latest analysis]`);
+      setEditingDesc(false);
+    } catch (e) {
+      setDescError((e as Error).message || "Couldn't refresh description.");
+    } finally {
+      setRefreshBusy(false);
     }
   }
 
@@ -2666,10 +2711,66 @@ function TaskBanner({ task, busy, onSetStatus, onSaveDescription, onCreateInvers
           <Pencil className="h-3 w-3" /> Add description
         </button>
       ) : null}
+      {/* Current read: what the shipment looks like NOW, next to the
+          frozen task text. Only rendered when there is something newer
+          to show than the task itself. */}
+      {shipment && (currentRead || latestNote) ? (
+        <div className={`mt-2 rounded-lg px-3 py-2 ring-1 text-xs ${textIsStale ? "bg-amber-50 ring-amber-200" : "bg-white/70 ring-violet-100"}`}>
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
+              Now{shipment.shipment_status ? <span className="ml-1.5 font-semibold normal-case tracking-normal text-slate-500">· {shipment.shipment_status}</span> : null}
+            </div>
+            <div className="text-[10px] text-slate-500">
+              {shipment.last_analyzed_at ? `analyzed ${fmtRelative(shipment.last_analyzed_at)}` : ""}
+              {textIsStale ? <span className="ml-1.5 text-amber-800 font-semibold">task text is older than this</span> : null}
+            </div>
+          </div>
+          {shipment.ai_issue ? <div className="text-slate-800 leading-snug">{shipment.ai_issue}</div> : null}
+          {shipment.ai_recommendation ? <div className="text-slate-600 leading-snug mt-1">{shipment.ai_recommendation}</div> : null}
+          {latestNote ? (
+            <div className="mt-1.5 pt-1.5 border-t border-slate-200/70 text-slate-700">
+              <span className="font-semibold text-slate-600">Last note</span>
+              <span className="text-slate-400"> · {latestNote.created_by || "—"} · {fmtRelative(latestNote.created_at)}</span>
+              <div className="whitespace-pre-wrap leading-snug">{latestNote.body}</div>
+            </div>
+          ) : null}
+          {onSaveDescription && currentRead && textIsStale ? (
+            <div className="mt-1.5">
+              <button
+                type="button"
+                onClick={refreshFromAnalysis}
+                disabled={refreshBusy || descBusy}
+                className="text-[11px] font-semibold rounded-md px-2 py-1 bg-white text-amber-800 ring-1 ring-amber-300 hover:bg-amber-100 disabled:opacity-50 inline-flex items-center gap-1"
+                title="Replace the task description with the current AI issue + recommendation (the old text stays in the audit log)"
+              >
+                <RefreshCw className={`h-3 w-3 ${refreshBusy ? "animate-spin" : ""}`} /> {refreshBusy ? "Refreshing…" : "Refresh task text from latest analysis"}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {siblings.length ? (
+        <div className="mt-2 text-[11px] text-slate-600">
+          <span className="font-semibold text-slate-700">{siblings.length} other active task{siblings.length === 1 ? "" : "s"} on this shipment:</span>
+          <ul className="mt-0.5 space-y-0.5">
+            {siblings.slice(0, 4).map((s) => (
+              <li key={s.id} className="flex items-center gap-1.5 min-w-0">
+                <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-semibold ring-1 shrink-0 ${TASK_STATUS_TONE[s.status] || TASK_STATUS_TONE.open}`}>{TASK_STATUS_LABEL[s.status] || s.status}</span>
+                {onOpenTask ? (
+                  <button type="button" onClick={() => onOpenTask(s.id)} className="truncate text-left text-sky-700 hover:underline" title={s.title}>{s.title}</button>
+                ) : <span className="truncate" title={s.title}>{s.title}</span>}
+                <span className="text-slate-400 shrink-0">{new Date(s.created_at).toLocaleDateString()}</span>
+              </li>
+            ))}
+            {siblings.length > 4 ? <li className="text-slate-400">+{siblings.length - 4} more in the Tasks tab</li> : null}
+          </ul>
+        </div>
+      ) : null}
       <div className="flex items-center justify-between gap-2 mt-2.5 flex-wrap">
         <div className="text-[11px] text-slate-500">
           {task.assigned_to ? <span className="mr-2">{task.assigned_to}</span> : null}
           <span>created {new Date(task.created_at).toLocaleDateString()}</span>
+          {task.updated_at && task.updated_at !== task.created_at ? <span className="ml-2 text-slate-400">edited {fmtRelative(task.updated_at)}</span> : null}
         </div>
         <div className="inline-flex items-center gap-1.5 flex-wrap">
           {inverseAudience ? (

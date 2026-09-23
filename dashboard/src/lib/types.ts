@@ -31,6 +31,9 @@ export interface Shipment {
   action_required: ActionStatus;
   ai_issue: string | null;
   ai_recommendation: string | null;
+  // When the per-shipment AI last ran on this row (stamped server-side on
+  // every analysis). Null for rows never analyzed.
+  last_analyzed_at?: string | null;
   raw_data: unknown;
   scraped_at: string;
   created_at: string;
