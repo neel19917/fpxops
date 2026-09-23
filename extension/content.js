@@ -733,42 +733,72 @@ function resolveJobLink(job) {
   return null;
 }
 
-// Is a shipment modal / Kendo window currently open? "Open" means a visible
-// dialog root AND a visible dismiss control — the same signal
-// waitForCloseButton keys on — so a persistent role=dialog widget elsewhere
-// on the page doesn't read as a stuck modal on every row.
-function isModalOpen() {
+const DIALOG_ROOT_SELECTOR = ".modal.in, .modal.show, .k-window, [role='dialog']";
+
+// The dialog element that owns a dismiss control (CLOSE button / Kendo X).
+function dialogRootFor(el) {
+  try { return (el && el.closest(".modal, .k-window, [role='dialog']")) || null; } catch { return null; }
+}
+
+// Dismiss control INSIDE a given dialog root only — never a "Close" button
+// elsewhere on the page.
+function findDismissControlWithin(root) {
+  if (!root) return null;
   try {
-    const dialogs = document.querySelectorAll(".modal.in, .modal.show, .k-window, [role='dialog']");
-    let visible = false;
-    for (const d of dialogs) { if (isVisibleForClick(d)) { visible = true; break; } }
-    if (!visible) return false;
-    return !!findModalDismissControl();
+    for (const el of root.querySelectorAll("button, a[role='button'], [role='button'], a.k-window-action")) {
+      if (!isVisibleForClick(el)) continue;
+      const txt = String(el.innerText || "").replace(/\s+/g, " ").trim();
+      if (/^close$/i.test(txt) || /^done$/i.test(txt)) return el;
+      const al = (el.getAttribute("aria-label") || "").trim();
+      if (/^(close|dismiss)$/i.test(al)) return el;
+      if (el.classList.contains("k-window-action") && el.querySelector(".k-i-close")) return el;
+    }
+  } catch {}
+  return null;
+}
+
+// Is a shipment modal currently open?
+//   - with `root`: is THAT dialog still attached and visible (the one we
+//     just scraped) — no guessing about unrelated dialogs.
+//   - without: is there a visible dialog that has its own dismiss control
+//     inside it. A persistent role=dialog widget with no Close of its own
+//     does not count, and neither does a Close button outside any dialog.
+// Getting this wrong is expensive: a false "open" adds seconds of waiting
+// plus an Escape/dismiss escalation to EVERY row on the page.
+function isModalOpen(root) {
+  try {
+    if (root) return !!(root.isConnected && isVisibleForClick(root));
+    for (const d of document.querySelectorAll(DIALOG_ROOT_SELECTOR)) {
+      if (isVisibleForClick(d) && findDismissControlWithin(d)) return true;
+    }
+    return false;
   } catch { return false; }
 }
 
 // After clicking CLOSE, wait for the dialog to actually go away. If it
 // lingers (animation stuck, second dialog, click swallowed), escalate:
-// Escape key, then any dismiss control again. A modal left open makes every
-// subsequent row's click land on the overlay, so one bad row used to turn
-// into a 25s timeout for each remaining row on the page.
-async function ensureModalClosed(timeoutMs = 4000) {
+// Escape key, then the dialog's own dismiss control again. A modal left
+// open makes every subsequent row's click land on the overlay, so one bad
+// row used to turn into a 25s timeout for each remaining row on the page.
+// Returns quickly in the normal case — polls every 100ms and exits on the
+// first "closed" reading.
+async function ensureModalClosed(timeoutMs = 2500, root = null) {
   const start = Date.now();
   let escalated = 0;
   while (Date.now() - start < timeoutMs) {
-    if (!isModalOpen()) return true;
-    await sleep(200);
+    if (!isModalOpen(root)) return true;
+    await sleep(100);
     const elapsed = Date.now() - start;
-    if (escalated === 0 && elapsed > 1200) {
+    if (escalated === 0 && elapsed > 800) {
       escalated = 1;
       try { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true })); } catch {}
-    } else if (escalated === 1 && elapsed > 2400) {
+    } else if (escalated === 1 && elapsed > 1600) {
       escalated = 2;
-      const btn = findModalDismissControl();
+      const btn = root ? findDismissControlWithin(root) : null;
       if (btn) { try { simulateClick(btn); } catch {} }
     }
   }
-  return !isModalOpen();
+  return !isModalOpen(root);
 }
 
 // Build the row we upload when a shipment could not be fully scraped. It
@@ -989,8 +1019,11 @@ async function processPage() {
     // and the rest of the page was never scraped or uploaded.
     try {
       // If a stale modal is still up from the previous row, our click would
-      // land on its overlay. Clear it first.
-      if (isModalOpen()) await ensureModalClosed(1500);
+      // land on its overlay. Clear it first. Scoped to a dialog that has its
+      // own dismiss control, so this is a no-op on a clean page.
+      const rowStart = Date.now();
+      let preCloseMs = 0;
+      if (isModalOpen()) { await ensureModalClosed(1500); preCloseMs = Date.now() - rowStart; }
 
       const link = resolveJobLink(job);
       if (!link) {
@@ -1004,7 +1037,9 @@ async function processPage() {
       await humanDelay(300, 600);
 
       sendStatus(`Clicked ${trackingNum} — waiting for modal...`);
+      const waitStart = Date.now();
       const closeBtn = await waitForCloseButton(25000);
+      const modalWaitMs = Date.now() - waitStart;
       if (!closeBtn) {
         failures++;
         logRows.push(buildPartialRow(trackingNum, "Modal did not appear (timeout)", pickupResponse, kendoRow));
@@ -1030,6 +1065,11 @@ async function processPage() {
 
       // Extension is scrape-only — analysis runs server-side after upload.
       delete modalData["FULL MODAL TEXT"];
+      // Per-row timing lands in raw_data so a slow run can be diagnosed
+      // from the database: was it the carrier modal, or our own waits?
+      modalData._modalWaitMs = modalWaitMs;
+      if (preCloseMs) modalData._preCloseMs = preCloseMs;
+      const dialogRoot = dialogRootFor(closeBtn);
       logRows.push(modalData);
       // Legacy 25-row chrome.storage._fpxCheckpoint write was retired —
       // the persistent upload queue (background.js / chrome.storage
@@ -1040,7 +1080,10 @@ async function processPage() {
       const actionTag = modalData._needsActionSheet ? " [ACTION NEEDED]" : "";
       sendStatus(`Done ${trackingNum}${actionTag} — closing modal...`);
       try { simulateClick(closeBtn); } catch {}
-      const closed = await ensureModalClosed(4000);
+      const closeStart = Date.now();
+      const closed = await ensureModalClosed(2500, dialogRoot);
+      modalData._closeMs = Date.now() - closeStart;
+      modalData._rowMs = Date.now() - rowStart;
       if (!closed) console.warn(`[FPX] modal for ${trackingNum} did not close cleanly`);
       await humanDelay(200, 500);
     } catch (e) {
@@ -1049,7 +1092,7 @@ async function processPage() {
       logRows.push(buildPartialRow(trackingNum, `Scrape error: ${e?.message || e}`, pickupResponse, kendoRow));
       sendStatus(`Error on ${trackingNum} (${e?.message || e}) — recorded grid data only, continuing.`);
       // Don't leave a half-open dialog for the next row to trip over.
-      try { await ensureModalClosed(3000); } catch {}
+      try { await ensureModalClosed(2000); } catch {}
     }
 
     await humanDelay(250, 600);
