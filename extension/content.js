@@ -3468,7 +3468,7 @@ function fpxFilterViaKendoPopup(colName, value) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] inject-kendo-popup.js failed to load");
+        dlog("[FPX] inject-kendo-popup.js failed to load");
         resolve(false);
       }
     };
@@ -3478,7 +3478,7 @@ function fpxFilterViaKendoPopup(colName, value) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] Kendo popup driver timed out");
+        dlog("[FPX] Kendo popup driver timed out");
         resolve(false);
       }
     }, 4000);
@@ -3514,7 +3514,7 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] inject-kendo-filter.js failed to load");
+        dlog("[FPX] inject-kendo-filter.js failed to load");
         resolve(false);
       }
     };
@@ -3524,7 +3524,7 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] Kendo API filter timed out (jQuery not on page?)");
+        dlog("[FPX] Kendo API filter timed out (jQuery not on page?)");
         resolve(false);
       }
     }, 1500);
@@ -3597,6 +3597,29 @@ window.addEventListener("message", async (event) => {
     const col = String(data.column || "").trim();
     const val = String(data.value || "").trim();
     if (!col || !val) return;
+    // The dashboard fires this as soon as any FreightPOP frame says hello —
+    // which includes FP's login page (third-party cookies) and the first
+    // seconds before Kendo has rendered. Running the strategy chain there
+    // can only fail, and every failure used to land as a console.warn on
+    // the chrome://extensions Errors page. Wait briefly for a grid; if
+    // none shows up, answer quietly and let fpxGridReady trigger a resend.
+    if (!(await fpxEnsureGridReady(6000))) {
+      const reason = fpxDescribeFrameState();
+      dlog(`[FPX] Bridge filter deferred — ${reason}`);
+      try {
+        event.source && event.source.postMessage({
+          source: "fpx-extension",
+          type: "fpxFilterAck",
+          column: col,
+          value: val,
+          ok: false,
+          reason: "grid-not-ready",
+          error: `FreightPOP grid not loaded in this frame (${reason}). The filter will re-apply once the grid appears.`,
+          injectDetail: "",
+        }, event.origin);
+      } catch {}
+      return;
+    }
     sendStatus(`Bridge: filtering ${col} → "${val}"`);
     let applied = false;
     let strategy = "";
@@ -3673,9 +3696,19 @@ window.addEventListener("message", async (event) => {
     // the row's tracking link (the same UI path a rep takes manually).
     const tn = String(data.trackingNumber || "").trim();
     if (!tn) return;
-    sendStatus(`Bridge: opening modal for ${tn}`);
     let openOk = false;
     let openErr = null;
+    if (!(await fpxEnsureGridReady(6000))) {
+      openErr = `FreightPOP grid not loaded in this frame (${fpxDescribeFrameState()})`;
+      dlog(`[FPX] Bridge open-tracking skipped — ${openErr}`);
+      try {
+        event.source && event.source.postMessage({
+          source: "fpx-extension", type: "fpxOpenTrackingAck", trackingNumber: tn, ok: false, reason: "grid-not-ready", error: openErr,
+        }, event.origin);
+      } catch {}
+      return;
+    }
+    sendStatus(`Bridge: opening modal for ${tn}`);
     try {
       // Filter first so the matching row is on-screen; ignore failure
       // here because the row may already be visible from a prior filter.
@@ -3723,6 +3756,39 @@ try {
     window.parent.postMessage({ source: "fpx-extension", type: "fpxHello" }, "*");
   }
 } catch {}
+
+// True once the Kendo grid in this frame has at least one data row; waits
+// up to `timeoutMs` for it to render.
+async function fpxEnsureGridReady(timeoutMs = 6000) {
+  try {
+    const existing = document.querySelector(".k-grid-content tbody tr, .k-grid tbody tr");
+    if (existing && !existing.classList.contains("k-no-data")) return true;
+    return !!(await waitForGridWithObserver(timeoutMs));
+  } catch { return false; }
+}
+
+// Short human-readable reason for "no grid here", surfaced in the bridge ack
+// so the dashboard can tell the operator what to do (log in, wait, open the
+// Transactions view) instead of showing a generic failure.
+function fpxDescribeFrameState() {
+  try {
+    if (document.querySelector("input[type='password']")) return "FreightPOP login page — sign in inside the frame";
+    if (document.readyState !== "complete") return "page still loading";
+    if (document.querySelector(".k-grid")) return "grid has no rows yet";
+    return "no shipment grid on this view";
+  } catch { return "frame state unknown"; }
+}
+
+// Tell the dashboard when the grid actually becomes usable in this frame
+// (after login, after FP finishes rendering). The dashboard re-sends any
+// filter that was deferred with reason "grid-not-ready". Observer
+// disconnects as soon as the first row appears, or after 5 minutes.
+(async function fpxAnnounceGridReady() {
+  if (window.parent === window) return;
+  try {
+    if (await fpxEnsureGridReady(5 * 60 * 1000)) fpxTellParent({ type: "fpxGridReady" });
+  } catch {}
+})();
 
 // =====================================================================
 // Third-party cookie recovery for the FPXpress embed.

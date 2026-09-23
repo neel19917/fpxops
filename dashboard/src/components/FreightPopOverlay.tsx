@@ -152,6 +152,11 @@ export function FreightPopOverlay() {
     error: string | null;
   } | null>(null);
   const cookiesBlocked = storageAccess?.supported === true && storageAccess.hasAccess === false;
+  // A filter the extension deferred because the FreightPOP frame had no
+  // grid yet (login page / still rendering). Re-sent once the extension
+  // announces fpxGridReady. A ref, not state: it is only read inside the
+  // message handler and must not re-render or re-fire the auto-filter.
+  const pendingFilterRef = useRef<{ column: FpxFilterColumn; value: string } | null>(null);
 
   // Persist creds whenever the user edits them in the popover.
   useEffect(() => { saveCreds(creds); }, [creds]);
@@ -177,8 +182,22 @@ export function FreightPopOverlay() {
         });
         // It reached us, so the bridge is demonstrably alive.
         setBridgeReady(true);
+      } else if (d.type === "fpxGridReady") {
+        // The frame's Kendo grid just rendered (operator logged in, or FP
+        // finished loading). Replay the filter that was deferred, if any.
+        setBridgeReady(true);
+        const pending = pendingFilterRef.current;
+        if (pending) {
+          pendingFilterRef.current = null;
+          postFpxFilter(iframeRef.current, pending.column, pending.value);
+        }
       } else if (d.type === "fpxFilterAck") {
         if (d.ok) setLastFilter({ column: String(d.column || ""), value: String(d.value || "") });
+        if (!d.ok && d.reason === "grid-not-ready" && typeof d.column === "string" && typeof d.value === "string") {
+          pendingFilterRef.current = { column: d.column as FpxFilterColumn, value: d.value };
+        } else if (d.ok) {
+          pendingFilterRef.current = null;
+        }
         setLastAck({
           ok: !!d.ok,
           strategy: typeof d.strategy === "string" ? d.strategy : undefined,
