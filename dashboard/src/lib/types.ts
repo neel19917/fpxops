@@ -427,6 +427,42 @@ export interface DailySummaryResult {
   stop_reason?: string | null;
 }
 
+// Exact analysis totals from fpx_analyses_stats() (/api/analyses/stats).
+export interface AnalysesStats {
+  count: number;
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  avg_duration_ms: number;
+  errors: number;
+  first_at: string | null;
+  last_at: string | null;
+  by_kind: { kind: string; subkind: string; count: number; cost_usd: number }[];
+}
+
+// Plain-English shipment brief (/api/shipments/:id/plain-summary). Mirrors
+// server/lib/plainSummary.js.
+export interface PlainSummary {
+  headline: string;
+  what_happened: string;
+  why_it_matters: string;
+  next_steps: { step: string; who: string | null }[];
+  by_when: string;
+  urgency: "today" | "this_week" | "monitor" | "none";
+}
+export interface PlainSummaryResult {
+  summary: PlainSummary;
+  // Dates / hours / amounts / reference numbers in the prose that the server
+  // could not find in the fact sheet the model was given.
+  unverified: string[];
+  facts: Record<string, unknown> | null;
+  model: string | null;
+  cost_usd: number | null;
+  analysis_id: string | null;
+  created_at: string | null;
+  cached: boolean;
+}
+
 export type FeedbackCategory = "bug" | "feature" | "support" | "other";
 export type FeedbackStatus = "open" | "triaged" | "in_progress" | "resolved" | "wont_fix";
 export type FeedbackSeverity = "low" | "normal" | "high" | "urgent";

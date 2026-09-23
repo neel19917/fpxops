@@ -14,6 +14,7 @@ import { LoadingState } from "../components/LoadingState";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { UserPicker } from "../components/UserPicker";
 import { swrGet, swrSet } from "../lib/swrCache";
+import { setTasksView } from "../lib/tasksView";
 
 // ---------------------------------------------------------------------------
 // Tasks v2
@@ -275,7 +276,7 @@ export function TasksV2Page() {
   // came from v2 and hands it the board's current active order, so the
   // drawer's prev/next chevrons walk THIS list and closing the drawer
   // returns here instead of the classic Tasks page.
-  const openTask = (id: string) => navigate(`/tasks/${id}`, {
+  const openTask = (id: string) => navigate(`/tasks/v2/${id}`, {
     state: { from: "/tasks/v2", walkIds: visible.filter((r) => isActive(r.task.status)).map((r) => r.task.id) },
   });
 
@@ -413,8 +414,12 @@ export function TasksV2Page() {
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <button onClick={() => navigate("/tasks")} className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50">
-            <Undo2 className="h-4 w-4" /> Classic view
+          <button
+            onClick={() => { setTasksView("legacy"); navigate("/tasks/legacy"); }}
+            className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50"
+            title="Open the legacy Tasks list and make it your default until you switch back"
+          >
+            <Undo2 className="h-4 w-4" /> Legacy view
           </button>
           <button onClick={() => load()} className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50" title="Reload board">
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh

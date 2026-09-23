@@ -8,6 +8,7 @@ import { useNav } from "../lib/nav";
 import { UserPicker } from "../components/UserPicker";
 import { requestAutoFilter } from "../lib/freightpopFrame";
 import { swrGet, swrSet } from "../lib/swrCache";
+import { setTasksView } from "../lib/tasksView";
 
 // Convention-based detector: a task is a "Carrier Followup" when its
 // title contains both "carrier" and "follow" (case-insensitive). Mirrors
@@ -219,7 +220,7 @@ export function TasksPage() {
   function setPageTab(next: "all" | "carrier" | "customer") {
     if (next === "carrier") navigate("/tasks/carrier-followups");
     else if (next === "customer") navigate("/tasks/customer-followups");
-    else navigate("/tasks");
+    else navigate("/tasks/legacy");
   }
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -642,12 +643,12 @@ export function TasksPage() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => navigate("/tasks/v2")}
+            onClick={() => { setTasksView("v2"); navigate("/tasks"); }}
             className="rounded-lg ring-1 ring-violet-200 bg-violet-50 text-violet-800 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-violet-100"
-            title="Segmented board with health flags and AI triage"
+            title="Switch back to the v2 board (segments, health flags, AI triage) and make it the default"
           >
             <Sparkles className="h-4 w-4 shrink-0" />
-            <span>Try Tasks v2</span>
+            <span>Switch to v2</span>
           </button>
           <div className="inline-flex rounded-lg ring-1 ring-slate-200 bg-white overflow-hidden">
             <button

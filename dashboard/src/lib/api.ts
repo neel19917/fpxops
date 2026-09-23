@@ -1,7 +1,7 @@
 import type {
   AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
   InvoiceAudit, InvoiceAuditRow, ReanalyzeCurrent, ReanalyzePreview, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
-  TaskBoard, TaskTriageResult, DailyDigest, DailySummaryResult,
+  TaskBoard, TaskTriageResult, DailyDigest, DailySummaryResult, PlainSummaryResult, AnalysesStats,
 } from "./types";
 import { sb } from "./supabase";
 import { impersonateHeaders } from "./impersonate";
@@ -247,6 +247,11 @@ export const api = {
       request<{ shipment: Shipment }>(`/api/shipments/${id}/action`, { method: "PATCH", body: JSON.stringify(body) }),
     reanalyze: (id: string) =>
       request<{ shipment: Shipment }>(`/api/shipments/${id}/reanalyze`, { method: "POST" }),
+    // Plain-English brief for the drawer. Cached server-side per analysis;
+    // `force` regenerates. `unverified` lists figures the server could not
+    // find in the fact sheet the model was given.
+    plainSummary: (id: string, body: { force?: boolean } = {}) =>
+      request<PlainSummaryResult>(`/api/shipments/${id}/plain-summary`, { method: "POST", body: JSON.stringify(body), timeoutMs: 60_000 }),
     // Run a fresh analysis on the chosen model and return the proposed
     // verdict WITHOUT persisting it (powers the Re-analyze modal). The run is
     // logged to fpx_ai_analyses; the shipment only changes on applyReanalysis.
@@ -304,6 +309,8 @@ export const api = {
     list: (params?: {
       limit?: number;
       kind?: string;
+      subkind?: string;
+      before?: string;
       tracking_number?: string;
       model?: string;
       user_email?: string;
@@ -311,7 +318,10 @@ export const api = {
       from?: string;
       to?: string;
       rating?: "up" | "down" | "unrated";
-    }) => request<{ data: AiAnalysis[] }>("/api/analyses", { params }),
+    }) => request<{ data: AiAnalysis[]; next_before?: string | null }>("/api/analyses", { params }),
+    // Exact totals across ALL matching rows (the list is capped at 1000).
+    stats: (params?: { kind?: string; subkind?: string; days?: number }) =>
+      request<{ stats: AnalysesStats }>("/api/analyses/stats", { params }),
     // Reps rate AI generations 👍 / 👎 so the team can iterate on
     // prompts. Passing rating=null clears a prior rating (mistaken
     // click). Reason is optional but encouraged on 👎.

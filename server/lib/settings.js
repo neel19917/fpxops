@@ -87,6 +87,22 @@ const FALLBACKS = {
     '## 9. Plan for tomorrow\nOrdered checklist (8-12 items) with an owner where obvious.\n' +
     '## 10. Questions for leadership\n2-4 decisions or policy questions surfaced by today\'s data.\n\n' +
     'Rules: refer to people by the display name in digest.people (e.g. "Victor", "Allen"), never by email. Use ONLY facts present in the digest; never invent shipments, numbers, or names. Always cite tracking numbers when you mention a shipment. Be dense and specific — no filler, no generic advice. 900-1500 words. Markdown only, no code fences, no preamble.',
+  // Plain-English brief in the shipment drawer (lib/plainSummary.js). Read
+  // by non-technical people, so: fact sheet in, strict JSON out, every
+  // number cross-checked. Sonnet 5 by default — small task, accuracy over
+  // cost; cached per analysis so it runs once per re-analysis, not per open.
+  "prompt.plain_summary.model": "claude-sonnet-5",
+  "prompt.plain_summary.system":
+    'You explain a freight shipment\'s situation to someone with no logistics background — a customer\'s account manager or a director skimming on their phone. You are given a fact sheet about ONE shipment: identifiers, customer, carrier, dates, the carrier\'s latest comment, the operations AI\'s read, computed signals (storage risk, redelivery, ETA passed), the open follow-up tasks, and the latest operator note.\n\n' +
+    'Write plain English. No jargon: say "the trucking company" or the carrier\'s name, not "carrier"; "the delivery appointment", not "appt"; "where the freight is right now", not "status"; "the customer" and name them. Spell out what "storage" or "redelivery" means the first time. Short sentences.\n\n' +
+    'Output strict JSON with exactly these keys:\n' +
+    '- headline: one sentence, the single most important thing (max 25 words).\n' +
+    '- what_happened: 2-3 sentences: where the freight is, what went wrong or is about to, and since when. Use the dates from the fact sheet in MM/DD/YYYY form.\n' +
+    '- why_it_matters: 1-2 sentences on the consequence — extra charges, a customer waiting, a missed commitment.\n' +
+    '- next_steps: 2-4 items, each {"step": "...", "who": "..."}. Each step starts with a verb, names who to call/email (the customer by name, or the trucking company), and says what to ask or decide. "who" is the FPX owner from open_tasks if present, else "FPX ops".\n' +
+    '- by_when: when this must happen, tied to a date from the fact sheet (e.g. "before the 09/24/2026 appointment").\n' +
+    '- urgency: one of "today", "this_week", "monitor", "none".\n\n' +
+    'Rules: use ONLY facts from the fact sheet. Never invent dates, hours, dollar amounts, names or reference numbers; if a figure is not in the sheet, do not state one. Do not speculate about causes or condition (damage, loss, theft, refusal) unless the sheet states them — say "the note says it was returned", not "possibly damaged or lost". Refer to people by the names given in open_tasks.owner / latest_note.by (never by email). If the sheet says the freight is delivered, say so and set urgency "none". Copy numbers exactly as given (e.g. 69.9 hours, 48-hour limit). No preamble, no markdown, JSON only.',
   // Storage-charge risk on delivery holds (lib/storageRisk.js). Carriers on
   // this list bill storage once freight sits at the destination terminal
   // longer than hold_hours waiting for an appointment. Comma-separated

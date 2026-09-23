@@ -7,6 +7,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, usePa
 import { Layout, type TabId } from "./components/Layout";
 import { AuthProvider, useAuth } from "./lib/auth";
 import { NavCtx, type NavApi } from "./lib/nav";
+import { getTasksView } from "./lib/tasksView";
 import { SignInPage } from "./pages/SignIn";
 import { PendingApprovalPage } from "./pages/PendingApproval";
 
@@ -218,10 +219,16 @@ function AuthedApp() {
             <Route path="/tracking" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
-            <Route path="/tasks" element={<TasksPage />} />
-            {/* Tasks v2: segmented board + heavy-model triage. Static path,
-                so it must be declared before /tasks/:taskId below. */}
+            {/* /tasks opens whichever view the user last chose (v2 by
+                default). /tasks/v2 and /tasks/legacy are always explicit.
+                Static paths must be declared before /tasks/:taskId. */}
+            <Route path="/tasks" element={<TasksHome />} />
+            <Route path="/tasks/legacy" element={<TasksPage />} />
             <Route path="/tasks/v2" element={<TasksV2Page />} />
+            {/* Task opened FROM v2: the board stays mounted underneath and
+                the shipment drawer slides over it. */}
+            <Route path="/tasks/v2/:taskId" element={<TaskWalkRoute v2 />} />
+            <Route path="/tasks/v2/:taskId/:section" element={<TaskWalkRoute v2 />} />
             {/* Static sub-routes win over /tasks/:taskId in react-router v6
                 ranking (static > dynamic). They render the same TasksPage
                 with a different sub-tab inferred from the URL. */}
@@ -299,12 +306,19 @@ function ShipmentsRoute() {
   );
 }
 
+// /tasks — renders the v2 board unless this browser opted back into the
+// legacy list (see lib/tasksView.ts). Rendered inline (no redirect) so the
+// URL stays /tasks and the nav highlight is stable.
+function TasksHome() {
+  return getTasksView() === "legacy" ? <TasksPage /> : <TasksV2Page />;
+}
+
 // /tasks/:taskId — task-walk-through entry point. Hits the database route
 // lookup (GET /api/tasks/:id?walk=active) to resolve the focused task to a
 // shipment and to get its prev/next sibling task ids for the drawer's
 // chevrons. While the lookup is in flight we render a small placeholder.
 // On not-found / no-shipment we fall back to /tasks so the URL doesn't dead-end.
-function TaskWalkRoute() {
+function TaskWalkRoute({ v2 = false }: { v2?: boolean } = {}) {
   const { taskId, section } = useParams<{ taskId: string; section?: string }>();
   const navigate = useNavigate();
   // Where the operator came from and, optionally, the exact task order they
@@ -312,11 +326,17 @@ function TaskWalkRoute() {
   // prev/next step through the board in its current sort and closing the
   // drawer lands back on v2 — not on the classic Tasks list. Router state
   // survives every walk step because onWalk re-sends it.
+  //
+  // `v2` = mounted at /tasks/v2/:taskId: the v2 board renders underneath and
+  // the drawer slides over it (ShipmentsPage in drawerOnly mode), so the
+  // operator never leaves the board.
   const location = useLocation();
   const walkState = (location.state || {}) as { from?: string; walkIds?: string[] };
-  const backTo = walkState.from || "/tasks";
+  const base = v2 ? "/tasks/v2" : "/tasks";
+  const backTo = walkState.from || base;
   const walkIds = Array.isArray(walkState.walkIds) && taskId && walkState.walkIds.includes(taskId) ? walkState.walkIds : null;
   const go = (path: string) => navigate(path, { state: walkState });
+  const taskPath = (id: string, sec?: string | null) => (sec ? `${base}/${id}/${sec}` : `${base}/${id}`);
   const [resolved, setResolved] = useState<{
     task: ShipmentTask;
     shipmentId: string;
@@ -414,7 +434,7 @@ function TaskWalkRoute() {
   useEffect(() => {
     if (!autoSkip || !resolved) return;
     const t = setTimeout(() => {
-      if (resolved.nextTaskId) go(`/tasks/${resolved.nextTaskId}`);
+      if (resolved.nextTaskId) go(taskPath(resolved.nextTaskId));
       else navigate(backTo);
     }, 5000);
     return () => clearTimeout(t);
@@ -482,7 +502,7 @@ function TaskWalkRoute() {
           <div className="flex items-center gap-3 text-xs">
             <button
               onClick={() => {
-                if (resolved.nextTaskId) go(`/tasks/${resolved.nextTaskId}`);
+                if (resolved.nextTaskId) go(taskPath(resolved.nextTaskId));
                 else navigate(backTo);
               }}
               className="px-2 py-1 rounded-md bg-amber-600 text-white hover:bg-amber-700"
@@ -498,7 +518,9 @@ function TaskWalkRoute() {
           </div>
         </div>
       ) : null}
+      {v2 ? <TasksV2Page /> : null}
       <ShipmentsPage
+      drawerOnly={v2}
       initialShipmentId={resolved.shipmentId}
       drawerSection={section || null}
       onShipmentConsumed={() => { /* URL already has the task id */ }}
@@ -513,8 +535,7 @@ function TaskWalkRoute() {
           return;
         }
         // Same shipment — only the section changed.
-        if (nextSection) go(`/tasks/${taskId}/${nextSection}`);
-        else go(`/tasks/${taskId}`);
+        go(taskPath(taskId!, nextSection));
       }}
       taskWalk={{
         taskId,
@@ -523,7 +544,7 @@ function TaskWalkRoute() {
         nextTaskId: resolved.nextTaskId,
         index: resolved.index,
         total: resolved.total,
-        onWalk: (nextTaskId) => go(section ? `/tasks/${nextTaskId}/${section}` : `/tasks/${nextTaskId}`),
+        onWalk: (nextTaskId) => go(taskPath(nextTaskId, section)),
         onTaskStatusChanged: () => setReloadKey((k) => k + 1),
       }}
     />

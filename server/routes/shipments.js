@@ -4,7 +4,8 @@ import { mapShipment, mapShipmentsBulk } from "../lib/shipments.js";
 import { logAudit } from "../lib/audit.js";
 import { generateEmailDraft } from "../lib/emailDraft.js";
 import { getSettings } from "../lib/settings.js";
-import { analyzeExistingShipment, runShipmentAnalysis } from "./analyze.js";
+import { analyzeExistingShipment, runShipmentAnalysis, computeTemporalTriggers } from "./analyze.js";
+import { buildPlainFacts, runPlainSummary, extractJson as extractPlainJson, normalizePlainSummary, crossCheck } from "../lib/plainSummary.js";
 import { extractAiJsonFields } from "../lib/anthropic.js";
 import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG } from "../lib/redelivery.js";
 import { detectStorageRisk, isStorageRiskTitle, STORAGE_TAG } from "../lib/storageRisk.js";
@@ -892,6 +893,62 @@ shipmentsRouter.post("/bulk-reanalyze", async (req, res) => {
       });
     })
     .catch((e) => console.error("[FPX] bulk-reanalyze batch error:", e));
+});
+
+// POST /shipments/:id/plain-summary  { force?: boolean }
+// Plain-English brief for the drawer (lib/plainSummary.js). Cached on
+// fpx_ai_analyses (metadata.subkind = plain_summary, with the fact sheet it
+// was written from) and reused until the shipment is re-analysed or a newer
+// operator note lands. `force` regenerates. Response carries `unverified`:
+// dates / hours / amounts in the prose that are NOT in the fact sheet, so
+// the UI can flag them rather than present them as fact.
+shipmentsRouter.post("/:id/plain-summary", async (req, res) => {
+  const force = req.body?.force === true;
+  const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!ship) return res.status(404).json({ error: "Shipment not found" });
+
+  const [tasksRes, notesRes, cachedRes, settings] = await Promise.all([
+    supabase.from("fpx_shipment_tasks").select("id, title, status, assigned_to, created_at").eq("shipment_id", ship.id).is("archived_at", null).order("created_at", { ascending: false }).limit(20),
+    supabase.from("fpx_shipment_notes").select("body, created_by, created_at").eq("shipment_id", ship.id).order("created_at", { ascending: false }).limit(3),
+    supabase.from("fpx_ai_analyses").select("id, created_at, model, response_text, cost_usd, metadata")
+      .eq("shipment_uuid", ship.id).contains("metadata", { subkind: "plain_summary" })
+      .order("created_at", { ascending: false }).limit(1),
+    getSettings("storage.hold_hours", "storage.carriers"),
+  ]);
+  const tasks = tasksRes.data || [];
+  const notes = notesRes.data || [];
+
+  // Serve the cache when nothing that feeds the brief has changed since.
+  const cached = cachedRes.data?.[0];
+  const newest = Math.max(
+    ship.last_analyzed_at ? Date.parse(ship.last_analyzed_at) : 0,
+    notes[0]?.created_at ? Date.parse(notes[0].created_at) : 0,
+  );
+  if (cached && !force && Date.parse(cached.created_at) >= newest) {
+    const parsed = extractPlainJson(cached.response_text);
+    if (parsed) {
+      const summary = normalizePlainSummary(parsed);
+      const facts = cached.metadata?.facts || null;
+      return res.json({
+        summary,
+        unverified: facts ? crossCheck(summary, facts) : [],
+        facts,
+        model: cached.model, cost_usd: cached.cost_usd, analysis_id: cached.id, created_at: cached.created_at, cached: true,
+      });
+    }
+  }
+
+  const triggers = computeTemporalTriggers(ship, Date.now(), {
+    storageHoldHours: settings["storage.hold_hours"], storageCarriers: settings["storage.carriers"],
+  });
+  const facts = buildPlainFacts({ ship, tasks, notes, triggers, people: Object.fromEntries((await peopleIndex()).names) });
+  const result = await runPlainSummary({
+    facts,
+    callMeta: { api_key_id: req.apiKey?.id, user_email: req.user?.email, shipment_uuid: ship.id, metadata: { facts } },
+  });
+  if (result.error) return res.status(500).json({ error: result.error });
+  res.json({ ...result, facts, created_at: new Date().toISOString(), cached: false });
 });
 
 // POST /shipments/:id/reanalyze — manual trigger from the dashboard. Runs

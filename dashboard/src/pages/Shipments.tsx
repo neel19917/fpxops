@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, Pencil } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
-import type { AiAnalysis, EmailDraft, Shipment, ShipmentNote, ShipmentTask, TaskStatus } from "../lib/types";
+import type { AiAnalysis, EmailDraft, PlainSummaryResult, Shipment, ShipmentNote, ShipmentTask, TaskStatus } from "../lib/types";
 import { ActionBadge } from "../components/Badge";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
@@ -77,6 +77,10 @@ interface ShipmentsPageProps {
   // hunting for the toolbar toggle. The user can still toggle it off
   // from the toolbar; the URL stays /notes either way.
   notesMode?: boolean;
+  // Render ONLY the drawer (+ its modals), no pills / toolbar / table, and
+  // skip the list + stats fetches. Used by the Tasks v2 task-walk route so
+  // the drawer slides over the v2 board instead of over the Tracking page.
+  drawerOnly?: boolean;
   // When the drawer was entered via a /tasks/:taskId URL, the task-walk
   // context drives prev/next instead of the local `filtered` shipments list.
   // taskId is the focused task; prev / next are sibling task ids resolved
@@ -110,7 +114,7 @@ function asDrawerTab(s: string | null | undefined): DrawerTabId {
   return DRAWER_TABS.includes(s as DrawerTabId) ? (s as DrawerTabId) : "overview";
 }
 
-export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk, notesMode = false }: ShipmentsPageProps = {}) {
+export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk, notesMode = false, drawerOnly = false }: ShipmentsPageProps = {}) {
   const { clientConfig } = useAuth();
   const embedCfg = clientConfig?.embed_freightpop;
   // Master parcel switch (admin, default OFF). When off, parcel-mode rows
@@ -241,6 +245,20 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [notesDraft, setNotesDraft] = useState("");
   const [notesBusy, setNotesBusy] = useState(false);
   const [notesLog, setNotesLog] = useState<ShipmentNote[]>([]);
+  // Plain-English brief for the open shipment (server-cached per analysis).
+  const [plainSummary, setPlainSummary] = useState<PlainSummaryResult | null>(null);
+  const [plainBusy, setPlainBusy] = useState(false);
+  const [plainError, setPlainError] = useState<string | null>(null);
+  async function loadPlainSummary(id: string, force = false) {
+    setPlainBusy(true); setPlainError(null);
+    try {
+      const r = await api.shipments.plainSummary(id, { force });
+      // Drawer may have moved on to another shipment while this ran.
+      setPlainSummary((prev) => (drawerIdRef.current === id ? r : prev));
+    } catch (e) { setPlainError((e as Error).message); }
+    finally { setPlainBusy(false); }
+  }
+  const drawerIdRef = useRef<string | null>(null);
 
   // CRM-style drawer keyboard navigation.
   const [drawerHelpOpen, setDrawerHelpOpen] = useState(false);
@@ -386,14 +404,17 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   // parcel visibility (the count must match what the grid shows) and statsNonce
   // (bumped by Refresh / bulk ops). Non-fatal — pills fall back to page counts.
   useEffect(() => {
+    if (drawerOnly) return; // no pills to feed
     let alive = true;
     api.shipments.stats(showParcels).then((s) => { if (alive) setStats(s); }).catch(() => {});
     return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showParcels, statsNonce]);
   // Stale-while-revalidate: paint instantly from the last successful
   // response, then let the live fetch swap in silently instead of
   // blanking the table to a spinner on every visit.
   useEffect(() => {
+    if (drawerOnly) { setLoading(false); return; } // drawer-only mount: no table to fill
     const cached = swrGet<{ data: Shipment[]; next_cursor: string | null }>("shipments.list");
     if (cached?.data?.length) {
       setRows(cached.data);
@@ -429,6 +450,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }
 
   useEffect(() => {
+    drawerIdRef.current = drawerId;
+    setPlainSummary(null); setPlainError(null);
     if (!drawerId) {
       setDrawerData(null);
       setDrawerTasks([]);
@@ -439,6 +462,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       setNotesLog([]);
       return;
     }
+    void loadPlainSummary(drawerId);
     // Cancel guard so a slower response for the previous shipment can't
     // overwrite drawerData after the user has walked to a different one.
     // Especially important during task-walk prev/next on a slow connection.
@@ -889,7 +913,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }, [stats, baseRows]);
 
   return (
-    <div className="space-y-5">
+    <div className={drawerOnly ? "" : "space-y-5"}>
+      {drawerOnly ? null : (<>
       <div className="flex flex-wrap gap-2">
         <StatPill label="Total"            count={pillCounts.total}            tone="gray"  active={pillFilter === "all"}              onClick={() => setPillFilter("all")} />
         <StatPill label="Booked"           count={pillCounts.booked}           tone="blue"  active={pillFilter === "booked"}           onClick={() => setPillFilter(pillFilter === "booked" ? "all" : "booked")} />
@@ -1270,6 +1295,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           </div>
         </div>
       ) : null}
+      </>)}
 
       <Drawer
         open={!!drawerId}
@@ -1504,6 +1530,22 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
             {drawerTab === "overview" && (
               <>
+                {/* Plain-English brief first: what happened, why it
+                    matters, what to do, by when — written for someone
+                    without a logistics background. The technical AI
+                    read moves below it behind "Technical details". */}
+                <PlainSummaryCard
+                  result={plainSummary}
+                  loading={plainBusy}
+                  error={plainError}
+                  onRefresh={() => { if (drawerId) void loadPlainSummary(drawerId, true); }}
+                  technical={{
+                    issue: drawerData.shipment.ai_issue,
+                    recommendation: drawerData.shipment.ai_recommendation,
+                    analyzedAt: drawerData.shipment.last_analyzed_at ?? null,
+                    onReanalyze: () => { if (drawerId) setReanalyzeOpen(true); },
+                  }}
+                />
                 {/* Notes is an append-only log hoisted to the top of
                     Overview — it's the field a rep touches most during a
                     walk-through. Each save is an immutable, timestamped,
@@ -1583,22 +1625,6 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                     <Field label="GP">{drawerData.shipment.shipment_gross_profit}</Field>
                     <Field label="Rate (marked up)">{drawerData.shipment.shipment_marked_up_rate}</Field>
                   </div>
-                </Section>
-                <Section title="AI summary">
-                  <div className="flex justify-end mb-2">
-                    <button
-                      disabled={!drawerId}
-                      onClick={() => { if (drawerId) setReanalyzeOpen(true); }}
-                      className="text-xs px-2.5 py-1 rounded-md bg-sky-50 text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
-                      title="Re-analyze on a chosen model and review before replacing"
-                    >
-                      <RefreshCw className="h-3.5 w-3.5" />
-                      Re-analyze
-                    </button>
-                  </div>
-                  <Field label="Issue">{drawerData.shipment.ai_issue}</Field>
-                  <div className="h-3" />
-                  <Field label="Recommendation">{drawerData.shipment.ai_recommendation}</Field>
                 </Section>
               </>
             )}
@@ -2067,6 +2093,111 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           </div>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+// =====================================================================
+// Plain-English brief — the first thing in the drawer's Overview. Written
+// by the model from a structured fact sheet (server/lib/plainSummary.js);
+// the server cross-checks every date / hour / amount in the prose against
+// that sheet and hands back anything it couldn't verify, which we surface
+// as a warning instead of hiding. The operator-grade AI read lives behind
+// "Technical details" underneath.
+// =====================================================================
+const URGENCY_TONE: Record<string, { label: string; cls: string }> = {
+  today:     { label: "Act today",   cls: "bg-rose-100 text-rose-800 ring-rose-200" },
+  this_week: { label: "This week",   cls: "bg-amber-100 text-amber-800 ring-amber-200" },
+  monitor:   { label: "Monitor",     cls: "bg-sky-100 text-sky-800 ring-sky-200" },
+  none:      { label: "No action",   cls: "bg-emerald-100 text-emerald-800 ring-emerald-200" },
+};
+
+function PlainSummaryCard({ result, loading, error, onRefresh, technical }: {
+  result: PlainSummaryResult | null;
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  technical: { issue: string | null; recommendation: string | null; analyzedAt: string | null; onReanalyze: () => void };
+}) {
+  const [showTech, setShowTech] = useState(false);
+  const s = result?.summary ?? null;
+  const urgency = s ? (URGENCY_TONE[s.urgency] || URGENCY_TONE.monitor) : null;
+  const unverified = result?.unverified ?? [];
+  return (
+    <div className="mb-4 rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm overflow-hidden">
+      <div className="px-4 pt-3 pb-2 flex items-center justify-between gap-2 border-b border-slate-100">
+        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">In plain English</div>
+        <div className="flex items-center gap-2">
+          {urgency ? <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ring-1 ${urgency.cls}`}>{urgency.label}</span> : null}
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={loading}
+            className="text-[11px] text-slate-500 hover:text-slate-800 inline-flex items-center gap-1 disabled:opacity-50"
+            title="Rewrite the brief from the latest facts"
+          >
+            <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} /> {loading ? "Writing…" : "Rewrite"}
+          </button>
+        </div>
+      </div>
+      <div className="px-4 py-3">
+        {error ? <div className="text-xs text-rose-700 mb-2">{error}</div> : null}
+        {!s && loading ? <div className="text-sm text-slate-500">Writing a plain-English brief from the latest facts…</div> : null}
+        {!s && !loading && !error ? <div className="text-sm text-slate-500">No brief yet.</div> : null}
+        {s ? (
+          <>
+            <div className="text-[15px] font-semibold text-slate-900 leading-snug">{s.headline}</div>
+            {s.what_happened ? <p className="text-sm text-slate-700 mt-2 leading-relaxed">{s.what_happened}</p> : null}
+            {s.why_it_matters ? (
+              <p className="text-sm text-slate-700 mt-1.5 leading-relaxed"><span className="font-semibold text-slate-800">Why it matters: </span>{s.why_it_matters}</p>
+            ) : null}
+            {s.next_steps.length ? (
+              <div className="mt-3">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">What to do{s.by_when ? <span className="font-normal normal-case tracking-normal text-slate-500"> · {s.by_when}</span> : null}</div>
+                <ol className="space-y-1.5">
+                  {s.next_steps.map((n, i) => (
+                    <li key={i} className="flex items-start gap-2 text-sm text-slate-800">
+                      <span className="mt-0.5 h-5 w-5 shrink-0 rounded-full bg-violet-100 text-violet-800 text-[11px] font-bold inline-flex items-center justify-center">{i + 1}</span>
+                      <span className="leading-snug">{n.step}{n.who ? <span className="text-slate-500"> — {n.who}</span> : null}</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            ) : null}
+            {unverified.length ? (
+              <div className="mt-3 rounded-lg bg-amber-50 ring-1 ring-amber-200 px-3 py-2 text-[11px] text-amber-900">
+                <span className="font-semibold">Check before quoting:</span> the brief mentions {unverified.map((u, i) => <span key={u}>{i ? ", " : " "}<code className="font-mono">{u}</code></span>)} which {unverified.length === 1 ? "isn't" : "aren't"} in the shipment record. Use the technical details below as the source of truth.
+              </div>
+            ) : null}
+            <div className="mt-3 flex items-center justify-between gap-2 text-[11px] text-slate-400">
+              <span>
+                {result?.created_at ? `Written ${fmtRelative(result.created_at)}` : ""}{result?.model ? ` · ${result.model}` : ""}{result?.cached ? " · cached" : ""}
+                {technical.analyzedAt ? ` · facts analyzed ${fmtRelative(technical.analyzedAt)}` : ""}
+              </span>
+              <button type="button" onClick={() => setShowTech((v) => !v)} className="text-slate-500 hover:text-slate-800 hover:underline">
+                {showTech ? "Hide technical details" : "Technical details"}
+              </button>
+            </div>
+          </>
+        ) : null}
+        {(showTech || !s) && (technical.issue || technical.recommendation) ? (
+          <div className="mt-3 rounded-lg bg-slate-50 ring-1 ring-slate-200 px-3 py-2.5">
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Operations AI read</div>
+              <button
+                type="button"
+                onClick={technical.onReanalyze}
+                className="text-[11px] px-2 py-0.5 rounded-md bg-sky-50 text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 inline-flex items-center gap-1"
+                title="Re-analyze on a chosen model and review before replacing"
+              >
+                <RefreshCw className="h-3 w-3" /> Re-analyze
+              </button>
+            </div>
+            {technical.issue ? <div className="text-xs text-slate-800 leading-snug"><span className="font-semibold text-slate-600">Issue: </span>{technical.issue}</div> : null}
+            {technical.recommendation ? <div className="text-xs text-slate-700 leading-snug mt-1"><span className="font-semibold text-slate-600">Recommendation: </span>{technical.recommendation}</div> : null}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -2688,7 +2819,27 @@ function TaskBanner({ task, shipment, latestNote, siblings = [], onOpenTask, bus
         </div>
       ) : task.description ? (
         <div className="group relative mt-1 flex items-start gap-1.5">
-          <div className="text-xs text-slate-600 leading-snug whitespace-pre-wrap flex-1 min-w-0">{task.description}</div>
+          {/* The auto-task description ends with a "Change log:" block of
+              raw field diffs (ISO timestamps etc.). Keep the human text
+              visible and fold the diff behind a disclosure. */}
+          <div className="text-xs text-slate-600 leading-snug flex-1 min-w-0">
+            {(() => {
+              const idx = task.description.indexOf("Change log:");
+              const human = idx >= 0 ? task.description.slice(0, idx).trim() : task.description;
+              const changeLog = idx >= 0 ? task.description.slice(idx).trim() : "";
+              return (
+                <>
+                  <div className="whitespace-pre-wrap">{human}</div>
+                  {changeLog ? (
+                    <details className="mt-1.5">
+                      <summary className="cursor-pointer text-[11px] text-slate-500 hover:text-slate-800 select-none">What changed between scrapes</summary>
+                      <pre className="mt-1 text-[11px] text-slate-500 whitespace-pre-wrap font-mono bg-white/70 rounded-md p-2 ring-1 ring-slate-200">{changeLog}</pre>
+                    </details>
+                  ) : null}
+                </>
+              );
+            })()}
+          </div>
           {onSaveDescription ? (
             <button
               type="button"
