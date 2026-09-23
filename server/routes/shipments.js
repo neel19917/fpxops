@@ -212,7 +212,7 @@ function reasonLineFor(s) {
 // `tag` is an optional structured marker placed right after the followup
 // prefix (e.g. "Storage risk — ") so /tasks search and the v2 board's
 // segmenter can recognise the task type without parsing the AI's wording.
-function buildStandardTask(s, changeLog, { tag = "" } = {}) {
+function buildStandardTask(s, changeLog, { tag = "", assignee = null } = {}) {
   // When the AI knows who to chase (action_target), prefix the task
   // title with the matching followup convention so the task lands
   // in the Carrier Followups or Customer Followups panel on /tasks.
@@ -238,7 +238,9 @@ function buildStandardTask(s, changeLog, { tag = "" } = {}) {
     description,
     status: "open",
     priority: "high",
-    assigned_to: s.created_by || null,
+    // Explicit owner (e.g. storage.assignee) wins; otherwise the runner who
+    // scraped the shipment.
+    assigned_to: (assignee && String(assignee).trim()) || s.created_by || null,
     created_by: "system (auto-flag)",
   };
 }
@@ -296,7 +298,8 @@ async function autoCreateActionTasks(
     "ui.tracking.show_parcels": showParcels,
     "storage.hold_hours": storageHoldHours,
     "storage.carriers": storageCarriers,
-  } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers");
+    "storage.assignee": storageAssignee,
+  } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers", "storage.assignee");
   const storageOpts = { asOfMs: Date.now(), holdHours: storageHoldHours, carriers: storageCarriers };
   const candidates = (upsertedRows || []).filter(
     (s) => String(s.action_required || "").toUpperCase() === "YES"
@@ -352,7 +355,7 @@ async function autoCreateActionTasks(
       const storage = detectStorageRisk({ ...s, ...current }, storageOpts).storage_risk === true;
       if (storage) {
         if (prior.some((t) => isStorageRiskTitle(t.title))) continue;
-        rows.push(buildStandardTask(s, changeLog, { tag: STORAGE_TAG }));
+        rows.push(buildStandardTask(s, changeLog, { tag: STORAGE_TAG, assignee: storageAssignee }));
         continue;
       }
       if (prior.length) continue;
