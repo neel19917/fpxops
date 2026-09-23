@@ -307,6 +307,16 @@ function ShipmentsRoute() {
 function TaskWalkRoute() {
   const { taskId, section } = useParams<{ taskId: string; section?: string }>();
   const navigate = useNavigate();
+  // Where the operator came from and, optionally, the exact task order they
+  // were looking at. Tasks v2 sets { from: "/tasks/v2", walkIds: [...] } so
+  // prev/next step through the board in its current sort and closing the
+  // drawer lands back on v2 — not on the classic Tasks list. Router state
+  // survives every walk step because onWalk re-sends it.
+  const location = useLocation();
+  const walkState = (location.state || {}) as { from?: string; walkIds?: string[] };
+  const backTo = walkState.from || "/tasks";
+  const walkIds = Array.isArray(walkState.walkIds) && taskId && walkState.walkIds.includes(taskId) ? walkState.walkIds : null;
+  const go = (path: string) => navigate(path, { state: walkState });
   const [resolved, setResolved] = useState<{
     task: ShipmentTask;
     shipmentId: string;
@@ -353,13 +363,16 @@ function TaskWalkRoute() {
           setError("This task isn't linked to a shipment.");
           return;
         }
+        // Client-supplied order (Tasks v2) wins over the server's active-task
+        // walk so the chevrons follow what the operator was looking at.
+        const pos = walkIds ? walkIds.indexOf(r.task.id) : -1;
         setResolved({
           task: r.task,
           shipmentId: r.task.shipment_id,
-          prevTaskId: r.walk?.prev_id || null,
-          nextTaskId: r.walk?.next_id || null,
-          index: r.walk?.index ?? 0,
-          total: r.walk?.total ?? 1,
+          prevTaskId: walkIds ? (pos > 0 ? walkIds[pos - 1] : null) : (r.walk?.prev_id || null),
+          nextTaskId: walkIds ? (pos >= 0 && pos < walkIds.length - 1 ? walkIds[pos + 1] : null) : (r.walk?.next_id || null),
+          index: walkIds ? Math.max(0, pos) : (r.walk?.index ?? 0),
+          total: walkIds ? walkIds.length : (r.walk?.total ?? 1),
         });
         // Every task entry — direct URL, prev/next walk, drawer open from
         // Tasks list — auto-requests a Kendo filter on the embedded
@@ -401,10 +414,11 @@ function TaskWalkRoute() {
   useEffect(() => {
     if (!autoSkip || !resolved) return;
     const t = setTimeout(() => {
-      if (resolved.nextTaskId) navigate(`/tasks/${resolved.nextTaskId}`);
-      else navigate("/tasks");
+      if (resolved.nextTaskId) go(`/tasks/${resolved.nextTaskId}`);
+      else navigate(backTo);
     }, 5000);
     return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoSkip, resolved, navigate]);
 
   if (error) {
@@ -417,7 +431,7 @@ function TaskWalkRoute() {
             className="text-sky-700 hover:text-sky-900 hover:underline"
           >Retry</button>
           <button
-            onClick={() => navigate("/tasks")}
+            onClick={() => navigate(backTo)}
             className="text-slate-600 hover:text-slate-900 hover:underline"
           >← Back to Tasks</button>
         </div>
@@ -443,7 +457,7 @@ function TaskWalkRoute() {
                 className="text-sky-700 hover:text-sky-900 hover:underline"
               >Retry</button>
               <button
-                onClick={() => navigate("/tasks")}
+                onClick={() => navigate(backTo)}
                 className="text-slate-600 hover:text-slate-900 hover:underline"
               >← Back to Tasks</button>
             </div>
@@ -468,8 +482,8 @@ function TaskWalkRoute() {
           <div className="flex items-center gap-3 text-xs">
             <button
               onClick={() => {
-                if (resolved.nextTaskId) navigate(`/tasks/${resolved.nextTaskId}`);
-                else navigate("/tasks");
+                if (resolved.nextTaskId) go(`/tasks/${resolved.nextTaskId}`);
+                else navigate(backTo);
               }}
               className="px-2 py-1 rounded-md bg-amber-600 text-white hover:bg-amber-700"
             >
@@ -489,8 +503,9 @@ function TaskWalkRoute() {
       drawerSection={section || null}
       onShipmentConsumed={() => { /* URL already has the task id */ }}
       onDrawerChange={(nextId, nextSection) => {
-        // Closing the drawer in task-walk mode pops back to the Tasks page.
-        if (!nextId) { navigate("/tasks"); return; }
+        // Closing the drawer in task-walk mode pops back to wherever the
+        // operator came from (Tasks v2 or the classic list).
+        if (!nextId) { navigate(backTo); return; }
         // Drawer changing the *shipment* id while in task-walk mode would
         // sever the task↔shipment link, so push to /tracking instead.
         if (nextId !== resolved.shipmentId) {
@@ -498,8 +513,8 @@ function TaskWalkRoute() {
           return;
         }
         // Same shipment — only the section changed.
-        if (nextSection) navigate(`/tasks/${taskId}/${nextSection}`);
-        else navigate(`/tasks/${taskId}`);
+        if (nextSection) go(`/tasks/${taskId}/${nextSection}`);
+        else go(`/tasks/${taskId}`);
       }}
       taskWalk={{
         taskId,
@@ -508,7 +523,7 @@ function TaskWalkRoute() {
         nextTaskId: resolved.nextTaskId,
         index: resolved.index,
         total: resolved.total,
-        onWalk: (nextTaskId) => navigate(section ? `/tasks/${nextTaskId}/${section}` : `/tasks/${nextTaskId}`),
+        onWalk: (nextTaskId) => go(section ? `/tasks/${nextTaskId}/${section}` : `/tasks/${nextTaskId}`),
         onTaskStatusChanged: () => setReloadKey((k) => k + 1),
       }}
     />
