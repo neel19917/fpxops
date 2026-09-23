@@ -68,7 +68,7 @@ const GROUPS: {
     label: "Tasks v2 — AI triage",
     description: "Board-level triage on the Tasks v2 page: the heavy model ranks work, flags moot tasks, and batches related tasks. Plus the stale-data threshold for health flags.",
     Icon: Sparkles,
-    match: (k) => k.startsWith("prompt.task_triage") || k.startsWith("ui.tasks."),
+    match: (k) => k.startsWith("prompt.task_triage") || k.startsWith("prompt.daily_summary") || k.startsWith("ui.tasks."),
   },
   {
     id: "model",
@@ -129,6 +129,8 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "storage.hold_hours": "Free hold at destination terminal before storage applies (hours)",
   "prompt.task_triage.model": "Tasks v2 triage — model",
   "prompt.task_triage.system": "Tasks v2 triage — system prompt",
+  "prompt.daily_summary.model": "Tasks v2 daily exec summary — model",
+  "prompt.daily_summary.system": "Tasks v2 daily exec summary — system prompt (sections + rules)",
   "ui.tasks.stale_days": "Tasks v2 — days without a scrape before shipment data counts as stale",
   "embed.freightpop.enabled": "FreightPOP embed — enabled",
   "embed.freightpop.url_template": "FreightPOP embed — URL template",
@@ -153,6 +155,7 @@ const ENUM_OPTIONS: Record<string, { value: string; label: string }[]> = {
   "prompt.email_draft.carrier_group.model": MODEL_OPTIONS,
   "prompt.email_draft.customer_group.model": MODEL_OPTIONS,
   "prompt.task_triage.model": MODEL_OPTIONS,
+  "prompt.daily_summary.model": MODEL_OPTIONS,
 };
 
 function valueShape(v: unknown): "string" | "number" | "boolean" | "json" {

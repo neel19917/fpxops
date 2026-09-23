@@ -3,9 +3,10 @@ import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { computeWalkContext } from "../lib/taskWalk.js";
 import { generateCarrierGroupEmail, generateCustomerGroupEmail } from "../lib/emailDraft.js";
-import { buildBoard, TASK_SEGMENTS, TASK_FLAGS } from "../lib/taskSegments.js";
+import { TASK_SEGMENTS, TASK_FLAGS } from "../lib/taskSegments.js";
 import { runTaskTriage, extractJson, normalizeTriage, TRIAGE_MAX_ROWS } from "../lib/taskTriage.js";
-import { getSettings } from "../lib/settings.js";
+import { loadBoard } from "../lib/taskBoard.js";
+import { collectDailyDigest, runDailySummary } from "../lib/dailySummary.js";
 
 export const tasksRouter = Router();
 
@@ -388,54 +389,10 @@ tasksRouter.post("/customer-email-draft", async (req, res) => {
 // Tasks v2 board
 // ---------------------------------------------------------------------------
 // The v2 page needs every active task joined to its shipment in one shot,
-// plus a segment + health classification per task (lib/taskSegments.js).
+// plus a segment + health classification per task (lib/taskSegments.js);
+// loading lives in lib/taskBoard.js so the daily summary can share it.
 // Static /v2/* paths sit above the UUID-constrained /:id routes; the regex
 // on those would reject "v2" anyway, but keep the ordering obvious.
-
-const BOARD_SHIPMENT_COLS = [
-  "id", "tracking_number", "shipment_id", "customer_name", "carrier", "carrier_name", "mode",
-  "shipment_status", "updated_eta", "delivery_date", "scraped_at", "last_modified_at", "archived_at",
-  "action_required", "action_target", "action_confidence", "ai_issue", "ai_recommendation",
-  "tracking_comments", "origin", "destination", "ship_from", "ship_to",
-].join(", ");
-
-// Load tasks + shipments and classify. `statuses` defaults to the active
-// set; pass include_closed to add done/cancelled from the last N days so
-// the board can show what was just cleared (and so triage can see that a
-// shipment already had a worked task).
-async function loadBoard({ includeClosed = false, closedDays = 7, staleDays } = {}) {
-  const ACTIVE = ["open", "in_progress", "blocked"];
-  let q = supabase.from("fpx_shipment_tasks").select("*").is("archived_at", null)
-    .order("created_at", { ascending: false }).limit(2000);
-  if (includeClosed) {
-    const since = new Date(Date.now() - closedDays * 86400000).toISOString();
-    q = q.or(`status.in.(${ACTIVE.join(",")}),and(status.in.(done,cancelled),updated_at.gte.${since})`);
-  } else {
-    q = q.in("status", ACTIVE);
-  }
-  const { data: tasks, error } = await q;
-  if (error) throw new Error(error.message);
-
-  const shipIds = Array.from(new Set((tasks || []).map((t) => t.shipment_id).filter(Boolean)));
-  const byId = new Map();
-  // .in() with ~1000 uuids is fine for PostgREST; chunk anyway to stay
-  // under URL-length limits on the widest boards.
-  for (let i = 0; i < shipIds.length; i += 400) {
-    const chunk = shipIds.slice(i, i + 400);
-    const { data: ships, error: shipErr } = await supabase
-      .from("fpx_shipments").select(BOARD_SHIPMENT_COLS).in("id", chunk);
-    if (shipErr) throw new Error(shipErr.message);
-    for (const s of ships || []) byId.set(s.id, s);
-  }
-
-  let stale = staleDays;
-  if (!Number.isFinite(stale)) {
-    const s = await getSettings("ui.tasks.stale_days");
-    stale = Number(s["ui.tasks.stale_days"]) || 7;
-  }
-  const board = buildBoard(tasks || [], byId, { staleDays: stale });
-  return { ...board, stale_days: stale };
-}
 
 // GET /tasks/v2/board?include_closed=1&stale_days=7
 tasksRouter.get("/v2/board", async (req, res) => {
@@ -529,6 +486,66 @@ tasksRouter.get("/v2/triage/latest", async (_req, res) => {
       count: row.metadata?.count ?? null,
       scope: row.metadata?.scope ?? null,
       user_email: row.user_email || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- Daily executive summary -------------------------------------------
+// GET /tasks/v2/daily-digest?hours=24 — the numeric digest alone (cheap, no
+// model call) so the page can show today's numbers instantly.
+tasksRouter.get("/v2/daily-digest", async (req, res) => {
+  try {
+    const digest = await collectDailyDigest({ hours: req.query.hours ? Number(req.query.hours) : 24 });
+    res.json({ digest });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /tasks/v2/daily-summary  { hours?: number, notes?: string }
+// Heavy-model long-form brief over the digest. Stored on fpx_ai_analyses
+// with metadata.subkind = daily_summary (digest included) so /latest can
+// replay it without re-running the model.
+tasksRouter.post("/v2/daily-summary", async (req, res) => {
+  try {
+    const hours = req.body?.hours ? Number(req.body.hours) : 24;
+    const notes = typeof req.body?.notes === "string" ? req.body.notes : null;
+    const digest = await collectDailyDigest({ hours });
+    const result = await runDailySummary({
+      digest, notes,
+      callMeta: { api_key_id: req.apiKey?.id, user_email: req.user?.email },
+    });
+    if (result.error) return res.status(500).json({ error: result.error });
+    logAudit(req, {
+      action: "create", entity_type: "daily_summary", entity_id: result.analysis_id || null,
+      summary: `Generated daily executive summary (${digest.window.hours}h window)`,
+      metadata: { hours: digest.window.hours, model: result.model, cost_usd: result.cost_usd, output_tokens: result.output_tokens },
+    });
+    res.json({ ...result, digest, created_at: new Date().toISOString(), user_email: req.user?.email || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /tasks/v2/daily-summary/latest
+tasksRouter.get("/v2/daily-summary/latest", async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("fpx_ai_analyses")
+      .select("id, created_at, model, response_text, cost_usd, input_tokens, output_tokens, user_email, metadata")
+      .contains("metadata", { subkind: "daily_summary" })
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (error) return res.status(500).json({ error: error.message });
+    const row = data?.[0];
+    if (!row) return res.json({ markdown: null });
+    res.json({
+      markdown: row.response_text || "",
+      digest: row.metadata?.digest || null,
+      analysis_id: row.id, created_at: row.created_at, model: row.model, cost_usd: row.cost_usd,
+      input_tokens: row.input_tokens, output_tokens: row.output_tokens, user_email: row.user_email || null,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

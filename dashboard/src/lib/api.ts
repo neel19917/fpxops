@@ -1,7 +1,7 @@
 import type {
   AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
   InvoiceAudit, InvoiceAuditRow, ReanalyzeCurrent, ReanalyzePreview, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
-  TaskBoard, TaskTriageResult,
+  TaskBoard, TaskTriageResult, DailyDigest, DailySummaryResult,
 } from "./types";
 import { sb } from "./supabase";
 import { impersonateHeaders } from "./impersonate";
@@ -422,6 +422,12 @@ export const api = {
     v2Triage: (body: { ids?: string[]; segment?: string; notes?: string }) =>
       request<TaskTriageResult>("/api/tasks/v2/triage", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
     v2TriageLatest: () => request<TaskTriageResult>("/api/tasks/v2/triage/latest"),
+    // Daily executive summary: numeric digest (cheap) and the heavy-model
+    // Markdown brief over it (slow — several minutes of budget).
+    v2DailyDigest: (params?: { hours?: number }) => request<{ digest: DailyDigest }>("/api/tasks/v2/daily-digest", { params }),
+    v2DailySummary: (body: { hours?: number; notes?: string }) =>
+      request<DailySummaryResult>("/api/tasks/v2/daily-summary", { method: "POST", body: JSON.stringify(body), timeoutMs: 300_000 }),
+    v2DailySummaryLatest: () => request<DailySummaryResult>("/api/tasks/v2/daily-summary/latest"),
     // Cancel-with-reason. The board's replacement for delete: the row stays
     // as a dedup tombstone so the auto-task builder doesn't respawn it.
     v2Dismiss: (body: { ids: string[]; reason?: string; disposition?: string }) =>

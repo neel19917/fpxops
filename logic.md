@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Chrome Extension (Manifest V3) that automates bulk shipment tracking refresh on the FreightPOP dashboard (`app.freightpop.com`). It iterates every tracking number in the Kendo UI grid, opens each shipment's detail modal, scrapes the data, optionally sends it to Claude Haiku for AI analysis, and exports everything to a multi-sheet XLSX file.
+A Chrome Extension (Manifest V3) that automates bulk shipment tracking refresh on the FreightPOP dashboard (`app.freightpop.com`). It iterates every tracking number in the Kendo UI grid, opens each shipment's detail modal, scrapes the data, and uploads it in per-page batches to the FPX API server, which runs the AI analysis, diffs against the previous scrape, and creates follow-up tasks. (Until April 2026 the extension called Claude itself and exported an XLSX; that path is retired.)
 
 ---
 
@@ -131,52 +131,30 @@ sleep(500), sleep(1000)
 
 ---
 
-## AI Integration
+## Upload & server-side analysis
 
-### Per-shipment analysis (`analyzeShipment` in background.js)
+The extension has been **scrape-only since April 2026** — it no longer calls Claude or writes a spreadsheet. Each page's rows go to `background.js`, which:
 
-1. Load prompts from `chrome.storage.local` (or defaults).
-2. Replace `{{data}}` in `perShipment` prompt with `JSON.stringify(modalData)`.
-3. POST to `https://api.anthropic.com/v1/messages` using `claude-haiku-4-5-20251001`, max 1 024 tokens.
-4. Return `{ text }` on success or `{ error }` on failure.
+1. Splits them into chunks and pushes each chunk into a `chrome.storage.local` queue (`pendingUploads`) so the work survives the MV3 service worker being killed mid-fetch.
+2. Drains the queue with bounded concurrency, `POST /api/shipments` with the runner's API key (`x-api-key`) or bearer token, retrying 5xx / network errors with backoff and giving up on 4xx.
+3. Runs the upload for page *N* in parallel with scraping page *N+1*; `logRows` is emptied per page to bound memory on long sweeps.
 
-### Parsing the AI response (`applyAiResponseToRow`)
+The server (`server/routes/shipments.js`) then does everything that used to happen in the extension: `mapShipment()` normalises the raw modal + grid keys into `fpx_shipments` columns (unknown keys are kept verbatim in `raw_data`), a material-field diff is computed against the previous scrape, changed or never-analysed rows are re-analysed with Claude, `action_required` / `ai_issue` / `ai_recommendation` are stamped on the row, and follow-up tasks + email drafts are created. See the sections on redelivery, storage risk and the Tasks v2 board below.
 
-The parser is defensive against malformed model output:
+### Sweep-complete
 
-1. `extractJsonObject(text)`:
-   - Strip markdown code fences.
-   - Run `repairModelJson` (fix `"actionRequired": true or false` literals, trailing commas).
-   - `JSON.parse` the full text.
-   - If that fails, slice from first `{` to last `}` and retry.
-   - `findAnalysisObject`: walk the parsed value recursively (up to depth 10) looking for an object whose keys match `actionRequired / issue / recommendation`.
+FreightPOP hides delivered shipments, so **absence from the grid is the delivery signal**. On a clean *unfiltered* run the extension collects every tracking number it saw and sends the set to `POST /api/shipments/sweep-complete`; the server soft-archives shipments that were not seen (and archives their tasks). Filtered runs skip this, since they cannot prove absence.
 
-2. If `extractJsonObject` returns null → `scrapeFieldsFromLooseJson` using regex to pull `"issue"`, `"recommendation"`, and boolean `actionRequired` directly from the raw string.
+### What the extension captures per shipment
 
-3. `coerceActionRequired`: normalize the raw value to `"YES"` / `"NO"` / `""`.
-
-4. `deriveActionRequired`: if the AI said NO but the `issue` text is not clearly on-track (checked by `isClearlyOnTrackIssue`), escalate to YES.
-
-5. `finalizeActionSheetFlag`: compute `_needsActionSheet` (boolean for the Actions sheet filter) and ensure `_actionRequired` is promoted to YES if the flag is set.
-
-### Executive summary (`summarizeAll` in background.js)
-
-After all pages, content.js sends all `logRows` to background, which replaces `{{allShipments}}` in the summary prompt and calls Claude once more. The result is displayed in the popup AI Summary section and written to the Summary sheet in the XLSX.
-
----
-
-## XLSX Export (`downloadXLSX`)
-
-Produces a four-sheet workbook via SheetJS:
-
-| Sheet | Contents |
+| Source | Fields |
 |---|---|
-| **Actions** | Rows where `_needsActionSheet === true` |
-| **Inputs** | Every row with **dynamic columns** — the union of all scraped modal keys plus `_trackingNumber`, `_timestamp`, and `_error`. AI-derived keys (`_aiRawAnalysis`, `_aiIssue`, `_aiRecommendation`, `_actionRequired`, `_needsActionSheet`, `_inputSummary`, `_outputSummary`) are excluded so the sheet shows raw scraped data only. |
-| **All Shipments** | Every scraped row (curated `DISPLAY_COLUMNS` only) |
-| **Summary** | Counts (total / action / no-action / errors) + AI executive summary text |
+| Modal, Pattern A (label → sibling value) | Tracking Number, Shipment status, Tracking Comments, Carrier, ETA, Pickup/Delivery dates, **Details** (full carrier event history as one flattened string — 8000-char cap since v4.4, 300 before) … |
+| Modal, Pattern B (table th/td) | Each event row's first cell becomes a key (`"Held for appointment from NAG": ""`); timestamps live in a middle column and are not kept here — the `Details` string is the copy that has them |
+| Kendo grid prefetch (`fetchKendoRowMap`) | Grid-only columns: Order #, references, Company, Shipment Date, Spot Quote, **Appointment Date / Appointment Set**, Last Modified Date, Updated ETA, Pickup Response |
+| Extension | `_trackingNumber`, `_timestamp`, `_error` (modal timeout) |
 
-Only columns that have at least one non-empty value across all rows are included. Column widths are auto-fitted (capped at 60 characters). The file is downloaded via a temporary object URL as `fpx-shipment-analysis-<ISO-timestamp>.xlsx`.
+Every value is trimmed and whitespace-collapsed; empty values are omitted rather than guessed (no fallback to surrounding container text — that used to mash the whole modal into one field).
 
 ---
 
@@ -208,17 +186,19 @@ The background state allows the popup to restore UI correctly if closed and reop
 
 ---
 
-## Customizable Prompts
+## Prompts & settings
 
-Three prompts are editable in the "Prompt Settings" collapsible section:
+Prompts are no longer edited in the extension popup. Everything the AI reads lives in the `fpx_settings` table and is edited in the dashboard under **Admin → Settings** (`server/lib/settings.js` holds the hard-coded fallbacks):
 
-| Prompt | Template variable | Purpose |
-|---|---|---|
-| System | — | Role/persona for Claude |
-| Per-Shipment | `{{data}}` | Analysis prompt sent once per shipment |
-| Summary | `{{allShipments}}` | Executive summary prompt sent at the end |
+| Group | Keys |
+|---|---|
+| Per-shipment analysis | `prompt.system`, `prompt.per_shipment`, `prompt.per_shipment_logic` (the rule list: late delivery, pickup, redelivery, storage risk…) |
+| Email drafts | `prompt.email_draft.*` (single + carrier/customer group) |
+| Tasks v2 | `prompt.task_triage.*`, `prompt.daily_summary.*`, `ui.tasks.stale_days` |
+| Storage risk | `storage.carriers`, `storage.hold_hours` |
+| Models | `model.default` (Haiku), `model.large` (Opus 5) |
 
-Saved to `chrome.storage.local`. Reset button restores the hardcoded defaults defined in both `popup.js` and `background.js`.
+Settings are cached in-process for 30 s; `getSettingsSync` serves the cache for hot paths that cannot await.
 
 ---
 
@@ -384,3 +364,14 @@ Timestamps are carrier local time read as UTC — the same convention the row's 
 - **Settings → Storage-charge risk**: `storage.carriers`, `storage.hold_hours`.
 
 Preview on 2026-09-23 (live XPO rows): 200643273 (arrived 9/18, appt 9/22 → 81h) and 200918911 (arrived 9/21, appt 9/24 → 70h) flag; 200919832 (19h) does not.
+
+
+---
+
+## Daily executive summary (Tasks v2)
+
+Added 2026-09-23. One click on the Tasks v2 page ("Daily exec summary") produces a long-form operations brief for the director.
+
+1. **Digest** (`server/lib/dailySummary.js#collectDailyDigest`, `GET /api/tasks/v2/daily-digest?hours=24`): numeric facts for the trailing window — tasks created / completed / dismissed (by segment and owner, with tracking numbers), the live board (active, needs-attention items with health, aging, likely-resolved, stale, unassigned, top carriers/customers), shipments scraped / newly flagged / delivered / archived, AI calls and cost by kind, per-operator audit activity, notes. `shapeDigest` is pure and tested.
+2. **Brief** (`runDailySummary`, `POST /api/tasks/v2/daily-summary {hours, notes}`): the heavy model (`prompt.daily_summary.model`, default Opus 5) writes ~900–1500 words of Markdown with fixed sections — Headline, KPI table, What moved today, Live exposures (ranked, with next actions), Carrier hotspots, Customer hotspots, Team throughput, Data & system health, Plan for tomorrow, Questions for leadership. It may only cite facts from the digest. Stored on `fpx_ai_analyses` (`metadata.subkind = daily_summary`, digest included) so `GET /api/tasks/v2/daily-summary/latest` replays it without a model call.
+3. **Page**: the panel shows the digest as KPI chips, renders the Markdown (tracking numbers on the board become links into the drawer), and has a *Copy* button for pasting into Teams. Window selectable: 24h / 48h / 72h / 7 days.

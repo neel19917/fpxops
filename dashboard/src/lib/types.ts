@@ -380,6 +380,47 @@ export interface TaskTriageResult {
   truncated?: boolean;
 }
 
+// Daily executive summary (/api/tasks/v2/daily-*). Mirrors
+// server/lib/dailySummary.js#shapeDigest; typed loosely where the page only
+// displays counts.
+export interface DailyDigest {
+  window: { from: string; to: string; hours: number };
+  tasks: {
+    created_count: number; completed_count: number; dismissed_count: number;
+    created_by_segment: Record<string, number>;
+    created_by_assignee: Record<string, number>;
+    completed_by_assignee: Record<string, number>;
+    dismissed_by_assignee: Record<string, number>;
+    created: unknown[]; completed: unknown[]; dismissed: unknown[];
+  };
+  board: {
+    active: number; needs_attention_count: number; aging_count: number; likely_resolved_count: number;
+    stale_count: number; stale_days: number; unassigned_count: number;
+    by_segment: Record<string, number>; by_flag: Record<string, number>; by_assignee: Record<string, number>;
+    top_carriers: { key: string; count: number }[]; top_customers: { key: string; count: number }[];
+    needs_attention: unknown[]; aging_oldest: unknown[];
+  };
+  shipments: {
+    scraped_in_window: number; last_scrape_at: string | null; active_action_required: number;
+    newly_flagged_count: number; delivered_in_window: number; archived_in_window: number;
+  };
+  ai: { calls: number; cost_usd: number; by_kind: Record<string, { count: number; cost_usd: number }> };
+  team: { audit_events: number; notes_count: number; by_actor: Record<string, { total: number; by_action: Record<string, number> }> };
+}
+
+export interface DailySummaryResult {
+  markdown: string | null;
+  digest: DailyDigest | null;
+  analysis_id: string | null;
+  created_at: string | null;
+  model: string | null;
+  cost_usd: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  user_email?: string | null;
+  stop_reason?: string | null;
+}
+
 export type FeedbackCategory = "bug" | "feature" | "support" | "other";
 export type FeedbackStatus = "open" | "triaged" | "in_progress" | "resolved" | "wont_fix";
 export type FeedbackSeverity = "low" | "normal" | "high" | "urgent";
