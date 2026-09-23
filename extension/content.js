@@ -25,7 +25,35 @@ function sendComplete(text) {
   try { chrome.runtime.sendMessage({ type: "complete", text }); } catch {}
 }
 
+// ---------------------------------------------------------------------
+// Background-safe clock.
+//
+// Chrome throttles a hidden tab's timers to 1/s, and to 1/min once the tab
+// has been hidden for five minutes. Every wait in this script used to ride
+// on those timers, so a scrape that did a row every 3s in the foreground
+// took minutes per row the moment the operator switched tabs. The
+// extension's service worker is NOT throttled by tab visibility, so while
+// the tab is hidden we ask it to time our waits for us. If the worker is
+// unreachable the local timer still fires — slower, but never stuck.
+// ---------------------------------------------------------------------
+let _bgClockOk = true;
 function sleep(ms) {
+  if (ms >= 50 && typeof document !== "undefined" && document.hidden && _bgClockOk) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      try {
+        chrome.runtime.sendMessage({ type: "bgSleep", ms }, () => {
+          // lastError (worker asleep / context gone) → just resolve; the
+          // local fallback below guarantees progress either way.
+          if (chrome.runtime.lastError) _bgClockOk = false;
+          finish();
+        });
+      } catch { _bgClockOk = false; }
+      // Fallback: local timer. Throttled when hidden, but it fires.
+      setTimeout(finish, ms);
+    });
+  }
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -37,6 +65,9 @@ function humanDelay(minMs, maxMs) {
 
 // Yield to the browser so it can paint/reflow — prevents "page unresponsive"
 function yieldToBrowser() {
+  // setTimeout(0) is clamped to ≥1s in a hidden tab; go through the
+  // background clock there instead.
+  if (typeof document !== "undefined" && document.hidden) return sleep(60);
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
@@ -79,46 +110,27 @@ function findModalDismissControl() {
 }
 
 // Poll for a dismiss control (CLOSE button, Kendo X, aria-label Close) up to `timeout` ms.
-function waitForCloseButton(timeout = 25000) {
-  return new Promise((resolve) => {
-    const interval = 400;
-    let elapsed = 0;
-
-    const timer = setInterval(() => {
-      const btn = findModalDismissControl();
-      if (btn) {
-        clearInterval(timer);
-        resolve(btn);
-        return;
-      }
-      elapsed += interval;
-      if (elapsed >= timeout) {
-        clearInterval(timer);
-        resolve(null);
-      }
-    }, interval);
-  });
+// Wall-clock deadline + background-safe sleep, so a hidden tab neither
+// inflates the wait nor stalls it.
+async function waitForCloseButton(timeout = 25000) {
+  const deadline = Date.now() + timeout;
+  while (true) {
+    const btn = findModalDismissControl();
+    if (btn) return btn;
+    if (Date.now() >= deadline) return null;
+    await sleep(400);
+  }
 }
 
 // Poll for an element matching `selector` to appear in the DOM (visible).
-function waitForElement(selector, timeout = 5000) {
-  return new Promise((resolve) => {
-    const interval = 300;
-    let elapsed = 0;
-    const timer = setInterval(() => {
-      const el = document.querySelector(selector);
-      if (el && el.offsetParent !== null) {
-        clearInterval(timer);
-        resolve(el);
-        return;
-      }
-      elapsed += interval;
-      if (elapsed >= timeout) {
-        clearInterval(timer);
-        resolve(null);
-      }
-    }, interval);
-  });
+async function waitForElement(selector, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (true) {
+    const el = document.querySelector(selector);
+    if (el && el.offsetParent !== null) return el;
+    if (Date.now() >= deadline) return null;
+    await sleep(300);
+  }
 }
 
 // MutationObserver-based wait for the shipment detail view (#ShipmentSale) to
@@ -492,43 +504,62 @@ function scrapeModal() {
   const LONG_VALUE_KEYS = new Set(["Details"]);
   const MAX_LONG_VALUE_LEN = 8000;
   const capFor = (key) => (LONG_VALUE_KEYS.has(key) ? MAX_LONG_VALUE_LEN : MAX_VALUE_LEN);
+  // `data[key]` truthiness is the wrong "already set" test: a label that
+  // happens to read "constructor" or "toString" collides with Object
+  // prototype members. Use an own-property check instead.
+  const hasKey = (k) => Object.prototype.hasOwnProperty.call(data, k);
+  const isSafeKey = (k) => k !== "__proto__" && k !== "constructor" && k !== "prototype";
   const labels = modal.querySelectorAll("label, strong, b, .field-label, .control-label, dt");
   for (const lbl of labels) {
-    const key = lbl.textContent.trim().replace(/:$/, "");
-    if (!key || key.length > 80) continue;
-    if (key === "CLOSE") continue;
-    if (data[key]) continue;                                // first-write-wins; don't overwrite
-    const maxLen = capFor(key);
+    // One odd node (detached mid-iteration, exotic element without
+    // textContent, a getter that throws) must not abort the whole modal.
+    try {
+      const key = String(lbl.textContent || "").replace(/\s+/g, " ").trim().replace(/:$/, "");
+      if (!key || key.length > 80) continue;
+      if (key === "CLOSE") continue;
+      if (!isSafeKey(key)) continue;
+      if (hasKey(key)) continue;                             // first-write-wins; don't overwrite
+      const maxLen = capFor(key);
 
-    let val = "";
-    const next = lbl.nextElementSibling;
-    if (next) {
-      val = (next.value || next.textContent || "").trim();
-    }
-    // Sibling-of-parent: <div><label/></div><div>VALUE</div>
-    if (!val && lbl.parentElement && lbl.parentElement.nextElementSibling) {
-      const sib = lbl.parentElement.nextElementSibling;
-      const sibText = (sib.textContent || "").trim();
-      if (sibText && sibText.length < maxLen) val = sibText;
-    }
+      let val = "";
+      const next = lbl.nextElementSibling;
+      if (next) {
+        const nv = next.value;
+        val = String((typeof nv === "string" && nv) || next.textContent || "").trim();
+      }
+      // Sibling-of-parent: <div><label/></div><div>VALUE</div>
+      if (!val && lbl.parentElement && lbl.parentElement.nextElementSibling) {
+        const sib = lbl.parentElement.nextElementSibling;
+        const sibText = String(sib.textContent || "").trim();
+        if (sibText && sibText.length < maxLen) val = sibText;
+      }
 
-    if (!val) continue;
-    val = val.replace(/\s+/g, " ").trim();
-    if (val.length > maxLen) val = val.slice(0, maxLen).replace(/\s+\S*$/, "") + "…";
-    data[key] = val;
+      if (!val) continue;
+      val = val.replace(/\s+/g, " ").trim();
+      if (val.length > maxLen) val = val.slice(0, maxLen).replace(/\s+\S*$/, "") + "…";
+      data[key] = val;
+    } catch (e) {
+      console.warn("[FPX] scrapeModal: skipped a label node:", e?.message || e);
+    }
   }
 
   // Pattern B: table rows with th/td pairs inside the modal
   const rows = modal.querySelectorAll("table tr");
   for (const row of rows) {
-    const th = row.querySelector("th, td:first-child");
-    const td = row.querySelector("td:last-child");
-    if (th && td && th !== td) {
-      const key = th.textContent.trim().replace(/:$/, "");
-      const val = td.textContent.trim();
-      if (key && key !== "CLOSE") {
-        data[key] = val;
+    try {
+      const th = row.querySelector("th, td:first-child");
+      const td = row.querySelector("td:last-child");
+      if (th && td && th !== td) {
+        const key = String(th.textContent || "").replace(/\s+/g, " ").trim().replace(/:$/, "");
+        let val = String(td.textContent || "").replace(/\s+/g, " ").trim();
+        if (key && key !== "CLOSE" && isSafeKey(key) && val) {
+          const maxLen = capFor(key);
+          if (val.length > maxLen) val = val.slice(0, maxLen).replace(/\s+\S*$/, "") + "…";
+          data[key] = val;
+        }
       }
+    } catch (e) {
+      console.warn("[FPX] scrapeModal: skipped a table row:", e?.message || e);
     }
   }
 
@@ -536,14 +567,16 @@ function scrapeModal() {
     ".modal.in, .modal.show, .k-window, [role='dialog']"
   );
   if (dialogRoot) {
-    const raw = String(dialogRoot.innerText || "")
-      .replace(/\u00a0/g, " ")
-      .replace(/[ \t\f\v]+\n/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-    if (raw) {
-      data["FULL MODAL TEXT"] = raw;
-    }
+    try {
+      const raw = String(dialogRoot.innerText || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/[ \t\f\v]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      if (raw) {
+        data["FULL MODAL TEXT"] = raw;
+      }
+    } catch {}
   }
 
   dlog("[FPX] Scraped modal data keys:", Object.keys(data).length);
@@ -626,6 +659,214 @@ function applyGridPickupResponse(modalData, raw) {
   if (cn) modalData["CONFIRMATION NUMBER"] = cn[1].trim();
 }
 
+// ---------------------------------------------------------------------
+// Bad-row hardening helpers
+// ---------------------------------------------------------------------
+
+// Grid cells that render a placeholder instead of a tracking number. Clicking
+// these opens nothing, so the old loop burned a 25s modal timeout on each.
+const TRACKING_PLACEHOLDERS = new Set(["", "-", "—", "–", "n/a", "na", "none", "null", "pending", "tbd", "undefined"]);
+function isPlaceholderTracking(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+  return TRACKING_PLACEHOLDERS.has(t);
+}
+
+// Coerce a scraped row into something structured-cloneable + JSON-safe:
+// primitives only, no functions / DOM nodes / undefined, prototype-key names
+// dropped, oversized strings capped. Anything that slips past here would
+// throw inside chrome.runtime.sendMessage and take the whole page flush
+// with it.
+const ROW_VALUE_CAP = 20000;
+function sanitizeRow(row) {
+  if (!row || typeof row !== "object") return null;
+  const out = {};
+  for (const k of Object.keys(row)) {
+    if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+    let v;
+    try { v = row[k]; } catch { continue; }
+    if (v === undefined || v === null || v === "") continue;
+    const t = typeof v;
+    if (t === "string") {
+      out[k] = v.length > ROW_VALUE_CAP ? v.slice(0, ROW_VALUE_CAP) + "…" : v;
+    } else if (t === "number" || t === "boolean") {
+      if (t === "number" && !Number.isFinite(v)) continue;
+      out[k] = v;
+    } else if (t === "bigint") {
+      out[k] = String(v);
+    } else if (v instanceof Date) {
+      if (!isNaN(v.getTime())) out[k] = v.toISOString();
+    } else if (t === "object") {
+      if (typeof Node !== "undefined" && v instanceof Node) continue;
+      try {
+        const j = JSON.stringify(v);
+        if (j && j !== "{}" && j !== "[]") out[k] = j.length > ROW_VALUE_CAP ? j.slice(0, ROW_VALUE_CAP) + "…" : j;
+      } catch { /* circular / unserializable — drop */ }
+    }
+    // functions, symbols: dropped
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// Collapse duplicate tracking numbers in a batch (last sighting wins) so the
+// server's upsert never touches one conflict key twice, and sanitize every
+// row on the way through. Rows without a usable tracking number are
+// dropped and counted — they can't be keyed server-side anyway.
+function prepareRowsForUpload(rows) {
+  const byTracking = new Map();
+  let dropped = 0;
+  for (const raw of rows || []) {
+    const row = sanitizeRow(raw);
+    const tn = row && String(row._trackingNumber || "").replace(/\s+/g, " ").trim();
+    if (!row || !tn || isPlaceholderTracking(tn)) { dropped++; continue; }
+    row._trackingNumber = tn;
+    byTracking.delete(tn);
+    byTracking.set(tn, row);
+  }
+  return { rows: Array.from(byTracking.values()), dropped };
+}
+
+// A job's link element can be detached between collection and click — Kendo
+// re-renders body rows after some modal closes, and a scroll/virtualize can
+// swap them. Re-find the cell by tracking text in the live grid rather than
+// clicking a ghost node and waiting 25s for a modal that never comes.
+function resolveJobLink(job) {
+  const link = job && job.link;
+  if (link && link.isConnected) return link;
+  const wanted = String(job && job.trackingNum || "").trim();
+  if (!wanted) return null;
+  const rows = document.querySelectorAll(".k-grid-content tbody tr, .k-grid-content-locked tbody tr, .k-grid tbody tr");
+  for (const row of rows) {
+    if (row.classList.contains("k-grouping-row") || row.classList.contains("k-no-data")) continue;
+    const candidates = row.querySelectorAll("a, [ng-click], [onclick], span.k-link, span[style*='cursor']");
+    for (const el of candidates) {
+      if (String(el.textContent || "").trim() === wanted) return el;
+    }
+  }
+  return null;
+}
+
+const DIALOG_ROOT_SELECTOR = ".modal.in, .modal.show, .k-window, [role='dialog']";
+
+// The dialog element that owns a dismiss control (CLOSE button / Kendo X).
+function dialogRootFor(el) {
+  try { return (el && el.closest(".modal, .k-window, [role='dialog']")) || null; } catch { return null; }
+}
+
+// Dismiss control INSIDE a given dialog root only — never a "Close" button
+// elsewhere on the page.
+function findDismissControlWithin(root) {
+  if (!root) return null;
+  try {
+    for (const el of root.querySelectorAll("button, a[role='button'], [role='button'], a.k-window-action")) {
+      if (!isVisibleForClick(el)) continue;
+      const txt = String(el.innerText || "").replace(/\s+/g, " ").trim();
+      if (/^close$/i.test(txt) || /^done$/i.test(txt)) return el;
+      const al = (el.getAttribute("aria-label") || "").trim();
+      if (/^(close|dismiss)$/i.test(al)) return el;
+      if (el.classList.contains("k-window-action") && el.querySelector(".k-i-close")) return el;
+    }
+  } catch {}
+  return null;
+}
+
+// Is a shipment modal currently open?
+//   - with `root`: is THAT dialog still attached and visible (the one we
+//     just scraped) — no guessing about unrelated dialogs.
+//   - without: is there a visible dialog that has its own dismiss control
+//     inside it. A persistent role=dialog widget with no Close of its own
+//     does not count, and neither does a Close button outside any dialog.
+// Getting this wrong is expensive: a false "open" adds seconds of waiting
+// plus an Escape/dismiss escalation to EVERY row on the page.
+function isModalOpen(root) {
+  try {
+    if (root) return !!(root.isConnected && isVisibleForClick(root));
+    for (const d of document.querySelectorAll(DIALOG_ROOT_SELECTOR)) {
+      if (isVisibleForClick(d) && findDismissControlWithin(d)) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+// After clicking CLOSE, wait for the dialog to actually go away. If it
+// lingers (animation stuck, second dialog, click swallowed), escalate:
+// Escape key, then the dialog's own dismiss control again. A modal left
+// open makes every subsequent row's click land on the overlay, so one bad
+// row used to turn into a 25s timeout for each remaining row on the page.
+// Returns quickly in the normal case — polls every 100ms and exits on the
+// first "closed" reading.
+async function ensureModalClosed(timeoutMs = 2500, root = null) {
+  const start = Date.now();
+  let escalated = 0;
+  while (Date.now() - start < timeoutMs) {
+    if (!isModalOpen(root)) return true;
+    await sleep(100);
+    const elapsed = Date.now() - start;
+    if (escalated === 0 && elapsed > 800) {
+      escalated = 1;
+      try { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true })); } catch {}
+    } else if (escalated === 1 && elapsed > 1600) {
+      escalated = 2;
+      const btn = root ? findDismissControlWithin(root) : null;
+      if (btn) { try { simulateClick(btn); } catch {} }
+    }
+  }
+  return !isModalOpen(root);
+}
+
+// The scrape keeps running while the tab is hidden (waits ride the
+// background clock, see sleep()). FreightPOP's own page timers are still
+// throttled by Chrome, so rows are a bit slower in the background — tell the
+// operator once per hidden stretch so a slower pace isn't mistaken for a
+// stall. Returns true when the tab is hidden.
+let _wasHidden = false;
+function noteBackgroundState(trackingNum) {
+  const hidden = typeof document.hidden === "boolean" && document.hidden;
+  if (hidden && !_wasHidden) {
+    sendStatus(`Running in the background (tab hidden) — a little slower per row, keeps going${trackingNum ? ` (next: ${trackingNum})` : ""}.`);
+  } else if (!hidden && _wasHidden) {
+    sendStatus("Tab visible again — back to full speed.");
+  }
+  _wasHidden = hidden;
+  return hidden;
+}
+
+// Circuit breaker for the "every modal times out" cascade. Seen 2026-09-23:
+// FreightPOP stopped opening tracking modals mid-run (page state broke) and
+// the loop burned 25s per row recording partials for the rest of the grid.
+// After this many consecutive timeouts the run stops with a message telling
+// the operator to refresh FreightPOP and restart.
+const MAX_CONSECUTIVE_MODAL_TIMEOUTS = 5;
+let consecutiveModalTimeouts = 0;
+let lastGoodTrackingNum = null;
+let abortRunReason = null;
+
+// Which pager page the Kendo grid is on right now ("1" for the first page).
+// Returns null when there is no pager (single page) or it can't be read.
+function currentGridPage() {
+  try {
+    const sel = document.querySelector(".k-pager-numbers .k-state-selected, .k-pager-numbers .k-selected, .k-pager-numbers [aria-current='page']");
+    const t = sel ? String(sel.textContent || "").trim() : "";
+    return /^\d+$/.test(t) ? parseInt(t, 10) : null;
+  } catch { return null; }
+}
+
+// Build the row we upload when a shipment could not be fully scraped. It
+// carries the grid columns (Kendo merge + Pickup Response) plus `_error`, so
+// the server updates only what we actually observed instead of nulling the
+// modal-only fields it already holds.
+function buildPartialRow(trackingNum, errorMsg, pickupResponse, kendoRow) {
+  const row = {
+    _trackingNumber: trackingNum,
+    _timestamp: new Date().toISOString(),
+    _error: errorMsg,
+    _partial: true,
+    _needsActionSheet: false,
+  };
+  try { applyGridPickupResponse(row, pickupResponse); } catch {}
+  try { mergeKendoRow(row, kendoRow); } catch {}
+  return row;
+}
+
 // Find the Tracking Number column and Pickup Response column, then collect
 // { link, pickupResponse } for each body row that has a tracking control.
 function collectShipmentJobs() {
@@ -663,52 +904,76 @@ function collectShipmentJobs() {
   dlog("[FPX] Body rows found:", allRows.length);
 
   const jobs = [];
+  let skippedRows = 0;
+  const seenOnPage = new Set();
 
   for (const row of allRows) {
-    if (row.classList.contains("k-grouping-row")) continue;
-    if (row.classList.contains("k-no-data")) continue;
-    const cells = row.querySelectorAll("td");
+    // A single malformed row (missing cells, exotic node, detached mid-loop)
+    // must not abort collection for the rest of the page.
+    try {
+      if (row.classList.contains("k-grouping-row")) continue;
+      if (row.classList.contains("k-no-data")) continue;
+      if (row.classList.contains("k-detail-row")) continue;
+      const cells = row.querySelectorAll("td");
+      if (!cells.length) continue;
 
-    let cell = null;
-    if (trackingScrollIndex >= 0 && trackingScrollIndex < cells.length) {
-      cell = cells[trackingScrollIndex];
-    }
-    if (
-      (!cell || !cell.textContent.trim()) &&
-      trackingDataIndex >= 0 &&
-      trackingDataIndex < cells.length
-    ) {
-      cell = cells[trackingDataIndex];
-    }
+      let cell = null;
+      if (trackingScrollIndex >= 0 && trackingScrollIndex < cells.length) {
+        cell = cells[trackingScrollIndex];
+      }
+      if (
+        (!cell || !String(cell.textContent || "").trim()) &&
+        trackingDataIndex >= 0 &&
+        trackingDataIndex < cells.length
+      ) {
+        cell = cells[trackingDataIndex];
+      }
 
-    if (!cell) continue;
+      if (!cell) continue;
 
-    const pickupText = readGridCellText(row, pickupDataIndex, lockedCount);
+      const pickupText = readGridCellText(row, pickupDataIndex, lockedCount);
 
-    const clickable =
-      cell.querySelector("a") ||
-      cell.querySelector("[ng-click]") ||
-      cell.querySelector("[onclick]") ||
-      cell.querySelector("span[style*='cursor']") ||
-      cell.querySelector("span.k-link");
+      const clickable =
+        cell.querySelector("a") ||
+        cell.querySelector("[ng-click]") ||
+        cell.querySelector("[onclick]") ||
+        cell.querySelector("span[style*='cursor']") ||
+        cell.querySelector("span.k-link");
 
-    if (clickable && clickable.textContent.trim()) {
-      jobs.push({ link: clickable, pickupResponse: pickupText });
-    } else if (cell.textContent.trim() && cell.querySelector("*")) {
-      const children = cell.querySelectorAll("*");
-      for (const child of children) {
-        const t = child.textContent.trim();
-        if (t && child.childElementCount === 0 && /\d/.test(t)) {
-          jobs.push({ link: child, pickupResponse: pickupText });
-          break;
+      let link = null;
+      if (clickable && String(clickable.textContent || "").trim()) {
+        link = clickable;
+      } else if (String(cell.textContent || "").trim() && cell.querySelector("*")) {
+        const children = cell.querySelectorAll("*");
+        for (const child of children) {
+          const t = String(child.textContent || "").trim();
+          if (t && child.childElementCount === 0 && /\d/.test(t)) {
+            link = child;
+            break;
+          }
         }
       }
+      if (!link) continue;
+
+      const trackingNum = String(link.textContent || "").replace(/\s+/g, " ").trim();
+      if (isPlaceholderTracking(trackingNum)) { skippedRows++; continue; }
+      // Same tracking number twice on one page (multi-leg / duplicate
+      // booking): scrape it once. The second modal is identical and the
+      // server would reject a batch that upserts the same key twice.
+      if (seenOnPage.has(trackingNum)) { skippedRows++; continue; }
+      seenOnPage.add(trackingNum);
+
+      jobs.push({ link, trackingNum, pickupResponse: pickupText });
+    } catch (e) {
+      skippedRows++;
+      console.warn("[FPX] collectShipmentJobs: skipped a grid row:", e?.message || e);
     }
   }
 
-  dlog("[FPX] Shipment jobs:", jobs.length);
+  dlog("[FPX] Shipment jobs:", jobs.length, "skipped:", skippedRows);
   sendStatus(
     `Found ${jobs.length} tracking link(s) on this page` +
+      (skippedRows ? ` (${skippedRows} row(s) skipped: no usable tracking number)` : "") +
       (pickupDataIndex >= 0
         ? " (Pickup Response column mapped)."
         : " (Pickup Response header not found — column left blank).")
@@ -740,31 +1005,26 @@ function goToNextPage() {
   return false;
 }
 
-function waitForGridReady(timeout = 3000) {
-  return new Promise((resolve) => {
-    const interval = 300;
-    let elapsed = 0;
-    const timer = setInterval(() => {
-      const rows = document.querySelectorAll(
-        ".k-grid-content tbody tr, .k-grid tbody tr"
-      );
-      const loading = document.querySelector(".k-loading-mask, .k-loading-image");
-      if (rows.length > 0 && !loading) {
-        clearInterval(timer);
-        resolve();
-        return;
-      }
-      elapsed += interval;
-      if (elapsed >= timeout) {
-        clearInterval(timer);
-        resolve();
-      }
-    }, interval);
-  });
+async function waitForGridReady(timeout = 3000) {
+  const deadline = Date.now() + timeout;
+  while (true) {
+    const rows = document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr");
+    const loading = document.querySelector(".k-loading-mask, .k-loading-image");
+    if (rows.length > 0 && !loading) return;
+    if (Date.now() >= deadline) return;
+    await sleep(300);
+  }
 }
 
 async function processPage() {
-  const jobs = collectShipmentJobs();
+  let jobs = [];
+  try {
+    jobs = collectShipmentJobs();
+  } catch (e) {
+    console.warn("[FPX] collectShipmentJobs failed:", e?.message || e);
+    sendStatus(`Could not read the grid on this page (${e?.message || e}) — skipping page.`);
+    return;
+  }
   const total = jobs.length;
 
   if (total === 0) {
@@ -777,32 +1037,87 @@ async function processPage() {
   // Company, Shipment Date, Spot Quote, Appointments, etc.).
   const kendoRowMap = await fetchKendoRowMap();
 
+  let failures = 0;
   for (let i = 0; i < total; i++) {
     if (stopRequested) {
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
     }
 
-    const { link, pickupResponse } = jobs[i];
-    const trackingNum = link.textContent.trim();
+    const job = jobs[i];
+    const trackingNum = job.trackingNum || String(job.link?.textContent || "").trim();
+    const pickupResponse = job.pickupResponse;
+    const kendoRow = kendoRowMap.get(trackingNum);
+    const hiddenAtStart = noteBackgroundState(trackingNum);
     sendStatus(`Processing ${i + 1} of ${total} — ${trackingNum}`);
 
-    simulateClick(link);
-    await humanDelay(300, 600);
+    // Every step for one shipment is isolated: a throw records a partial row
+    // for THIS shipment and the loop moves on. Before this, a single bad row
+    // unwound processPage → run, the side panel stayed on "running" forever,
+    // and the rest of the page was never scraped or uploaded.
+    try {
+      // If a stale modal is still up from the previous row, our click would
+      // land on its overlay. Clear it first. Scoped to a dialog that has its
+      // own dismiss control, so this is a no-op on a clean page.
+      const rowStart = Date.now();
+      let preCloseMs = 0;
+      if (isModalOpen()) { await ensureModalClosed(1500); preCloseMs = Date.now() - rowStart; }
 
-    sendStatus(`Clicked ${trackingNum} — waiting for modal...`);
-    const closeBtn = await waitForCloseButton(25000);
-    if (closeBtn) {
+      const link = resolveJobLink(job);
+      if (!link) {
+        failures++;
+        logRows.push(buildPartialRow(trackingNum, "Row disappeared from grid before click", pickupResponse, kendoRow));
+        sendStatus(`Row ${trackingNum} left the grid — recorded grid data only, skipping modal.`);
+        continue;
+      }
+
+      simulateClick(link);
+      await humanDelay(300, 600);
+
+      sendStatus(`Clicked ${trackingNum} — waiting for modal...`);
+      const waitStart = Date.now();
+      const closeBtn = await waitForCloseButton(25000);
+      const modalWaitMs = Date.now() - waitStart;
+      if (!closeBtn) {
+        failures++;
+        consecutiveModalTimeouts++;
+        logRows.push(buildPartialRow(trackingNum, "Modal did not appear (timeout)", pickupResponse, kendoRow));
+        sendStatus(`Timeout on ${trackingNum} — no modal appeared, recorded grid data only.`);
+        if (consecutiveModalTimeouts >= MAX_CONSECUTIVE_MODAL_TIMEOUTS) {
+          abortRunReason = `FreightPOP stopped opening tracking modals — ${consecutiveModalTimeouts} rows in a row timed out` +
+            (lastGoodTrackingNum ? ` (last good: ${lastGoodTrackingNum})` : "") +
+            `. Refresh the FreightPOP page and click Scrape & upload again.`;
+          return;
+        }
+        continue;
+      }
+      consecutiveModalTimeouts = 0;
+      lastGoodTrackingNum = trackingNum;
+
       await humanDelay(350, 700);
       sendStatus(`Scraping modal data for ${trackingNum}...`);
-      const modalData = scrapeModal();
+      let modalData;
+      try {
+        modalData = scrapeModal();
+      } catch (e) {
+        // Scrape blew up on this modal's DOM — keep what the grid knows.
+        console.warn(`[FPX] scrapeModal failed for ${trackingNum}:`, e?.message || e);
+        modalData = { _error: `Modal scrape failed: ${e?.message || e}`, _partial: true };
+        failures++;
+      }
       modalData._trackingNumber = trackingNum;
       modalData._timestamp = new Date().toISOString();
-      applyGridPickupResponse(modalData, pickupResponse);
-      mergeKendoRow(modalData, kendoRowMap.get(trackingNum));
+      try { applyGridPickupResponse(modalData, pickupResponse); } catch {}
+      try { mergeKendoRow(modalData, kendoRow); } catch {}
 
       // Extension is scrape-only — analysis runs server-side after upload.
       delete modalData["FULL MODAL TEXT"];
+      // Per-row timing lands in raw_data so a slow run can be diagnosed
+      // from the database: was it the carrier modal, or our own waits?
+      modalData._modalWaitMs = modalWaitMs;
+      if (preCloseMs) modalData._preCloseMs = preCloseMs;
+      if (hiddenAtStart) modalData._scrapedHidden = true;
+      const dialogRoot = dialogRootFor(closeBtn);
       logRows.push(modalData);
       // Legacy 25-row chrome.storage._fpxCheckpoint write was retired —
       // the persistent upload queue (background.js / chrome.storage
@@ -812,24 +1127,26 @@ async function processPage() {
 
       const actionTag = modalData._needsActionSheet ? " [ACTION NEEDED]" : "";
       sendStatus(`Done ${trackingNum}${actionTag} — closing modal...`);
-      simulateClick(closeBtn);
+      try { simulateClick(closeBtn); } catch {}
+      const closeStart = Date.now();
+      const closed = await ensureModalClosed(2500, dialogRoot);
+      modalData._closeMs = Date.now() - closeStart;
+      modalData._rowMs = Date.now() - rowStart;
+      if (!closed) console.warn(`[FPX] modal for ${trackingNum} did not close cleanly`);
       await humanDelay(200, 500);
-    } else {
-      const timeoutRow = {
-        _trackingNumber: trackingNum,
-        _timestamp: new Date().toISOString(),
-        _error: "Modal did not appear (timeout)",
-        _needsActionSheet: false,
-      };
-      applyGridPickupResponse(timeoutRow, pickupResponse);
-      mergeKendoRow(timeoutRow, kendoRowMap.get(trackingNum));
-      logRows.push(timeoutRow);
-      sendStatus(`Timeout on ${trackingNum} — no modal appeared, skipping.`);
+    } catch (e) {
+      failures++;
+      console.warn(`[FPX] row ${trackingNum} failed:`, e?.message || e);
+      logRows.push(buildPartialRow(trackingNum, `Scrape error: ${e?.message || e}`, pickupResponse, kendoRow));
+      sendStatus(`Error on ${trackingNum} (${e?.message || e}) — recorded grid data only, continuing.`);
+      // Don't leave a half-open dialog for the next row to trip over.
+      try { await ensureModalClosed(2000); } catch {}
     }
 
     await humanDelay(250, 600);
     if (i % 5 === 4) await yieldToBrowser();
   }
+  if (failures) sendStatus(`Page done — ${failures} of ${total} row(s) recorded with grid data only.`);
 }
 
 async function run(filterCol, filterVal) {
@@ -837,6 +1154,9 @@ async function run(filterCol, filterVal) {
   // after upload (POST /api/shipments → background per-row Claude).
   stopRequested = false;
   logRows = [];
+  consecutiveModalTimeouts = 0;
+  lastGoodTrackingNum = null;
+  abortRunReason = null;
   // Tracks every tracking number we see across the entire sweep (not just
   // this page). On a clean unfiltered completion we ship this to the
   // server so it can soft-archive shipments that have left the
@@ -866,6 +1186,14 @@ async function run(filterCol, filterVal) {
   }
 
   let pageNum = 1;
+  // A sweep that starts anywhere but the grid's first page cannot see every
+  // shipment, so its "not seen" set must never drive the delivered-archive
+  // pass. Read the pager before we touch anything.
+  const startingGridPage = currentGridPage();
+  const startedOnFirstPage = startingGridPage === null || startingGridPage === 1;
+  if (!startedOnFirstPage) {
+    sendStatus(`Starting from grid page ${startingGridPage} — delivered-shipment archiving will be skipped for this run.`);
+  }
   // We drop uploaded rows from logRows so the array doesn't grow
   // unboundedly during long scrapes (a 50-page sweep with 50 rows/page
   // and ~30 KB per modal = ~75 MB resident otherwise — tips reps with
@@ -875,6 +1203,7 @@ async function run(filterCol, filterVal) {
   let pageRowCount = 0;        // rows scraped this page (reset each iteration)
   let totalScraped = 0;        // total rows scraped this run, for the "Done" line
   let confirmedRows = 0;       // rows the server has acked
+  let droppedRows = 0;         // rows with no usable tracking number (never uploaded)
 
   // Helper: ship the current logRows buffer to background, then
   // truncate logRows so memory stays bounded to ~one page at a time.
@@ -887,28 +1216,51 @@ async function run(filterCol, filterVal) {
     // next page starts clean. structuredClone via postMessage means
     // background gets its own copy — we don't have to wait for the
     // round-trip to clear our reference.
-    const slice = logRows;
+    const buffered = logRows;
     logRows = [];
     // Memorize every tracking number leaving the page so we can compare
-    // against the DB at sweep-completion time.
-    for (const row of slice) {
+    // against the DB at sweep-completion time. Done on the raw buffer so a
+    // shipment we saw but couldn't upload is still never archived.
+    for (const row of buffered) {
       const tn = row && row._trackingNumber;
-      if (tn) sweepTrackingNumbers.add(String(tn).trim());
+      if (tn) sweepTrackingNumbers.add(String(tn).replace(/\s+/g, " ").trim());
     }
+    // Primitive-only values, duplicates collapsed, unkeyed rows dropped.
+    const { rows: slice, dropped } = prepareRowsForUpload(buffered);
+    if (dropped) {
+      droppedRows += dropped;
+      console.warn(`[FPX] ${label}: dropped ${dropped} row(s) with no usable tracking number`);
+    }
+    if (!slice.length) return Promise.resolve({ count: 0, ok: true });
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: slice }, (r) => {
-        if (r && r.ok) {
-          confirmedRows += r.count || slice.length;
-        } else if (r && r.error) {
-          // Background queues the chunk on failure — it'll retry on
-          // the next page's stream call AND on worker boot. We just
-          // surface the side-panel chip; no in-page logging.
-        }
-        resolve(r || { ok: false, error: "no response" });
-      });
+      try {
+        chrome.runtime.sendMessage({ type: "upsertShipmentsBulk", rows: slice }, (r) => {
+          // A dead service worker surfaces as lastError + undefined response.
+          const le = chrome.runtime.lastError;
+          if (r && r.ok) {
+            confirmedRows += r.count || slice.length;
+          } else if (r && r.error) {
+            // Background queues the chunk on failure — it'll retry on
+            // the next page's stream call AND on worker boot. We just
+            // surface the side-panel chip; no in-page logging.
+          }
+          resolve(r || { ok: false, error: le?.message || "no response" });
+        });
+      } catch (e) {
+        // sendMessage itself threw (extension context invalidated, or an
+        // unserializable value that slipped past sanitizeRow). The rows are
+        // lost for this run, but the sweep continues.
+        console.warn(`[FPX] ${label}: sendMessage failed:`, e?.message || e);
+        resolve({ ok: false, error: e?.message || "sendMessage failed" });
+      }
     });
   }
 
+  // Everything from here on is guarded: any throw (grid vanished, pager
+  // changed shape, page navigated) flushes whatever was scraped and sends
+  // a terminal "complete" so the side panel / headless runner never sit on
+  // "running" forever.
+  try {
   while (true) {
     if (stopRequested) {
       await flushAndDropLogRows("stopped");
@@ -919,13 +1271,26 @@ async function run(filterCol, filterVal) {
     sendStatus(`Processing page ${pageNum}...`);
     // logRows was emptied by the previous page's flush, so its length
     // after processPage is exactly this page's contribution.
-    await processPage();
+    try {
+      await processPage();
+    } catch (e) {
+      // processPage isolates per-row failures; this catches the rare
+      // page-level throw (kendo prefetch, grid read). Keep whatever rows
+      // it managed to log and move to the next page.
+      console.warn(`[FPX] page ${pageNum} failed:`, e?.message || e);
+      sendStatus(`Page ${pageNum} hit an error (${e?.message || e}) — keeping ${logRows.length} row(s), moving on.`);
+    }
     pageRowCount = logRows.length;
     totalScraped += pageRowCount;
 
     if (stopRequested) {
       await flushAndDropLogRows("stopped");
       sendComplete(`Stopped by user. ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
+      return;
+    }
+    if (abortRunReason) {
+      await flushAndDropLogRows("aborted");
+      sendComplete(`Stopped on page ${pageNum}: ${abortRunReason} ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
       return;
     }
 
@@ -938,7 +1303,8 @@ async function run(filterCol, filterVal) {
     flushAndDropLogRows(`page ${pageNum}`).catch(() => { /* surfaced via side-panel chip */ });
 
     sendStatus(`Page ${pageNum} done. Checking for next page...`);
-    const advanced = goToNextPage();
+    let advanced = false;
+    try { advanced = goToNextPage(); } catch (e) { console.warn("[FPX] goToNextPage failed:", e?.message || e); }
     if (!advanced) break;
 
     pageNum++;
@@ -963,7 +1329,7 @@ async function run(filterCol, filterVal) {
   // tell delivered apart from filtered-out, and a stopped run hasn't
   // visited every page so its set is incomplete.
   let archiveSummary = "";
-  if (!filterCol && !filterVal && sweepTrackingNumbers.size > 0) {
+  if (!filterCol && !filterVal && startedOnFirstPage && sweepTrackingNumbers.size > 0) {
     sendStatus(`Reconciling delivered shipments (${sweepTrackingNumbers.size} seen)…`);
     try {
       const r = await chrome.runtime.sendMessage({
@@ -980,10 +1346,16 @@ async function run(filterCol, filterVal) {
     }
   }
 
-  const queuedButUnconfirmed = totalScraped - confirmedRows;
+  const queuedButUnconfirmed = Math.max(0, totalScraped - droppedRows - confirmedRows);
   sendComplete(
-    `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}${archiveSummary}. Open the dashboard to see analysis.`
+    `Done — ${pageNum} page(s), ${confirmedRows} confirmed${queuedButUnconfirmed > 0 ? `, ${queuedButUnconfirmed} queued for retry` : ""}${droppedRows > 0 ? `, ${droppedRows} skipped (no tracking number)` : ""}${archiveSummary}. Open the dashboard to see analysis.`
   );
+  } catch (e) {
+    console.error("[FPX] run() aborted:", e?.stack || e);
+    // Ship whatever is buffered so the rows already scraped aren't lost.
+    try { await flushAndDropLogRows("error flush"); } catch {}
+    sendComplete(`Stopped after an error on page ${pageNum}: ${e?.message || e}. ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
+  }
 }
 
 // =====================================================================
@@ -1147,9 +1519,10 @@ async function fetchKendoRowMap() {
     if (!rows || !rows.length) return new Map();
     const map = new Map();
     for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
       const tn = String(
         row["Tracking Number"] || row["TrackingNumber"] || row["Tracking"] || ""
-      ).trim();
+      ).replace(/\s+/g, " ").trim();
       if (tn) map.set(tn, row);
     }
     dlog("[FPX] Kendo row map: keyed", map.size, "of", rows.length);
@@ -1163,9 +1536,9 @@ async function fetchKendoRowMap() {
 // Modal data wins for shared keys (it's richer / has freshest timestamps).
 // Kendo row only fills keys not already present, and skips internal keys.
 function mergeKendoRow(modalData, kendoRow) {
-  if (!kendoRow) return;
+  if (!kendoRow || typeof kendoRow !== "object" || !modalData) return;
   for (const k of Object.keys(kendoRow)) {
-    if (k.startsWith("_")) continue;
+    if (k.startsWith("_") || k === "__proto__" || k === "constructor") continue;
     const existing = modalData[k];
     if (existing !== undefined && existing !== null && existing !== "") continue;
     const v = kendoRow[k];
@@ -1179,24 +1552,35 @@ function getKendoGridAllRows() {
     let settled = false;
 
     function onMessage(event) {
-      if (event.data && event.data.type === "_fpxKendoResult") {
-        window.removeEventListener("message", onMessage);
-        settled = true;
+      if (!event.data || event.data.type !== "_fpxKendoResult") return;
+      window.removeEventListener("message", onMessage);
+      settled = true;
+      // Everything below runs after `settled` flips, so a throw here would
+      // leave the promise pending forever (the timeout guard checks
+      // `settled`). Wrap it: a malformed payload resolves null instead of
+      // hanging the whole page scrape.
+      try {
         const result = event.data.payload;
+        if (!result || typeof result !== "object") { resolve(null); return; }
 
         if (result.error) {
           dlog("[FPX-GP] Kendo inject error:", result.error);
           resolve(null);
           return;
         }
+        if (!Array.isArray(result.rows)) { resolve(null); return; }
 
-        dlog("[FPX-GP] Kendo inject: got", result.rows.length, "of", result.total, "total rows");
+        dlog("[FPX-GP] Kendo inject: got", result.rows.length, "of", result.total, "total rows",
+          result.skipped ? `(${result.skipped} skipped)` : "");
         dlog("[FPX-GP] Field map:", JSON.stringify(result.fieldMap));
         if (result.rows.length > 0) {
           dlog("[FPX-GP] Sample keys:", Object.keys(result.rows[0]).join(", "));
           dlog("[FPX-GP] Sample row:", JSON.stringify(result.rows[0]));
         }
-        resolve(result.rows);
+        resolve(result.rows.filter((r) => r && typeof r === "object"));
+      } catch (e) {
+        console.warn("[FPX] Kendo result handler failed:", e?.message || e);
+        resolve(null);
       }
     }
 
@@ -3191,7 +3575,7 @@ function fpxFilterViaKendoPopup(colName, value) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] inject-kendo-popup.js failed to load");
+        dlog("[FPX] inject-kendo-popup.js failed to load");
         resolve(false);
       }
     };
@@ -3201,7 +3585,7 @@ function fpxFilterViaKendoPopup(colName, value) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] Kendo popup driver timed out");
+        dlog("[FPX] Kendo popup driver timed out");
         resolve(false);
       }
     }, 4000);
@@ -3237,7 +3621,7 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] inject-kendo-filter.js failed to load");
+        dlog("[FPX] inject-kendo-filter.js failed to load");
         resolve(false);
       }
     };
@@ -3247,7 +3631,7 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        console.warn("[FPX] Kendo API filter timed out (jQuery not on page?)");
+        dlog("[FPX] Kendo API filter timed out (jQuery not on page?)");
         resolve(false);
       }
     }, 1500);
@@ -3320,6 +3704,29 @@ window.addEventListener("message", async (event) => {
     const col = String(data.column || "").trim();
     const val = String(data.value || "").trim();
     if (!col || !val) return;
+    // The dashboard fires this as soon as any FreightPOP frame says hello —
+    // which includes FP's login page (third-party cookies) and the first
+    // seconds before Kendo has rendered. Running the strategy chain there
+    // can only fail, and every failure used to land as a console.warn on
+    // the chrome://extensions Errors page. Wait briefly for a grid; if
+    // none shows up, answer quietly and let fpxGridReady trigger a resend.
+    if (!(await fpxEnsureGridReady(6000))) {
+      const reason = fpxDescribeFrameState();
+      dlog(`[FPX] Bridge filter deferred — ${reason}`);
+      try {
+        event.source && event.source.postMessage({
+          source: "fpx-extension",
+          type: "fpxFilterAck",
+          column: col,
+          value: val,
+          ok: false,
+          reason: "grid-not-ready",
+          error: `FreightPOP grid not loaded in this frame (${reason}). The filter will re-apply once the grid appears.`,
+          injectDetail: "",
+        }, event.origin);
+      } catch {}
+      return;
+    }
     sendStatus(`Bridge: filtering ${col} → "${val}"`);
     let applied = false;
     let strategy = "";
@@ -3396,9 +3803,19 @@ window.addEventListener("message", async (event) => {
     // the row's tracking link (the same UI path a rep takes manually).
     const tn = String(data.trackingNumber || "").trim();
     if (!tn) return;
-    sendStatus(`Bridge: opening modal for ${tn}`);
     let openOk = false;
     let openErr = null;
+    if (!(await fpxEnsureGridReady(6000))) {
+      openErr = `FreightPOP grid not loaded in this frame (${fpxDescribeFrameState()})`;
+      dlog(`[FPX] Bridge open-tracking skipped — ${openErr}`);
+      try {
+        event.source && event.source.postMessage({
+          source: "fpx-extension", type: "fpxOpenTrackingAck", trackingNumber: tn, ok: false, reason: "grid-not-ready", error: openErr,
+        }, event.origin);
+      } catch {}
+      return;
+    }
+    sendStatus(`Bridge: opening modal for ${tn}`);
     try {
       // Filter first so the matching row is on-screen; ignore failure
       // here because the row may already be visible from a prior filter.
@@ -3446,6 +3863,39 @@ try {
     window.parent.postMessage({ source: "fpx-extension", type: "fpxHello" }, "*");
   }
 } catch {}
+
+// True once the Kendo grid in this frame has at least one data row; waits
+// up to `timeoutMs` for it to render.
+async function fpxEnsureGridReady(timeoutMs = 6000) {
+  try {
+    const existing = document.querySelector(".k-grid-content tbody tr, .k-grid tbody tr");
+    if (existing && !existing.classList.contains("k-no-data")) return true;
+    return !!(await waitForGridWithObserver(timeoutMs));
+  } catch { return false; }
+}
+
+// Short human-readable reason for "no grid here", surfaced in the bridge ack
+// so the dashboard can tell the operator what to do (log in, wait, open the
+// Transactions view) instead of showing a generic failure.
+function fpxDescribeFrameState() {
+  try {
+    if (document.querySelector("input[type='password']")) return "FreightPOP login page — sign in inside the frame";
+    if (document.readyState !== "complete") return "page still loading";
+    if (document.querySelector(".k-grid")) return "grid has no rows yet";
+    return "no shipment grid on this view";
+  } catch { return "frame state unknown"; }
+}
+
+// Tell the dashboard when the grid actually becomes usable in this frame
+// (after login, after FP finishes rendering). The dashboard re-sends any
+// filter that was deferred with reason "grid-not-ready". Observer
+// disconnects as soon as the first row appears, or after 5 minutes.
+(async function fpxAnnounceGridReady() {
+  if (window.parent === window) return;
+  try {
+    if (await fpxEnsureGridReady(5 * 60 * 1000)) fpxTellParent({ type: "fpxGridReady" });
+  } catch {}
+})();
 
 // =====================================================================
 // Third-party cookie recovery for the FPXpress embed.

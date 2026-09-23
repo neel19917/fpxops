@@ -91,7 +91,7 @@ export function mapShipment(raw, runnerName) {
   const guessedCustomer = explicitCustomer || companyName || guessCustomerNameFromAddress(origin);
   return {
     created_by: runnerName || null,
-    tracking_number: pick(raw, ["_trackingNumber", "Tracking Number", "TRACKING"]),
+    tracking_number: normalizeTrackingNumber(pick(raw, ["_trackingNumber", "Tracking Number", "TRACKING"])),
     // FreightPOP actually emits "Shipment Id" (capital S, lowercase d)
     // — the older "Shipment ID" / "SHIPMENT ID" keys have never matched
     // a real scrape, which is why the drawer was falling back to the
@@ -177,6 +177,91 @@ export function mapShipment(raw, runnerName) {
   };
 }
 
+// Bulk mapping. Drops rows that don't map to a tracking number and
+// collapses duplicate tracking numbers to the LAST occurrence. FreightPOP
+// can show the same tracking number twice on a page (multi-leg bookings,
+// a grid re-render mid-scrape), and Postgres rejects an upsert batch that
+// touches one conflict key twice ("ON CONFLICT DO UPDATE command cannot
+// affect row a second time") — which used to fail the whole 250-row chunk.
 export function mapShipmentsBulk(rows, runnerName) {
-  return (rows || []).map((r) => mapShipment(r, runnerName)).filter((r) => r && r.tracking_number);
+  const byTracking = new Map();
+  for (const r of rows || []) {
+    let mapped = null;
+    try {
+      mapped = mapShipment(r, runnerName);
+    } catch (e) {
+      // One malformed row must not poison the batch. Skip it and move on.
+      console.warn("[FPX] mapShipment threw on a scraped row:", e?.message || e);
+      continue;
+    }
+    if (!mapped || !mapped.tracking_number) continue;
+    byTracking.delete(mapped.tracking_number); // keep insertion order = last sighting
+    byTracking.set(mapped.tracking_number, mapped);
+  }
+  return Array.from(byTracking.values());
+}
+
+// Tracking numbers arrive with stray whitespace / NBSPs from the grid cell
+// or modal. Normalize so "401770491 " and "401770491" are the same shipment.
+export function normalizeTrackingNumber(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).replace(/[\s\u00a0]+/g, " ").trim();
+  return s || null;
+}
+
+// Key the raw extension payloads by their normalized tracking number, last
+// occurrence wins (mirrors mapShipmentsBulk). Replaces index-aligned pairing,
+// which silently attached the wrong raw_data to a shipment as soon as any
+// row in the batch had been filtered out.
+export function pairRawByTracking(rows) {
+  const out = new Map();
+  for (const r of rows || []) {
+    if (!r || typeof r !== "object") continue;
+    const tn = normalizeTrackingNumber(pick(r, ["_trackingNumber", "Tracking Number", "TRACKING"]));
+    if (!tn) continue;
+    out.set(tn, r);
+  }
+  return out;
+}
+
+// The extension flags rows it could not fully scrape (modal never opened,
+// row vanished from the grid, exception mid-scrape) with `_error`. Those
+// rows only carry the grid columns, so writing them as-is would null out
+// every modal-only field the server already holds for that shipment.
+export function isPartialScrape(raw) {
+  return !!(raw && typeof raw === "object" && (raw._error || raw._partial));
+}
+
+// Keys a partial row must always carry even when null: the conflict key,
+// the raw payload / scrape stamp, and the un-archive signal (seeing the
+// shipment on the dashboard at all means it isn't delivered).
+const PARTIAL_ROW_KEEP = new Set(["tracking_number", "raw_data", "scraped_at", "archived_at", "archived_reason"]);
+
+// Return a copy of a mapped row with null-valued columns removed, so an
+// upsert only overwrites what this scrape actually observed.
+export function stripNullFields(mapped) {
+  const out = {};
+  for (const [k, v] of Object.entries(mapped || {})) {
+    if (v === null || v === undefined) {
+      if (PARTIAL_ROW_KEEP.has(k)) out[k] = v ?? null;
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+// PostgREST bulk inserts require every object in the array to have the same
+// keys ("All object keys must match" → 400 for the whole batch). Group rows
+// by key signature so callers can issue one upsert per group instead of
+// failing the entire chunk when one row is shaped differently.
+export function groupByKeySignature(rows) {
+  const groups = new Map();
+  for (const r of rows || []) {
+    if (!r || typeof r !== "object") continue;
+    const sig = Object.keys(r).sort().join("\u0001");
+    if (!groups.has(sig)) groups.set(sig, []);
+    groups.get(sig).push(r);
+  }
+  return Array.from(groups.values());
 }

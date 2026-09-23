@@ -436,7 +436,11 @@ function newQueueId() {
 }
 
 async function enqueueChunks(rows) {
-  if (!Array.isArray(rows) || !rows.length) return [];
+  // Only plain objects can be mapped server-side; anything else would 400
+  // the chunk it rides in. Filter here so one stray value never blocks the
+  // 249 good rows around it.
+  rows = Array.isArray(rows) ? rows.filter((r) => r && typeof r === "object" && !Array.isArray(r)) : [];
+  if (!rows.length) return [];
   const queue = await readQueue();
   const queuedAt = new Date().toISOString();
   const newEntries = [];
@@ -471,6 +475,43 @@ async function enqueueChunks(rows) {
 // concurrent calls (one from the message handler, one from the
 // startup hook) don't double-process. Returns aggregate counts so
 // the caller can report progress.
+// Server statuses that mean "this payload was rejected", as opposed to
+// "the server / network is unhealthy". Only these trigger bisecting a
+// chunk to isolate the offending row(s); gateway errors, auth failures
+// and rate limits are chunk-agnostic and just get the attempts++ path.
+const ROW_FAULT_STATUSES = new Set([400, 413, 422, 500]);
+function rowFaultStatus(errStr) {
+  const m = /^API (\d{3})\b/.exec(String(errStr || ""));
+  if (!m) return null;
+  const code = Number(m[1]);
+  return ROW_FAULT_STATUSES.has(code) ? code : null;
+}
+// Hard ceiling on POSTs a single chunk may spend isolating bad rows. Log2 of
+// a 250-row chunk is ~8 levels × 2 halves = ~17 calls to corner one bad row;
+// 24 leaves headroom for two. If the server is rejecting everything the
+// budget runs out fast and the leftovers go back on the queue as-is.
+const BISECT_CALL_BUDGET = 24;
+
+// POST a set of rows; on a row-fault status split and recurse so a single
+// bad row costs one row, not 250. Returns { count, rejected: [{rows, error}] }.
+async function postRowsIsolating(rows, budget, depth = 0) {
+  if (!rows.length) return { count: 0, rejected: [] };
+  if (budget.calls <= 0) return { count: 0, rejected: [{ rows, error: budget.lastError || "isolation budget exhausted" }] };
+  budget.calls--;
+  const result = await callApi("/api/shipments", { shipments: rows });
+  if (!result.error) return { count: result.count || rows.length, rejected: [] };
+  budget.lastError = result.error;
+  const status = rowFaultStatus(result.error);
+  if (!status || rows.length <= 1) {
+    return { count: 0, rejected: [{ rows, error: result.error }] };
+  }
+  if (depth === 0) console.warn(`[FPX] chunk of ${rows.length} rejected (${status}) — bisecting to isolate bad row(s)`);
+  const mid = Math.ceil(rows.length / 2);
+  const left = await postRowsIsolating(rows.slice(0, mid), budget, depth + 1);
+  const right = await postRowsIsolating(rows.slice(mid), budget, depth + 1);
+  return { count: left.count + right.count, rejected: [...left.rejected, ...right.rejected] };
+}
+
 async function flushPendingUploads() {
   if (_flushInFlight) return { skipped: true };
   _flushInFlight = true;
@@ -482,31 +523,55 @@ async function flushPendingUploads() {
     let queue = await readQueue();
     for (let i = 0; i < queue.length; i++) {
       const entry = queue[i];
-      if (entry.attempts >= MAX_QUEUE_ATTEMPTS) { dead++; continue; }
-      const result = await callApi("/api/shipments", { shipments: entry.rows });
-      if (result.error) {
-        // Leave the entry in the queue with attempts++ so the next
-        // flush picks it up again. callApi already retried 3x with
-        // backoff before returning an error, so this is a hard fail
-        // for this round.
-        entry.attempts = (entry.attempts || 0) + 1;
-        entry.lastError = result.error;
-        failed++;
-        // Persist the bumped attempts even if subsequent chunks
-        // succeed — readers should always see the latest state.
+      if (!entry || !Array.isArray(entry.rows) || !entry.rows.length) {
+        // Corrupt / empty entry (older build, interrupted write) — drop it.
+        queue = queue.filter((q) => q !== entry);
         await writeQueue(queue);
-        console.warn(`[FPX] queue chunk ${entry.id} failed (attempt ${entry.attempts}/${MAX_QUEUE_ATTEMPTS}): ${result.error}`);
-      } else {
+        i--;
+        continue;
+      }
+      if (entry.attempts >= MAX_QUEUE_ATTEMPTS) { dead++; continue; }
+      const budget = { calls: BISECT_CALL_BUDGET, lastError: null };
+      const { count, rejected } = await postRowsIsolating(entry.rows, budget);
+      totalCount += count;
+      if (!rejected.length) {
         // Success — remove the entry from the queue.
         succeeded++;
-        totalCount += result.count || entry.rows.length;
         queue = queue.filter((q) => q.id !== entry.id);
         await writeQueue(queue);
         // i was incremented past the now-removed entry; rewind one
         // step so the next iteration picks up what was previously
         // queue[i+1].
         i--;
+        continue;
       }
+      // Some rows landed, some were rejected. Replace the entry with one
+      // entry per rejected slice (attempts++ so a poison row still dies
+      // after MAX_QUEUE_ATTEMPTS instead of retrying forever). callApi
+      // already retried transient failures 3x with backoff before this.
+      const attempts = (entry.attempts || 0) + 1;
+      const replacements = rejected.map((r) => ({
+        id: newQueueId(),
+        // Lineage back to the chunk the caller enqueued, so
+        // upsertShipmentsBulkRobust can still report these rows as
+        // "pending from this upload" after the split.
+        origin: entry.origin || entry.id,
+        rows: r.rows,
+        attempts,
+        queuedAt: entry.queuedAt || new Date().toISOString(),
+        lastError: r.error,
+      }));
+      if (count > 0) succeeded++;
+      failed += replacements.length;
+      const rejectedRows = rejected.reduce((n, r) => n + r.rows.length, 0);
+      console.warn(`[FPX] queue chunk ${entry.id}: ${count} row(s) landed, ${rejectedRows} rejected across ${replacements.length} slice(s) (attempt ${attempts}/${MAX_QUEUE_ATTEMPTS}): ${rejected[0].error}`);
+      // Splice in place; the replacements have already been attempted this
+      // round, so skip past them.
+      queue.splice(i, 1, ...replacements);
+      i += replacements.length - 1;
+      // Persist the new state even if subsequent chunks succeed —
+      // readers should always see the latest state.
+      await writeQueue(queue);
     }
   } finally {
     _flushInFlight = false;
@@ -536,7 +601,7 @@ async function upsertShipmentsBulkRobust(rows) {
   // Re-read the queue post-flush to figure out what's still pending
   // for THIS upload (vs entries from prior failed sessions).
   const remaining = await readQueue();
-  const stillPendingFromThisCall = remaining.filter((q) => enqueued.some((e) => e.id === q.id));
+  const stillPendingFromThisCall = remaining.filter((q) => enqueued.some((e) => e.id === q.id || e.id === q.origin));
   return {
     ok: stillPendingFromThisCall.length === 0,
     count: flushResult.count || 0,
@@ -753,6 +818,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else sendResponse({ error: result.error });
       }
     })();
+    return true;
+  } else if (msg.type === "bgSleep") {
+    // Background-safe clock for the content script. A hidden tab's own
+    // timers are throttled to 1/s (1/min after five minutes hidden); the
+    // service worker's are not. Capped so a bad request can't pin the
+    // worker; the content script also keeps a local fallback timer.
+    const ms = Math.max(0, Math.min(Number(msg.ms) || 0, 30000));
+    setTimeout(() => { try { sendResponse({ ok: true, ms }); } catch {} }, ms);
     return true;
   } else if (msg.type === "getQueueStatus") {
     // Surfaced to the side panel so the rep can see "N rows pending,
