@@ -23,6 +23,7 @@ describe("segmentForTitle", () => {
     assert.equal(segmentForTitle("Customer followup: Redelivery — notify customer of failed delivery attempt (attempt 2)"), "redelivery");
     assert.equal(segmentForTitle("Carrier followup: Return/claim — confirm return charges"), "return_claim");
     assert.equal(segmentForTitle("Customer followup: Return/claim — get disposition"), "return_claim");
+    assert.equal(segmentForTitle("Customer followup: Storage risk — move the XPO appointment earlier"), "storage_risk");
     assert.equal(segmentForTitle("Carrier followup: FPX should contact Pilot"), "carrier");
     assert.equal(segmentForTitle("Customer followup: confirm receiving hours"), "customer");
     assert.equal(segmentForTitle("Customer wants carrier followup"), "carrier");

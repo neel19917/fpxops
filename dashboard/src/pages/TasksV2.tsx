@@ -60,12 +60,13 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 const SEGMENT_CLS: Record<TaskSegment, string> = {
   redelivery: "bg-rose-50 text-rose-800 ring-rose-200",
   return_claim: "bg-fuchsia-50 text-fuchsia-800 ring-fuchsia-200",
+  storage_risk: "bg-amber-50 text-amber-900 ring-amber-300",
   carrier: "bg-sky-50 text-sky-800 ring-sky-200",
   customer: "bg-teal-50 text-teal-800 ring-teal-200",
   other: "bg-slate-100 text-slate-700 ring-slate-200",
 };
 const SEGMENT_SHORT: Record<TaskSegment, string> = {
-  redelivery: "Redelivery", return_claim: "Return / claim", carrier: "Carrier", customer: "Customer", other: "Other",
+  redelivery: "Redelivery", return_claim: "Return / claim", storage_risk: "Storage risk", carrier: "Carrier", customer: "Customer", other: "Other",
 };
 const FLAG_CLS: Record<string, string> = {
   emerald: "bg-emerald-50 text-emerald-800 ring-emerald-200",
@@ -108,7 +109,7 @@ function Pill({ children, cls, title }: { children: ReactNode; cls: string; titl
 function shortTitle(title: string): string {
   return title
     .replace(/^(carrier|customer) followup:\s*/i, "")
-    .replace(/^(redelivery|return\/claim) — /i, "")
+    .replace(/^(redelivery|return\/claim|storage risk) — /i, "")
     .trim();
 }
 
@@ -187,7 +188,7 @@ export function TasksV2Page() {
     let list = rows;
     if (prefs.seg === "attention") {
       list = list.filter((r) => isActive(r.task.status) && !r.seg.flags.includes("resolved_upstream")
-        && (r.seg.segment === "redelivery" || r.seg.segment === "return_claim" || r.seg.flags.includes("repeat")));
+        && (r.seg.segment === "redelivery" || r.seg.segment === "return_claim" || r.seg.segment === "storage_risk" || r.seg.flags.includes("repeat")));
     } else if (prefs.seg !== "all") {
       list = list.filter((r) => r.seg.segment === prefs.seg);
     }
@@ -215,7 +216,7 @@ export function TasksV2Page() {
         let s = 1000;
         if (r.seg.flags.includes("resolved_upstream")) s += 5000;
         if (!isActive(r.task.status)) s += 9000;
-        if (r.seg.segment === "redelivery" || r.seg.segment === "return_claim" || r.seg.flags.includes("repeat")) s -= 500;
+        if (r.seg.segment === "redelivery" || r.seg.segment === "return_claim" || r.seg.segment === "storage_risk" || r.seg.flags.includes("repeat")) s -= 500;
         s += PRIORITY_WEIGHT[r.task.priority] * 100;
         return s;
       };
@@ -367,7 +368,7 @@ export function TasksV2Page() {
       {/* KPI strip */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
         <KPI label="Active tasks" value={kpi.active} icon={ListChecks} />
-        <KPI label="Needs attention" value={kpi.attention} icon={AlertTriangle} tone={kpi.attention ? "danger" : "default"} hint="Redelivery, return/claim, repeat failures" />
+        <KPI label="Needs attention" value={kpi.attention} icon={AlertTriangle} tone={kpi.attention ? "danger" : "default"} hint="Redelivery, return/claim, storage risk, repeat failures" />
         <KPI label="Likely resolved" value={kpi.resolved} icon={ShieldCheck} tone={kpi.resolved ? "success" : "default"} hint="Delivered / archived / AI says no" />
         <KPI label="Stale data" value={kpi.stale} icon={Clock} tone={kpi.stale ? "warn" : "default"} hint={`No scrape in ${staleDays}+ days`} />
         <KPI label="Unassigned" value={kpi.unassigned} icon={UserPlus} tone={kpi.unassigned ? "warn" : "default"} />

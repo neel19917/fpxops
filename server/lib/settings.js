@@ -68,6 +68,13 @@ const FALLBACKS = {
     '4. risks — up to 5 short observations the lead should know (e.g. "3 Modesto redeliveries for the same consignee — likely a receiving-hours problem").\n' +
     '5. summary — 2-3 plain sentences for the standup.\n\n' +
     'Rules: only reference task_id values that appear in the input. Do not invent shipments. Never put the same task_id in both priority_queue and close_candidates. Be terse: every reason and first_action is ONE sentence under 25 words; at most 15 priority_queue items, 30 close_candidates (the clearest cases first), 8 batches, 5 risks. Output strict JSON only, no prose before or after, with keys: summary, priority_queue [{task_id, reason, first_action}], close_candidates [{task_id, disposition, reason}], batches [{label, reason, task_ids}], risks [string].',
+  // Storage-charge risk on delivery holds (lib/storageRisk.js). Carriers on
+  // this list bill storage once freight sits at the destination terminal
+  // longer than hold_hours waiting for an appointment. Comma-separated
+  // substrings matched against carrier_name. XPO is the confirmed case
+  // (Allen/Victor, 2026-09-23); add others as they're confirmed.
+  "storage.carriers": "XPO",
+  "storage.hold_hours": 48,
   // Days without a scrape before a task's shipment data counts as stale on
   // the Tasks v2 board. 7 = "not seen this week"; the scraper normally hits
   // every live shipment daily, so anything past that has dropped off the
@@ -140,6 +147,21 @@ export async function getSetting(key) {
   const row = c[key];
   if (row && row.value !== undefined && row.value !== null) return row.value;
   return FALLBACKS[key];
+}
+
+// Synchronous read for hot paths that can't await (computeTemporalTriggers
+// runs inside a sync JSON build). Serves the in-process cache when it has
+// been loaded by any earlier async call — which is always the case on the
+// analysis path, since the threshold is read first — and the hard-coded
+// fallback otherwise. Never blocks, never throws.
+export function getSettingsSync(...keys) {
+  const c = cache || {};
+  const out = {};
+  for (const k of keys) {
+    const row = c[k];
+    out[k] = row && row.value !== undefined && row.value !== null ? row.value : FALLBACKS[k];
+  }
+  return out;
 }
 
 export async function getSettings(...keys) {

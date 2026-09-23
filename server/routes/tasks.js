@@ -80,6 +80,28 @@ tasksRouter.get("/", async (req, res) => {
   res.json({ data: enriched });
 });
 
+// GET /tasks/counts — exact per-status totals across ALL non-archived
+// tasks. The list route caps at 1000 rows, so the classic page's "All"
+// KPI was showing the cap (1000) once done tasks passed it. Six cheap
+// HEAD counts beat pulling the whole table.
+tasksRouter.get("/counts", async (_req, res) => {
+  const statuses = ["open", "in_progress", "blocked", "done", "cancelled"];
+  try {
+    const results = await Promise.all([
+      ...statuses.map((s) => supabase.from("fpx_shipment_tasks").select("id", { count: "exact", head: true }).eq("status", s).is("archived_at", null)),
+      supabase.from("fpx_shipment_tasks").select("id", { count: "exact", head: true }).is("archived_at", null),
+    ]);
+    const bad = results.find((r) => r.error);
+    if (bad) return res.status(500).json({ error: bad.error.message });
+    const counts = {};
+    statuses.forEach((s, i) => { counts[s] = results[i].count ?? 0; });
+    counts.total = results[statuses.length].count ?? 0;
+    res.json({ counts });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /tasks/carrier-followups
 // Returns active (open + in_progress) carrier-followup tasks joined to
 // their shipments so the dashboard can group by carrier without N round
