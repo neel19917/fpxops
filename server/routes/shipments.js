@@ -7,7 +7,7 @@ import { getSettings } from "../lib/settings.js";
 import { analyzeExistingShipment, runShipmentAnalysis } from "./analyze.js";
 import { extractAiJsonFields } from "../lib/anthropic.js";
 import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG } from "../lib/redelivery.js";
-import { detectStorageRisk, STORAGE_TAG } from "../lib/storageRisk.js";
+import { detectStorageRisk, isStorageRiskTitle, STORAGE_TAG } from "../lib/storageRisk.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
 
 // Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
@@ -340,12 +340,23 @@ async function autoCreateActionTasks(
     const redelivery = detectRedelivery({ ...s, ...current }) === true;
 
     if (!redelivery) {
-      if (prior.length) continue;
       // Storage-hold exposure gets the structured "Storage risk — " tag so
       // it lands in its own segment on the board. Detection needs
-      // raw_data.Details, which only the freshly mapped row carries.
+      // raw_data.Details, which the freshly mapped row (or a select("*")
+      // row on the manual re-analyze path) carries.
+      //
+      // Like redelivery, storage risk is a distinct, time-boxed event: a
+      // shipment that already has a generic carrier followup still gets
+      // ONE storage task (deduped on the tag), because the customer has to
+      // decide before the free window closes.
       const storage = detectStorageRisk({ ...s, ...current }, storageOpts).storage_risk === true;
-      rows.push(buildStandardTask(s, changeLog, { tag: storage ? STORAGE_TAG : "" }));
+      if (storage) {
+        if (prior.some((t) => isStorageRiskTitle(t.title))) continue;
+        rows.push(buildStandardTask(s, changeLog, { tag: STORAGE_TAG }));
+        continue;
+      }
+      if (prior.length) continue;
+      rows.push(buildStandardTask(s, changeLog));
       continue;
     }
 
@@ -892,7 +903,19 @@ shipmentsRouter.post("/:id/reanalyze", async (req, res) => {
     before: { action_required: row.action_required, ai_issue: row.ai_issue },
     after:  { action_required: updated?.action_required, ai_issue: updated?.ai_issue },
   });
-  res.json({ shipment: updated || row });
+  // Same task fan-out as the scrape path, so a manual re-analyze that flips
+  // a shipment to action-required (or surfaces a redelivery / storage
+  // event) produces the task immediately instead of on the next scrape.
+  // The select("*") row carries raw_data, which the storage detector needs.
+  let tasks = 0;
+  if (updated && String(updated.action_required || "").toUpperCase() === "YES") {
+    try {
+      tasks = await autoCreateActionTasks(req, [{ ...row, ...updated }]);
+    } catch (e) {
+      console.warn("[FPX] reanalyze auto-task failed:", e.message);
+    }
+  }
+  res.json({ shipment: updated || row, tasks_created: tasks });
 });
 
 // POST /shipments/:id/reanalyze/preview  { model? }
