@@ -819,6 +819,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     })();
     return true;
+  } else if (msg.type === "bgSleep") {
+    // Background-safe clock for the content script. A hidden tab's own
+    // timers are throttled to 1/s (1/min after five minutes hidden); the
+    // service worker's are not. Capped so a bad request can't pin the
+    // worker; the content script also keeps a local fallback timer.
+    const ms = Math.max(0, Math.min(Number(msg.ms) || 0, 30000));
+    setTimeout(() => { try { sendResponse({ ok: true, ms }); } catch {} }, ms);
+    return true;
   } else if (msg.type === "getQueueStatus") {
     // Surfaced to the side panel so the rep can see "N rows pending,
     // K failed". Sync read off chrome.storage; cheap.

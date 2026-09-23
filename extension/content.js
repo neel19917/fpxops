@@ -25,7 +25,35 @@ function sendComplete(text) {
   try { chrome.runtime.sendMessage({ type: "complete", text }); } catch {}
 }
 
+// ---------------------------------------------------------------------
+// Background-safe clock.
+//
+// Chrome throttles a hidden tab's timers to 1/s, and to 1/min once the tab
+// has been hidden for five minutes. Every wait in this script used to ride
+// on those timers, so a scrape that did a row every 3s in the foreground
+// took minutes per row the moment the operator switched tabs. The
+// extension's service worker is NOT throttled by tab visibility, so while
+// the tab is hidden we ask it to time our waits for us. If the worker is
+// unreachable the local timer still fires — slower, but never stuck.
+// ---------------------------------------------------------------------
+let _bgClockOk = true;
 function sleep(ms) {
+  if (ms >= 50 && typeof document !== "undefined" && document.hidden && _bgClockOk) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      try {
+        chrome.runtime.sendMessage({ type: "bgSleep", ms }, () => {
+          // lastError (worker asleep / context gone) → just resolve; the
+          // local fallback below guarantees progress either way.
+          if (chrome.runtime.lastError) _bgClockOk = false;
+          finish();
+        });
+      } catch { _bgClockOk = false; }
+      // Fallback: local timer. Throttled when hidden, but it fires.
+      setTimeout(finish, ms);
+    });
+  }
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -37,6 +65,9 @@ function humanDelay(minMs, maxMs) {
 
 // Yield to the browser so it can paint/reflow — prevents "page unresponsive"
 function yieldToBrowser() {
+  // setTimeout(0) is clamped to ≥1s in a hidden tab; go through the
+  // background clock there instead.
+  if (typeof document !== "undefined" && document.hidden) return sleep(60);
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
@@ -79,48 +110,27 @@ function findModalDismissControl() {
 }
 
 // Poll for a dismiss control (CLOSE button, Kendo X, aria-label Close) up to `timeout` ms.
-function waitForCloseButton(timeout = 25000) {
-  return new Promise((resolve) => {
-    const interval = 400;
-    // Wall-clock deadline, not tick counting. In a hidden tab Chrome slows
-    // timers to 1/s and eventually 1/min, so counting 400ms per tick turned
-    // a 25s wait into many minutes.
-    const deadline = Date.now() + timeout;
-
-    const timer = setInterval(() => {
-      const btn = findModalDismissControl();
-      if (btn) {
-        clearInterval(timer);
-        resolve(btn);
-        return;
-      }
-      if (Date.now() >= deadline) {
-        clearInterval(timer);
-        resolve(null);
-      }
-    }, interval);
-  });
+// Wall-clock deadline + background-safe sleep, so a hidden tab neither
+// inflates the wait nor stalls it.
+async function waitForCloseButton(timeout = 25000) {
+  const deadline = Date.now() + timeout;
+  while (true) {
+    const btn = findModalDismissControl();
+    if (btn) return btn;
+    if (Date.now() >= deadline) return null;
+    await sleep(400);
+  }
 }
 
 // Poll for an element matching `selector` to appear in the DOM (visible).
-function waitForElement(selector, timeout = 5000) {
-  return new Promise((resolve) => {
-    const interval = 300;
-    let elapsed = 0;
-    const timer = setInterval(() => {
-      const el = document.querySelector(selector);
-      if (el && el.offsetParent !== null) {
-        clearInterval(timer);
-        resolve(el);
-        return;
-      }
-      elapsed += interval;
-      if (elapsed >= timeout) {
-        clearInterval(timer);
-        resolve(null);
-      }
-    }, interval);
-  });
+async function waitForElement(selector, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (true) {
+    const el = document.querySelector(selector);
+    if (el && el.offsetParent !== null) return el;
+    if (Date.now() >= deadline) return null;
+    await sleep(300);
+  }
 }
 
 // MutationObserver-based wait for the shipment detail view (#ShipmentSale) to
@@ -803,34 +813,21 @@ async function ensureModalClosed(timeoutMs = 2500, root = null) {
   return !isModalOpen(root);
 }
 
-// Chrome throttles timers in a hidden tab (1/s, then 1/min after five
-// minutes) — and FreightPOP's own page slows with them. A run that does a
-// row every 3s in the foreground took 4-7 MINUTES per row in the
-// background, and any modal that missed the 25s window came back as a
-// partial row. Rather than grind through that, hold the loop while the tab
-// is hidden and tell the operator why. Resumes the moment the tab is
-// visible again. Returns the ms spent paused.
-async function pauseWhileHidden(trackingNum) {
-  if (typeof document.hidden !== "boolean" || !document.hidden) return 0;
-  const start = Date.now();
-  sendStatus(`Paused — the FreightPOP tab is in the background. Bring it to the front to continue${trackingNum ? ` (next: ${trackingNum})` : ""}.`);
-  await new Promise((resolve) => {
-    const onVis = () => {
-      if (!document.hidden) {
-        document.removeEventListener("visibilitychange", onVis);
-        clearInterval(poll);
-        resolve();
-      }
-    };
-    document.addEventListener("visibilitychange", onVis);
-    // Belt and braces: visibilitychange is reliable, but poll too in case
-    // the tab is re-shown via a path that doesn't fire it.
-    const poll = setInterval(onVis, 1000);
-    onVis();
-  });
-  const pausedMs = Date.now() - start;
-  sendStatus(`Resumed after ${Math.round(pausedMs / 1000)}s in the background.`);
-  return pausedMs;
+// The scrape keeps running while the tab is hidden (waits ride the
+// background clock, see sleep()). FreightPOP's own page timers are still
+// throttled by Chrome, so rows are a bit slower in the background — tell the
+// operator once per hidden stretch so a slower pace isn't mistaken for a
+// stall. Returns true when the tab is hidden.
+let _wasHidden = false;
+function noteBackgroundState(trackingNum) {
+  const hidden = typeof document.hidden === "boolean" && document.hidden;
+  if (hidden && !_wasHidden) {
+    sendStatus(`Running in the background (tab hidden) — a little slower per row, keeps going${trackingNum ? ` (next: ${trackingNum})` : ""}.`);
+  } else if (!hidden && _wasHidden) {
+    sendStatus("Tab visible again — back to full speed.");
+  }
+  _wasHidden = hidden;
+  return hidden;
 }
 
 // Build the row we upload when a shipment could not be fully scraped. It
@@ -988,26 +985,15 @@ function goToNextPage() {
   return false;
 }
 
-function waitForGridReady(timeout = 3000) {
-  return new Promise((resolve) => {
-    const interval = 300;
-    const deadline = Date.now() + timeout;
-    const timer = setInterval(() => {
-      const rows = document.querySelectorAll(
-        ".k-grid-content tbody tr, .k-grid tbody tr"
-      );
-      const loading = document.querySelector(".k-loading-mask, .k-loading-image");
-      if (rows.length > 0 && !loading) {
-        clearInterval(timer);
-        resolve();
-        return;
-      }
-      if (Date.now() >= deadline) {
-        clearInterval(timer);
-        resolve();
-      }
-    }, interval);
-  });
+async function waitForGridReady(timeout = 3000) {
+  const deadline = Date.now() + timeout;
+  while (true) {
+    const rows = document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr");
+    const loading = document.querySelector(".k-loading-mask, .k-loading-image");
+    if (rows.length > 0 && !loading) return;
+    if (Date.now() >= deadline) return;
+    await sleep(300);
+  }
 }
 
 async function processPage() {
@@ -1042,11 +1028,7 @@ async function processPage() {
     const trackingNum = job.trackingNum || String(job.link?.textContent || "").trim();
     const pickupResponse = job.pickupResponse;
     const kendoRow = kendoRowMap.get(trackingNum);
-    const pausedMs = await pauseWhileHidden(trackingNum);
-    if (stopRequested) {
-      sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
-      return;
-    }
+    const hiddenAtStart = noteBackgroundState(trackingNum);
     sendStatus(`Processing ${i + 1} of ${total} — ${trackingNum}`);
 
     // Every step for one shipment is isolated: a throw records a partial row
@@ -1105,7 +1087,7 @@ async function processPage() {
       // from the database: was it the carrier modal, or our own waits?
       modalData._modalWaitMs = modalWaitMs;
       if (preCloseMs) modalData._preCloseMs = preCloseMs;
-      if (pausedMs) modalData._pausedHiddenMs = pausedMs;
+      if (hiddenAtStart) modalData._scrapedHidden = true;
       const dialogRoot = dialogRootFor(closeBtn);
       logRows.push(modalData);
       // Legacy 25-row chrome.storage._fpxCheckpoint write was retired —
