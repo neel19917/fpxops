@@ -830,6 +830,26 @@ function noteBackgroundState(trackingNum) {
   return hidden;
 }
 
+// Circuit breaker for the "every modal times out" cascade. Seen 2026-09-23:
+// FreightPOP stopped opening tracking modals mid-run (page state broke) and
+// the loop burned 25s per row recording partials for the rest of the grid.
+// After this many consecutive timeouts the run stops with a message telling
+// the operator to refresh FreightPOP and restart.
+const MAX_CONSECUTIVE_MODAL_TIMEOUTS = 5;
+let consecutiveModalTimeouts = 0;
+let lastGoodTrackingNum = null;
+let abortRunReason = null;
+
+// Which pager page the Kendo grid is on right now ("1" for the first page).
+// Returns null when there is no pager (single page) or it can't be read.
+function currentGridPage() {
+  try {
+    const sel = document.querySelector(".k-pager-numbers .k-state-selected, .k-pager-numbers .k-selected, .k-pager-numbers [aria-current='page']");
+    const t = sel ? String(sel.textContent || "").trim() : "";
+    return /^\d+$/.test(t) ? parseInt(t, 10) : null;
+  } catch { return null; }
+}
+
 // Build the row we upload when a shipment could not be fully scraped. It
 // carries the grid columns (Kendo merge + Pickup Response) plus `_error`, so
 // the server updates only what we actually observed instead of nulling the
@@ -1060,10 +1080,19 @@ async function processPage() {
       const modalWaitMs = Date.now() - waitStart;
       if (!closeBtn) {
         failures++;
+        consecutiveModalTimeouts++;
         logRows.push(buildPartialRow(trackingNum, "Modal did not appear (timeout)", pickupResponse, kendoRow));
         sendStatus(`Timeout on ${trackingNum} — no modal appeared, recorded grid data only.`);
+        if (consecutiveModalTimeouts >= MAX_CONSECUTIVE_MODAL_TIMEOUTS) {
+          abortRunReason = `FreightPOP stopped opening tracking modals — ${consecutiveModalTimeouts} rows in a row timed out` +
+            (lastGoodTrackingNum ? ` (last good: ${lastGoodTrackingNum})` : "") +
+            `. Refresh the FreightPOP page and click Scrape & upload again.`;
+          return;
+        }
         continue;
       }
+      consecutiveModalTimeouts = 0;
+      lastGoodTrackingNum = trackingNum;
 
       await humanDelay(350, 700);
       sendStatus(`Scraping modal data for ${trackingNum}...`);
@@ -1125,6 +1154,9 @@ async function run(filterCol, filterVal) {
   // after upload (POST /api/shipments → background per-row Claude).
   stopRequested = false;
   logRows = [];
+  consecutiveModalTimeouts = 0;
+  lastGoodTrackingNum = null;
+  abortRunReason = null;
   // Tracks every tracking number we see across the entire sweep (not just
   // this page). On a clean unfiltered completion we ship this to the
   // server so it can soft-archive shipments that have left the
@@ -1154,6 +1186,14 @@ async function run(filterCol, filterVal) {
   }
 
   let pageNum = 1;
+  // A sweep that starts anywhere but the grid's first page cannot see every
+  // shipment, so its "not seen" set must never drive the delivered-archive
+  // pass. Read the pager before we touch anything.
+  const startingGridPage = currentGridPage();
+  const startedOnFirstPage = startingGridPage === null || startingGridPage === 1;
+  if (!startedOnFirstPage) {
+    sendStatus(`Starting from grid page ${startingGridPage} — delivered-shipment archiving will be skipped for this run.`);
+  }
   // We drop uploaded rows from logRows so the array doesn't grow
   // unboundedly during long scrapes (a 50-page sweep with 50 rows/page
   // and ~30 KB per modal = ~75 MB resident otherwise — tips reps with
@@ -1248,6 +1288,11 @@ async function run(filterCol, filterVal) {
       sendComplete(`Stopped by user. ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
       return;
     }
+    if (abortRunReason) {
+      await flushAndDropLogRows("aborted");
+      sendComplete(`Stopped on page ${pageNum}: ${abortRunReason} ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
+      return;
+    }
 
     // Stream this page's rows to the dashboard. Don't await — the
     // upload runs in parallel with the next page's scrape so the
@@ -1284,7 +1329,7 @@ async function run(filterCol, filterVal) {
   // tell delivered apart from filtered-out, and a stopped run hasn't
   // visited every page so its set is incomplete.
   let archiveSummary = "";
-  if (!filterCol && !filterVal && sweepTrackingNumbers.size > 0) {
+  if (!filterCol && !filterVal && startedOnFirstPage && sweepTrackingNumbers.size > 0) {
     sendStatus(`Reconciling delivered shipments (${sweepTrackingNumbers.size} seen)…`);
     try {
       const r = await chrome.runtime.sendMessage({
