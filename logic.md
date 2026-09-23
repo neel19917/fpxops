@@ -360,7 +360,9 @@ Added 2026-09-23 (Allen + Victor): XPO bills storage once freight sits at the de
 
 ### Data
 
-The grid has no arrival-at-destination column (`actual_arrival` is 0% populated), but the extension already captures the carrier's full event history in `raw_data.Details` as one flattened string: `<status><status comment><MM/DD/YYYY HH:MM:SS><City><ST>` repeated, newest first. `lib/storageRisk.js#parseCarrierEvents` splits it on the timestamps. **No extension change is required.** When `Details` is missing (~8% of rows; XPO "History details not found" PROs), it falls back to `tracking_comments` + `last_modified_at` (date-only, so ±1 day).
+The grid has no arrival-at-destination column (`actual_arrival` is 0% populated), but the extension captures the carrier's event history from the shipment modal in `raw_data.Details` as one flattened string: `<status><status comment><MM/DD/YYYY HH:MM:SS><City><ST>` repeated, newest first. `lib/storageRisk.js#parseCarrierEvents` splits it on the timestamps.
+
+**Extension change (v4.4):** up to v4.3 the extension capped every modal field at 300 chars with a trailing "…", so `Details` kept only the 2–3 newest events and the arrival event was usually cut off before its timestamp. v4.4 gives `Details` its own 8000-char cap (`LONG_VALUE_KEYS` in `extension/content.js`). Until every runner is on v4.4 the server compensates: when the destination phrase sits in the truncated tail, arrival is bounded to the oldest timestamped event (`source: "events_truncated"`, hold hours are a floor). When `Details` is missing entirely (~8% of rows; XPO "History details not found" PROs) it falls back to `tracking_comments` + `last_modified_at` (date-only, so ±1 day).
 
 ### Detection (`lib/storageRisk.js#detectStorageRisk`)
 

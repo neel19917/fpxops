@@ -49,6 +49,13 @@ describe("detectDestinationArrival", () => {
     assert.deepEqual(detectDestinationArrival(ship({ raw_data: { Details: SAIA_ARRIVED } })), { at: "2026-09-22T07:04:00.000Z", source: "events" });
     assert.deepEqual(detectDestinationArrival(ship({ raw_data: { Details: XPO_TRAP } })), { at: "2026-09-22T10:40:00.000Z", source: "events" });
   });
+  it("bounds arrival by the oldest timestamp when the destination event is in the truncated tail (prod 200918911: 295-char Details)", () => {
+    const truncated = "Carrier Status Code Status Status Comment Status Date City State Longitude Latitude Unloaded from trailerUnloaded from trailer09/21/2026 07:09:00North AugustaSCStaged to dock locationStaged to dock location09/21/2026 07:09:00North AugustaSCHeld for appointment from NAGHeld for appointment from…";
+    assert.deepEqual(detectDestinationArrival(ship({ raw_data: { Details: truncated } })), { at: "2026-09-21T07:09:00.000Z", source: "events_truncated" });
+    // A truncated tail with no destination phrase does not bound anything.
+    const truncatedTransit = "Carrier Status Code Status Status Comment Status Date City State Longitude Latitude Schedule departed from LDA to UDVSchedule departed from LDA to UDV09/22/2026 04:21:00DallasTXRecord updatedRecord upd…";
+    assert.equal(detectDestinationArrival(ship({ raw_data: { Details: truncatedTransit }, tracking_comments: "En route to destination" })), null);
+  });
   it("falls back to tracking_comments + last_modified_at when Details has no arrival", () => {
     const s = ship({ raw_data: { Details: IN_TRANSIT_ONLY }, tracking_comments: "At destination", last_modified_at: "2026-09-22T00:00:00Z" });
     assert.deepEqual(detectDestinationArrival(s), { at: "2026-09-22T00:00:00.000Z", source: "comment" });
