@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mapShipment, mapShipmentsBulk, guessCustomerNameFromAddress } from "../lib/shipments.js";
+import {
+  mapShipment, mapShipmentsBulk, guessCustomerNameFromAddress,
+  normalizeTrackingNumber, pairRawByTracking, isPartialScrape, stripNullFields, groupByKeySignature,
+} from "../lib/shipments.js";
 
 describe("guessCustomerNameFromAddress", () => {
   it("takes leading non-numeric segments before street number", () => {
@@ -199,5 +202,106 @@ describe("mapShipmentsBulk", () => {
   it("returns [] for null/undefined input", () => {
     assert.deepEqual(mapShipmentsBulk(null), []);
     assert.deepEqual(mapShipmentsBulk(undefined), []);
+  });
+});
+
+describe("mapShipmentsBulk — bad-row hardening", () => {
+  it("collapses duplicate tracking numbers to the last occurrence", () => {
+    const out = mapShipmentsBulk([
+      { _trackingNumber: "DUP", CARRIER: "first" },
+      { _trackingNumber: "OTHER" },
+      { _trackingNumber: "DUP", CARRIER: "second" },
+    ]);
+    assert.deepEqual(out.map((r) => r.tracking_number), ["OTHER", "DUP"]);
+    assert.equal(out.find((r) => r.tracking_number === "DUP").carrier, "second");
+  });
+  it("treats whitespace variants of a tracking number as the same shipment", () => {
+    const out = mapShipmentsBulk([
+      { _trackingNumber: " 4017 70491\u00a0" },
+      { _trackingNumber: "4017 70491" },
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].tracking_number, "4017 70491");
+  });
+  it("survives rows that are not objects or have hostile shapes", () => {
+    const out = mapShipmentsBulk([
+      42, "str", [], null, undefined,
+      { _trackingNumber: "OK", "Shipment Date": { nested: true }, "Total Weight": ["x"] },
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].tracking_number, "OK");
+    assert.equal(out[0].shipment_date, null);
+    assert.equal(out[0].total_weight, null);
+  });
+});
+
+describe("normalizeTrackingNumber", () => {
+  it("trims, collapses whitespace, and nulls empties", () => {
+    assert.equal(normalizeTrackingNumber("  A  B \n"), "A B");
+    assert.equal(normalizeTrackingNumber("   "), null);
+    assert.equal(normalizeTrackingNumber(null), null);
+    assert.equal(normalizeTrackingNumber(12345), "12345");
+  });
+});
+
+describe("pairRawByTracking", () => {
+  it("keys raw payloads by tracking number regardless of skipped rows", () => {
+    const bulk = [
+      { "Customer Name": "no tracking" },
+      { _trackingNumber: "A", Details: "a-details" },
+      null,
+      { _trackingNumber: "B", Details: "b-details" },
+    ];
+    const mapped = mapShipmentsBulk(bulk);
+    const raw = pairRawByTracking(bulk);
+    for (const m of mapped) {
+      assert.equal(raw.get(m.tracking_number).Details, `${m.tracking_number.toLowerCase()}-details`);
+    }
+    assert.equal(raw.size, 2);
+  });
+  it("last duplicate wins, matching mapShipmentsBulk", () => {
+    const raw = pairRawByTracking([
+      { _trackingNumber: "D", Details: "old" },
+      { _trackingNumber: "D", Details: "new" },
+    ]);
+    assert.equal(raw.get("D").Details, "new");
+  });
+});
+
+describe("partial scrape rows", () => {
+  it("isPartialScrape flags _error / _partial rows only", () => {
+    assert.equal(isPartialScrape({ _error: "Modal did not appear (timeout)" }), true);
+    assert.equal(isPartialScrape({ _partial: true }), true);
+    assert.equal(isPartialScrape({ _trackingNumber: "X" }), false);
+    assert.equal(isPartialScrape(null), false);
+  });
+  it("stripNullFields drops null columns but keeps the conflict key and un-archive signal", () => {
+    const mapped = mapShipment({ _trackingNumber: "P1", _error: "timeout", "Shipment status": "In Transit" });
+    const stripped = stripNullFields(mapped);
+    assert.equal(stripped.tracking_number, "P1");
+    assert.equal(stripped.shipment_status, "In Transit");
+    assert.equal("archived_at" in stripped, true);
+    assert.equal(stripped.archived_at, null);
+    assert.equal("carrier" in stripped, false);
+    assert.equal("updated_eta" in stripped, false);
+    assert.equal(typeof stripped.scraped_at, "string");
+  });
+});
+
+describe("groupByKeySignature", () => {
+  it("groups rows with identical key sets and separates differently shaped rows", () => {
+    const groups = groupByKeySignature([
+      { a: 1, b: 2 },
+      { b: 3, a: 4 },
+      { a: 5 },
+      null,
+    ]);
+    assert.equal(groups.length, 2);
+    assert.equal(groups[0].length, 2);
+    assert.equal(groups[1].length, 1);
+  });
+  it("returns [] for empty input", () => {
+    assert.deepEqual(groupByKeySignature([]), []);
+    assert.deepEqual(groupByKeySignature(null), []);
   });
 });

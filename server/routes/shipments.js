@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
-import { mapShipment, mapShipmentsBulk } from "../lib/shipments.js";
+import { mapShipment, mapShipmentsBulk, pairRawByTracking, isPartialScrape, stripNullFields, groupByKeySignature } from "../lib/shipments.js";
 import { logAudit } from "../lib/audit.js";
 import { generateEmailDraft } from "../lib/emailDraft.js";
 import { getSettings } from "../lib/settings.js";
@@ -623,71 +623,106 @@ shipmentsRouter.post("/", async (req, res) => {
     return res.json({ shipment: data });
   }
   if (Array.isArray(bulk)) {
-    const mapped = mapShipmentsBulk(bulk, runnerName);
-    if (!mapped.length) return res.json({ count: 0, ids: [] });
+    try {
+      const mapped = mapShipmentsBulk(bulk, runnerName);
+      if (!mapped.length) return res.json({ count: 0, ids: [] });
 
-    // Scrape-only extension uploads carry no AI fields. Preserve whatever the
-    // server has already analyzed instead of overwriting with nulls.
-    preserveExistingAi(mapped);
+      // Raw payloads keyed by tracking number — NOT by index. mapShipmentsBulk
+      // drops rows without a tracking number and collapses duplicates, so
+      // mapped[i] and bulk[i] stop lining up the moment any row is skipped,
+      // and index pairing stamped the wrong raw_data / Details on the wrong
+      // shipment for every row after the gap.
+      const rawByTracking = pairRawByTracking(bulk);
 
-    // ---- Scrape history ------------------------------------------------
-    // Pull the prior snapshot for every tracking_number so we can compute a
-    // material-field diff before the upsert clobbers the row. Only the
-    // fields we compare on are pulled — keeps the query small.
-    const trackingNumbers = mapped.map((m) => m.tracking_number).filter(Boolean);
-    const priorByTracking = new Map();
-    if (trackingNumbers.length) {
-      const cols = ["id", "tracking_number", "action_source", "mode", "last_modified_at", ...MATERIAL_FIELDS].join(", ");
-      const { data: priors } = await supabase
-        .from("fpx_shipments").select(cols).in("tracking_number", trackingNumbers);
-      for (const p of priors || []) priorByTracking.set(p.tracking_number, p);
-    }
-    // Compute the diff per scraped row (null if first sighting / no change).
-    const diffByTracking = new Map();
-    for (const m of mapped) {
-      const prev = priorByTracking.get(m.tracking_number);
-      const diff = computeMaterialDiff(prev, m);
-      if (diff) diffByTracking.set(m.tracking_number, diff);
-    }
-    // ---- Upsert (latest-snapshot table) --------------------------------
-    const { data, error } = await supabase
-      .from("fpx_shipments")
-      .upsert(mapped, { onConflict: "tracking_number" })
-      .select("id,tracking_number,seen_count,created_by,mode,tracking_comments,comments,delivery_date,action_required,action_source,action_target,ai_issue,ai_recommendation");
-    if (error) return res.status(500).json({ error: error.message });
+      // Scrape-only extension uploads carry no AI fields. Preserve whatever the
+      // server has already analyzed instead of overwriting with nulls.
+      preserveExistingAi(mapped);
 
-    const upsertedIds = data.map((r) => r.id);
+      // Rows the extension flagged as partial (modal never opened, row vanished
+      // mid-scrape) only carry grid columns. Strip their nulls so the upsert
+      // updates what we saw and leaves the modal-only fields alone.
+      const upsertRows = mapped.map((m) =>
+        isPartialScrape(rawByTracking.get(m.tracking_number)) ? stripNullFields(m) : m
+      );
 
-    // Single shared post-upsert pipeline. Records scrape history,
-    // flags stale manual overrides, stamps last_material_change_at,
-    // and runs the background analyze + auto-task + auto-draft pass
-    // (with the diff plumbed through so each task description gets a
-    // Change log section).
-    const rawByTracking = new Map();
-    for (let i = 0; i < mapped.length; i += 1) {
-      rawByTracking.set(mapped[i].tracking_number, bulk[i]);
-    }
-    const { materialChangedIds, staleTargets } = await runPostUpsertFlow(req, {
-      mapped, data, rawByTracking, priorByTracking, diffByTracking, runnerName,
-    });
+      // ---- Scrape history ------------------------------------------------
+      // Pull the prior snapshot for every tracking_number so we can compute a
+      // material-field diff before the upsert clobbers the row. Only the
+      // fields we compare on are pulled — keeps the query small.
+      const trackingNumbers = mapped.map((m) => m.tracking_number).filter(Boolean);
+      const priorByTracking = new Map();
+      if (trackingNumbers.length) {
+        const cols = ["id", "tracking_number", "action_source", "mode", "last_modified_at", ...MATERIAL_FIELDS].join(", ");
+        const { data: priors } = await supabase
+          .from("fpx_shipments").select(cols).in("tracking_number", trackingNumbers);
+        for (const p of priors || []) priorByTracking.set(p.tracking_number, p);
+      }
+      // Compute the diff per scraped row (null if first sighting / no change).
+      // Partial rows diff against what they actually carry, so an unscraped
+      // field reads as "unchanged" rather than "cleared".
+      const diffByTracking = new Map();
+      for (const m of upsertRows) {
+        const prev = priorByTracking.get(m.tracking_number);
+        const diff = computeMaterialDiff(prev, m);
+        if (diff) diffByTracking.set(m.tracking_number, diff);
+      }
+      // ---- Upsert (latest-snapshot table) --------------------------------
+      // One upsert per key-signature group: PostgREST rejects a bulk array
+      // whose objects don't all share the same keys, and partial rows have
+      // fewer keys than full ones. Groups never share a tracking number
+      // (deduped above), so no conflict key is touched twice.
+      const SELECT_COLS = "id,tracking_number,seen_count,created_by,mode,tracking_comments,comments,delivery_date,action_required,action_source,action_target,ai_issue,ai_recommendation";
+      const data = [];
+      for (const group of groupByKeySignature(upsertRows)) {
+        const { data: got, error } = await supabase
+          .from("fpx_shipments")
+          .upsert(group, { onConflict: "tracking_number" })
+          .select(SELECT_COLS);
+        if (error) {
+          console.error(`[FPX] bulk upsert failed for ${group.length} row(s):`, error.message);
+          return res.status(500).json({ error: error.message, rows: group.length });
+        }
+        for (const r of got || []) data.push(r);
+      }
 
-    logAudit(req, {
-      action: "bulk_create",
-      entity_type: "shipment",
-      summary: `Upserted ${data.length} shipments` + (materialChangedIds.size ? ` (${materialChangedIds.size} with material changes)` : ""),
-      metadata: {
+      const upsertedIds = data.map((r) => r.id);
+
+      // Single shared post-upsert pipeline. Records scrape history,
+      // flags stale manual overrides, stamps last_material_change_at,
+      // and runs the background analyze + auto-task + auto-draft pass
+      // (with the diff plumbed through so each task description gets a
+      // Change log section).
+      const { materialChangedIds, staleTargets } = await runPostUpsertFlow(req, {
+        mapped: upsertRows, data, rawByTracking, priorByTracking, diffByTracking, runnerName,
+      });
+
+      logAudit(req, {
+        action: "bulk_create",
+        entity_type: "shipment",
+        summary: `Upserted ${data.length} shipments` + (materialChangedIds.size ? ` (${materialChangedIds.size} with material changes)` : ""),
+        metadata: {
+          count: data.length,
+          runner: runnerName,
+          received: bulk.length,
+          skipped: bulk.length - mapped.length,
+          material_changes: materialChangedIds.size,
+          stale_overrides_flagged: staleTargets.length,
+        },
+      });
+      return res.json({
         count: data.length,
-        runner: runnerName,
+        ids: upsertedIds,
+        skipped: bulk.length - mapped.length,
         material_changes: materialChangedIds.size,
-        stale_overrides_flagged: staleTargets.length,
-      },
-    });
-    return res.json({
-      count: data.length,
-      ids: upsertedIds,
-      material_changes: materialChangedIds.size,
-      stale_overrides: staleTargets.length,
-    });
+        stale_overrides: staleTargets.length,
+      });
+    } catch (e) {
+      // Express 4 doesn't catch async throws — without this the extension's
+      // request would hang until its fetch timeout and the chunk would look
+      // like a network failure instead of a server error it can isolate.
+      console.error("[FPX] bulk shipments upsert threw:", e?.stack || e);
+      return res.status(500).json({ error: e?.message || "bulk upsert failed" });
+    }
   }
   res.status(400).json({ error: "Provide { shipment } or { shipments: [] }" });
 });
