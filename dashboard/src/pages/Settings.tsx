@@ -127,6 +127,7 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "model.large": "Large model (long prompts ≥ ~12k chars)",
   "storage.carriers": "Carriers that bill storage on delivery holds (comma-separated, matched against carrier name)",
   "storage.hold_hours": "Free hold at destination terminal before storage applies (hours)",
+  "storage.assignee": "Owner of auto-created storage-risk tasks (blank = whoever scraped the shipment)",
   "prompt.task_triage.model": "Tasks v2 triage — model",
   "prompt.task_triage.system": "Tasks v2 triage — system prompt",
   "prompt.daily_summary.model": "Tasks v2 daily exec summary — model",
