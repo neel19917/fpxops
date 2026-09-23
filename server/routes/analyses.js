@@ -8,10 +8,30 @@ export const analysesRouter = Router();
 // `from` / `to` are ISO timestamps. `rating` accepts "up", "down",
 // or "unrated" (the latter matches rows where rating IS NULL — useful
 // for the admin export page to slice ratings split).
+// GET /analyses/stats?kind=&subkind=&days=
+// Exact totals via the fpx_analyses_stats() SQL function (see
+// migrations/2026-09-23_analyses_stats_fn.sql). PostgREST caps a select at
+// 1000 rows on this project, so the page can't add these up client-side —
+// it was showing "1000 analyses / $4.47" against a real $197 all-time.
+analysesRouter.get("/stats", async (req, res) => {
+  const days = req.query.days ? Number(req.query.days) : null;
+  const { data, error } = await supabase.rpc("fpx_analyses_stats", {
+    p_kind: req.query.kind ? String(req.query.kind) : null,
+    p_subkind: req.query.subkind ? String(req.query.subkind) : null,
+    p_days: Number.isFinite(days) && days > 0 ? Math.round(days) : null,
+  });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ stats: data });
+});
+
 analysesRouter.get("/", async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 500, 5000);
+  // PostgREST hard-caps at 1000 rows per request; page with `before`.
+  const limit = Math.min(Number(req.query.limit) || 500, 1000);
   let q = supabase.from("fpx_ai_analyses").select("*").order("created_at", { ascending: false }).limit(limit);
   if (req.query.kind) q = q.eq("kind", String(req.query.kind));
+  // Sub-kind lives in metadata (email_draft_carrier, task_triage, daily_summary, plain_summary…).
+  if (req.query.subkind) q = q.contains("metadata", { subkind: String(req.query.subkind) });
+  if (req.query.before) q = q.lt("created_at", String(req.query.before));
   if (req.query.tracking_number) q = q.eq("tracking_number", String(req.query.tracking_number));
   if (req.query.model) q = q.eq("model", String(req.query.model));
   if (req.query.user_email) q = q.eq("user_email", String(req.query.user_email));
@@ -25,7 +45,10 @@ analysesRouter.get("/", async (req, res) => {
   }
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data: data || [] });
+  const rows = data || [];
+  // Cursor for the next page: created_at of the last row, or null when
+  // this page came back short (no more rows).
+  res.json({ data: rows, next_before: rows.length === limit ? rows[rows.length - 1].created_at : null });
 });
 
 analysesRouter.get("/:id", async (req, res) => {

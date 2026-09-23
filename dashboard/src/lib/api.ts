@@ -1,7 +1,7 @@
 import type {
   AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
   InvoiceAudit, InvoiceAuditRow, ReanalyzeCurrent, ReanalyzePreview, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
-  TaskBoard, TaskTriageResult, DailyDigest, DailySummaryResult, PlainSummaryResult,
+  TaskBoard, TaskTriageResult, DailyDigest, DailySummaryResult, PlainSummaryResult, AnalysesStats,
 } from "./types";
 import { sb } from "./supabase";
 import { impersonateHeaders } from "./impersonate";
@@ -309,6 +309,8 @@ export const api = {
     list: (params?: {
       limit?: number;
       kind?: string;
+      subkind?: string;
+      before?: string;
       tracking_number?: string;
       model?: string;
       user_email?: string;
@@ -316,7 +318,10 @@ export const api = {
       from?: string;
       to?: string;
       rating?: "up" | "down" | "unrated";
-    }) => request<{ data: AiAnalysis[] }>("/api/analyses", { params }),
+    }) => request<{ data: AiAnalysis[]; next_before?: string | null }>("/api/analyses", { params }),
+    // Exact totals across ALL matching rows (the list is capped at 1000).
+    stats: (params?: { kind?: string; subkind?: string; days?: number }) =>
+      request<{ stats: AnalysesStats }>("/api/analyses/stats", { params }),
     // Reps rate AI generations 👍 / 👎 so the team can iterate on
     // prompts. Passing rating=null clears a prior rating (mistaken
     // click). Reason is optional but encouraged on 👎.

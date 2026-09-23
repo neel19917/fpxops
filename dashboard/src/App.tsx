@@ -7,6 +7,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, usePa
 import { Layout, type TabId } from "./components/Layout";
 import { AuthProvider, useAuth } from "./lib/auth";
 import { NavCtx, type NavApi } from "./lib/nav";
+import { getTasksView } from "./lib/tasksView";
 import { SignInPage } from "./pages/SignIn";
 import { PendingApprovalPage } from "./pages/PendingApproval";
 
@@ -218,9 +219,11 @@ function AuthedApp() {
             <Route path="/tracking" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
-            <Route path="/tasks" element={<TasksPage />} />
-            {/* Tasks v2: segmented board + heavy-model triage. Static path,
-                so it must be declared before /tasks/:taskId below. */}
+            {/* /tasks opens whichever view the user last chose (v2 by
+                default). /tasks/v2 and /tasks/legacy are always explicit.
+                Static paths must be declared before /tasks/:taskId. */}
+            <Route path="/tasks" element={<TasksHome />} />
+            <Route path="/tasks/legacy" element={<TasksPage />} />
             <Route path="/tasks/v2" element={<TasksV2Page />} />
             {/* Task opened FROM v2: the board stays mounted underneath and
                 the shipment drawer slides over it. */}
@@ -301,6 +304,13 @@ function ShipmentsRoute() {
       }}
     />
   );
+}
+
+// /tasks — renders the v2 board unless this browser opted back into the
+// legacy list (see lib/tasksView.ts). Rendered inline (no redirect) so the
+// URL stays /tasks and the nav highlight is stable.
+function TasksHome() {
+  return getTasksView() === "legacy" ? <TasksPage /> : <TasksV2Page />;
 }
 
 // /tasks/:taskId — task-walk-through entry point. Hits the database route

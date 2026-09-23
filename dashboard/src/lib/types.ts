@@ -427,6 +427,19 @@ export interface DailySummaryResult {
   stop_reason?: string | null;
 }
 
+// Exact analysis totals from fpx_analyses_stats() (/api/analyses/stats).
+export interface AnalysesStats {
+  count: number;
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  avg_duration_ms: number;
+  errors: number;
+  first_at: string | null;
+  last_at: string | null;
+  by_kind: { kind: string; subkind: string; count: number; cost_usd: number }[];
+}
+
 // Plain-English shipment brief (/api/shipments/:id/plain-summary). Mirrors
 // server/lib/plainSummary.js.
 export interface PlainSummary {
