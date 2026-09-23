@@ -165,6 +165,7 @@ const KANBAN_COLS: { id: TaskStatus; label: string; tone: string; chip: string }
 export function TasksPage() {
   const nav = useNav();
   const [tasks, setTasks] = useState<ShipmentTask[]>([]);
+  const [serverCounts, setServerCounts] = useState<{ open: number; in_progress: number; blocked: number; done: number; cancelled: number; total: number } | null>(null);
   const [loading, setLoading] = useState(true);
   // First-visit default = "active" (open + in_progress). Otherwise restore
   // whatever the user last picked so the view sticks across reloads.
@@ -360,6 +361,10 @@ export function TasksPage() {
       const r = await api.tasks.list({ limit: 1000, include_archived: 1 });
       setTasks(r.data);
       swrSet("tasks.list", r.data);
+      // The list is capped at 1000 rows, so once done tasks pass that the
+      // client-side totals lie ("All 1000"). Pull exact counts separately;
+      // a failure here just leaves the client-side numbers in place.
+      api.tasks.counts().then((c) => setServerCounts(c.counts)).catch(() => {});
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -616,13 +621,17 @@ export function TasksPage() {
 
   // Status counts across the currently loaded list — drives the KPI strip
   // and the "Start all" enable/disable.
-  const counts = useMemo(() => ({
+  // Prefer the server's exact counts (see load()); fall back to counting
+  // the loaded list, which is exact only while the table is under the
+  // 1000-row cap.
+  const counts = useMemo(() => serverCounts ? { ...serverCounts } : ({
     open: tasks.filter((t) => t.status === "open").length,
     in_progress: tasks.filter((t) => t.status === "in_progress").length,
     blocked: tasks.filter((t) => t.status === "blocked").length,
     done: tasks.filter((t) => t.status === "done").length,
     cancelled: tasks.filter((t) => t.status === "cancelled").length,
-  }), [tasks]);
+    total: tasks.length,
+  }), [tasks, serverCounts]);
 
   return (
     <div>
@@ -802,7 +811,7 @@ export function TasksPage() {
           the kanban scrolling underneath. */}
       <div className="flex items-center gap-1 border-b border-slate-200 mb-4 -mx-1 px-1 overflow-x-auto">
         {([
-          { id: "all" as const,      label: "All Tasks",          count: tasks.length, tone: "border-slate-900 text-slate-900" },
+          { id: "all" as const,      label: "All Tasks",          count: counts.total, tone: "border-slate-900 text-slate-900" },
           { id: "carrier" as const,  label: "Carrier Followups",  count: tasks.filter((t) => isCarrierFollowupTitle(t.title) && (t.status === "open" || t.status === "in_progress")).length, tone: "border-violet-600 text-violet-700" },
           { id: "customer" as const, label: "Customer Followups", count: tasks.filter((t) => {
             const ti = (t.title || "").toLowerCase();
@@ -846,7 +855,7 @@ export function TasksPage() {
       <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mb-4">
         {([
           { id: "active",      label: "Active",      count: counts.open + counts.in_progress, tone: "bg-violet-50 text-violet-800 ring-violet-200" },
-          { id: "",            label: "All",         count: tasks.length,        tone: "bg-slate-50 text-slate-700 ring-slate-200" },
+          { id: "",            label: "All",         count: counts.total,        tone: "bg-slate-50 text-slate-700 ring-slate-200" },
           { id: "open",        label: "Open",        count: counts.open,         tone: "bg-sky-50 text-sky-800 ring-sky-200" },
           { id: "in_progress", label: "In Progress", count: counts.in_progress,  tone: "bg-indigo-50 text-indigo-800 ring-indigo-200" },
           { id: "blocked",     label: "Blocked",     count: counts.blocked,      tone: "bg-amber-50 text-amber-800 ring-amber-200" },

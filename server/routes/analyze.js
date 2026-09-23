@@ -4,6 +4,8 @@ import { callClaude } from "../lib/anthropic.js";
 import { mapShipment } from "../lib/shipments.js";
 import { getSettings } from "../lib/settings.js";
 import { detectRedelivery } from "../lib/redelivery.js";
+import { detectStorageRisk } from "../lib/storageRisk.js";
+import { getSettingsSync } from "../lib/settings.js";
 // GP/Invoice prompt defaults — editable in the Settings tab via prompt.gp_* /
 // prompt.invoice_* keys (registered in FALLBACKS in lib/settings.js).
 import {
@@ -598,7 +600,7 @@ function ts(v) {
 // captures Last Modified). Kept in full form so they light up automatically
 // if/when those columns start arriving. `src` must carry normalized snake_case
 // columns (a fpx_shipments row or a mapShipment() result), not raw_data.
-export function computeTemporalTriggers(src, asOfMs) {
+export function computeTemporalTriggers(src, asOfMs, opts = {}) {
   const operativeEta = ts(src.updated_eta) ?? ts(src.estimated_arrival) ?? ts(src.original_eta);
   const updatedEta = ts(src.updated_eta);
   const originalEta = ts(src.original_eta);
@@ -637,6 +639,16 @@ export function computeTemporalTriggers(src, asOfMs) {
     // model sees one flat set of precomputed facts. LTL only; null for other
     // modes or when there is no comment text. See lib/redelivery.js.
     redelivery_needed: detectRedelivery(src),
+    // Storage-charge exposure on a delivery hold: when the freight reached
+    // the destination terminal (parsed from raw_data.Details), how long it
+    // has sat, and how long it will have sat by the booked appointment.
+    // storage_risk is true only for carriers on the storage list (XPO by
+    // default). See lib/storageRisk.js.
+    ...detectStorageRisk(src, {
+      asOfMs,
+      holdHours: opts.storageHoldHours,
+      carriers: opts.storageCarriers,
+    }),
   };
 }
 
@@ -649,7 +661,9 @@ function attachTemporalContext(slim, src, asOf) {
   slim.as_of = asOf;
   const asOfMs = Date.parse(asOf);
   if (src && Number.isFinite(asOfMs)) {
-    Object.assign(slim, computeTemporalTriggers(src, asOfMs));
+    const { "storage.hold_hours": storageHoldHours, "storage.carriers": storageCarriers } =
+      getSettingsSync("storage.hold_hours", "storage.carriers");
+    Object.assign(slim, computeTemporalTriggers(src, asOfMs, { storageHoldHours, storageCarriers }));
   }
   return slim;
 }

@@ -12,6 +12,7 @@
 // Pure functions only — no supabase — so the whole thing is unit-testable.
 
 import { isRedeliveryTitle } from "./redelivery.js";
+import { isStorageRiskTitle } from "./storageRisk.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -20,6 +21,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export const TASK_SEGMENTS = [
   { id: "redelivery",   label: "Redelivery",        description: "LTL failed delivery attempts (carrier re-attempt + customer notify pairs)." },
   { id: "return_claim", label: "Return / claim",    description: "Freight coming back to the shipper; disposition or claim needed." },
+  { id: "storage_risk", label: "Storage risk",      description: "Freight held at the destination terminal past the carrier's free window; customer must move the appointment or accept storage." },
   { id: "carrier",      label: "Carrier follow-ups", description: "FPX needs something from the carrier (ETA, POD, pickup confirmation)." },
   { id: "customer",     label: "Customer follow-ups", description: "FPX needs something from the shipper or consignee." },
   { id: "other",        label: "Other",             description: "Manually created or untagged tasks." },
@@ -68,6 +70,7 @@ function isCustomerTitle(title) {
 export function segmentForTitle(title) {
   if (isRedeliveryTitle(title)) return "redelivery";
   if (isReturnClaimTitle(title)) return "return_claim";
+  if (isStorageRiskTitle(title)) return "storage_risk";
   if (isCarrierTitle(title)) return "carrier";
   if (isCustomerTitle(title)) return "customer";
   return "other";
@@ -175,7 +178,7 @@ export function buildBoard(tasks, shipmentsById, opts = {}) {
     needs_attention: rows.filter((r) =>
       isActive(r.task.status)
       && !r.seg.flags.includes("resolved_upstream")
-      && (r.seg.segment === "redelivery" || r.seg.segment === "return_claim" || r.seg.flags.includes("repeat")),
+      && (r.seg.segment === "redelivery" || r.seg.segment === "return_claim" || r.seg.segment === "storage_risk" || r.seg.flags.includes("repeat")),
     ).length,
   };
   return { rows, summary };

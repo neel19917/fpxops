@@ -7,6 +7,7 @@ import { getSettings } from "../lib/settings.js";
 import { analyzeExistingShipment, runShipmentAnalysis } from "./analyze.js";
 import { extractAiJsonFields } from "../lib/anthropic.js";
 import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG } from "../lib/redelivery.js";
+import { detectStorageRisk, STORAGE_TAG } from "../lib/storageRisk.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
 
 // Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
@@ -208,7 +209,10 @@ function reasonLineFor(s) {
     : (s.ai_issue ? String(s.ai_issue).slice(0, 140) : "Action needed on this shipment");
 }
 
-function buildStandardTask(s, changeLog) {
+// `tag` is an optional structured marker placed right after the followup
+// prefix (e.g. "Storage risk — ") so /tasks search and the v2 board's
+// segmenter can recognise the task type without parsing the AI's wording.
+function buildStandardTask(s, changeLog, { tag = "" } = {}) {
   // When the AI knows who to chase (action_target), prefix the task
   // title with the matching followup convention so the task lands
   // in the Carrier Followups or Customer Followups panel on /tasks.
@@ -216,9 +220,11 @@ function buildStandardTask(s, changeLog) {
   // generic Kanban — the operator had to hand-tag every one to
   // surface it in the grouped view.
   const tgt = String(s.action_target || "").toLowerCase();
+  // A tagged task always gets a followup prefix (default customer) so the
+  // tag sits in the "<Audience> followup: <Tag>" slot the segmenter reads.
   const prefix =
     tgt === "carrier" ? "Carrier followup: "
-    : tgt === "customer" ? "Customer followup: "
+    : tgt === "customer" || tag ? "Customer followup: "
     : "";
   // Append the material diff (what moved between scrapes) so the rep
   // sees exactly what changed without opening the drawer's history
@@ -228,7 +234,7 @@ function buildStandardTask(s, changeLog) {
   return {
     shipment_id: s.id,
     tracking_number: s.tracking_number,
-    title: prefix + reasonLineFor(s),
+    title: prefix + tag + reasonLineFor(s),
     description,
     status: "open",
     priority: "high",
@@ -286,7 +292,12 @@ async function autoCreateActionTasks(
   // toggle governs both Tracking-page visibility and task spawn across
   // every scrape source. No audit row is emitted for the skip: the audit
   // log only fires on successful inserts below.
-  const { "ui.tracking.show_parcels": showParcels } = await getSettings("ui.tracking.show_parcels");
+  const {
+    "ui.tracking.show_parcels": showParcels,
+    "storage.hold_hours": storageHoldHours,
+    "storage.carriers": storageCarriers,
+  } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers");
+  const storageOpts = { asOfMs: Date.now(), holdHours: storageHoldHours, carriers: storageCarriers };
   const candidates = (upsertedRows || []).filter(
     (s) => String(s.action_required || "").toUpperCase() === "YES"
         && (showParcels === true || String(s.mode || "").trim().toLowerCase() !== "parcel")
@@ -330,7 +341,11 @@ async function autoCreateActionTasks(
 
     if (!redelivery) {
       if (prior.length) continue;
-      rows.push(buildStandardTask(s, changeLog));
+      // Storage-hold exposure gets the structured "Storage risk — " tag so
+      // it lands in its own segment on the board. Detection needs
+      // raw_data.Details, which only the freshly mapped row carries.
+      const storage = detectStorageRisk({ ...s, ...current }, storageOpts).storage_risk === true;
+      rows.push(buildStandardTask(s, changeLog, { tag: storage ? STORAGE_TAG : "" }));
       continue;
     }
 

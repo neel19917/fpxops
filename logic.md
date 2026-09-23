@@ -351,3 +351,34 @@ Every task gets exactly one **segment** from its title and zero or more **health
 ### Models
 
 `model.large` default moved from Sonnet 4.6 to `claude-opus-5`; triage defaults to `claude-opus-5`. Both are admin-editable under Settings → *Tasks v2 — AI triage* / *Models*. Pricing rows for `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5-1` were added to `MODEL_PRICING`.
+
+---
+
+## Storage-charge risk on delivery holds (server)
+
+Added 2026-09-23 (Allen + Victor): XPO bills storage once freight sits at the destination terminal longer than ~48h waiting for a delivery appointment (arrives Friday, appointment Monday → storage). The agent flags it early so the customer can pull the appointment in or knowingly accept the charge.
+
+### Data
+
+The grid has no arrival-at-destination column (`actual_arrival` is 0% populated), but the extension already captures the carrier's full event history in `raw_data.Details` as one flattened string: `<status><status comment><MM/DD/YYYY HH:MM:SS><City><ST>` repeated, newest first. `lib/storageRisk.js#parseCarrierEvents` splits it on the timestamps. **No extension change is required.** When `Details` is missing (~8% of rows; XPO "History details not found" PROs), it falls back to `tracking_comments` + `last_modified_at` (date-only, so ±1 day).
+
+### Detection (`lib/storageRisk.js#detectStorageRisk`)
+
+| Field (in the prompt's temporal triggers) | Meaning |
+|---|---|
+| `at_destination_since` | earliest event matching `DESTINATION_PATTERN` (*arrived at destination*, *at destination*, *appointment required at destination*, *held for appointment*, *held on trap trailer*, *closed for delivery*, *available for delivery*, *at delivery terminal*). Deliberately **not** *staged to dock* / *unloaded from trailer* — XPO logs those at origin too. |
+| `hold_hours_so_far` | arrival → as_of |
+| `hold_hours_at_appointment` | arrival → `appointment_date` (null without an appointment) |
+| `storage_carrier_policy` | carrier matches `storage.carriers` (default `XPO`, comma-separated substrings) |
+| `storage_hold_limit_hours` | `storage.hold_hours` (default 48) |
+| `storage_risk` | LTL + policy carrier + not delivered + (appointment gap > limit, or no appointment and hold ≥ limit/2). `null` = not LTL / not at destination. |
+
+Timestamps are carrier local time read as UTC — the same convention the row's other dates use, so hour math stays consistent.
+
+### What it drives
+
+- **Prompt rule** (`PER_SHIPMENT_LOGIC`): `storage_risk` true → flag, issue starts "Storage risk:", `actionTarget` customer, confidence ≥ 0.85; near-limit exposure is mentioned without flagging.
+- **Auto-task**: standard single task tagged `Customer followup: Storage risk — …` (`STORAGE_TAG`), so /tasks search finds it and Tasks v2 puts it in the **Storage risk** segment (counts toward Needs attention).
+- **Settings → Storage-charge risk**: `storage.carriers`, `storage.hold_hours`.
+
+Preview on 2026-09-23 (live XPO rows): 200643273 (arrived 9/18, appt 9/22 → 81h) and 200918911 (arrived 9/21, appt 9/24 → 70h) flag; 200919832 (19h) does not.

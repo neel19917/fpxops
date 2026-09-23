@@ -294,7 +294,7 @@ export interface CarrierFollowupShipment {
 // ---------------------------------------------------------------------------
 // Tasks v2 board (/api/tasks/v2/*). Mirrors server/lib/taskSegments.js.
 // ---------------------------------------------------------------------------
-export type TaskSegment = "redelivery" | "return_claim" | "carrier" | "customer" | "other";
+export type TaskSegment = "redelivery" | "return_claim" | "storage_risk" | "carrier" | "customer" | "other";
 export type TaskFlag = "resolved_upstream" | "stale" | "duplicate" | "repeat" | "aging" | "unassigned" | "blocked";
 
 export interface TaskBoardShipment {

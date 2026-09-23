@@ -57,6 +57,13 @@ const GROUPS: {
     match: (k) => k.startsWith("prompt.invoice_"),
   },
   {
+    id: "storage",
+    label: "Storage-charge risk",
+    description: "Which carriers bill storage on delivery holds and after how many hours at the destination terminal. Drives the storage_risk trigger, the prompt rule, and the \"Storage risk\" task segment.",
+    Icon: Box,
+    match: (k) => k.startsWith("storage."),
+  },
+  {
     id: "task_triage",
     label: "Tasks v2 — AI triage",
     description: "Board-level triage on the Tasks v2 page: the heavy model ranks work, flags moot tasks, and batches related tasks. Plus the stale-data threshold for health flags.",
@@ -118,6 +125,8 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "prompt.invoice_row_review": "Invoice Audit — per-row review prompt",
   "model.default": "Default model (short prompts)",
   "model.large": "Large model (long prompts ≥ ~12k chars)",
+  "storage.carriers": "Carriers that bill storage on delivery holds (comma-separated, matched against carrier name)",
+  "storage.hold_hours": "Free hold at destination terminal before storage applies (hours)",
   "prompt.task_triage.model": "Tasks v2 triage — model",
   "prompt.task_triage.system": "Tasks v2 triage — system prompt",
   "ui.tasks.stale_days": "Tasks v2 — days without a scrape before shipment data counts as stale",

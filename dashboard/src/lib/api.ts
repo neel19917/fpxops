@@ -408,6 +408,9 @@ export const api = {
       request<{ updated: number }>("/api/tasks/bulk-update", { method: "POST", body: JSON.stringify(body) }),
     bulkDelete: (body: { ids: string[] }) =>
       request<{ deleted: number }>("/api/tasks/bulk-delete", { method: "POST", body: JSON.stringify(body) }),
+    // Exact per-status totals (the list route caps at 1000 rows).
+    counts: () =>
+      request<{ counts: { open: number; in_progress: number; blocked: number; done: number; cancelled: number; total: number } }>("/api/tasks/counts"),
     // ---- Tasks v2 board ------------------------------------------------
     // Every active task joined to its shipment + segment/health
     // classification in one round trip. See server/lib/taskSegments.js.
