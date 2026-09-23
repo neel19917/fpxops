@@ -275,7 +275,7 @@ export function TasksV2Page() {
   // came from v2 and hands it the board's current active order, so the
   // drawer's prev/next chevrons walk THIS list and closing the drawer
   // returns here instead of the classic Tasks page.
-  const openTask = (id: string) => navigate(`/tasks/${id}`, {
+  const openTask = (id: string) => navigate(`/tasks/v2/${id}`, {
     state: { from: "/tasks/v2", walkIds: visible.filter((r) => isActive(r.task.status)).map((r) => r.task.id) },
   });
 

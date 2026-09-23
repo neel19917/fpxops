@@ -77,6 +77,10 @@ interface ShipmentsPageProps {
   // hunting for the toolbar toggle. The user can still toggle it off
   // from the toolbar; the URL stays /notes either way.
   notesMode?: boolean;
+  // Render ONLY the drawer (+ its modals), no pills / toolbar / table, and
+  // skip the list + stats fetches. Used by the Tasks v2 task-walk route so
+  // the drawer slides over the v2 board instead of over the Tracking page.
+  drawerOnly?: boolean;
   // When the drawer was entered via a /tasks/:taskId URL, the task-walk
   // context drives prev/next instead of the local `filtered` shipments list.
   // taskId is the focused task; prev / next are sibling task ids resolved
@@ -110,7 +114,7 @@ function asDrawerTab(s: string | null | undefined): DrawerTabId {
   return DRAWER_TABS.includes(s as DrawerTabId) ? (s as DrawerTabId) : "overview";
 }
 
-export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk, notesMode = false }: ShipmentsPageProps = {}) {
+export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentConsumed, onDrawerChange, taskWalk, notesMode = false, drawerOnly = false }: ShipmentsPageProps = {}) {
   const { clientConfig } = useAuth();
   const embedCfg = clientConfig?.embed_freightpop;
   // Master parcel switch (admin, default OFF). When off, parcel-mode rows
@@ -386,14 +390,17 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   // parcel visibility (the count must match what the grid shows) and statsNonce
   // (bumped by Refresh / bulk ops). Non-fatal — pills fall back to page counts.
   useEffect(() => {
+    if (drawerOnly) return; // no pills to feed
     let alive = true;
     api.shipments.stats(showParcels).then((s) => { if (alive) setStats(s); }).catch(() => {});
     return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showParcels, statsNonce]);
   // Stale-while-revalidate: paint instantly from the last successful
   // response, then let the live fetch swap in silently instead of
   // blanking the table to a spinner on every visit.
   useEffect(() => {
+    if (drawerOnly) { setLoading(false); return; } // drawer-only mount: no table to fill
     const cached = swrGet<{ data: Shipment[]; next_cursor: string | null }>("shipments.list");
     if (cached?.data?.length) {
       setRows(cached.data);
@@ -889,7 +896,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   }, [stats, baseRows]);
 
   return (
-    <div className="space-y-5">
+    <div className={drawerOnly ? "" : "space-y-5"}>
+      {drawerOnly ? null : (<>
       <div className="flex flex-wrap gap-2">
         <StatPill label="Total"            count={pillCounts.total}            tone="gray"  active={pillFilter === "all"}              onClick={() => setPillFilter("all")} />
         <StatPill label="Booked"           count={pillCounts.booked}           tone="blue"  active={pillFilter === "booked"}           onClick={() => setPillFilter(pillFilter === "booked" ? "all" : "booked")} />
@@ -1270,6 +1278,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
           </div>
         </div>
       ) : null}
+      </>)}
 
       <Drawer
         open={!!drawerId}
