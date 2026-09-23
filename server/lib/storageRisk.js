@@ -60,7 +60,16 @@ const EVENT_TS_RE = /(\d{2})\/(\d{2})\/(\d{4}) (\d{2}):(\d{2}):(\d{2})/g;
 // convention the rest of the row uses (appointment_date "05:00+00" is really
 // a local 5am), so hour math between them stays consistent.
 export function parseCarrierEvents(details) {
-  if (typeof details !== "string" || !details.trim()) return [];
+  return parseCarrierEventsWithTail(details).events;
+}
+
+// Same, plus the text after the last timestamp. The extension has been
+// storing Details truncated to ~300 chars with a trailing "…", so the
+// oldest captured event is usually cut off before its timestamp — and for
+// a shipment that has been sitting for days, that cut-off event is often
+// the arrival we are looking for. The tail lets the caller bound it.
+export function parseCarrierEventsWithTail(details) {
+  if (typeof details !== "string" || !details.trim()) return { events: [], tail: "" };
   const out = [];
   let prevEnd = 0;
   for (const m of details.matchAll(EVENT_TS_RE)) {
@@ -71,8 +80,11 @@ export function parseCarrierEvents(details) {
     out.push({ text, at, atIso: new Date(at).toISOString() });
     prevEnd = m.index + m[0].length;
   }
+  // Strip the previous event's trailing "CityST" is not possible without
+  // delimiters; the tail is only ever regex-matched, so that's fine.
+  const tail = details.slice(prevEnd).replace(/…$/, "").trim();
   out.sort((a, b) => a.at - b.at);
-  return out;
+  return { events: out, tail };
 }
 
 function ts(v) {
@@ -88,14 +100,22 @@ function detailsOf(src) {
 }
 
 // When did the freight reach the delivering terminal?
-//   source "events"  — earliest matching event in raw_data.Details (precise)
-//   source "comment" — tracking_comments matches, no usable history; fall back
-//                      to last_modified_at (date-only, so ±1 day)
-//   null             — no evidence it is at destination
+//   source "events"           — earliest matching event in raw_data.Details (precise)
+//   source "events_truncated" — the destination phrase is in the cut-off tail
+//                               of Details (older than every timestamped
+//                               event), so arrival is AT OR BEFORE the oldest
+//                               timestamp we have; we use that bound. Hold
+//                               hours are therefore a floor, not exact.
+//   source "comment"          — tracking_comments matches, no usable history;
+//                               fall back to last_modified_at (date-only, ±1 day)
+//   null                      — no evidence it is at destination
 export function detectDestinationArrival(src) {
-  const events = parseCarrierEvents(detailsOf(src));
+  const { events, tail } = parseCarrierEventsWithTail(detailsOf(src));
   const hit = events.find((e) => DESTINATION_PATTERN.test(e.text));
   if (hit) return { at: hit.atIso, source: "events" };
+  if (events.length && tail && DESTINATION_PATTERN.test(tail)) {
+    return { at: events[0].atIso, source: "events_truncated" };
+  }
   const comment = [src?.tracking_comments, src?.comments].filter((v) => typeof v === "string").join(" / ");
   if (DESTINATION_PATTERN.test(comment)) {
     const lm = ts(src?.last_modified_at);

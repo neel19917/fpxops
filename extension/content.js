@@ -483,12 +483,22 @@ function scrapeModal() {
   // and stamps it onto whatever label was nearest. Better to leave the field
   // empty than to corrupt it.
   const MAX_VALUE_LEN = 300;
+  // "Details" is the carrier's full event history (status / comment /
+  // timestamp / city per event). The server parses it to find when the
+  // freight reached the destination terminal (storage-charge risk, see
+  // server/lib/storageRisk.js), and for a shipment that has been sitting
+  // for days that event is well past the first 300 chars — at 300 we were
+  // keeping only the 2-3 newest events. Give it its own, much larger cap.
+  const LONG_VALUE_KEYS = new Set(["Details"]);
+  const MAX_LONG_VALUE_LEN = 8000;
+  const capFor = (key) => (LONG_VALUE_KEYS.has(key) ? MAX_LONG_VALUE_LEN : MAX_VALUE_LEN);
   const labels = modal.querySelectorAll("label, strong, b, .field-label, .control-label, dt");
   for (const lbl of labels) {
     const key = lbl.textContent.trim().replace(/:$/, "");
     if (!key || key.length > 80) continue;
     if (key === "CLOSE") continue;
     if (data[key]) continue;                                // first-write-wins; don't overwrite
+    const maxLen = capFor(key);
 
     let val = "";
     const next = lbl.nextElementSibling;
@@ -499,12 +509,12 @@ function scrapeModal() {
     if (!val && lbl.parentElement && lbl.parentElement.nextElementSibling) {
       const sib = lbl.parentElement.nextElementSibling;
       const sibText = (sib.textContent || "").trim();
-      if (sibText && sibText.length < MAX_VALUE_LEN) val = sibText;
+      if (sibText && sibText.length < maxLen) val = sibText;
     }
 
     if (!val) continue;
     val = val.replace(/\s+/g, " ").trim();
-    if (val.length > MAX_VALUE_LEN) val = val.slice(0, MAX_VALUE_LEN).replace(/\s+\S*$/, "") + "…";
+    if (val.length > maxLen) val = val.slice(0, maxLen).replace(/\s+\S*$/, "") + "…";
     data[key] = val;
   }
 
