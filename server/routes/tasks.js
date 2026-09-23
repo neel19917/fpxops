@@ -7,6 +7,7 @@ import { TASK_SEGMENTS, TASK_FLAGS } from "../lib/taskSegments.js";
 import { runTaskTriage, extractJson, normalizeTriage, TRIAGE_MAX_ROWS } from "../lib/taskTriage.js";
 import { loadBoard } from "../lib/taskBoard.js";
 import { collectDailyDigest, runDailySummary } from "../lib/dailySummary.js";
+import { resolveAssignee } from "../lib/people.js";
 
 export const tasksRouter = Router();
 
@@ -643,7 +644,7 @@ tasksRouter.post("/bulk", async (req, res) => {
   if (!title) return res.status(400).json({ error: "title required" });
   const description = req.body?.description ? String(req.body.description) : null;
   const priority = ["low","normal","high","urgent"].includes(req.body?.priority) ? req.body.priority : "normal";
-  const overrideAssignee = req.body?.assigned_to ? String(req.body.assigned_to) : null;
+  const overrideAssignee = req.body?.assigned_to ? await resolveAssignee(req.body.assigned_to) : null;
   const creatorName = req.user?.email || req.apiKey?.name || req.header("x-fpx-user-name") || null;
   const due_at = req.body?.due_at || null;
 
@@ -665,7 +666,7 @@ tasksRouter.post("/bulk", async (req, res) => {
       description,
       priority,
       status: "open",
-      assigned_to: overrideAssignee || s.created_by || null,
+      assigned_to: overrideAssignee || (await resolveAssignee(s.created_by)) || null,
       created_by: creatorName,
       due_at,
     });
@@ -691,6 +692,7 @@ tasksRouter.post("/bulk-update", async (req, res) => {
   const patch = {};
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
   if (!Object.keys(patch).length) return res.status(400).json({ error: "no fields to update" });
+  if ("assigned_to" in patch) patch.assigned_to = await resolveAssignee(patch.assigned_to);
   if (patch.status === "done") patch.completed_at = new Date().toISOString();
   if (patch.status && patch.status !== "done") patch.completed_at = null;
   const { data, error } = await supabase
@@ -727,6 +729,7 @@ tasksRouter.patch("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
   const allowed = ["status", "priority", "assigned_to", "title", "description", "due_at"];
   const patch = {};
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+  if ("assigned_to" in patch) patch.assigned_to = await resolveAssignee(patch.assigned_to);
   if (patch.status === "done" && !patch.completed_at) patch.completed_at = new Date().toISOString();
   if (patch.status && patch.status !== "done") patch.completed_at = null;
   const { data: before } = await supabase

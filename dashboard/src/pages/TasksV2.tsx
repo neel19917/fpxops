@@ -215,6 +215,13 @@ export function TasksV2Page() {
   const rows = board?.rows ?? [];
   const summary = board?.summary;
   const staleDays = board?.stale_days ?? 7;
+  // Owners are stored as emails; show the person's name everywhere.
+  const people = board?.people ?? {};
+  const nameOf = (who: string | null | undefined) => {
+    const k = (who || "").trim();
+    if (!k) return "";
+    return people[k] || people[k.toLowerCase()] || k;
+  };
   const rowById = useMemo(() => new Map(rows.map((r) => [r.task.id, r])), [rows]);
 
   // Triage rank per task id — feeds the "smart" sort and the rank chip.
@@ -273,7 +280,7 @@ export function TasksV2Page() {
         case "segment": return SEGMENT_SHORT[r.seg.segment];
         case "carrier": return (r.shipment?.carrier_name || r.shipment?.carrier || "").trim() || "(unknown carrier)";
         case "customer": return (r.shipment?.customer_name || "").trim() || "(unknown customer)";
-        case "assignee": return (r.task.assigned_to || "").trim() || "(unassigned)";
+        case "assignee": return nameOf(r.task.assigned_to) || "(unassigned)";
         case "shipment": return r.shipment ? `${r.shipment.tracking_number || "?"} · ${r.shipment.customer_name || ""}` : "(no shipment)";
         default: return "";
       }
@@ -282,7 +289,8 @@ export function TasksV2Page() {
     for (const r of visible) { const k = keyFn(r); if (!m.has(k)) m.set(k, []); m.get(k)!.push(r); }
     return Array.from(m.entries()).map(([key, rows]) => ({ key, label: key, rows }))
       .sort((a, b) => b.rows.length - a.rows.length || a.label.localeCompare(b.label));
-  }, [visible, prefs.groupBy]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, prefs.groupBy, people]);
 
   const visibleIds = useMemo(() => visible.map((r) => r.task.id), [visible]);
   const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
@@ -459,6 +467,7 @@ export function TasksV2Page() {
         open={prefs.triageOpen}
         onToggle={() => setPref("triageOpen", !prefs.triageOpen)}
         rowById={rowById}
+        people={people}
         onOpen={(id) => nav.openTask(id)}
         onStart={(id) => setStatus(id, "in_progress", { open: true })}
         onDismissOne={(id, disposition, reason) => openDismiss([id], disposition, reason)}
@@ -496,7 +505,7 @@ export function TasksV2Page() {
           <RailSection title="Owner">
             <RailItem active={!assigneeFilter} onClick={() => setAssigneeFilter("")} label="Everyone" count={summary?.total ?? 0} />
             {assignees.map(([who, n]) => (
-              <RailItem key={who} active={assigneeFilter === who} onClick={() => setAssigneeFilter(assigneeFilter === who ? "" : who)} label={who} count={n} />
+              <RailItem key={who} active={assigneeFilter === who} onClick={() => setAssigneeFilter(assigneeFilter === who ? "" : who)} label={who === "(unassigned)" ? who : nameOf(who)} count={n} title={who} />
             ))}
           </RailSection>
         </aside>
@@ -601,6 +610,7 @@ export function TasksV2Page() {
                       closeCandidateIds={closeCandidateIds}
                       staleDays={staleDays}
                       flagsMeta={board?.flags ?? []}
+                      people={people}
                       onOpen={(id) => nav.openTask(id)}
                       onStatus={setStatus}
                       onDismiss={(id) => openDismiss([id])}
@@ -666,12 +676,13 @@ function RailItem({ active, onClick, label, count, title, tone, checkbox }: {
 // ---------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------
-function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, selected, toggle, triageRank, closeCandidateIds, staleDays, flagsMeta, onOpen, onStatus, onDismiss }: {
+function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, selected, toggle, triageRank, closeCandidateIds, staleDays, flagsMeta, people, onOpen, onStatus, onDismiss }: {
   group: { key: string; label: string; rows: TaskBoardRow[] };
   showHeader: boolean; collapsed: boolean; onToggle: () => void; onSelectGroup: () => void;
   selected: Set<string>; toggle: (id: string) => void;
   triageRank: Map<string, number>; closeCandidateIds: Set<string>; staleDays: number;
   flagsMeta: { id: TaskFlag; label: string; tone: string; description: string }[];
+  people: Record<string, string>;
   onOpen: (id: string) => void; onStatus: (id: string, s: TaskStatus, opts?: { open?: boolean }) => void; onDismiss: (id: string) => void;
 }) {
   const flagMeta = useMemo(() => new Map(flagsMeta.map((f) => [f.id, f])), [flagsMeta]);
@@ -701,6 +712,7 @@ function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, sele
           closeCandidate={closeCandidateIds.has(r.task.id)}
           staleDays={staleDays}
           flagMeta={flagMeta}
+          people={people}
           onOpen={() => onOpen(r.task.id)}
           onStatus={(s, opts) => onStatus(r.task.id, s, opts)}
           onDismiss={() => onDismiss(r.task.id)}
@@ -710,9 +722,10 @@ function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, sele
   );
 }
 
-function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagMeta, onOpen, onStatus, onDismiss }: {
+function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagMeta, people, onOpen, onStatus, onDismiss }: {
   row: TaskBoardRow; checked: boolean; onCheck: () => void; rank?: number; closeCandidate: boolean; staleDays: number;
   flagMeta: Map<string, { id: TaskFlag; label: string; tone: string; description: string }>;
+  people: Record<string, string>;
   onOpen: () => void; onStatus: (s: TaskStatus, opts?: { open?: boolean }) => void; onDismiss: () => void;
 }) {
   const { task: t, shipment: s, seg } = row;
@@ -765,7 +778,7 @@ function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagM
       </td>
       <td className="px-3 py-2.5 text-xs text-slate-600" title={`Created ${fmtDate(t.created_at)}`}>{seg.age_days === null ? "—" : seg.age_days === 0 ? "today" : `${seg.age_days}d`}</td>
       <td className="px-3 py-2.5 text-xs">
-        {t.assigned_to ? <span className="text-slate-800">{t.assigned_to}</span> : <Pill cls={FLAG_CLS.slate}>unassigned</Pill>}
+        {t.assigned_to ? <span className="text-slate-800" title={t.assigned_to}>{people[t.assigned_to] || t.assigned_to}</span> : <Pill cls={FLAG_CLS.slate}>unassigned</Pill>}
       </td>
       <td className="px-3 py-2.5"><Pill cls={STATUS_CLS[t.status]}>{STATUS_LABEL[t.status]}</Pill></td>
       <td className="px-3 py-2.5">
@@ -793,9 +806,9 @@ function IconBtn({ children, title, onClick, cls }: { children: ReactNode; title
 // ---------------------------------------------------------------------------
 // Triage panel
 // ---------------------------------------------------------------------------
-function TriagePanel({ result, busy, error, open, onToggle, rowById, onOpen, onStart, onDismissOne, onDismissAll, onSelectBatch }: {
+function TriagePanel({ result, busy, error, open, onToggle, rowById, people, onOpen, onStart, onDismissOne, onDismissAll, onSelectBatch }: {
   result: TaskTriageResult | null; busy: boolean; error: string | null; open: boolean; onToggle: () => void;
-  rowById: Map<string, TaskBoardRow>;
+  rowById: Map<string, TaskBoardRow>; people: Record<string, string>;
   onOpen: (id: string) => void; onStart: (id: string) => void;
   onDismissOne: (id: string, disposition: string, reason: string) => void; onDismissAll: () => void;
   onSelectBatch: (ids: string[]) => void;
@@ -850,7 +863,7 @@ function TriagePanel({ result, busy, error, open, onToggle, rowById, onOpen, onS
                       <div className="flex items-center gap-1 mt-1.5">
                         {r.task.status === "open" ? <button onClick={() => onStart(p.task_id)} className="inline-flex items-center gap-1 rounded-md bg-indigo-600 text-white px-2 py-1 hover:bg-indigo-700"><Play className="h-3 w-3" /> Start</button> : null}
                         <button onClick={() => onOpen(p.task_id)} className="inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2 py-1 hover:bg-slate-50 text-slate-700"><ExternalLink className="h-3 w-3" /> Open</button>
-                        <span className="ml-auto text-slate-400">{r.task.assigned_to || "unassigned"}</span>
+                        <span className="ml-auto text-slate-400">{r.task.assigned_to ? (people[r.task.assigned_to] || r.task.assigned_to) : "unassigned"}</span>
                       </div>
                     </div>
                   );

@@ -19,6 +19,7 @@ import { callClaude } from "./anthropic.js";
 import { getSettings } from "./settings.js";
 import { loadBoard } from "./taskBoard.js";
 import { segmentForTitle, attemptFor } from "./taskSegments.js";
+import { peopleIndex, resolveWithIndex } from "./people.js";
 
 const HOUR = 3_600_000;
 
@@ -129,6 +130,9 @@ export function shapeDigest({
 
   return {
     window: { from, to, hours: Math.round(((toMs - fromMs) / HOUR) * 10) / 10 },
+    // email → display name, so the brief can say "Victor" while every
+    // count is keyed on the stable email.
+    people: board.people || {},
     tasks: {
       created_count: created.length,
       created_by_segment: countBy(created, (t) => t.segment),
@@ -219,7 +223,9 @@ export async function collectDailyDigest({ hours = 24 } = {}) {
 
   // Tasks touched today may be on shipments that are no longer on the
   // active board; fetch those shipments so the digest can name them.
-  const tasks = tasksRes.data || [];
+  // Owners canonicalised the same way the board does.
+  const idx = await peopleIndex();
+  const tasks = (tasksRes.data || []).map((t) => ({ ...t, assigned_to: resolveWithIndex(idx, t.assigned_to) }));
   const shipmentsById = new Map();
   for (const r of board.rows) if (r.shipment) shipmentsById.set(r.shipment.id, r.shipment);
   const missing = Array.from(new Set(tasks.map((t) => t.shipment_id).filter((id) => id && !shipmentsById.has(id))));

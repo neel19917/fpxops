@@ -86,7 +86,7 @@ const FALLBACKS = {
     '## 8. Data & system health\nScrape volume and last scrape time, stale shipments, likely-resolved tasks that should be dismissed, respawn or duplicate risk, anything that looks like a data-quality problem (e.g. carrier history not found), and AI cost by kind.\n' +
     '## 9. Plan for tomorrow\nOrdered checklist (8-12 items) with an owner where obvious.\n' +
     '## 10. Questions for leadership\n2-4 decisions or policy questions surfaced by today\'s data.\n\n' +
-    'Rules: use ONLY facts present in the digest; never invent shipments, numbers, or names. Always cite tracking numbers when you mention a shipment. Be dense and specific — no filler, no generic advice. 900-1500 words. Markdown only, no code fences, no preamble.',
+    'Rules: refer to people by the display name in digest.people (e.g. "Victor", "Allen"), never by email. Use ONLY facts present in the digest; never invent shipments, numbers, or names. Always cite tracking numbers when you mention a shipment. Be dense and specific — no filler, no generic advice. 900-1500 words. Markdown only, no code fences, no preamble.',
   // Storage-charge risk on delivery holds (lib/storageRisk.js). Carriers on
   // this list bill storage once freight sits at the destination terminal
   // longer than hold_hours waiting for an appointment. Comma-separated
@@ -97,7 +97,7 @@ const FALLBACKS = {
   // Who owns auto-created storage-risk tasks. Empty = whoever scraped the
   // shipment (the default for every other auto-task). Neel's call
   // 2026-09-23: storage-charge conversations with customers go to Victor.
-  "storage.assignee": "Victor Zarate",
+  "storage.assignee": "victorz@freightpop.com",
   // Days without a scrape before a task's shipment data counts as stale on
   // the Tasks v2 board. 7 = "not seen this week"; the scraper normally hits
   // every live shipment daily, so anything past that has dropped off the
