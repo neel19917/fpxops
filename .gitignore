@@ -22,3 +22,6 @@ extension-headless/.chrome-profile-*/
 
 # Deno lockfile from local Netlify tooling
 dashboard/deno.lock
+
+# Extension distributables built by hand (see README)
+FPXpress-*.zip

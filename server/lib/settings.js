@@ -68,6 +68,25 @@ const FALLBACKS = {
     '4. risks — up to 5 short observations the lead should know (e.g. "3 Modesto redeliveries for the same consignee — likely a receiving-hours problem").\n' +
     '5. summary — 2-3 plain sentences for the standup.\n\n' +
     'Rules: only reference task_id values that appear in the input. Do not invent shipments. Never put the same task_id in both priority_queue and close_candidates. Be terse: every reason and first_action is ONE sentence under 25 words; at most 15 priority_queue items, 30 close_candidates (the clearest cases first), 8 batches, 5 risks. Output strict JSON only, no prose before or after, with keys: summary, priority_queue [{task_id, reason, first_action}], close_candidates [{task_id, disposition, reason}], batches [{label, reason, task_ids}], risks [string].',
+  // Tasks v2 daily executive summary (lib/dailySummary.js): long-form
+  // Markdown brief over a numeric digest of the last 24h. Heavy model on
+  // purpose — it has to weigh ~10 sections of facts against each other.
+  "prompt.daily_summary.model": "claude-opus-5",
+  "prompt.daily_summary.system":
+    'You are chief of staff to the Director of Operations at FPX, a freight broker. Every day you write the operations brief for the tracking team (Allen, Victor) and their director. You are given a JSON digest covering the last window (default 24h): tasks created / completed / dismissed, the live task board with segments and health flags, shipments scraped and newly flagged, storage and redelivery exposures, per-operator activity, notes, and AI spend.\n\n' +
+    'Write a DETAILED brief in Markdown with exactly these sections, in this order, using these headings:\n' +
+    '# Daily Operations Brief — <window end date>\n' +
+    '## 1. Headline\n3-5 bullets: the things the director must know in 30 seconds. Lead with customer-visible failures and money at risk.\n' +
+    '## 2. KPIs\nA Markdown table: metric | value | note. Include active tasks, needs attention, created / completed / dismissed today, likely-resolved backlog, stale-data count, unassigned, shipments scraped, newly flagged, delivered, AI spend (USD).\n' +
+    '## 3. What moved today\nWhat was created (by segment), completed and dismissed — with tracking numbers and customers for the notable ones — and who did it.\n' +
+    '## 4. Live exposures (work first)\nRanked list of the needs-attention items: redelivery, return/claim, storage risk, repeat failures. For each: tracking number, customer, carrier, what is wrong (hours held / attempt number / status), owner, and the concrete next action. Storage-risk items must state the projected hold hours and the appointment date.\n' +
+    '## 5. Carrier hotspots\nCarriers with the most open work and what pattern you see (e.g. one carrier not posting POD scans). Cite counts.\n' +
+    '## 6. Customer hotspots\nCustomers with several open items; whether a single call could cover them.\n' +
+    '## 7. Team throughput\nPer operator: tasks completed, dismissed, notes written, items still in progress, anything aging on their plate. Neutral tone, numbers first.\n' +
+    '## 8. Data & system health\nScrape volume and last scrape time, stale shipments, likely-resolved tasks that should be dismissed, respawn or duplicate risk, anything that looks like a data-quality problem (e.g. carrier history not found), and AI cost by kind.\n' +
+    '## 9. Plan for tomorrow\nOrdered checklist (8-12 items) with an owner where obvious.\n' +
+    '## 10. Questions for leadership\n2-4 decisions or policy questions surfaced by today\'s data.\n\n' +
+    'Rules: use ONLY facts present in the digest; never invent shipments, numbers, or names. Always cite tracking numbers when you mention a shipment. Be dense and specific — no filler, no generic advice. 900-1500 words. Markdown only, no code fences, no preamble.',
   // Storage-charge risk on delivery holds (lib/storageRisk.js). Carriers on
   // this list bill storage once freight sits at the destination terminal
   // longer than hold_hours waiting for an appointment. Comma-separated

@@ -2,13 +2,13 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, ExternalLink, Filter, Layers, ListChecks,
-  Loader2, Play, RefreshCw, Search, Sparkles, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw,
+  Loader2, Play, RefreshCw, Search, Sparkles, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, Copy, Check, FileText,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
-  TaskBoard, TaskBoardRow, TaskFlag, TaskPriority, TaskSegment, TaskStatus, TaskTriage, TaskTriageResult,
+  DailySummaryResult, TaskBoard, TaskBoardRow, TaskFlag, TaskPriority, TaskSegment, TaskStatus, TaskTriage, TaskTriageResult,
 } from "../lib/types";
-import { fmtDate, fmtRelative, fmtUsd } from "../lib/format";
+import { carrierTrackingUrl, fmtDate, fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import { useNav } from "../lib/nav";
 import { KPI } from "../components/KPI";
 import { LoadingState } from "../components/LoadingState";
@@ -104,6 +104,30 @@ function Pill({ children, cls, title }: { children: ReactNode; cls: string; titl
   );
 }
 
+// Tracking number as a link: click opens the task/shipment in the drawer,
+// the small arrow opens the carrier's public tracking page in a new tab.
+function TrackingLink({ tracking, carrier, onOpen, className = "" }: {
+  tracking: string | null | undefined; carrier?: string | null; onOpen?: () => void; className?: string;
+}) {
+  const tn = (tracking || "").trim();
+  if (!tn) return <span className={`font-mono text-slate-400 ${className}`}>—</span>;
+  const ext = carrierTrackingUrl(carrier, tn);
+  return (
+    <span className={`inline-flex items-center gap-0.5 ${className}`}>
+      {onOpen ? (
+        <button type="button" onClick={onOpen} className="font-mono text-sky-700 hover:text-sky-900 hover:underline" title="Open in FPX">{tn}</button>
+      ) : (
+        <span className="font-mono text-slate-800">{tn}</span>
+      )}
+      {ext ? (
+        <a href={ext} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className="text-slate-400 hover:text-sky-700" title={`Track on ${carrier || "carrier site"}`} aria-label="Carrier tracking page">
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      ) : null}
+    </span>
+  );
+}
+
 // Strip the "Carrier followup: Redelivery — " scaffolding so the title
 // column shows the actual ask; the segment badge already says the rest.
 function shortTitle(title: string): string {
@@ -113,8 +137,8 @@ function shortTitle(title: string): string {
     .trim();
 }
 
-interface Prefs { seg: SegFilter; flags: TaskFlag[]; groupBy: GroupBy; sortBy: SortBy; triageOpen: boolean; includeClosed: boolean }
-const DEFAULT_PREFS: Prefs = { seg: "all", flags: [], groupBy: "none", sortBy: "smart", triageOpen: true, includeClosed: false };
+interface Prefs { seg: SegFilter; flags: TaskFlag[]; groupBy: GroupBy; sortBy: SortBy; triageOpen: boolean; dailyOpen: boolean; includeClosed: boolean }
+const DEFAULT_PREFS: Prefs = { seg: "all", flags: [], groupBy: "none", sortBy: "smart", triageOpen: true, dailyOpen: true, includeClosed: false };
 function loadPrefs(): Prefs {
   try {
     const raw = localStorage.getItem(PREF_KEY);
@@ -144,6 +168,9 @@ export function TasksV2Page() {
   const [triage, setTriage] = useState<TaskTriageResult | null>(null);
   const [triageBusy, setTriageBusy] = useState(false);
   const [triageError, setTriageError] = useState<string | null>(null);
+  const [daily, setDaily] = useState<DailySummaryResult | null>(null);
+  const [dailyBusy, setDailyBusy] = useState(false);
+  const [dailyError, setDailyError] = useState<string | null>(null);
 
   async function load(silent = false) {
     if (!silent) setLoading(true);
@@ -161,11 +188,25 @@ export function TasksV2Page() {
   async function loadTriage() {
     try { setTriage(await api.tasks.v2TriageLatest()); } catch { /* panel just shows "no triage yet" */ }
   }
+  async function loadDaily() {
+    try { setDaily(await api.tasks.v2DailySummaryLatest()); } catch { /* panel shows "not generated yet" */ }
+  }
+  async function runDaily(hours: number) {
+    if (dailyBusy) return;
+    setDailyBusy(true); setDailyError(null);
+    try {
+      const r = await api.tasks.v2DailySummary({ hours });
+      setDaily(r);
+      setPref("dailyOpen", true);
+    } catch (e) { setDailyError((e as Error).message); }
+    finally { setDailyBusy(false); }
+  }
   useEffect(() => {
     const cached = swrGet<TaskBoard>(BOARD_KEY);
     if (cached?.rows?.length) { setBoard(cached); setLoading(false); load(true); }
     else load();
     loadTriage();
+    loadDaily();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => { load(true); // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -295,9 +336,22 @@ export function TasksV2Page() {
       const r = await api.tasks.v2Triage(scope);
       setTriage(r);
       setPref("triageOpen", true);
-    } catch (e) { setTriageError((e as Error).message); }
+    } catch (e) {
+      const msg = (e as Error).message;
+      setTriageError(/No active tasks in scope/i.test(msg)
+        ? "Nothing to triage: the selected segment has no open, in-progress or blocked tasks. Pick another segment or run it on the whole board."
+        : msg);
+    }
     finally { setTriageBusy(false); }
   }
+  // What "AI triage" would run over from the current rail selection — a
+  // named segment, or the whole active board. Drives the button's enabled
+  // state so an empty segment can't fire a request that 400s.
+  const triageScope = useMemo(() => {
+    const segment = prefs.seg !== "all" && prefs.seg !== "attention" ? prefs.seg : null;
+    const active = rows.filter((r) => isActive(r.task.status) && (!segment || r.seg.segment === segment));
+    return { segment, count: active.length };
+  }, [rows, prefs.seg]);
 
   // Dismiss every close candidate the model named, grouped by disposition
   // so each tombstone carries the model's reason.
@@ -352,13 +406,24 @@ export function TasksV2Page() {
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh
           </button>
           <button
-            onClick={() => runTriage(prefs.seg !== "all" && prefs.seg !== "attention" ? { segment: prefs.seg } : {})}
-            disabled={triageBusy || kpi.active === 0}
+            onClick={() => runTriage(triageScope.segment ? { segment: triageScope.segment } : {})}
+            disabled={triageBusy || triageScope.count === 0}
             className="rounded-lg bg-violet-600 text-white text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
-            title={prefs.seg !== "all" && prefs.seg !== "attention" ? `Triage the ${SEGMENT_SHORT[prefs.seg]} segment with the heavy model` : "Triage every active task with the heavy model"}
+            title={triageScope.count === 0
+              ? (triageScope.segment ? `No active ${SEGMENT_SHORT[triageScope.segment]} tasks to triage` : "No active tasks to triage")
+              : triageScope.segment ? `Triage the ${triageScope.count} active ${SEGMENT_SHORT[triageScope.segment]} task(s) with the heavy model` : `Triage all ${triageScope.count} active tasks with the heavy model`}
           >
             {triageBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
-            {triageBusy ? "Triaging…" : prefs.seg !== "all" && prefs.seg !== "attention" ? `AI triage: ${SEGMENT_SHORT[prefs.seg]}` : "AI triage board"}
+            {triageBusy ? "Triaging…" : triageScope.segment ? `AI triage: ${SEGMENT_SHORT[triageScope.segment]} (${triageScope.count})` : `AI triage board (${triageScope.count})`}
+          </button>
+          <button
+            onClick={() => runDaily(24)}
+            disabled={dailyBusy}
+            className="rounded-lg ring-1 ring-violet-300 bg-white text-violet-800 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-violet-50 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Generate the detailed daily executive summary for the last 24h with the heavy model"
+          >
+            {dailyBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+            {dailyBusy ? "Writing brief…" : "Daily exec summary"}
           </button>
         </div>
       </div>
@@ -373,6 +438,18 @@ export function TasksV2Page() {
         <KPI label="Stale data" value={kpi.stale} icon={Clock} tone={kpi.stale ? "warn" : "default"} hint={`No scrape in ${staleDays}+ days`} />
         <KPI label="Unassigned" value={kpi.unassigned} icon={UserPlus} tone={kpi.unassigned ? "warn" : "default"} />
       </div>
+
+      {/* Daily executive summary */}
+      <DailySummaryPanel
+        result={daily}
+        busy={dailyBusy}
+        error={dailyError}
+        open={prefs.dailyOpen}
+        onToggle={() => setPref("dailyOpen", !prefs.dailyOpen)}
+        onRun={runDaily}
+        rows={rows}
+        onOpenTask={(id) => nav.openTask(id)}
+      />
 
       {/* Triage panel */}
       <TriagePanel
@@ -664,7 +741,7 @@ function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagM
         {s ? (
           <div className="space-y-0.5">
             <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="font-mono text-xs text-slate-800">{s.tracking_number || "—"}</span>
+              <TrackingLink tracking={s.tracking_number} carrier={s.carrier_name || s.carrier} onOpen={onOpen} className="text-xs" />
               {s.shipment_id ? <span className="text-[11px] text-slate-400">#{s.shipment_id}</span> : null}
               {s.mode ? <span className="text-[10px] uppercase tracking-wide text-slate-400">{s.mode}</span> : null}
             </div>
@@ -764,7 +841,7 @@ function TriagePanel({ result, busy, error, open, onToggle, rowById, onOpen, onS
                       <div className="flex items-center gap-1.5 mb-1">
                         <Pill cls="bg-violet-600 text-white ring-violet-600">#{p.rank}</Pill>
                         <Pill cls={SEGMENT_CLS[r.seg.segment]}>{SEGMENT_SHORT[r.seg.segment]}</Pill>
-                        <span className="font-mono text-slate-600">{r.shipment?.tracking_number || ""}</span>
+                        <TrackingLink tracking={r.shipment?.tracking_number} carrier={r.shipment?.carrier_name || r.shipment?.carrier} onOpen={() => onOpen(p.task_id)} />
                         <span className="text-slate-500 truncate">{r.shipment?.customer_name || ""}</span>
                       </div>
                       <div className="text-slate-800 font-medium line-clamp-2">{shortTitle(r.task.title)}</div>
@@ -790,7 +867,7 @@ function TriagePanel({ result, busy, error, open, onToggle, rowById, onOpen, onS
                     <div key={c.task_id} className="rounded-lg bg-white ring-1 ring-slate-200 p-2.5 text-xs">
                       <div className="flex items-center gap-1.5 mb-1">
                         <Pill cls="bg-emerald-100 text-emerald-800 ring-emerald-200">{DISPOSITION_LABEL[c.disposition] || c.disposition}</Pill>
-                        <span className="font-mono text-slate-600">{r.shipment?.tracking_number || ""}</span>
+                        <TrackingLink tracking={r.shipment?.tracking_number} carrier={r.shipment?.carrier_name || r.shipment?.carrier} onOpen={() => onOpen(c.task_id)} />
                         <span className="text-slate-500 truncate">{r.shipment?.customer_name || ""}</span>
                       </div>
                       <div className="text-slate-800 line-clamp-2">{shortTitle(r.task.title)}</div>
@@ -812,7 +889,14 @@ function TriagePanel({ result, busy, error, open, onToggle, rowById, onOpen, onS
                       <div className="font-medium text-slate-800">{b.label} <span className="text-slate-400 font-normal">· {live.length} tasks</span></div>
                       {b.reason ? <div className="text-slate-600 mt-0.5">{b.reason}</div> : null}
                       <div className="mt-1 flex flex-wrap gap-1">
-                        {live.slice(0, 8).map((id) => { const r = rowById.get(id)!; return <span key={id} className="font-mono text-[11px] text-slate-600 bg-slate-50 ring-1 ring-slate-200 rounded px-1">{r.shipment?.tracking_number || id.slice(0, 6)}</span>; })}
+                        {live.slice(0, 8).map((id) => {
+                          const r = rowById.get(id)!;
+                          return (
+                            <span key={id} className="inline-flex items-center bg-slate-50 ring-1 ring-slate-200 rounded px-1 text-[11px]">
+                              <TrackingLink tracking={r.shipment?.tracking_number || id.slice(0, 6)} carrier={r.shipment?.carrier_name || r.shipment?.carrier} onOpen={() => onOpen(id)} />
+                            </span>
+                          );
+                        })}
                         {live.length > 8 ? <span className="text-[11px] text-slate-400">+{live.length - 8}</span> : null}
                       </div>
                       <button onClick={() => onSelectBatch(live)} className="mt-1.5 inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2 py-1 hover:bg-slate-50 text-slate-700"><Layers className="h-3 w-3" /> Select batch</button>
@@ -840,6 +924,186 @@ function TriageColumn({ title, tone, action, children }: { title: string; tone: 
       <div className="space-y-1.5 max-h-[28rem] overflow-y-auto pr-0.5">{children}</div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Daily executive summary
+// ---------------------------------------------------------------------------
+function DailySummaryPanel({ result, busy, error, open, onToggle, onRun, rows, onOpenTask }: {
+  result: DailySummaryResult | null; busy: boolean; error: string | null; open: boolean; onToggle: () => void;
+  onRun: (hours: number) => void; rows: TaskBoardRow[]; onOpenTask: (taskId: string) => void;
+}) {
+  const [hours, setHours] = useState(24);
+  const [copied, setCopied] = useState(false);
+  const digest = result?.digest ?? null;
+  // Tracking numbers on the active board → task id, so numbers cited in the
+  // brief become links into the drawer.
+  const trackingIndex = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const r of rows) { const tn = (r.shipment?.tracking_number || r.task.tracking_number || "").trim(); if (tn && !m.has(tn)) m.set(tn, r.task.id); }
+    return m;
+  }, [rows]);
+  async function copy() {
+    if (!result?.markdown) return;
+    try { await navigator.clipboard.writeText(result.markdown); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ }
+  }
+  const chips = digest ? [
+    ["Created", digest.tasks.created_count], ["Completed", digest.tasks.completed_count], ["Dismissed", digest.tasks.dismissed_count],
+    ["Active", digest.board.active], ["Needs attention", digest.board.needs_attention_count], ["Likely resolved", digest.board.likely_resolved_count],
+    ["Scraped", digest.shipments.scraped_in_window], ["Newly flagged", digest.shipments.newly_flagged_count],
+    ["AI spend", fmtUsd(digest.ai.cost_usd)],
+  ] as [string, string | number][] : [];
+  return (
+    <div className="rounded-2xl ring-1 ring-slate-200 bg-white shadow-sm mb-4">
+      <div className="flex items-center gap-2 px-4 py-3">
+        <button onClick={onToggle} className="flex items-center gap-2 text-left min-w-0">
+          {open ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
+          <FileText className="h-4 w-4 text-slate-700" />
+          <span className="font-semibold text-slate-900">Daily exec summary</span>
+          {result?.created_at ? (
+            <span className="text-xs text-slate-500 truncate">
+              {fmtRelative(result.created_at)} · {result.model || "model"}{result.cost_usd != null ? ` · ${fmtUsd(result.cost_usd)}` : ""}{digest ? ` · ${digest.window.hours}h window` : ""}{result.user_email ? ` · by ${result.user_email}` : ""}
+            </span>
+          ) : <span className="text-xs text-slate-500">Not generated yet</span>}
+        </button>
+        <div className="ml-auto flex items-center gap-1.5">
+          <select value={hours} onChange={(e) => setHours(Number(e.target.value))} className="rounded-md border border-slate-200 px-2 py-1 text-xs bg-white" aria-label="Window">
+            <option value={24}>Last 24h</option>
+            <option value={48}>Last 48h</option>
+            <option value={72}>Last 72h</option>
+            <option value={168}>Last 7 days</option>
+          </select>
+          <button onClick={() => onRun(hours)} disabled={busy} className="text-xs inline-flex items-center gap-1 rounded-md bg-violet-600 text-white px-2.5 py-1.5 hover:bg-violet-700 disabled:opacity-50">
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />} {busy ? "Writing…" : result?.markdown ? "Regenerate" : "Generate"}
+          </button>
+          {result?.markdown ? (
+            <button onClick={copy} className="text-xs inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2.5 py-1.5 hover:bg-slate-50 text-slate-700" title="Copy as Markdown (paste into Teams / email)">
+              {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />} {copied ? "Copied" : "Copy"}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      {open ? (
+        <div className="px-4 pb-4">
+          {error ? <div className="mb-3"><ErrorBlock>{error}</ErrorBlock></div> : null}
+          {busy ? <div className="text-xs text-violet-700 mb-3 inline-flex items-center gap-1.5"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Collecting the day's digest and writing a ~1,200-word brief with the heavy model. This takes a minute or two.</div> : null}
+          {chips.length ? (
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              {chips.map(([label, value]) => (
+                <span key={label} className="inline-flex items-baseline gap-1 rounded-md bg-slate-50 ring-1 ring-slate-200 px-2 py-1 text-xs"><span className="text-slate-500">{label}</span><span className="font-semibold text-slate-900 tabular-nums">{value}</span></span>
+              ))}
+              {digest?.window ? <span className="text-[11px] text-slate-400 self-center">{fmtDateTime(digest.window.from)} → {fmtDateTime(digest.window.to)}</span> : null}
+            </div>
+          ) : null}
+          {result?.markdown ? (
+            <MarkdownLite text={result.markdown} trackingIndex={trackingIndex} onOpenTask={onOpenTask} />
+          ) : !busy ? (
+            <div className="text-sm text-slate-600">
+              Generates a detailed operations brief for the director: headline, KPI table, what moved today, live exposures ranked with next actions, carrier and customer hotspots, per-operator throughput, data health, tomorrow's plan and open questions. Copy it straight into Teams.
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// Minimal Markdown renderer for the brief: headings, paragraphs, bullet and
+// numbered lists, pipe tables, blockquotes, rules, **bold**, `code`. Tracking
+// numbers that exist on the board become links into the task drawer. Kept
+// deliberately small rather than pulling in a Markdown library for one panel.
+function MarkdownLite({ text, trackingIndex, onOpenTask }: { text: string; trackingIndex: Map<string, string>; onOpenTask: (taskId: string) => void }) {
+  const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
+  const inline = (s: string, key: string) => renderInline(s, key, trackingIndex, onOpenTask);
+  return (
+    <div className="text-sm text-slate-800 leading-relaxed space-y-2 max-w-none">
+      {blocks.map((b, i) => {
+        const k = `b${i}`;
+        switch (b.type) {
+          case "h1": return <h2 key={k} className="text-lg font-semibold text-slate-900 mt-2">{inline(b.text, k)}</h2>;
+          case "h2": return <h3 key={k} className="text-sm font-semibold uppercase tracking-wide text-violet-800 mt-4 border-b border-violet-100 pb-1">{inline(b.text, k)}</h3>;
+          case "h3": return <h4 key={k} className="text-sm font-semibold text-slate-900 mt-2">{inline(b.text, k)}</h4>;
+          case "hr": return <hr key={k} className="border-slate-200" />;
+          case "quote": return <blockquote key={k} className="border-l-2 border-slate-300 pl-3 text-slate-600 italic">{inline(b.text, k)}</blockquote>;
+          case "ul": return <ul key={k} className="list-disc pl-5 space-y-0.5">{b.items.map((it, j) => <li key={j}>{inline(it, `${k}-${j}`)}</li>)}</ul>;
+          case "ol": return <ol key={k} className="list-decimal pl-5 space-y-0.5">{b.items.map((it, j) => <li key={j}>{inline(it, `${k}-${j}`)}</li>)}</ol>;
+          case "table": return (
+            <div key={k} className="overflow-x-auto">
+              <table className="text-xs w-full ring-1 ring-slate-200 rounded-lg overflow-hidden">
+                <thead className="bg-slate-50 text-slate-600 uppercase tracking-wide text-[10px]"><tr>{b.header.map((h, j) => <th key={j} className="text-left px-2 py-1.5 font-semibold">{inline(h, `${k}h${j}`)}</th>)}</tr></thead>
+                <tbody>{b.rows.map((r, ri) => <tr key={ri} className="border-t border-slate-100">{r.map((c, ci) => <td key={ci} className="px-2 py-1.5 align-top">{inline(c, `${k}r${ri}c${ci}`)}</td>)}</tr>)}</tbody>
+              </table>
+            </div>
+          );
+          default: return <p key={k}>{inline(b.text, k)}</p>;
+        }
+      })}
+    </div>
+  );
+}
+
+type MdBlock =
+  | { type: "h1" | "h2" | "h3" | "p" | "quote"; text: string }
+  | { type: "hr" }
+  | { type: "ul" | "ol"; items: string[] }
+  | { type: "table"; header: string[]; rows: string[][] };
+
+function parseMarkdownBlocks(text: string): MdBlock[] {
+  const lines = text.replace(/\r/g, "").split("\n");
+  const out: MdBlock[] = [];
+  let i = 0;
+  const splitRow = (l: string) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  while (i < lines.length) {
+    const line = lines[i];
+    const t = line.trim();
+    if (!t) { i++; continue; }
+    if (/^-{3,}$|^\*{3,}$/.test(t)) { out.push({ type: "hr" }); i++; continue; }
+    const h = t.match(/^(#{1,3})\s+(.*)$/);
+    if (h) { out.push({ type: h[1].length === 1 ? "h1" : h[1].length === 2 ? "h2" : "h3", text: h[2] }); i++; continue; }
+    if (t.startsWith(">")) { out.push({ type: "quote", text: t.replace(/^>\s?/, "") }); i++; continue; }
+    if (t.startsWith("|")) {
+      const header = splitRow(t); i++;
+      if (i < lines.length && /^\|?\s*:?-{2,}/.test(lines[i].trim())) i++;
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) { rows.push(splitRow(lines[i])); i++; }
+      out.push({ type: "table", header, rows });
+      continue;
+    }
+    if (/^[-*•]\s+/.test(t)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) { items.push(lines[i].trim().replace(/^[-*•]\s+/, "")); i++; }
+      out.push({ type: "ul", items }); continue;
+    }
+    if (/^\d+[.)]\s+/.test(t)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) { items.push(lines[i].trim().replace(/^\d+[.)]\s+/, "")); i++; }
+      out.push({ type: "ol", items }); continue;
+    }
+    const para: string[] = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,3}\s|[-*•]\s|\d+[.)]\s|\||>)/.test(lines[i].trim())) { para.push(lines[i].trim()); i++; }
+    out.push({ type: "p", text: para.join(" ") });
+  }
+  return out;
+}
+
+// **bold**, `code`, and tracking-number links. Tracking numbers are matched
+// as 6-14 digit runs (optionally "-N" suffix) that exist on the board.
+function renderInline(s: string, key: string, trackingIndex: Map<string, string>, onOpenTask: (id: string) => void): ReactNode[] {
+  const out: ReactNode[] = [];
+  const re = /(\*\*[^*]+\*\*|`[^`]+`|\b\d{6,14}(?:-\d)?\b)/g;
+  let last = 0, m: RegExpExecArray | null, n = 0;
+  while ((m = re.exec(s))) {
+    if (m.index > last) out.push(s.slice(last, m.index));
+    const tok = m[0];
+    const k = `${key}-${n++}`;
+    if (tok.startsWith("**")) out.push(<strong key={k} className="font-semibold text-slate-900">{tok.slice(2, -2)}</strong>);
+    else if (tok.startsWith("`")) out.push(<code key={k} className="font-mono text-[12px] bg-slate-100 rounded px-1">{tok.slice(1, -1)}</code>);
+    else if (trackingIndex.has(tok)) out.push(<button key={k} type="button" onClick={() => onOpenTask(trackingIndex.get(tok)!)} className="font-mono text-sky-700 hover:underline" title="Open in FPX">{tok}</button>);
+    else out.push(tok);
+    last = m.index + tok.length;
+  }
+  if (last < s.length) out.push(s.slice(last));
+  return out;
 }
 
 // ---------------------------------------------------------------------------
