@@ -9,7 +9,6 @@ import type {
   DailySummaryResult, TaskBoard, TaskBoardRow, TaskFlag, TaskPriority, TaskSegment, TaskStatus, TaskTriage, TaskTriageResult,
 } from "../lib/types";
 import { carrierTrackingUrl, fmtDate, fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
-import { useNav } from "../lib/nav";
 import { KPI } from "../components/KPI";
 import { LoadingState } from "../components/LoadingState";
 import { ErrorBlock } from "../components/ErrorBlock";
@@ -147,7 +146,6 @@ function loadPrefs(): Prefs {
 }
 
 export function TasksV2Page() {
-  const nav = useNav();
   const navigate = useNavigate();
   const [board, setBoard] = useState<TaskBoard | null>(null);
   const [loading, setLoading] = useState(true);
@@ -273,6 +271,14 @@ export function TasksV2Page() {
     return sorted;
   }, [rows, prefs.seg, prefs.flags, prefs.sortBy, assigneeFilter, carrierFilter, search, triageRank]);
 
+  // Open a task in the drawer. Router state tells the /tasks/:id route we
+  // came from v2 and hands it the board's current active order, so the
+  // drawer's prev/next chevrons walk THIS list and closing the drawer
+  // returns here instead of the classic Tasks page.
+  const openTask = (id: string) => navigate(`/tasks/${id}`, {
+    state: { from: "/tasks/v2", walkIds: visible.filter((r) => isActive(r.task.status)).map((r) => r.task.id) },
+  });
+
   const groups = useMemo(() => {
     if (prefs.groupBy === "none") return [{ key: "__all", label: "", rows: visible }];
     const keyFn = (r: TaskBoardRow): string => {
@@ -314,7 +320,7 @@ export function TasksV2Page() {
     try {
       const { task } = await api.tasks.update(id, { status });
       patchLocal(task);
-      if (opts.open) nav.openTask(id);
+      if (opts.open) openTask(id);
     } catch (e) { setError((e as Error).message); }
   }
   async function bulk(fn: () => Promise<unknown>) {
@@ -456,7 +462,7 @@ export function TasksV2Page() {
         onToggle={() => setPref("dailyOpen", !prefs.dailyOpen)}
         onRun={runDaily}
         rows={rows}
-        onOpenTask={(id) => nav.openTask(id)}
+        onOpenTask={(id) => openTask(id)}
       />
 
       {/* Triage panel */}
@@ -468,7 +474,7 @@ export function TasksV2Page() {
         onToggle={() => setPref("triageOpen", !prefs.triageOpen)}
         rowById={rowById}
         people={people}
-        onOpen={(id) => nav.openTask(id)}
+        onOpen={(id) => openTask(id)}
         onStart={(id) => setStatus(id, "in_progress", { open: true })}
         onDismissOne={(id, disposition, reason) => openDismiss([id], disposition, reason)}
         onDismissAll={dismissAllCandidates}
@@ -611,7 +617,7 @@ export function TasksV2Page() {
                       staleDays={staleDays}
                       flagsMeta={board?.flags ?? []}
                       people={people}
-                      onOpen={(id) => nav.openTask(id)}
+                      onOpen={(id) => openTask(id)}
                       onStatus={setStatus}
                       onDismiss={(id) => openDismiss([id])}
                     />
