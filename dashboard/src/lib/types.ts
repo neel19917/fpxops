@@ -427,6 +427,29 @@ export interface DailySummaryResult {
   stop_reason?: string | null;
 }
 
+// Plain-English shipment brief (/api/shipments/:id/plain-summary). Mirrors
+// server/lib/plainSummary.js.
+export interface PlainSummary {
+  headline: string;
+  what_happened: string;
+  why_it_matters: string;
+  next_steps: { step: string; who: string | null }[];
+  by_when: string;
+  urgency: "today" | "this_week" | "monitor" | "none";
+}
+export interface PlainSummaryResult {
+  summary: PlainSummary;
+  // Dates / hours / amounts / reference numbers in the prose that the server
+  // could not find in the fact sheet the model was given.
+  unverified: string[];
+  facts: Record<string, unknown> | null;
+  model: string | null;
+  cost_usd: number | null;
+  analysis_id: string | null;
+  created_at: string | null;
+  cached: boolean;
+}
+
 export type FeedbackCategory = "bug" | "feature" | "support" | "other";
 export type FeedbackStatus = "open" | "triaged" | "in_progress" | "resolved" | "wont_fix";
 export type FeedbackSeverity = "low" | "normal" | "high" | "urgent";

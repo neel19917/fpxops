@@ -40,7 +40,7 @@ const GROUPS: {
     label: "Per-shipment analysis prompts",
     description: "Drives the AI's per-shipment classification + recommendation that surfaces in the dashboard's action column.",
     Icon: Sparkles,
-    match: (k) => k.startsWith("prompt.system") || k.startsWith("prompt.per_shipment") || k.startsWith("prompt.priority") || k.startsWith("prompt.summary"),
+    match: (k) => k.startsWith("prompt.system") || k.startsWith("prompt.per_shipment") || k.startsWith("prompt.priority") || k.startsWith("prompt.summary") || k.startsWith("prompt.plain_summary"),
   },
   {
     id: "gp_prompts",
@@ -130,6 +130,8 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "storage.assignee": "Owner of auto-created storage-risk tasks — user email (blank = whoever scraped the shipment)",
   "prompt.task_triage.model": "Tasks v2 triage — model",
   "prompt.task_triage.system": "Tasks v2 triage — system prompt",
+  "prompt.plain_summary.model": "Drawer plain-English brief — model",
+  "prompt.plain_summary.system": "Drawer plain-English brief — system prompt (audience + rules)",
   "prompt.daily_summary.model": "Tasks v2 daily exec summary — model",
   "prompt.daily_summary.system": "Tasks v2 daily exec summary — system prompt (sections + rules)",
   "ui.tasks.stale_days": "Tasks v2 — days without a scrape before shipment data counts as stale",
@@ -157,6 +159,7 @@ const ENUM_OPTIONS: Record<string, { value: string; label: string }[]> = {
   "prompt.email_draft.customer_group.model": MODEL_OPTIONS,
   "prompt.task_triage.model": MODEL_OPTIONS,
   "prompt.daily_summary.model": MODEL_OPTIONS,
+  "prompt.plain_summary.model": MODEL_OPTIONS,
 };
 
 function valueShape(v: unknown): "string" | "number" | "boolean" | "json" {
