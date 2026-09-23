@@ -82,7 +82,10 @@ function findModalDismissControl() {
 function waitForCloseButton(timeout = 25000) {
   return new Promise((resolve) => {
     const interval = 400;
-    let elapsed = 0;
+    // Wall-clock deadline, not tick counting. In a hidden tab Chrome slows
+    // timers to 1/s and eventually 1/min, so counting 400ms per tick turned
+    // a 25s wait into many minutes.
+    const deadline = Date.now() + timeout;
 
     const timer = setInterval(() => {
       const btn = findModalDismissControl();
@@ -91,8 +94,7 @@ function waitForCloseButton(timeout = 25000) {
         resolve(btn);
         return;
       }
-      elapsed += interval;
-      if (elapsed >= timeout) {
+      if (Date.now() >= deadline) {
         clearInterval(timer);
         resolve(null);
       }
@@ -801,6 +803,36 @@ async function ensureModalClosed(timeoutMs = 2500, root = null) {
   return !isModalOpen(root);
 }
 
+// Chrome throttles timers in a hidden tab (1/s, then 1/min after five
+// minutes) — and FreightPOP's own page slows with them. A run that does a
+// row every 3s in the foreground took 4-7 MINUTES per row in the
+// background, and any modal that missed the 25s window came back as a
+// partial row. Rather than grind through that, hold the loop while the tab
+// is hidden and tell the operator why. Resumes the moment the tab is
+// visible again. Returns the ms spent paused.
+async function pauseWhileHidden(trackingNum) {
+  if (typeof document.hidden !== "boolean" || !document.hidden) return 0;
+  const start = Date.now();
+  sendStatus(`Paused — the FreightPOP tab is in the background. Bring it to the front to continue${trackingNum ? ` (next: ${trackingNum})` : ""}.`);
+  await new Promise((resolve) => {
+    const onVis = () => {
+      if (!document.hidden) {
+        document.removeEventListener("visibilitychange", onVis);
+        clearInterval(poll);
+        resolve();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    // Belt and braces: visibilitychange is reliable, but poll too in case
+    // the tab is re-shown via a path that doesn't fire it.
+    const poll = setInterval(onVis, 1000);
+    onVis();
+  });
+  const pausedMs = Date.now() - start;
+  sendStatus(`Resumed after ${Math.round(pausedMs / 1000)}s in the background.`);
+  return pausedMs;
+}
+
 // Build the row we upload when a shipment could not be fully scraped. It
 // carries the grid columns (Kendo merge + Pickup Response) plus `_error`, so
 // the server updates only what we actually observed instead of nulling the
@@ -959,7 +991,7 @@ function goToNextPage() {
 function waitForGridReady(timeout = 3000) {
   return new Promise((resolve) => {
     const interval = 300;
-    let elapsed = 0;
+    const deadline = Date.now() + timeout;
     const timer = setInterval(() => {
       const rows = document.querySelectorAll(
         ".k-grid-content tbody tr, .k-grid tbody tr"
@@ -970,8 +1002,7 @@ function waitForGridReady(timeout = 3000) {
         resolve();
         return;
       }
-      elapsed += interval;
-      if (elapsed >= timeout) {
+      if (Date.now() >= deadline) {
         clearInterval(timer);
         resolve();
       }
@@ -1011,6 +1042,11 @@ async function processPage() {
     const trackingNum = job.trackingNum || String(job.link?.textContent || "").trim();
     const pickupResponse = job.pickupResponse;
     const kendoRow = kendoRowMap.get(trackingNum);
+    const pausedMs = await pauseWhileHidden(trackingNum);
+    if (stopRequested) {
+      sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
+      return;
+    }
     sendStatus(`Processing ${i + 1} of ${total} — ${trackingNum}`);
 
     // Every step for one shipment is isolated: a throw records a partial row
@@ -1069,6 +1105,7 @@ async function processPage() {
       // from the database: was it the carrier modal, or our own waits?
       modalData._modalWaitMs = modalWaitMs;
       if (preCloseMs) modalData._preCloseMs = preCloseMs;
+      if (pausedMs) modalData._pausedHiddenMs = pausedMs;
       const dialogRoot = dialogRootFor(closeBtn);
       logRows.push(modalData);
       // Legacy 25-row chrome.storage._fpxCheckpoint write was retired —
