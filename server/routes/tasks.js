@@ -8,6 +8,7 @@ import { runTaskTriage, extractJson, normalizeTriage, TRIAGE_MAX_ROWS } from "..
 import { loadBoard } from "../lib/taskBoard.js";
 import { collectDailyDigest, runDailySummary } from "../lib/dailySummary.js";
 import { resolveAssignee } from "../lib/people.js";
+import { getSettings } from "../lib/settings.js";
 
 export const tasksRouter = Router();
 
@@ -634,8 +635,8 @@ tasksRouter.get("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
 });
 
 // POST /tasks/bulk  { shipment_ids: string[], title, description?, priority?, assigned_to? }
-// Creates one task per shipment. assigned_to defaults to that shipment's
-// created_by (the runner who scraped it). Skips already-completed shipments? No —
+// Creates one task per shipment. assigned_to defaults to
+// tasks.default_assignee, then that shipment's created_by (the runner). Skips already-completed shipments? No —
 // we let the user fan out tasks to any selection. Returns { created, errors }.
 tasksRouter.post("/bulk", async (req, res) => {
   const ids = Array.isArray(req.body?.shipment_ids) ? req.body.shipment_ids.filter((x) => typeof x === "string") : [];
@@ -645,6 +646,8 @@ tasksRouter.post("/bulk", async (req, res) => {
   const description = req.body?.description ? String(req.body.description) : null;
   const priority = ["low","normal","high","urgent"].includes(req.body?.priority) ? req.body.priority : "normal";
   const overrideAssignee = req.body?.assigned_to ? await resolveAssignee(req.body.assigned_to) : null;
+  const { "tasks.default_assignee": defaultRaw } = await getSettings("tasks.default_assignee");
+  const defaultAssignee = defaultRaw ? await resolveAssignee(defaultRaw) : null;
   const creatorName = req.user?.email || req.apiKey?.name || req.header("x-fpx-user-name") || null;
   const due_at = req.body?.due_at || null;
 
@@ -666,7 +669,7 @@ tasksRouter.post("/bulk", async (req, res) => {
       description,
       priority,
       status: "open",
-      assigned_to: overrideAssignee || (await resolveAssignee(s.created_by)) || null,
+      assigned_to: overrideAssignee || defaultAssignee || (await resolveAssignee(s.created_by)) || null,
       created_by: creatorName,
       due_at,
     });
