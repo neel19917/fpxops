@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/package-extension.mjs",
     "dev": "vite",
+    "prebuild": "node scripts/package-extension.mjs",
+    "package-extension": "node scripts/package-extension.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit"

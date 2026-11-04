@@ -3,3 +3,6 @@ dist
 .env
 .env.local
 .vite
+
+# Built from ../extension by scripts/package-extension.mjs on every build
+public/downloads/
