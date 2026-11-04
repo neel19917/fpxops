@@ -110,10 +110,14 @@ const FALLBACKS = {
   // (Allen/Victor, 2026-09-23); add others as they're confirmed.
   "storage.carriers": "XPO",
   "storage.hold_hours": 48,
-  // Who owns auto-created storage-risk tasks. Empty = whoever scraped the
-  // shipment (the default for every other auto-task). Neel's call
-  // 2026-09-23: storage-charge conversations with customers go to Victor.
+  // Who owns auto-created storage-risk tasks. Empty = tasks.default_assignee.
+  // Neel's call 2026-09-23: storage-charge conversations with customers go
+  // to Victor.
   "storage.assignee": "victorz@freightpop.com",
+  // Default owner for every new task (auto-flag, redelivery, manual, bulk)
+  // when the caller doesn't name one. Empty = whoever scraped the shipment.
+  // Neel's call 2026-09-24: all tasks go to Victor by default, not the runner.
+  "tasks.default_assignee": "victorz@freightpop.com",
   // Days without a scrape before a task's shipment data counts as stale on
   // the Tasks v2 board. 7 = "not seen this week"; the scraper normally hits
   // every live shipment daily, so anything past that has dropped off the

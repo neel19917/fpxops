@@ -3,6 +3,10 @@
 The FPX API runs in the cloud on Railway. You just need to install the Chrome
 extension and paste a key — no server to run, no terminal to keep open.
 
+> **Easiest path:** sign in at https://fpxpress.netlify.app/install. It has the
+> latest extension download (rebuilt on every deploy) and step-by-step install
+> instructions. The steps below are the older manual zip + API-key route.
+
 ## One-time setup (2 min)
 
 1. **Unzip FPXpress** to a permanent folder (e.g. `~/FPXpress` or `C:\FPXpress`).

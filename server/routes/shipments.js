@@ -9,7 +9,7 @@ import { buildPlainFacts, runPlainSummary, extractJson as extractPlainJson, norm
 import { extractAiJsonFields } from "../lib/anthropic.js";
 import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG } from "../lib/redelivery.js";
 import { detectStorageRisk, isStorageRiskTitle, STORAGE_TAG } from "../lib/storageRisk.js";
-import { peopleIndex, resolveWithIndex } from "../lib/people.js";
+import { peopleIndex, resolveWithIndex, resolveAssignee } from "../lib/people.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
 
 // Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
@@ -240,8 +240,8 @@ function buildStandardTask(s, changeLog, { tag = "", assignee = null } = {}) {
     description,
     status: "open",
     priority: "high",
-    // Explicit owner (e.g. storage.assignee) wins; otherwise the runner who
-    // scraped the shipment.
+    // Resolved by the caller: storage.assignee for storage tasks, else
+    // tasks.default_assignee, else the runner who scraped the shipment.
     assigned_to: (assignee && String(assignee).trim()) || s.created_by || null,
     created_by: "system (auto-flag)",
   };
@@ -252,7 +252,7 @@ function buildStandardTask(s, changeLog, { tag = "", assignee = null } = {}) {
 // the attempt failed. Both carry "Redelivery — " so /tasks search finds
 // them, and each lands in its Carrier/Customer Followups panel via the
 // prefix. `attempt` > 1 means the redelivery itself failed again.
-function buildRedeliveryTasks(s, changeLog, attempt) {
+function buildRedeliveryTasks(s, changeLog, attempt, assignee = null) {
   const suffix = attempt > 1 ? ` (attempt ${attempt})` : "";
   const repeatNote = attempt > 1
     ? `Redelivery failed again — this is failed attempt #${attempt} on this shipment. Earlier redelivery tasks exist; check them before calling the carrier.`
@@ -262,7 +262,7 @@ function buildRedeliveryTasks(s, changeLog, attempt) {
     tracking_number: s.tracking_number,
     status: "open",
     priority: "high",
-    assigned_to: s.created_by || null,
+    assigned_to: assignee || s.created_by || null,
     created_by: "system (auto-flag)",
   };
   return [
@@ -301,13 +301,17 @@ async function autoCreateActionTasks(
     "storage.hold_hours": storageHoldHours,
     "storage.carriers": storageCarriers,
     "storage.assignee": storageAssignee,
-  } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers", "storage.assignee");
+    "tasks.default_assignee": defaultAssignee,
+  } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers", "storage.assignee", "tasks.default_assignee");
   const storageOpts = { asOfMs: Date.now(), holdHours: storageHoldHours, carriers: storageCarriers };
   // Owners are stored as the profile email. created_by is the runner's
   // display name from the extension ("Victor Zarate"); resolve it here so
   // one person never shows up under two strings on the board.
   const people = await peopleIndex();
   const owner = (raw) => resolveWithIndex(people, raw);
+  // tasks.default_assignee (Victor) owns auto-tasks; the runner is the
+  // fallback only when the setting is blank.
+  const defaultOwner = (s) => owner(defaultAssignee) || owner(s.created_by);
   const candidates = (upsertedRows || []).filter(
     (s) => String(s.action_required || "").toUpperCase() === "YES"
         && (showParcels === true || String(s.mode || "").trim().toLowerCase() !== "parcel")
@@ -362,11 +366,11 @@ async function autoCreateActionTasks(
       const storage = detectStorageRisk({ ...s, ...current }, storageOpts).storage_risk === true;
       if (storage) {
         if (prior.some((t) => isStorageRiskTitle(t.title))) continue;
-        rows.push(buildStandardTask(s, changeLog, { tag: STORAGE_TAG, assignee: owner(storageAssignee) || owner(s.created_by) }));
+        rows.push(buildStandardTask(s, changeLog, { tag: STORAGE_TAG, assignee: owner(storageAssignee) || defaultOwner(s) }));
         continue;
       }
       if (prior.length) continue;
-      rows.push(buildStandardTask(s, changeLog, { assignee: owner(s.created_by) }));
+      rows.push(buildStandardTask(s, changeLog, { assignee: defaultOwner(s) }));
       continue;
     }
 
@@ -381,7 +385,7 @@ async function autoCreateActionTasks(
     } else {
       continue;
     }
-    rows.push(...buildRedeliveryTasks(s, changeLog, attempt).map((t) => ({ ...t, assigned_to: owner(t.assigned_to) })));
+    rows.push(...buildRedeliveryTasks(s, changeLog, attempt, defaultOwner(s)));
   }
   if (!rows.length) return 0;
 
@@ -1268,8 +1272,8 @@ shipmentsRouter.get("/:id/tasks", async (req, res) => {
   res.json({ data: data || [] });
 });
 
-// POST /shipments/:id/tasks — create a task. assigned_to defaults to the
-// shipment's created_by (the runner who scraped it).
+// POST /shipments/:id/tasks — create a task. assigned_to defaults to
+// tasks.default_assignee, then the shipment's created_by (the runner).
 shipmentsRouter.post("/:id/tasks", async (req, res) => {
   const title = String(req.body?.title || "").trim();
   if (!title) return res.status(400).json({ error: "title required" });
@@ -1284,6 +1288,7 @@ shipmentsRouter.post("/:id/tasks", async (req, res) => {
   // time. "done"/"cancelled" intentionally not allowed via this path
   // (use the separate update flow with completed_at handling).
   const allowedStatus = ["open", "in_progress", "blocked"];
+  const { "tasks.default_assignee": defaultAssignee } = await getSettings("tasks.default_assignee");
   const row = {
     shipment_id: ship.id,
     tracking_number: ship.tracking_number,
@@ -1291,7 +1296,7 @@ shipmentsRouter.post("/:id/tasks", async (req, res) => {
     description: req.body?.description ? String(req.body.description) : null,
     priority: ["low","normal","high","urgent"].includes(req.body?.priority) ? req.body.priority : "normal",
     status: allowedStatus.includes(req.body?.status) ? req.body.status : "open",
-    assigned_to: req.body?.assigned_to || ship.created_by || null,
+    assigned_to: await resolveAssignee(req.body?.assigned_to || defaultAssignee || ship.created_by) || null,
     created_by: creatorName,
     due_at: req.body?.due_at || null,
   };

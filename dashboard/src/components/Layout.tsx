@@ -1,11 +1,11 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3 } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "audit" | "settings" | "services" | "ai_export";
+export type TabId = "tracking" | "tasks" | "ops" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export";
 
 interface TabDef {
   id: TabId;
@@ -31,6 +31,7 @@ const ALL_TABS: TabDef[] = [
   { id: "analyses", label: "AI Analyses",    Icon: Sparkles,     group: "more" },
   { id: "shares",   label: "Share Links",    Icon: Link2,        group: "more" },
   { id: "feedback", label: "Feedback",       Icon: MessageSquare, group: "more" },
+  { id: "install",  label: "Install Extension", Icon: Puzzle,     group: "more" },
   { id: "users",     label: "Users",          Icon: Users,        group: "admin" },
   { id: "keys",      label: "API Keys",       Icon: KeyRound,     group: "admin" },
   { id: "audit",     label: "Audit Log",      Icon: ScrollText,   group: "admin" },

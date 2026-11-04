@@ -32,6 +32,7 @@ const SettingsPage    = lazy(() => import("./pages/Settings").then((m) => ({ def
 const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default: m.OpsPage })));
 const ServicesPage    = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServicesPage })));
 const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServiceDetailPage })));
+const InstallPage     = lazy(() => import("./pages/Install").then((m) => ({ default: m.InstallPage })));
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
@@ -45,6 +46,7 @@ const TAB_PATH: Record<TabId, string> = {
   invoice: "/audits/invoice",
   shares: "/shares",
   feedback: "/feedback",
+  install: "/install",
   users: "/admin/users",
   keys: "/admin/keys",
   audit: "/admin/audit",
@@ -72,6 +74,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/analyses")) return "analyses";
   if (pathname.startsWith("/shares")) return "shares";
   if (pathname.startsWith("/feedback")) return "feedback";
+  if (pathname.startsWith("/install")) return "install";
   return "tracking";
 }
 
@@ -243,6 +246,7 @@ function AuthedApp() {
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
             <Route path="/shares" element={<ShareLinksPage />} />
             <Route path="/feedback" element={<FeedbackPage />} />
+            <Route path="/install" element={<InstallPage />} />
             {isAdmin ? (
               <>
                 <Route path="/admin/users" element={<UsersPage />} />
