@@ -14,6 +14,7 @@ export function FreightPopLoginPage() {
   const viewer = useRef<HostedFreightPopHandle | null>(null);
   const [status, setStatus] = useState<HostedBrowserStatus | null>(null);
   const [url, setUrl] = useState("");
+  const [liveSignedIn, setLiveSignedIn] = useState<boolean | null>(null);
   const [viewerKey, setViewerKey] = useState(0);
   const [resetting, setResetting] = useState(false);
   const [msg, setMsg] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
@@ -33,6 +34,7 @@ export function FreightPopLoginPage() {
     try {
       await hostedBrowser.resetLogin();
       setMsg({ tone: "ok", text: "Signed out. Sign in to FreightPOP below." });
+      setLiveSignedIn(null);
       setViewerKey((k) => k + 1);
       refresh();
     } catch (e) { setMsg({ tone: "err", text: (e as Error).message }); }
@@ -43,10 +45,12 @@ export function FreightPopLoginPage() {
     return <div className="text-sm text-slate-500">This dashboard isn't connected to a hosted browser (VITE_FPX_BROWSER_URL).</div>;
   }
 
-  // Signed in = cookies saved AND the last FreightPOP page wasn't a login page.
-  // The live URL wins over the saved state while the view is open.
+  // The hosted browser's own check (FreightPOP login data present) wins; on
+  // the sign-in page you're signed out whatever the check says.
   const onLoginPage = /#\/login|\/login\b|\/Account\/Login/i.test(url);
-  const signedIn = url ? (!onLoginPage && /freightpop\.com/i.test(url)) : !!(status?.hasProfile && status?.freightpop?.loggedIn);
+  const signedIn = onLoginPage ? false
+    : liveSignedIn != null ? liveSignedIn
+    : !!status?.freightpop?.loggedIn;
 
   return (
     <div className="space-y-4">
@@ -107,7 +111,7 @@ export function FreightPopLoginPage() {
           </a>
         </div>
         <div className="flex-1 min-h-0">
-          <HostedFreightPop key={viewerKey} ref={viewer} onUrl={setUrl} />
+          <HostedFreightPop key={viewerKey} ref={viewer} onUrl={setUrl} onSignedIn={setLiveSignedIn} />
         </div>
       </div>
     </div>
