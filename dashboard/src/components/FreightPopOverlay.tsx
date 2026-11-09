@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Check, ExternalLink, Filter, X as XIcon } from "lucide-react";
-import { useFrameState } from "../lib/freightpopFrame";
+import { Copy, Check, ExternalLink, Filter, X as XIcon, ArrowLeft, ArrowRight, RotateCw, Maximize2, Minimize2 } from "lucide-react";
+import { useFrameState, hideFrame } from "../lib/freightpopFrame";
 import { useAuth } from "../lib/auth";
 import { ErrorBlock } from "./ErrorBlock";
+import { HostedFreightPop, HOSTED_BROWSER_URL, type BridgeAck, type BridgePayload, type HostedFreightPopHandle } from "./HostedFreightPop";
 
 // postMessage bridge to the FPXpress Chrome extension. The extension's
 // content script runs inside the FreightPOP iframe (its host permissions
@@ -117,12 +118,35 @@ export function FreightPopOverlay() {
   const cfg = clientConfig?.embed_freightpop;
   const frame = useFrameState();
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  // Hosted mode (VITE_FPX_BROWSER_URL set): FreightPOP runs in the hosted
+  // browser service with the extension preloaded, so nobody needs the
+  // extension installed. Bridge commands go over its WebSocket instead of
+  // iframe postMessage; acks come back through the same handler.
+  const hosted = !!HOSTED_BROWSER_URL;
+  const hostedRef = useRef<HostedFreightPopHandle | null>(null);
   // Separate copy-state per source so the tracking-number copy doesn't
   // share a flash variable with the email-copy button (the previous
   // setCopied("email") reuse made the two affordances visually identical
   // on click, which was confusing to debug).
   const [copied, setCopied] = useState<"email" | "password" | null>(null);
   const [trackingCopied, setTrackingCopied] = useState(false);
+  const [typed, setTyped] = useState<"email" | "password" | null>(null);
+  // Full screen: cover the shipment drawer too. Esc exits.
+  const [paneFull, setPaneFull] = useState(false);
+  useEffect(() => {
+    if (!paneFull) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // While typing into the hosted page, Esc belongs to FreightPOP (closing
+      // its modals); use the Exit full screen button instead.
+      const el = document.activeElement as HTMLElement | null;
+      if (el?.getAttribute("aria-label") === "Hosted FreightPOP keyboard input") return;
+      e.stopPropagation();
+      setPaneFull(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [paneFull]);
   // Last filter ack the operator dismissed — once the user closes the
   // warning it stays dismissed for that ack identity so a stuck failure
   // doesn't bury the iframe forever.
@@ -158,6 +182,58 @@ export function FreightPopOverlay() {
   // message handler and must not re-render or re-fire the auto-filter.
   const pendingFilterRef = useRef<{ column: FpxFilterColumn; value: string } | null>(null);
 
+  // Shared by both transports (iframe postMessage + hosted WebSocket).
+  // Lives in a ref so the once-registered message listener sees it.
+  const handleFilterAckRef = useRef((d: BridgeAck) => {
+    if (d.ok) setLastFilter({ column: String(d.column || ""), value: String(d.value || "") });
+    if (!d.ok && d.reason === "grid-not-ready" && typeof d.column === "string" && typeof d.value === "string") {
+      pendingFilterRef.current = { column: d.column as FpxFilterColumn, value: d.value };
+    } else if (d.ok) {
+      pendingFilterRef.current = null;
+    }
+    setLastAck({
+      ok: !!d.ok,
+      strategy: typeof d.strategy === "string" ? d.strategy : undefined,
+      error: typeof d.error === "string" ? d.error : undefined,
+      injectDetail: typeof d.injectDetail === "string" ? d.injectDetail : undefined,
+    });
+    // New ack — re-show the warning so a fresh failure isn't
+    // hidden by an earlier dismissal.
+    setAckDismissed(false);
+  });
+
+  // Route a bridge command to whichever transport is active.
+  function sendBridge(payload: BridgePayload) {
+    if (hosted) {
+      // The hosted browser gets one robust "find this shipment" command
+      // instead of a raw column filter (the In Transit grid has no Tracking
+      // Number column, and filtering the wrong one emptied the grid).
+      let p: BridgePayload = payload;
+      if (payload.type === "fpxFilter" || payload.type === "fpxOpenTracking") {
+        const tn = payload.type === "fpxFilter" ? payload.value : payload.trackingNumber;
+        const sid = /^\d{5,}$/.test(String(frameRef.current.shipmentLabel || "").trim()) ? String(frameRef.current.shipmentLabel).trim() : null;
+        p = { type: "fpxFindShipment", shipmentId: sid, trackingNumber: tn || null, open: payload.type === "fpxOpenTracking" };
+      }
+      const tnForAck = p.type === "fpxFindShipment" ? p.trackingNumber || "" : "";
+      hostedRef.current?.bridge(p).then((ack) => {
+        handleFilterAckRef.current({ ...ack, column: "Tracking Number", value: tnForAck });
+      });
+      return;
+    }
+    if (payload.type === "fpxFilter") {
+      postFpxFilter(iframeRef.current, payload.column as FpxFilterColumn, payload.value);
+    } else if (payload.type === "fpxOpenTracking") {
+      postFpxOpenTracking(iframeRef.current, payload.trackingNumber);
+    } else if (payload.trackingNumber) {
+      // Extension (iframe) path has no find command; use the tracking filter.
+      postFpxFilter(iframeRef.current, "Tracking Number", payload.trackingNumber);
+    }
+  }
+  const frameRef = useRef(frame);
+  frameRef.current = frame;
+  const sendBridgeRef = useRef(sendBridge);
+  sendBridgeRef.current = sendBridge;
+
   // Persist creds whenever the user edits them in the popover.
   useEffect(() => { saveCreds(creds); }, [creds]);
 
@@ -192,21 +268,7 @@ export function FreightPopOverlay() {
           postFpxFilter(iframeRef.current, pending.column, pending.value);
         }
       } else if (d.type === "fpxFilterAck") {
-        if (d.ok) setLastFilter({ column: String(d.column || ""), value: String(d.value || "") });
-        if (!d.ok && d.reason === "grid-not-ready" && typeof d.column === "string" && typeof d.value === "string") {
-          pendingFilterRef.current = { column: d.column as FpxFilterColumn, value: d.value };
-        } else if (d.ok) {
-          pendingFilterRef.current = null;
-        }
-        setLastAck({
-          ok: !!d.ok,
-          strategy: typeof d.strategy === "string" ? d.strategy : undefined,
-          error: typeof d.error === "string" ? d.error : undefined,
-          injectDetail: typeof d.injectDetail === "string" ? d.injectDetail : undefined,
-        });
-        // New ack — re-show the warning so a fresh failure isn't
-        // hidden by an earlier dismissal.
-        setAckDismissed(false);
+        handleFilterAckRef.current(d);
       }
     }
     window.addEventListener("message", onMessage);
@@ -216,12 +278,12 @@ export function FreightPopOverlay() {
   // Periodically ping in case the iframe loaded before our listener was
   // attached (race on first render). Stops once the bridge answers.
   useEffect(() => {
-    if (bridgeReady) return;
+    if (bridgeReady || hosted) return;
     const id = setInterval(() => {
       iframeRef.current?.contentWindow?.postMessage({ source: "fpxpress", type: "fpxPing" }, "*");
     }, 1500);
     return () => clearInterval(id);
-  }, [bridgeReady]);
+  }, [bridgeReady, hosted]);
 
   // Auto-filter on demand. Keys on (trackingNumber + autoFilterTick): a
   // new tracking number arriving via showFrame fires once; a tick bump
@@ -237,7 +299,12 @@ export function FreightPopOverlay() {
     const key = `${frame.trackingNumber}#${frame.autoFilterTick}`;
     if (lastAutoFilteredKeyRef.current === key) return;
     lastAutoFilteredKeyRef.current = key;
-    postFpxFilter(iframeRef.current, "Tracking Number", frame.trackingNumber);
+    // Hosted pane: find the shipment AND open FreightPOP's tracking popup, so
+    // clicking a task lands straight on its details. (Extension iframe path
+    // keeps the plain grid filter.)
+    sendBridgeRef.current(hosted
+      ? { type: "fpxOpenTracking", trackingNumber: frame.trackingNumber }
+      : { type: "fpxFilter", column: "Tracking Number", value: frame.trackingNumber });
   }, [bridgeReady, frame.trackingNumber, frame.autoFilterTick]);
 
   // Open-tracking-modal trigger. Same keying pattern as auto-filter so a
@@ -252,7 +319,7 @@ export function FreightPopOverlay() {
     const key = `${frame.trackingNumber}#${frame.openTrackingTick}`;
     if (lastOpenTrackingKeyRef.current === key) return;
     lastOpenTrackingKeyRef.current = key;
-    postFpxOpenTracking(iframeRef.current, frame.trackingNumber);
+    sendBridgeRef.current({ type: "fpxOpenTracking", trackingNumber: frame.trackingNumber });
   }, [bridgeReady, frame.trackingNumber, frame.openTrackingTick]);
 
   // If the embed is disabled OR the iframe has never been asked to load,
@@ -263,9 +330,18 @@ export function FreightPopOverlay() {
 
   function applyFilterNow() {
     if (!frame.trackingNumber) return;
-    postFpxFilter(iframeRef.current, "Tracking Number", frame.trackingNumber);
+    sendBridge({ type: "fpxFilter", column: "Tracking Number", value: frame.trackingNumber });
   }
   const isFilteredToCurrent = !!(lastFilter && frame.trackingNumber && lastFilter.column === "Tracking Number" && lastFilter.value === frame.trackingNumber);
+
+  // Hosted mode: type a saved credential straight into the focused field of
+  // the hosted FreightPOP page — no clipboard round-trip needed.
+  function typeOne(kind: "email" | "password") {
+    const v = kind === "email" ? creds.email : creds.password;
+    if (!v || !hostedRef.current?.typeText(v)) return;
+    setTyped(kind);
+    setTimeout(() => setTyped(null), 1500);
+  }
 
   async function copyOne(kind: "email" | "password") {
     const v = kind === "email" ? creds.email : creds.password;
@@ -282,10 +358,33 @@ export function FreightPopOverlay() {
       // Position: fills the viewport area to the LEFT of the 720px drawer
       // when the drawer is open, otherwise off-screen via display:none.
       // We never unmount.
-      className="fixed top-0 left-0 right-0 sm:right-[720px] bottom-0 z-20 bg-slate-100 flex flex-col"
+      className={"fixed top-0 left-0 right-0 bottom-0 bg-slate-100 flex flex-col " + (paneFull ? "z-40" : "sm:right-[720px] z-20")}
       style={{ display: frame.visible ? "flex" : "none" }}
     >
       <div className="flex items-center gap-3 px-3 py-2 bg-white border-b border-slate-200 shadow-sm">
+        {/* Back to the dashboard page underneath (closes the pane; the
+            FreightPOP session stays alive and reopens where it was). */}
+        <button
+          onClick={() => { setPaneFull(false); hideFrame(); }}
+          className="shrink-0 inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+          title="Close FreightPOP and go back to the dashboard"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" /> Back to dashboard
+        </button>
+        {hosted ? (
+          // Browser controls for the hosted tab (there's no address bar).
+          <div className="shrink-0 inline-flex items-center rounded ring-1 ring-slate-200 bg-white">
+            <button onClick={() => hostedRef.current?.nav("back")} className="p-1 text-slate-600 hover:text-slate-900 hover:bg-slate-50 rounded-l" title="FreightPOP: back">
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <button onClick={() => hostedRef.current?.nav("forward")} className="p-1 text-slate-600 hover:text-slate-900 hover:bg-slate-50 border-l border-slate-200" title="FreightPOP: forward">
+              <ArrowRight className="h-4 w-4" />
+            </button>
+            <button onClick={() => hostedRef.current?.nav("reload")} className="p-1 text-slate-600 hover:text-slate-900 hover:bg-slate-50 border-l border-slate-200 rounded-r" title="FreightPOP: reload">
+              <RotateCw className="h-4 w-4" />
+            </button>
+          </div>
+        ) : null}
         <div className="flex items-center gap-2 min-w-0">
           {/* Lead with the FreightPOP shipment id — that's the unique
               identifier in the operator's mental map. Tracking number is
@@ -304,12 +403,16 @@ export function FreightPopOverlay() {
                 ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
                 : "bg-amber-50 text-amber-800 ring-amber-200")
             }
-            title={bridgeReady
-              ? "Chrome extension bridge connected — auto-filter works"
-              : "Chrome extension bridge not detected — install/reload the FPXpress extension and refresh"}
+            title={hosted
+              ? (bridgeReady
+                  ? "Hosted FreightPOP connected — the extension runs server-side, nothing to install"
+                  : "Connecting to the hosted FreightPOP browser…")
+              : bridgeReady
+                ? "Chrome extension bridge connected — auto-filter works"
+                : "Chrome extension bridge not detected — install/reload the FPXpress extension and refresh"}
           >
             <span className={"h-1.5 w-1.5 rounded-full " + (bridgeReady ? "bg-emerald-500" : "bg-amber-500")} />
-            Ext {bridgeReady ? "ok" : "off"}
+            {hosted ? "Hosted" : "Ext"} {bridgeReady ? "ok" : "off"}
           </span>
           {frame.trackingNumber ? (
             <span className="hidden sm:inline-flex items-center gap-1 text-[11px] text-slate-500 shrink-0 min-w-0">
@@ -352,7 +455,9 @@ export function FreightPopOverlay() {
                 ? (isFilteredToCurrent
                     ? `Filtered to ${frame.trackingNumber}`
                     : `Apply Kendo filter: Tracking Number = ${frame.trackingNumber}`)
-                : "Install/enable the FPXpress Chrome extension to filter the embedded grid"}
+                : hosted
+                  ? "Waiting for the hosted FreightPOP page to load"
+                  : "Install/enable the FPXpress Chrome extension to filter the embedded grid"}
             >
               {isFilteredToCurrent ? <Check className="h-3.5 w-3.5" /> : <Filter className="h-3.5 w-3.5" />}
               {isFilteredToCurrent ? "Filtered" : "Filter shipment"}
@@ -370,6 +475,14 @@ export function FreightPopOverlay() {
             aria-pressed={credsOpen}
           >
             Login helper
+          </button>
+          <button
+            onClick={() => setPaneFull((v) => !v)}
+            className="text-xs px-2 py-1 rounded ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1"
+            title={paneFull ? "Exit full screen (Esc)" : "Full screen"}
+          >
+            {paneFull ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+            {paneFull ? "Exit full screen" : "Full screen"}
           </button>
           <a
             href={frame.url}
@@ -413,7 +526,7 @@ export function FreightPopOverlay() {
           <ErrorBlock tone="warning" compact>
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
-                <div className="font-semibold">Filter didn't apply</div>
+                <div className="font-semibold">{hosted ? "Couldn't find this shipment in FreightPOP" : "Filter didn't apply"}</div>
                 {lastAck.error ? <div className="mt-0.5 text-[11px]">{lastAck.error}</div> : null}
                 {lastAck.injectDetail ? (
                   <details className="mt-1">
@@ -464,6 +577,17 @@ export function FreightPopOverlay() {
                   {copied === "email" ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                   Copy
                 </button>
+                {hosted ? (
+                  <button
+                    onClick={() => typeOne("email")}
+                    disabled={!creds.email}
+                    className="px-2 py-1.5 text-[11px] rounded ring-1 ring-violet-200 bg-violet-50 text-violet-800 hover:bg-violet-100 inline-flex items-center gap-1 disabled:opacity-40"
+                    title="Click the email field in FreightPOP first, then press this to type it in"
+                  >
+                    {typed === "email" ? <Check className="h-3.5 w-3.5" /> : null}
+                    Type in
+                  </button>
+                ) : null}
               </div>
             </div>
             <div className="flex flex-col gap-1">
@@ -485,6 +609,17 @@ export function FreightPopOverlay() {
                   {copied === "password" ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                   Copy
                 </button>
+                {hosted ? (
+                  <button
+                    onClick={() => typeOne("password")}
+                    disabled={!creds.password}
+                    className="px-2 py-1.5 text-[11px] rounded ring-1 ring-violet-200 bg-violet-50 text-violet-800 hover:bg-violet-100 inline-flex items-center gap-1 disabled:opacity-40"
+                    title="Click the password field in FreightPOP first, then press this to type it in"
+                  >
+                    {typed === "password" ? <Check className="h-3.5 w-3.5" /> : null}
+                    Type in
+                  </button>
+                ) : null}
               </div>
             </div>
           </div>
@@ -518,15 +653,19 @@ export function FreightPopOverlay() {
         </div>
       ) : null}
 
-      <div className="flex-1 bg-white">
-        <iframe
-          ref={iframeRef}
-          src={frame.url}
-          className="w-full h-full block"
-          title="FreightPOP"
-          allow={EMBED_ALLOW}
-          referrerPolicy="no-referrer-when-downgrade"
-        />
+      <div className="flex-1 bg-white min-h-0">
+        {hosted ? (
+          <HostedFreightPop ref={hostedRef} onBridgeReady={setBridgeReady} paused={!frame.visible} />
+        ) : (
+          <iframe
+            ref={iframeRef}
+            src={frame.url}
+            className="w-full h-full block"
+            title="FreightPOP"
+            allow={EMBED_ALLOW}
+            referrerPolicy="no-referrer-when-downgrade"
+          />
+        )}
       </div>
     </div>
   );

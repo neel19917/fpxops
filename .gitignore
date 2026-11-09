@@ -25,3 +25,7 @@ dashboard/deno.lock
 
 # Extension distributables built by hand (see README)
 FPXpress-*.zip
+
+# browser-service: local Chrome profile (holds the shared FreightPOP session)
+browser-service/.profile/
+browser-service/.profiles/

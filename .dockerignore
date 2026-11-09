@@ -1,0 +1,9 @@
+**/node_modules
+**/.profile
+dashboard
+server
+extension-headless
+native-host
+*.zip
+*.xlsx
+.git

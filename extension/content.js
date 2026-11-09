@@ -3591,7 +3591,10 @@ function fpxFilterViaKendoPopup(colName, value) {
     }, 4000);
   });
 }
-function fpxFilterViaKendoApi(value, fieldCandidates) {
+// opts: { mode: "filter"|"clear", titleRe: "regex for column titles" }
+// Resolves true only when the filter matched at least one row (the injector
+// restores the previous filter on a zero-row miss).
+function fpxFilterViaKendoApi(value, fieldCandidates, opts = {}) {
   return new Promise((resolve) => {
     const requestId = "fpx-filter-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
     let settled = false;
@@ -3615,6 +3618,9 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
     script.setAttribute("data-fpx-request-id", requestId);
     script.setAttribute("data-fpx-value", String(value));
     script.setAttribute("data-fpx-fields", JSON.stringify(fieldCandidates || ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"]));
+    script.setAttribute("data-fpx-mode", opts.mode || "filter");
+    if (opts.op) script.setAttribute("data-fpx-op", opts.op);
+    if (opts.titleRe) script.setAttribute("data-fpx-title-re", opts.titleRe);
     script.onload = () => script.remove();
     script.onerror = () => {
       script.remove();
@@ -3634,7 +3640,9 @@ function fpxFilterViaKendoApi(value, fieldCandidates) {
         dlog("[FPX] Kendo API filter timed out (jQuery not on page?)");
         resolve(false);
       }
-    }, 1500);
+      // Each candidate field can take up to ~16s (server load + restore on a
+      // zero-row miss), so allow a few of them.
+    }, 45000);
   });
 }
 
@@ -3692,18 +3700,136 @@ async function fpxFillTopSearch(value) {
   return true;
 }
 
-window.addEventListener("message", async (event) => {
-  const data = event.data;
-  if (!data || typeof data !== "object") return;
-  if (data.source !== "fpxpress") return;
-  if (!fpxIsTrustedParentOrigin(event.origin)) {
-    console.warn("[FPX] Ignored bridge message from untrusted origin:", event.origin);
-    return;
+// Column titles that mean "tracking number" — and NOT "Tracking Comments".
+const FPX_TRACKING_TITLE_RE = "^\\s*tracking\\s*(number|#|no\\.?)?\\s*$";
+const FPX_SHIPMENT_ID_FIELDS = ["ShipmentId", "ShipmentID", "shipmentId", "Shipment_Id", "shipment_id", "ShipmentNumber", "ShipmentNo", "ShipId", "Id", "ID"];
+// The dashboard grid's "Shipment Id" column uses a field name we can't
+// predict, so also match it by column TITLE.
+const FPX_SHIPMENT_ID_TITLE_RE = "^\\s*shipment\\s*(id|#|no\\.?|number)\\s*$";
+const FPX_TRACKING_FIELDS = ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number", "TrackingNo", "ProNumber"];
+
+// A Kendo grid is on screen and initialised — even if it currently shows "No
+// items to display". (fpxEnsureGridReady waits for ROWS, which made an empty
+// filter result look like "grid not loaded" forever.)
+async function fpxGridExists(timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (document.readyState === "complete" && document.querySelector(".k-grid .k-grid-header, .k-grid .k-pager-wrap, .k-grid .k-pager, .k-grid .k-grid-pager")) return true;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+function fpxVisibleRowCount() {
+  return Array.from(document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr"))
+    .filter((tr) => !tr.classList.contains("k-no-data") && tr.offsetParent !== null && (tr.textContent || "").trim()).length;
+}
+
+// Wait for a visible grid row that is actually the target shipment (its
+// text contains the shipment id or tracking number) — not just "any row".
+async function fpxWaitForTargetRow(needles, timeoutMs = 10000) {
+  const want = needles.map((n) => String(n || "").trim()).filter(Boolean);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const hit = Array.from(document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr"))
+      .some((tr) => tr.offsetParent !== null && want.some((w) => (tr.textContent || "").includes(w)));
+    if (hit) return true;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+// Find one shipment in the dashboard grid. Tries, in order:
+//   1. Kendo filter on the Shipment Id column (always present on the
+//      dashboard, exact numeric match)
+//   2. Kendo filter on a real tracking-number field
+//   3. FreightPOP's own "Tracking Number" search box + SEARCH (searches across
+//      tabs, server-side)
+// A miss never leaves the grid empty: the injector restores the previous
+// filter, and if everything misses we clear our filters.
+async function fpxFindShipment(shipmentId, trackingNumber) {
+  const sid = String(shipmentId || "").trim();
+  const tn = String(trackingNumber || "").trim();
+  if (!sid && !tn) return { ok: false, error: "Nothing to look up" };
+  if (!(await fpxGridExists(8000))) {
+    return { ok: false, reason: "grid-not-ready", error: `FreightPOP grid not loaded (${fpxDescribeFrameState()})` };
+  }
+  const details = [];
+  // Start clean: drop filters left by an earlier lookup, so a miss can't
+  // "restore" the previous shipment and pass for this one.
+  try { await fpxFilterViaKendoApi("", [], { mode: "clear" }); } catch {}
+  if (sid && /^\d+$/.test(sid)) {
+    if (await fpxFilterViaKendoApi(sid, FPX_SHIPMENT_ID_FIELDS, { titleRe: FPX_SHIPMENT_ID_TITLE_RE })) return { ok: true, strategy: "shipment-id", injectDetail: fpxLastInjectDetail };
+    details.push("shipment id: " + fpxLastInjectDetail);
+  }
+  if (tn) {
+    if (await fpxFilterViaKendoApi(tn, FPX_TRACKING_FIELDS, { titleRe: FPX_TRACKING_TITLE_RE })) return { ok: true, strategy: "tracking-field", injectDetail: fpxLastInjectDetail };
+    details.push("tracking field: " + fpxLastInjectDetail);
+    // FreightPOP sometimes stores the number differently (e.g. without the
+    // leading zero: 069931950 vs 69931950). Contains-match the core digits;
+    // the injector only accepts it when exactly one row matches.
+    const core = tn.replace(/^0+/, "") || tn;
+    if (core.length >= 6 && await fpxFilterViaKendoApi(core, FPX_TRACKING_FIELDS, { titleRe: FPX_TRACKING_TITLE_RE, op: "contains" })) {
+      return { ok: true, strategy: "tracking-contains", injectDetail: fpxLastInjectDetail };
+    }
+    details.push("tracking contains: " + fpxLastInjectDetail);
+    try {
+      if (await fpxFillTopSearch(tn)) {
+        // FreightPOP reloads the grid after SEARCH; only a row showing this
+        // shipment counts.
+        if (await fpxWaitForTargetRow([sid, tn], 12000)) return { ok: true, strategy: "freightpop-search", injectDetail: details.join(" || ") };
+        details.push(`FreightPOP search for ${tn}: no row with ${sid || tn}`);
+      }
+    } catch (e) { details.push("FreightPOP search threw: " + (e?.message || e)); }
+  }
+  // Leave the grid usable rather than empty.
+  try { await fpxFilterViaKendoApi("", [], { mode: "clear" }); } catch {}
+  return {
+    ok: false,
+    error: `Couldn't find shipment ${sid || ""}${sid && tn ? " / " : ""}${tn ? "tracking " + tn : ""} in this FreightPOP view. It may be in another tab (Return / Pending) or no longer active.`,
+    injectDetail: details.join(" || "),
+  };
+}
+
+// Click the row's tracking link (or its DETAILS button) to open FreightPOP's
+// own shipment modal. Assumes the grid is already filtered to the shipment.
+async function fpxOpenShipmentModal(shipmentId, trackingNumber) {
+  await new Promise((r) => setTimeout(r, 400));
+  const tn = String(trackingNumber || "").trim();
+  const sid = String(shipmentId || "").trim();
+  const jobs = collectShipmentJobs();
+  let match = tn ? jobs.find((j) => (j.link?.textContent || "").trim() === tn) : null;
+  if (!match && jobs.length === 1) match = jobs[0];
+  if (match?.link) { simulateClick(match.link); return { ok: true }; }
+  // Fall back to the DETAILS button on the row that shows this shipment id.
+  const row = Array.from(document.querySelectorAll(".k-grid tbody tr"))
+    .find((tr) => (sid && (tr.textContent || "").includes(sid)) || (tn && (tr.textContent || "").includes(tn)));
+  const btn = row && Array.from(row.querySelectorAll("a, button")).find((b) => /details|track/i.test(b.textContent || ""));
+  if (btn) { simulateClick(btn); return { ok: true }; }
+  return { ok: false, error: "Found the shipment but couldn't open its details" };
+}
+
+// Bridge command handler, shared by two transports:
+//   1. window.postMessage from the dashboard parent (iframe embed, below).
+//   2. The hosted browser service (browser-service/), which calls this
+//      function directly in the content script's isolated world over CDP
+//      Runtime.evaluate — there is no parent frame in that setup.
+// Returns the ack payload (without the `source` tag) or null when there is
+// nothing to answer.
+async function fpxBridgeHandle(data) {
+  if (!data || typeof data !== "object") return null;
+  if (data.type === "fpxFindShipment") {
+    // { shipmentId, trackingNumber, open }
+    sendStatus(`Bridge: finding shipment ${data.shipmentId || data.trackingNumber}`);
+    const found = await fpxFindShipment(data.shipmentId, data.trackingNumber);
+    if (!found.ok || !data.open) return { type: "fpxFindAck", ...found, opened: false };
+    const opened = await fpxOpenShipmentModal(data.shipmentId, data.trackingNumber);
+    return { type: "fpxFindAck", ...found, opened: opened.ok, ok: opened.ok, error: opened.ok ? null : opened.error };
   }
   if (data.type === "fpxFilter") {
     const col = String(data.column || "").trim();
     const val = String(data.value || "").trim();
-    if (!col || !val) return;
+    if (!col || !val) return null;
     // The dashboard fires this as soon as any FreightPOP frame says hello —
     // which includes FP's login page (third-party cookies) and the first
     // seconds before Kendo has rendered. Running the strategy chain there
@@ -3713,19 +3839,15 @@ window.addEventListener("message", async (event) => {
     if (!(await fpxEnsureGridReady(6000))) {
       const reason = fpxDescribeFrameState();
       dlog(`[FPX] Bridge filter deferred — ${reason}`);
-      try {
-        event.source && event.source.postMessage({
-          source: "fpx-extension",
-          type: "fpxFilterAck",
-          column: col,
-          value: val,
-          ok: false,
-          reason: "grid-not-ready",
-          error: `FreightPOP grid not loaded in this frame (${reason}). The filter will re-apply once the grid appears.`,
-          injectDetail: "",
-        }, event.origin);
-      } catch {}
-      return;
+      return {
+        type: "fpxFilterAck",
+        column: col,
+        value: val,
+        ok: false,
+        reason: "grid-not-ready",
+        error: `FreightPOP grid not loaded in this frame (${reason}). The filter will re-apply once the grid appears.`,
+        injectDetail: "",
+      };
     }
     sendStatus(`Bridge: filtering ${col} → "${val}"`);
     let applied = false;
@@ -3736,7 +3858,7 @@ window.addEventListener("message", async (event) => {
     // see window.jQuery + Kendo widgets (content scripts are sandboxed
     // away from those by Chrome's isolated-world rules).
     try {
-      if (await fpxFilterViaKendoApi(val, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"])) {
+      if (await fpxFilterViaKendoApi(val, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"], { titleRe: FPX_TRACKING_TITLE_RE })) {
         applied = true; strategy = "kendo-api";
       }
     } catch (e) { lastErr = e; }
@@ -3780,20 +3902,17 @@ window.addEventListener("message", async (event) => {
     }
     if (applied) {
       dlog(`[FPX] Bridge filter ok via ${strategy}: ${col}="${val}"`);
-      try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxFilterAck", column: col, value: val, ok: true, strategy, injectDetail: fpxLastInjectDetail }, event.origin); } catch {}
+      return { type: "fpxFilterAck", column: col, value: val, ok: true, strategy, injectDetail: fpxLastInjectDetail };
     } else {
       console.warn("[FPX] Bridge filter failed (all strategies):", lastErr, "inject:", fpxLastInjectDetail);
-      try {
-        event.source && event.source.postMessage({
-          source: "fpx-extension",
-          type: "fpxFilterAck",
-          column: col,
-          value: val,
-          ok: false,
-          error: String(lastErr?.message || lastErr || "no matching input"),
-          injectDetail: fpxLastInjectDetail,
-        }, event.origin);
-      } catch {}
+      return {
+        type: "fpxFilterAck",
+        column: col,
+        value: val,
+        ok: false,
+        error: String(lastErr?.message || lastErr || "no matching input"),
+        injectDetail: fpxLastInjectDetail,
+      };
     }
   } else if (data.type === "fpxOpenTracking") {
     // Open FreightPOP's native tracking modal for a specific tracking
@@ -3802,24 +3921,19 @@ window.addEventListener("message", async (event) => {
     // wait briefly for the grid to re-render, then simulate a click on
     // the row's tracking link (the same UI path a rep takes manually).
     const tn = String(data.trackingNumber || "").trim();
-    if (!tn) return;
+    if (!tn) return null;
     let openOk = false;
     let openErr = null;
     if (!(await fpxEnsureGridReady(6000))) {
       openErr = `FreightPOP grid not loaded in this frame (${fpxDescribeFrameState()})`;
       dlog(`[FPX] Bridge open-tracking skipped — ${openErr}`);
-      try {
-        event.source && event.source.postMessage({
-          source: "fpx-extension", type: "fpxOpenTrackingAck", trackingNumber: tn, ok: false, reason: "grid-not-ready", error: openErr,
-        }, event.origin);
-      } catch {}
-      return;
+      return { type: "fpxOpenTrackingAck", trackingNumber: tn, ok: false, reason: "grid-not-ready", error: openErr };
     }
     sendStatus(`Bridge: opening modal for ${tn}`);
     try {
       // Filter first so the matching row is on-screen; ignore failure
       // here because the row may already be visible from a prior filter.
-      try { await fpxFilterViaKendoApi(tn, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"]); } catch {}
+      try { await fpxFilterViaKendoApi(tn, ["TrackingNumber", "trackingNumber", "Tracking_Number", "tracking_number"], { titleRe: FPX_TRACKING_TITLE_RE }); } catch {}
       // Give the grid a beat to re-render the filtered rowset before
       // hunting for the link. 400ms covers slow Kendo redraws on rep
       // laptops without making the click feel laggy.
@@ -3838,20 +3952,27 @@ window.addEventListener("message", async (event) => {
     } catch (e) {
       openErr = String(e?.message || e || "Unknown error");
     }
-    try {
-      event.source && event.source.postMessage({
-        source: "fpx-extension",
-        type: "fpxOpenTrackingAck",
-        trackingNumber: tn,
-        ok: openOk,
-        error: openErr,
-      }, event.origin);
-    } catch {}
+    return { type: "fpxOpenTrackingAck", trackingNumber: tn, ok: openOk, error: openErr };
   } else if (data.type === "fpxPing") {
     // Lets the dashboard detect whether the extension is installed +
     // running inside this iframe. No filter side effects.
-    try { event.source && event.source.postMessage({ source: "fpx-extension", type: "fpxPong" }, event.origin); } catch {}
+    return { type: "fpxPong" };
   }
+  return null;
+}
+
+// Transport 1: postMessage from the dashboard parent frame.
+window.addEventListener("message", async (event) => {
+  const data = event.data;
+  if (!data || typeof data !== "object") return;
+  if (data.source !== "fpxpress") return;
+  if (!fpxIsTrustedParentOrigin(event.origin)) {
+    console.warn("[FPX] Ignored bridge message from untrusted origin:", event.origin);
+    return;
+  }
+  const ack = await fpxBridgeHandle(data);
+  if (!ack) return;
+  try { event.source && event.source.postMessage({ source: "fpx-extension", ...ack }, event.origin); } catch {}
 });
 
 // Announce presence to the parent on every load so the dashboard's overlay
