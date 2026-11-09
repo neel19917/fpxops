@@ -1185,6 +1185,15 @@ async function run(filterCol, filterVal) {
     sendStatus("No filter set — proceeding with current grid view.");
   }
 
+  // Fewer, bigger pages. Changing the page size returns the grid to page 1,
+  // so do it BEFORE reading the starting page below (the delivered-archive
+  // guard depends on that read).
+  if (Number(fpxScrapePageSize) > 10) {
+    sendStatus(`Setting the grid to ${fpxScrapePageSize} rows per page...`);
+    try { await setGridPageSize(Number(fpxScrapePageSize), sendStatus); } catch (e) { console.warn("[FPX] page size change failed:", e?.message || e); }
+    await humanDelay(600, 900);
+  }
+
   let pageNum = 1;
   // A sweep that starts anywhere but the grid's first page cannot see every
   // shipment, so its "not seen" set must never drive the delivered-archive
@@ -2401,7 +2410,15 @@ function invClearSession() {
   try { sessionStorage.removeItem(INV_SESSION_KEY); } catch {}
 }
 
-async function invoiceSetPageSize(target) {
+// Rows per grid page for Refresh All. Bigger pages = fewer page turns (each
+// turn costs a grid reload + settle wait). The hosted browser service sets
+// this from its admin setting before calling run(); 10 or less leaves the
+// grid as it is.
+let fpxScrapePageSize = 50;
+
+function invoiceSetPageSize(target) { return setGridPageSize(target, sendInvStatus); }
+
+async function setGridPageSize(target, report = sendInvStatus) {
   // Strategy 1: Kendo API
   try {
     const script = document.createElement("script");
@@ -2429,7 +2446,7 @@ async function invoiceSetPageSize(target) {
       setTimeout(() => { window.removeEventListener("message", onMsg); resolve(false); }, 3000);
     });
     if (ok) {
-      sendInvStatus(`Page size set to ${target} via Kendo API.`);
+      report(`Page size set to ${target} via Kendo API.`);
       await waitForGridReady(10000);
       return;
     }
@@ -2457,7 +2474,7 @@ async function invoiceSetPageSize(target) {
     if (bestOpt) {
       sel.value = bestOpt.value;
       sel.dispatchEvent(new Event("change", { bubbles: true }));
-      sendInvStatus(`Set page size to ${bestVal} from dropdown.`);
+      report(`Set page size to ${bestVal} from dropdown.`);
       await waitForGridReady(10000);
       return;
     }
@@ -2483,13 +2500,13 @@ async function invoiceSetPageSize(target) {
     }
     if (bestLi) {
       bestLi.click();
-      sendInvStatus(`Set page size to ${bestN} from Kendo dropdown.`);
+      report(`Set page size to ${bestN} from Kendo dropdown.`);
       await waitForGridReady(10000);
       return;
     }
   }
 
-  sendInvStatus("Could not change page size — will use default page size.");
+  report("Could not change page size — will use default page size.");
 }
 
 function makeErrorResult(ship, errorMsg) {

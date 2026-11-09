@@ -46,6 +46,11 @@ export const SETTINGS = {
     default: Math.round(config.idleCloseMs / 60_000),
     help: "A person's browser shuts down after this long with no views open. Their login is kept.",
   },
+  "browser.scrape_page_size": {
+    label: "Rows per grid page when scraping", unit: "rows", min: 10, max: 100, step: 10,
+    default: 50,
+    help: "FreightPOP grid page size during Refresh All. Bigger = fewer page turns, so a faster run. 10 = leave FreightPOP's default.",
+  },
   "browser.scrape_poll_seconds": {
     label: "Check for queued scrapes every", unit: "s", min: 10, max: 300, step: 5,
     default: Math.round(config.scrapePollMs / 1000),

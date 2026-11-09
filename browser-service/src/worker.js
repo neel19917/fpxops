@@ -2,6 +2,7 @@ import { acquireUserBrowser, hasProfile, getServiceWorker, openWindowPage, Exten
 import { config } from "./config.js";
 import { recordScrape } from "./usage.js";
 import { recordRun } from "./runs.js";
+import { get as setting } from "./settings.js";
 
 // Consumer for the fpx_scrape_requests queue (server/routes/ops.js). Until now
 // nothing fulfilled these — the dashboard's "Rescrape" button relied on some
@@ -306,6 +307,8 @@ async function runIn(browser, url) {
     const counts = await readDashboardCounts(page);
     if (current && counts) { current.fpCounts = counts; current.fpCountsAt = new Date().toISOString(); }
     logLine(total != null ? `Grid loaded — ${total} shipment(s) in the grid. Starting Refresh All` : "Grid loaded — starting Refresh All");
+    const pageSize = Number(setting("browser.scrape_page_size")) || 50;
+    await ext.evaluate(`fpxScrapePageSize = ${pageSize}; 'ok'`).catch(() => {});
     await ext.evaluate("run(); 'started'", { awaitPromise: false });
 
     const deadline = Date.now() + config.scrapeTimeoutMs;

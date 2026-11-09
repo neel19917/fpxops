@@ -25,7 +25,7 @@ const GROUPS: { title: string; hint: string; keys: string[] }[] = [
   {
     title: "Scraping",
     hint: "",
-    keys: ["browser.scrape_poll_seconds"],
+    keys: ["browser.scrape_page_size", "browser.scrape_poll_seconds"],
   },
 ];
 
