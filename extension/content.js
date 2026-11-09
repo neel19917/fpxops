@@ -3638,6 +3638,7 @@ function fpxFilterViaKendoApi(value, fieldCandidates, opts = {}) {
     script.setAttribute("data-fpx-mode", opts.mode || "filter");
     if (opts.op) script.setAttribute("data-fpx-op", opts.op);
     if (opts.titleRe) script.setAttribute("data-fpx-title-re", opts.titleRe);
+    if (opts.keepEmpty) script.setAttribute("data-fpx-keep-empty", "1");
     script.onload = () => script.remove();
     script.onerror = () => {
       script.remove();
@@ -3799,11 +3800,24 @@ async function fpxFindShipment(shipmentId, trackingNumber) {
       }
     } catch (e) { details.push("FreightPOP search threw: " + (e?.message || e)); }
   }
-  // Leave the grid usable rather than empty.
+  // Not found. Like the extension's own filter: leave the grid filtered to
+  // this Shipment Id (or tracking #) so it visibly shows 0 items — the user
+  // can see it isn't on this dashboard — instead of an unfiltered grid that
+  // looks like the lookup never ran. FreightPOP's "Reset Grid Settings" or
+  // the column filter clears it.
   try { await fpxFilterViaKendoApi("", [], { mode: "clear" }); } catch {}
+  let shown = false;
+  try {
+    shown = sid && /^\d+$/.test(sid)
+      ? await fpxFilterViaKendoApi(sid, FPX_SHIPMENT_ID_FIELDS, { titleRe: FPX_SHIPMENT_ID_TITLE_RE, keepEmpty: true })
+      : tn ? await fpxFilterViaKendoApi(tn, FPX_TRACKING_FIELDS, { titleRe: FPX_TRACKING_TITLE_RE, keepEmpty: true }) : false;
+    if (shown) details.push("shown empty: " + fpxLastInjectDetail);
+  } catch {}
   return {
     ok: false,
-    error: `Couldn't find shipment ${sid || ""}${sid && tn ? " / " : ""}${tn ? "tracking " + tn : ""} in this FreightPOP view. It may be in another tab (Return / Pending) or no longer active.`,
+    reason: "not-on-dashboard",
+    shownEmpty: !!shown,
+    error: `Shipment ${sid || tn} isn't on this FreightPOP dashboard${shown ? " — the grid is filtered to it and shows 0 items" : ""}. It may be delivered, cancelled, or under Return / Pending Shipments.`,
     injectDetail: details.join(" || "),
   };
 }
