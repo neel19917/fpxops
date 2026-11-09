@@ -165,7 +165,7 @@ export function FreightPopOverlay() {
   // back, success or failure. We surface failures in a small expandable
   // panel under the header so debugging doesn't require DevTools frame
   // switching.
-  const [lastAck, setLastAck] = useState<{ ok: boolean; strategy?: string; error?: string; injectDetail?: string } | null>(null);
+  const [lastAck, setLastAck] = useState<{ ok: boolean; strategy?: string; error?: string; injectDetail?: string; reason?: string } | null>(null);
   // Third-party-cookie status, reported by the extension's content script from
   // INSIDE the iframe (the only place it can be measured). null = we haven't
   // heard, which is different from "blocked" and must not render as a warning.
@@ -196,6 +196,7 @@ export function FreightPopOverlay() {
       strategy: typeof d.strategy === "string" ? d.strategy : undefined,
       error: typeof d.error === "string" ? d.error : undefined,
       injectDetail: typeof d.injectDetail === "string" ? d.injectDetail : undefined,
+      reason: typeof d.reason === "string" ? d.reason : undefined,
     });
     // New ack — re-show the warning so a fresh failure isn't
     // hidden by an earlier dismissal.
@@ -526,7 +527,10 @@ export function FreightPopOverlay() {
           <ErrorBlock tone="warning" compact>
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
-                <div className="font-semibold">{hosted ? "Couldn't find this shipment in FreightPOP" : "Filter didn't apply"}</div>
+                <div className="font-semibold">{!hosted ? "Filter didn't apply"
+                  : lastAck.reason === "not-on-dashboard" ? "Not on your FreightPOP dashboard"
+                  : lastAck.reason === "signed-out" ? "Sign in to FreightPOP"
+                  : "Couldn't find this shipment in FreightPOP"}</div>
                 {lastAck.error ? <div className="mt-0.5 text-[11px]">{lastAck.error}</div> : null}
                 {lastAck.injectDetail ? (
                   <details className="mt-1">

@@ -8,6 +8,11 @@
 //   data-fpx-fields      JSON array of candidate field names, in priority order
 //   data-fpx-title-re    optional regex (string) to match column TITLES as a
 //                        last resort, e.g. "^tracking( number| #| no)?$"
+//   data-fpx-keep-empty  "1": apply the filter on ONE field (the column whose
+//                        title matches, else the first known field) and keep
+//                        it even with zero rows. Used after a lookup misses,
+//                        so the user sees "Shipment Id = X → 0 items" and
+//                        knows it isn't on this dashboard.
 //
 // Rules (learned the hard way):
 //   * Only filter on fields the grid actually has — its columns, its data
@@ -27,6 +32,7 @@
   // FreightPOP stores with different formatting (leading zeros, prefixes);
   // with it, a match only counts when it narrows the grid to ONE row.
   var op = attr("data-fpx-op") === "contains" ? "contains" : "eq";
+  var keepEmpty = attr("data-fpx-keep-empty") === "1";
   var titleRe = null;
   try { titleRe = attr("data-fpx-title-re") ? new RegExp(attr("data-fpx-title-re"), "i") : null; } catch (_e) { titleRe = null; }
   var fields;
@@ -132,6 +138,19 @@
         });
       }
       note("grid " + gi + " candidates: " + (tries.join(", ") || "(none present)"));
+      if (keepEmpty && tries.length) {
+        // Prefer the column whose title names it ("Shipment Id"), not an
+        // internal field that happens to share a name (e.g. "Id").
+        var titled = (g.columns || []).filter(function (c) { return c.field && titleRe && titleRe.test(String(c.title || "")); }).map(function (c) { return c.field; });
+        var field = titled[0] || tries[0];
+        var ds = g.dataSource;
+        var v = typedValue(g, field);
+        await afterLoad(ds, function () { ds.filter({ field: field, operator: "eq", value: v }); }, 8000);
+        var total = typeof ds.total === "function" ? ds.total() : ds.view().length;
+        note("grid " + gi + ": showing '" + field + "' eq " + JSON.stringify(v) + " → " + total + " row(s) (kept)");
+        reply(true, { strategy: "kendo-api-kept", fieldUsed: field, rows: total });
+        return;
+      }
       if (!tries.length) note("grid " + gi + " columns: " + (g.columns || []).filter(function (c) { return c.field; }).map(function (c) { return (c.title || "?") + "=" + c.field; }).join(", "));
       for (var j = 0; j < tries.length; j++) {
         var rows = await tryField(g, gi, tries[j]);
