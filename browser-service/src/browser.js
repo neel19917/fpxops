@@ -31,9 +31,9 @@ const stateFile = (email) => path.join(profileDirFor(email), "fpx-state.json");
 
 // Remember where the user's FreightPOP tab last was, so we can say "logged in"
 // vs "needs login" even while their browser is closed.
-export function noteUrl(email, url) {
+export function noteUrl(email, url, signedIn = true) {
   if (!/^https:\/\/([a-z0-9-]+\.)*freightpop\.com/i.test(url || "")) return;
-  const loggedIn = !/#\/login|\/login\b|\/Account\/Login/i.test(url);
+  const loggedIn = signedIn && !/#\/login|\/login\b|\/Account\/Login/i.test(url);
   try { fs.writeFileSync(stateFile(email), JSON.stringify({ loggedIn, url, at: new Date().toISOString() })); } catch {}
 }
 

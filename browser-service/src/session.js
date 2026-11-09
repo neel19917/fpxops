@@ -143,7 +143,7 @@ export class ViewerSession {
       this.onNav = (f) => {
         if (f === this.page.mainFrame()) {
           this.send({ type: "url", url: f.url() });
-          noteUrl(this.who.email, f.url());
+          this.checkSignedIn(f.url()).catch(() => {});
         }
       };
       // Popups (FreightPOP opens some docs in new windows) — pull them into
@@ -177,7 +177,10 @@ export class ViewerSession {
     if (this.watchOnly || this.resumed) { this.send({ type: "url", url: this.page.url() }); return; }
     // Open on the user's dashboard so the shipment grid is there for
     // Filter / Open tracking (the bare site root lands elsewhere).
-    const start = config.startUrl !== "https://app.freightpop.com/" ? config.startUrl : dashboardUrlFor(this.who.email);
+    // Signed out → FreightPOP's sign-in page. (The Broker dashboard draws its
+    // menu bar when signed out, then crashes with a blank body.)
+    const start = config.startUrl !== "https://app.freightpop.com/" ? config.startUrl
+      : (await this.signedIn()) ? dashboardUrlFor(this.who.email) : SIGN_IN_URL;
     await this.page.goto(start, { waitUntil: "domcontentloaded", timeout: 60_000 })
       .catch((e) => this.send({ type: "error", error: `Navigation failed: ${e.message}` }));
   }
@@ -305,6 +308,39 @@ export class ViewerSession {
     }
   }
 
+  // Signed OUT of FreightPOP = no app.freightpop.com cookies AND nothing in
+  // its localStorage. (A working, signed-in profile on Railway had no app
+  // cookies — FreightPOP keeps its login in storage — so cookies alone would
+  // wrongly flag it. A reset profile has neither; the Broker page then draws
+  // only its menu and the Angular app throws on a null user.) Errs toward
+  // "signed in": anything unknown never blocks a lookup.
+  async signedIn() {
+    try {
+      const { cookies } = await this.cdp.send("Network.getCookies", { urls: FP_COOKIE_URLS });
+      if (cookies.length) return true;
+      const { entries } = await this.cdp.send("DOMStorage.getDOMStorageItems", { storageId: { storageKey: "https://app.freightpop.com/", isLocalStorage: true } });
+      return entries.length > 0;
+    } catch { return true; }
+  }
+
+  // After each main-frame navigation: remember the URL + signed-in state,
+  // tell the dashboard, and send a signed-out user from an app page (which
+  // would just render blank) to the sign-in page.
+  async checkSignedIn(url) {
+    if (!/freightpop\.com/i.test(url || "")) return;
+    const ok = await this.signedIn();
+    noteUrl(this.who.email, url, ok);
+    if (ok !== this.signedInLast) {
+      this.signedInLast = ok;
+      this.send({ type: "signedIn", value: ok });
+    }
+    if (!ok && /\/Broker\/|\.html/i.test(url) && Date.now() - (this.lastSignInRedirect || 0) > 15_000) {
+      this.lastSignInRedirect = Date.now();
+      console.log(`[ws] ${this.who.email} signed out of FreightPOP on ${url} → sign-in page`);
+      this.page.goto(SIGN_IN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+    }
+  }
+
   // Mouse/keyboard into the page. Chrome answers "Internal error" while the
   // page has no live renderer (stuck on "Loading…", mid-crash). Mouse moves
   // fire constantly, so don't toast every failure: after a few in a row,
@@ -335,6 +371,10 @@ export class ViewerSession {
   async bridgeWithRetry(payload) {
     if (!["fpxFindShipment", "fpxFilter", "fpxOpenTracking", "fpxPing"].includes(payload.type)) {
       return { ok: false, error: `Unsupported bridge command ${payload.type}` };
+    }
+    if (payload.type !== "fpxPing" && !this.watchOnly && !(await this.signedIn())) {
+      this.checkSignedIn(this.page?.url() || "").catch(() => {});
+      return { ok: false, reason: "signed-out", error: "You're not signed in to FreightPOP here — sign in in the FreightPOP pane (or More → FreightPOP login), then try again." };
     }
     const deadline = Date.now() + 60_000;
     let ack;
@@ -382,5 +422,8 @@ export class ViewerSession {
     this.lease = null;
   }
 }
+
+const SIGN_IN_URL = "https://app.freightpop.com/";
+const FP_COOKIE_URLS = ["https://app.freightpop.com/", "https://app.freightpop.com/Broker/Broker.html", "https://app.freightpop.com/app/"];
 
 function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, Number.isFinite(n) ? n : lo)); }

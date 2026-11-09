@@ -49,12 +49,14 @@ const BUTTONS = ["left", "middle", "right"] as const;
 export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   onBridgeReady?: (ready: boolean) => void;
   onUrl?: (url: string) => void;
+  /** Server's check: does this browser hold a FreightPOP login? */
+  onSignedIn?: (signedIn: boolean) => void;
   /** "scrape": read-only view of the user's running scrape window. */
   target?: "tab" | "scrape";
   onEnded?: (reason: string) => void;
   /** True while the pane is hidden: the service stops encoding frames. */
   paused?: boolean;
-}>(function HostedFreightPop({ onBridgeReady, onUrl, target = "tab", onEnded, paused = false }, ref) {
+}>(function HostedFreightPop({ onBridgeReady, onUrl, onSignedIn, target = "tab", onEnded, paused = false }, ref) {
   const watchOnly = target === "scrape";
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -75,8 +77,8 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   const pausedRef = useRef(paused);
   const syncPause = useRef<() => void>(() => {});
   const lastPauseSent = useRef<boolean | null>(null); // per connection
-  const cbRef = useRef({ onBridgeReady, onUrl, onEnded });
-  cbRef.current = { onBridgeReady, onUrl, onEnded };
+  const cbRef = useRef({ onBridgeReady, onUrl, onSignedIn, onEnded });
+  cbRef.current = { onBridgeReady, onUrl, onSignedIn, onEnded };
 
   function send(obj: unknown) {
     const ws = wsRef.current;
@@ -173,6 +175,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         }
         else if (m.type === "bridgeReady") cbRef.current.onBridgeReady?.(!!m.ready);
         else if (m.type === "url" && m.url) cbRef.current.onUrl?.(m.url);
+        else if (m.type === "signedIn") cbRef.current.onSignedIn?.(!!m.value);
         else if (m.type === "bridgeAck" && typeof m.id === "number") {
           const r = pendingRef.current.get(m.id);
           if (r) { pendingRef.current.delete(m.id); r(m.ack || { ok: false }); }
