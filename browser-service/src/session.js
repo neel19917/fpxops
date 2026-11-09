@@ -252,7 +252,7 @@ export class ViewerSession {
         return;
       }
       case "mouse":
-        return this.cdp.send("Input.dispatchMouseEvent", {
+        return this.input("Input.dispatchMouseEvent", {
           type: msg.event,
           x: Number(msg.x) || 0,
           y: Number(msg.y) || 0,
@@ -265,7 +265,7 @@ export class ViewerSession {
         });
       case "key": {
         const printable = typeof msg.text === "string" && msg.text.length > 0;
-        return this.cdp.send("Input.dispatchKeyEvent", {
+        return this.input("Input.dispatchKeyEvent", {
           type: msg.event === "keyUp" ? "keyUp" : (printable ? "keyDown" : "rawKeyDown"),
           key: msg.key,
           code: msg.code,
@@ -302,6 +302,31 @@ export class ViewerSession {
       }
       default:
         return;
+    }
+  }
+
+  // Mouse/keyboard into the page. Chrome answers "Internal error" while the
+  // page has no live renderer (stuck on "Loading…", mid-crash). Mouse moves
+  // fire constantly, so don't toast every failure: after a few in a row,
+  // reload the page once (per 30s) and tell the user.
+  async input(method, params) {
+    try {
+      const r = await this.cdp.send(method, params);
+      this.inputErrors = 0;
+      return r;
+    } catch (e) {
+      if (!/Internal error/i.test(e.message)) throw e;
+      this.inputErrors = (this.inputErrors || 0) + 1;
+      const now = Date.now();
+      if (this.inputErrors >= 5 && !this.watchOnly && this.page && now - (this.lastAutoReload || 0) > 30_000) {
+        this.lastAutoReload = now;
+        this.inputErrors = 0;
+        console.warn(`[ws] ${this.who.email}: page not taking input (${this.page.url()}) → reloading`);
+        this.send({ type: "error", error: "FreightPOP stopped responding — reloading the page…" });
+        const url = this.page.url();
+        const to = /freightpop\.com\/app\//i.test(url) || !/freightpop\.com/i.test(url) ? dashboardUrlFor(this.who.email) : null;
+        (to ? this.page.goto(to, { waitUntil: "domcontentloaded", timeout: 60_000 }) : this.page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 })).catch(() => {});
+      }
     }
   }
 

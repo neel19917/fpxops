@@ -9,7 +9,6 @@ import { fmtRelative } from "../lib/format";
 // shipment first. Each person has their own browser and login.
 
 const DASHBOARD_URL = "https://app.freightpop.com/Broker/Broker.html#!/Dashboard";
-const SIGN_IN_URL = "https://app.freightpop.com/";
 
 export function FreightPopLoginPage() {
   const viewer = useRef<HostedFreightPopHandle | null>(null);
@@ -85,9 +84,10 @@ export function FreightPopLoginPage() {
 
       {!signedIn ? (
         <ol className="rounded-xl bg-violet-50 ring-1 ring-violet-200 p-3 text-sm text-violet-900 list-decimal list-inside space-y-0.5">
-          <li>Click into the FreightPOP email field below and type (or paste with Ctrl/⌘+V) your FreightPOP email and password.</li>
+          <li>No sign-in form below? Click <b>Go to FreightPOP dashboard</b> — if you're signed out, FreightPOP shows its sign-in form.</li>
+          <li>Click into the FreightPOP email field and type (or paste with Ctrl/⌘+V) your FreightPOP email and password.</li>
           <li>Sign in. You should land on the FreightPOP dashboard with the shipment grid.</li>
-          <li>Seeing a blank or “404” page? Click <b>Dashboard</b> above the view. Still stuck? <b>Reset my login</b> and sign in again.</li>
+          <li>Blank, “Loading…” or “404” page? Click <b>Go to FreightPOP dashboard</b>. Still stuck? <b>Reset my login</b> and sign in again.</li>
         </ol>
       ) : null}
 
@@ -98,11 +98,7 @@ export function FreightPopLoginPage() {
           <NavBtn title="Reload" onClick={() => viewer.current?.nav("reload")}><RotateCw className="h-4 w-4" /></NavBtn>
           <button onClick={() => viewer.current?.navigate(DASHBOARD_URL)}
             className="ml-1 inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md ring-1 ring-slate-200 bg-white hover:bg-slate-100">
-            <Home className="h-3.5 w-3.5" /> Dashboard
-          </button>
-          <button onClick={() => viewer.current?.navigate(SIGN_IN_URL)}
-            className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md ring-1 ring-slate-200 bg-white hover:bg-slate-100">
-            <LogIn className="h-3.5 w-3.5" /> Sign-in page
+            <Home className="h-3.5 w-3.5" /> Go to FreightPOP dashboard
           </button>
           <div className="ml-2 flex-1 min-w-0 truncate text-xs text-slate-500 font-mono" title={url}>{url || "…"}</div>
           <a href={DASHBOARD_URL} target="_blank" rel="noreferrer"
