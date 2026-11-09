@@ -36,6 +36,7 @@ const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ d
 const InstallPage     = lazy(() => import("./pages/Install").then((m) => ({ default: m.InstallPage })));
 const HostedBrowserSettingsPage = lazy(() => import("./pages/HostedBrowserSettings").then((m) => ({ default: m.HostedBrowserSettingsPage })));
 const ScrapeLogsPage  = lazy(() => import("./pages/ScrapeLogs").then((m) => ({ default: m.ScrapeLogsPage })));
+const FreightPopLoginPage = lazy(() => import("./pages/FreightPopLogin").then((m) => ({ default: m.FreightPopLoginPage })));
 const ScrapingPage    = lazy(() => import("./pages/Scraping").then((m) => ({ default: m.ScrapingPage })));
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
 
@@ -45,6 +46,7 @@ const TAB_PATH: Record<TabId, string> = {
   tasks: "/tasks",
   ops: "/ops",
   scraping: "/scraping",
+  freightpop: "/freightpop",
   notes: "/notes",
   analyses: "/analyses",
   gp: "/audits/gp",
@@ -80,6 +82,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
   if (pathname.startsWith("/scraping")) return "scraping";
+  if (pathname.startsWith("/freightpop")) return "freightpop";
   if (pathname.startsWith("/notes")) return "notes";
   if (pathname.startsWith("/analyses")) return "analyses";
   if (pathname.startsWith("/shares")) return "shares";
@@ -252,6 +255,7 @@ function AuthedApp() {
             <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
             <Route path="/ops" element={<OpsPage />} />
             <Route path="/scraping" element={<ScrapingPage />} />
+            <Route path="/freightpop" element={<FreightPopLoginPage />} />
             <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />

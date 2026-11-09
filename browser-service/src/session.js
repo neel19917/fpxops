@@ -49,6 +49,12 @@ function dropParked(email, entry) {
   entry.lease.release();
 }
 
+// Close every parked window of this user (login reset).
+export function dropAllParked(email) {
+  for (const entry of [...(parked.get(email) || [])]) dropParked(email, entry);
+  parked.delete(email);
+}
+
 // Newest parked window that's still alive, or null.
 function takeParked(email) {
   const list = parked.get(email) || [];

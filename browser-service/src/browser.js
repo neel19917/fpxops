@@ -278,6 +278,24 @@ async function closeEntry(entry) {
   console.log(`[browser] closed idle Chromium for ${entry.email}`);
 }
 
+// Sign the user out of the hosted browser completely: close their Chromium
+// WITHOUT saving cookies, then delete their whole profile (cookies, FreightPOP
+// session, saved page). Their next view starts fresh on the FreightPOP login.
+// Refused while their browser is running a scrape.
+export async function resetUserProfile(email) {
+  const key = profileKey(email);
+  const entry = pool.get(key);
+  if (entry?.busy) throw Object.assign(new Error("A scrape is running in this browser — stop it first"), { status: 409 });
+  if (entry) {
+    pool.delete(key);
+    clearInterval(entry.saveTimer);
+    try { await entry.promise; } catch {}
+    try { await entry.browser?.close(); } catch {}
+  }
+  await fs.promises.rm(profileDirFor(email), { recursive: true, force: true });
+  console.log(`[browser] reset hosted login for ${email}`);
+}
+
 // Idle reaper.
 setInterval(() => {
   const cutoff = Date.now() - config.idleCloseMs;
