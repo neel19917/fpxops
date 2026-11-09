@@ -307,10 +307,22 @@ export class ViewerSession {
     }
     const deadline = Date.now() + 60_000;
     let ack;
+    let movedToDashboard = false;
     while (!this.closed) {
       ack = await this.ext.bridge(payload);
       const waiting = ack.reason === "grid-not-ready" || ack.reason === "no-extension";
       if (!waiting || Date.now() > deadline) break;
+      // The window is on a page with no shipment grid (an error page, a
+      // shipment detail, settings…) — waiting won't help. Go to the user's
+      // dashboard once, then keep retrying while the grid renders. Not on
+      // the login page: the user has to sign in first.
+      if (!movedToDashboard && !this.watchOnly && this.page && /no shipment grid on this view/i.test(ack.error || "")) {
+        movedToDashboard = true;
+        const url = dashboardUrlFor(this.who.email);
+        console.log(`[bridge] ${this.who.email} not on a grid page (${this.page.url()}) → opening ${url}`);
+        await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+        continue;
+      }
       await new Promise((r) => setTimeout(r, 2000));
     }
     return ack;

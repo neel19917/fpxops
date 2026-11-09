@@ -37,14 +37,18 @@ export function noteUrl(email, url) {
   try { fs.writeFileSync(stateFile(email), JSON.stringify({ loggedIn, url, at: new Date().toISOString() })); } catch {}
 }
 
-// The account's dashboard (where the shipment grid lives). The URL differs by
-// account type (e.g. /Broker/Broker.html#!/Dashboard), so prefer the last
-// dashboard page this user was on; /dashboard redirects to the right one.
+// The account's dashboard (where the shipment grid lives):
+// /Broker/Broker.html#!/Dashboard. Prefer the last real dashboard page this
+// user was on (an app page — "…html#!/Dashboard"). NOT the bare /dashboard
+// path: FreightPOP answers that with an IIS 404, and saving it once used to
+// send every later view (and every lookup) to the 404 page.
+export const DEFAULT_DASHBOARD_URL = "https://app.freightpop.com/Broker/Broker.html#!/Dashboard";
+const APP_DASHBOARD_RE = /\.html#!?\/dashboard/i;
 export function dashboardUrlFor(email) {
   if (config.trackingUrl) return config.trackingUrl;
   const last = readState(email);
-  if (last?.loggedIn && /dashboard/i.test(last.url || "")) return last.url;
-  return "https://app.freightpop.com/dashboard";
+  if (last?.loggedIn && APP_DASHBOARD_RE.test(last.url || "")) return last.url;
+  return DEFAULT_DASHBOARD_URL;
 }
 
 export function readState(email) {
