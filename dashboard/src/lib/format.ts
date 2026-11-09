@@ -52,7 +52,8 @@ export function fmtPct(n: number | null | undefined): string {
 export function freightpopTrackingUrl(trackingNumber: string | null | undefined): string | null {
   const tn = (trackingNumber || "").trim();
   if (!tn) return null;
-  return `https://app.freightpop.com/dashboard?TrackingNumber=${encodeURIComponent(tn)}`;
+  // The bare /dashboard path is an IIS 404 — the grid lives in the Broker app.
+  return `https://app.freightpop.com/Broker/Broker.html?TrackingNumber=${encodeURIComponent(tn)}#!/Dashboard`;
 }
 
 // Resolve a carrier + tracking number to a public tracking URL. Common

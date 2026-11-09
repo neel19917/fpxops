@@ -11,7 +11,7 @@ import type { AiAnalysis, GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditRow, Sh
 // search. Hardcoded here (rather than fetched from fpx_settings via auth)
 // because the share page is intentionally unauthed — keeping this static
 // avoids leaking tenant settings to anonymous viewers.
-const FREIGHTPOP_PUBLIC_URL = "https://app.freightpop.com/dashboard";
+const FREIGHTPOP_PUBLIC_URL = "https://app.freightpop.com/Broker/Broker.html#!/Dashboard"; // bare /dashboard is a 404
 
 // Same permissions-policy bundle the in-app overlay uses so login flows
 // and copy/paste work for whoever opens the share link.
