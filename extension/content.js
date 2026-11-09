@@ -3837,7 +3837,7 @@ async function fpxOpenShipmentModal(shipmentId, trackingNumber) {
     .find((tr) => (sid && (tr.textContent || "").includes(sid)) || (tn && (tr.textContent || "").includes(tn)));
   const btn = row && Array.from(row.querySelectorAll("a, button")).find((b) => /details|track/i.test(b.textContent || ""));
   if (btn) { simulateClick(btn); return { ok: true }; }
-  return { ok: false, error: "Found the shipment but couldn't open its details" };
+  return { ok: false, reason: "open-failed", error: "Found it — the grid is filtered to this shipment. Click its tracking number in the grid to open the details." };
 }
 
 // Bridge command handler, shared by two transports:
@@ -3855,7 +3855,9 @@ async function fpxBridgeHandle(data) {
     const found = await fpxFindShipment(data.shipmentId, data.trackingNumber);
     if (!found.ok || !data.open) return { type: "fpxFindAck", ...found, opened: false };
     const opened = await fpxOpenShipmentModal(data.shipmentId, data.trackingNumber);
-    return { type: "fpxFindAck", ...found, opened: opened.ok, ok: opened.ok, error: opened.ok ? null : opened.error };
+    // Found but the popup didn't open: still a successful lookup (the grid
+    // shows the row) — say so instead of reporting a failure.
+    return { type: "fpxFindAck", ...found, opened: opened.ok, ok: true, reason: opened.ok ? undefined : "open-failed", note: opened.ok ? null : opened.error };
   }
   if (data.type === "fpxFilter") {
     const col = String(data.column || "").trim();

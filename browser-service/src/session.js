@@ -293,7 +293,7 @@ export class ViewerSession {
         }
         return;
       case "bridge": {
-        const ack = await this.bridgeWithRetry(msg.payload || {});
+        const ack = await this.bridgeOnce(msg.payload || {});
         // Diagnostics for FreightPOP lookups (which strategy, which field and
         // value, how many rows) — this is how grid-field mismatches get found.
         const p = msg.payload || {};
@@ -368,6 +368,32 @@ export class ViewerSession {
 
   // The iframe path re-sent deferred filters on fpxGridReady. Here we just
   // retry for up to a minute while the grid renders (or the user logs in).
+  // One FreightPOP lookup at a time per view, and no duplicates. The
+  // dashboard can fire the same lookup twice (auto-filter + auto-open); run
+  // concurrently, each one's "clear filters" step wrecked the other's result
+  // (once a "found" lookup left all 1,262 rows showing), and the second one's
+  // "open popup" failed because the first had already opened it.
+  bridgeOnce(payload) {
+    if (payload.type !== "fpxFindShipment") return this.bridgeWithRetry(payload);
+    const key = `${payload.shipmentId || ""}|${payload.trackingNumber || ""}`;
+    const last = this.lastFind;
+    const wantsOpen = !!payload.open;
+    // Same shipment, in flight or just finished (8s), and it covered this
+    // request (opened if asked to) → reuse its answer.
+    if (last && last.key === key && (last.open || !wantsOpen) && (!last.done || Date.now() - last.done < 8000)) {
+      return last.promise;
+    }
+    const entry = { key, open: wantsOpen, done: 0 };
+    const run = async () => {
+      const ack = await this.bridgeWithRetry(payload);
+      entry.done = Date.now();
+      return ack;
+    };
+    entry.promise = (this.bridgeQueue = (this.bridgeQueue || Promise.resolve()).catch(() => {}).then(run));
+    this.lastFind = entry;
+    return entry.promise;
+  }
+
   async bridgeWithRetry(payload) {
     if (!["fpxFindShipment", "fpxFilter", "fpxOpenTracking", "fpxPing"].includes(payload.type)) {
       return { ok: false, error: `Unsupported bridge command ${payload.type}` };
