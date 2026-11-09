@@ -1,11 +1,11 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser";
 
 interface TabDef {
   id: TabId;
@@ -26,6 +26,7 @@ const ALL_TABS: TabDef[] = [
   { id: "tasks",    label: "Tasks",          Icon: ListChecks,   group: "primary" },
   { id: "ops",      label: "Ops",            Icon: Activity,     group: "primary" },
   { id: "scraping", label: "Scraping",       Icon: MonitorPlay,  group: "primary" },
+  { id: "freightpop", label: "FreightPOP login", Icon: LogIn,     group: "more" },
   { id: "gp",       label: "GP Audits",      Icon: TrendingUp,   group: "primary" },
   { id: "invoice",  label: "Invoice Audits", Icon: ReceiptText,  group: "primary" },
   { id: "notes",    label: "Notes",          Icon: NotebookPen,  group: "more" },

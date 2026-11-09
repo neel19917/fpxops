@@ -132,7 +132,24 @@ export interface BrowserSettingsResponse {
   live?: { sessions: number; browsers: number; memoryMb: number; egress: { mbLastHour: number; mbLast5Min: number } };
 }
 
+export interface HostedLogin {
+  email: string;
+  signedIn: boolean;
+  hasProfile: boolean;
+  running: boolean;
+  busy: boolean;
+  views: number;
+  memoryMb: number | null;
+  freightpop: { loggedIn: boolean; url: string; at: string } | null;
+}
+
 export const hostedBrowser = {
+  me: () => call<{ user: string; isAdmin: boolean; browser: HostedBrowserStatus }>("/me"),
+  /** Sign out of FreightPOP in the hosted browser (own, or anyone's for admins). */
+  resetLogin: (email?: string) =>
+    call<{ reset: boolean; email: string }>("/me/reset-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(email ? { email } : {}) }),
+  adminLogins: (emails: string[]) =>
+    call<{ logins: HostedLogin[] }>("/admin/logins", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ emails }) }),
   adminSettings: () => call<BrowserSettingsResponse>("/admin/settings"),
   saveAdminSettings: (settings: Record<string, number>) =>
     call<BrowserSettingsResponse>("/admin/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ settings }) }),

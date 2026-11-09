@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { KeyRound, Pencil, Shield, ShieldAlert, UserCheck, UserX, Users as UsersIcon } from "lucide-react";
+import { KeyRound, LogOut, Pencil, Shield, ShieldAlert, UserCheck, UserX, Users as UsersIcon } from "lucide-react";
+import { hostedBrowser, type HostedLogin } from "../lib/hostedBrowser";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
 import type { UserProfileRow } from "../lib/types";
@@ -64,13 +65,40 @@ export function UsersPage() {
   const [issueErr, setIssueErr] = useState<string | null>(null);
   const [issueResult, setIssueResult] = useState<null | { email: string; plaintext: string; keyName: string; revokedCount: number }>(null);
 
+  // Hosted FreightPOP login per user (browser-service). Optional: the
+  // column hides itself if the dashboard isn't connected to the service.
+  const [logins, setLogins] = useState<Map<string, HostedLogin> | null>(null);
+  const [loginsErr, setLoginsErr] = useState<string | null>(null);
+  const [resettingEmail, setResettingEmail] = useState<string | null>(null);
+  async function loadLogins(list: UserProfileRow[]) {
+    if (!hostedBrowser.enabled || !list.length) return;
+    try {
+      const r = await hostedBrowser.adminLogins(list.map((u) => u.email));
+      setLogins(new Map(r.logins.map((l) => [l.email, l])));
+      setLoginsErr(null);
+    } catch (e) { setLoginsErr((e as Error).message); }
+  }
+  async function resetLogin(email: string) {
+    if (!confirm(`Sign ${email} out of FreightPOP in the hosted browser?\n\nTheir FreightPOP views close and their saved FreightPOP login is deleted. They'll sign in again the next time they open FreightPOP in FPX.`)) return;
+    setResettingEmail(email);
+    try { await hostedBrowser.resetLogin(email); await loadLogins(rows); }
+    catch (e) { alert((e as Error).message); }
+    finally { setResettingEmail(null); }
+  }
+
   async function load() {
     setLoading(true); setErr(null);
-    try { setRows((await api.users.list()).data); }
+    try { const data = (await api.users.list()).data; setRows(data); loadLogins(data); }
     catch (e) { setErr((e as Error).message); }
     setLoading(false);
   }
   useEffect(() => { load(); }, []);
+  // Keep the login column fresh while the page is open.
+  useEffect(() => {
+    if (!rows.length) return;
+    const id = setInterval(() => loadLogins(rows), 20_000);
+    return () => clearInterval(id);
+  }, [rows]);
 
   async function toggleEnabled(u: UserProfileRow) {
     try {
@@ -164,14 +192,15 @@ export function UsersPage() {
             <th className="px-5 py-2.5 font-medium">User</th>
             <th className="px-5 py-2.5 font-medium">Email</th>
             <th className="px-5 py-2.5 font-medium">Role</th>
+            {hostedBrowser.enabled ? <th className="px-5 py-2.5 font-medium" title="FreightPOP login inside the hosted browser (FPX's built-in FreightPOP pane)">Hosted FreightPOP</th> : null}
             <th className="px-5 py-2.5 font-medium">Last login</th>
             <th className="px-5 py-2.5 font-medium">Joined</th>
             <th className="px-5 py-2.5 font-medium text-right">Access</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
-          {loading ? <LoadingState variant="row" colSpan={6} />
-          : rows.length === 0 ? <tr><td colSpan={6} className="p-8 text-center text-slate-500">No users yet.</td></tr>
+          {loading ? <LoadingState variant="row" colSpan={hostedBrowser.enabled ? 7 : 6} />
+          : rows.length === 0 ? <tr><td colSpan={hostedBrowser.enabled ? 7 : 6} className="p-8 text-center text-slate-500">No users yet.</td></tr>
           : rows.map((u) => {
             const isMe = profile?.id === u.id;
             return (
@@ -206,6 +235,12 @@ export function UsersPage() {
                   {u.role === "admin" ? <ShieldAlert className="inline-block ml-2 h-4 w-4 text-amber-500" />
                     : <Shield className="inline-block ml-2 h-4 w-4 text-slate-400" />}
                 </td>
+                {hostedBrowser.enabled ? (
+                  <td className="px-5 py-3 whitespace-nowrap">
+                    <HostedLoginCell login={logins?.get(u.email.toLowerCase()) || null} loading={!logins && !loginsErr} error={loginsErr}
+                      resetting={resettingEmail === u.email.toLowerCase()} onReset={() => resetLogin(u.email.toLowerCase())} />
+                  </td>
+                ) : null}
                 <td className="px-5 py-3 text-slate-500">{fmtRelative(u.last_login_at)}</td>
                 <td className="px-5 py-3 text-slate-500">{fmtDateTime(u.created_at)}</td>
                 <td className="px-5 py-3 text-right whitespace-nowrap">
@@ -236,6 +271,39 @@ export function UsersPage() {
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function HostedLoginCell({ login, loading, error, resetting, onReset }: {
+  login: HostedLogin | null; loading: boolean; error: string | null; resetting: boolean; onReset: () => void;
+}) {
+  if (error) return <span className="text-xs text-slate-400" title={error}>unavailable</span>;
+  if (loading || !login) return <span className="text-xs text-slate-400">…</span>;
+  const pill = login.signedIn
+    ? <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200">● Signed in</span>
+    : login.hasProfile || login.freightpop
+      ? <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 ring-1 ring-amber-200">Needs sign-in</span>
+      : <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">Never signed in</span>;
+  const detail = [
+    login.busy ? "scraping now" : null,
+    login.views ? `${login.views} view${login.views === 1 ? "" : "s"} open` : null,
+    login.freightpop?.at ? `active ${fmtRelative(login.freightpop.at)}` : null,
+  ].filter(Boolean).join(" · ");
+  const canReset = (login.hasProfile || login.running || !!login.freightpop) && !login.busy;
+  return (
+    <div className="flex items-center gap-2">
+      <div>
+        {pill}
+        {detail ? <div className="text-[11px] text-slate-500 mt-0.5">{detail}</div> : null}
+      </div>
+      {canReset ? (
+        <button onClick={onReset} disabled={resetting}
+          title="Sign them out of FreightPOP in the hosted browser and delete the saved login"
+          className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md text-rose-700 hover:bg-rose-50 ring-1 ring-rose-200 disabled:opacity-50">
+          <LogOut className="h-3.5 w-3.5" /> {resetting ? "Resetting…" : "Reset"}
+        </button>
+      ) : null}
     </div>
   );
 }

@@ -2,9 +2,9 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
 import { config } from "./config.js";
-import { poolStats, closeAll, userStatus, selfTest } from "./browser.js";
+import { poolStats, closeAll, userStatus, selfTest, resetUserProfile } from "./browser.js";
 import { summary as usageSummary, flush as flushUsage } from "./usage.js";
-import { ViewerSession, egressStats } from "./session.js";
+import { ViewerSession, egressStats, dropAllParked } from "./session.js";
 import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
 import { startScrapeWorker, workerBusy, workerState, requestStop, fullLog } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
@@ -22,6 +22,7 @@ function allowChat(email) {
 import { listSchedules, createSchedule, updateSchedule, deleteSchedule, runScheduleNow, startScheduler } from "./schedules.js";
 
 const sessions = new Set();
+const resetting = new Set(); // emails whose hosted login is being reset
 
 const bootedAt = new Date().toISOString();
 let selfTestResult = { ok: null, pending: true };
@@ -103,6 +104,33 @@ async function handleApi(req, res, url, who) {
   const p = url.pathname;
   const m = req.method;
 
+  // Sign out of FreightPOP in the hosted browser and start over. Admins may
+  // reset someone else's ({ email }); everyone else only their own.
+  if (p === "/me/reset-login" && m === "POST") {
+    const body = await readJson(req).catch(() => ({}));
+    const email = String(body.email || who.email).trim().toLowerCase();
+    if (email !== who.email.toLowerCase() && !who.isAdmin) return json(res, 403, { error: "Only admins can reset someone else's login" });
+    if (resetting.has(email)) return json(res, 409, { error: "Already resetting" });
+    resetting.add(email);
+    try {
+      if (userStatus(email).busy) return json(res, 409, { error: "A scrape is running in this browser — stop it first" });
+      for (const s of [...sessions]) {
+        if (s.who.email.toLowerCase() !== email) continue;
+        sessions.delete(s);
+        try { s.ws.close(4011, "login reset"); } catch {}
+        await s.close();
+      }
+      dropAllParked(email);
+      await resetUserProfile(email);
+      console.log(`[ws] ${who.email} reset the hosted FreightPOP login for ${email}`);
+      return json(res, 200, { reset: true, email });
+    } catch (e) {
+      return json(res, e.status || 500, { error: e.message });
+    } finally {
+      resetting.delete(email);
+    }
+  }
+
   if (p === "/me" && m === "GET") {
     return json(res, 200, { user: who.email, isAdmin: who.isAdmin, browser: userStatus(who.email) });
   }
@@ -149,6 +177,19 @@ async function handleApi(req, res, url, who) {
   if (p === "/runs" && m === "GET") {
     const q = Object.fromEntries(url.searchParams);
     return json(res, 200, { isAdmin: who.isAdmin, runs: runsFor(who, q) });
+  }
+  // Admin: each person's hosted FreightPOP login (for the Users page).
+  if (p === "/admin/logins" && m === "POST") {
+    if (!who.isAdmin) return json(res, 403, { error: "Admins only" });
+    const { emails = [] } = await readJson(req).catch(() => ({}));
+    const list = [...new Set((Array.isArray(emails) ? emails : []).map((e) => String(e).trim().toLowerCase()).filter(Boolean))].slice(0, 500);
+    return json(res, 200, {
+      logins: list.map((email) => {
+        const st = userStatus(email);
+        const views = [...sessions].filter((s) => s.who.email.toLowerCase() === email && !s.watchOnly).length;
+        return { email, signedIn: !!(st.hasProfile && st.freightpop?.loggedIn), hasProfile: st.hasProfile, running: st.running, busy: st.busy, views, memoryMb: st.memoryMb, freightpop: st.freightpop };
+      }),
+    });
   }
   if (p === "/admin/settings") {
     if (!who.isAdmin) return json(res, 403, { error: "Admins only" });
@@ -244,6 +285,8 @@ wss.on("connection", (ws, req) => {
         clearTimeout(authTimer);
         const who = await verifyUser(msg.token, msg.devUser);
         if (!who) { ws.close(4001, "unauthorized"); return; }
+        // Mid login-reset: have the client retry in a moment (normal backoff).
+        if (resetting.has(who.email.toLowerCase())) { ws.close(1013, "login reset in progress"); return; }
         const target = msg.target === "scrape" ? "scrape" : "tab";
         // Tracking views: many allowed, but each person is capped. Their
         // OLDEST view is closed (not the new one — that's the tab they're
