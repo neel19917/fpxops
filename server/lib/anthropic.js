@@ -12,6 +12,9 @@ const MODEL_PRICING = {
   "claude-opus-4-8":            { input: 5.00, output: 25.00 },
   "claude-sonnet-5":            { input: 2.00, output: 10.00 },
   "claude-opus-5":              { input: 5.00, output: 25.00 },
+  "claude-opus-5-5":            { input: 4.00, output: 20.00 },
+  "claude-sonnet-5-5":          { input: 2.00, output: 10.00 },
+  "claude-haiku-5-5":           { input: 0.10, output:  0.50 },
   "claude-fable-5-1":           { input: 10.00, output: 50.00 },
 };
 
@@ -89,6 +92,8 @@ export async function callClaude({
         "Content-Type": "application/json",
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
+        // Server-side refusal fallback (opt-in per call via extraBody.fallbacks).
+        ...(extraBody?.fallbacks ? { "anthropic-beta": "server-side-fallback-2026-07-01" } : {}),
       },
       body: JSON.stringify({
         model,

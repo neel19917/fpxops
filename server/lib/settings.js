@@ -19,6 +19,10 @@ const FALLBACKS = {
     'You are a freight brokerage operations assistant at FPX. FPX is the freight broker — not the carrier and not the customer. You always write FROM FPX. Drafting an email now. {{audienceCopy}} Output strict JSON: {"subject": "...", "body": "..."}. Body should be plain text with line breaks (\'\\n\') — no markdown. Sign as "[Your name]\\nFPX Operations" (do not invent a name).',
   "prompt.email_draft.audience_carrier":
     "Write a concise, professional email FROM the FPX brokerage operations team TO the carrier handling this shipment. Ask for the specific information needed to resolve the issue or confirm status. Reference carrier-side identifiers (PRO, pickup number, carrier-issued tracking).",
+  // Model for single-shipment emails (carrier / customer). Separate from
+  // model.default so emails can use Opus without moving every shipment
+  // analysis onto it.
+  "prompt.email_draft.model": "claude-opus-5-5",
   "prompt.email_draft.audience_customer":
     "Write a concise, professional email FROM the FPX brokerage account team TO the end customer (the shipper or consignee, not the carrier). Update them on shipment status in plain English; avoid carrier jargon. If action is required from the customer, state it clearly. Otherwise reassure them FPX is monitoring and following up directly with the carrier.",
   // Bulk carrier-followup email: one email per carrier covering every
@@ -33,7 +37,7 @@ const FALLBACKS = {
   // because this is a multi-shipment, multi-question task where the
   // larger model produces noticeably tighter consolidations. Admins can
   // dial back to Sonnet/Haiku in Settings if they want.
-  "prompt.email_draft.carrier_group.model": "claude-opus-4-7",
+  "prompt.email_draft.carrier_group.model": "claude-opus-5-5",
   // Bulk customer-followup email: one email per customer covering every
   // followup-tagged task assigned to that customer. Same shape as
   // carrier_group, audience flipped — recipient is the shipper /
@@ -43,7 +47,7 @@ const FALLBACKS = {
   "prompt.email_draft.customer_group.audience":
     "Write ONE concise, professional email FROM the FPX brokerage account team TO the end customer (the shipper/consignee, not the carrier) covering ALL of the customer's open shipments at once. Plain English; reassure them FPX is monitoring and following up directly with carriers as needed. State clearly when an action is required from the customer (signature, appointment confirmation, etc).",
   // Same Opus default as carrier_group for the same reason.
-  "prompt.email_draft.customer_group.model": "claude-opus-4-7",
+  "prompt.email_draft.customer_group.model": "claude-opus-5-5",
   "action.threshold": 0.7,
   "action.auto_draft_enabled": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",

@@ -1,6 +1,16 @@
 import { callClaude } from "./anthropic.js";
 import { getSettings } from "./settings.js";
 
+// Request extras for the current Claude 5 models. They always think before
+// answering and the thinking counts against max_tokens, so emails run at low
+// effort (short, direct drafts) with room to spare; a safety decline falls
+// back server-side instead of failing the draft. Older models get nothing
+// extra (they'd reject these fields).
+export function emailModelExtras(model) {
+  if (!/^claude-(opus-5|sonnet-5-5|fable-5-1)/.test(String(model || ""))) return null;
+  return { output_config: { effort: "low" }, fallbacks: "default" };
+}
+
 // Build the slim shipment context the email prompt sees. Centralized so the
 // manual draft route and the auto-drafter agree on what's available.
 export function slimShipmentForEmail(ship, notes) {
@@ -34,7 +44,9 @@ export async function generateEmailDraft({ ship, audience, notes, callMeta }) {
     "prompt.email_draft.system_base",
     "prompt.email_draft.audience_carrier",
     "prompt.email_draft.audience_customer",
+    "prompt.email_draft.model",
   );
+  const model = settings["prompt.email_draft.model"] || undefined;
   const audienceCopy = aud === "carrier"
     ? settings["prompt.email_draft.audience_carrier"]
     : settings["prompt.email_draft.audience_customer"];
@@ -46,7 +58,10 @@ export async function generateEmailDraft({ ship, audience, notes, callMeta }) {
   const result = await callClaude({
     systemPrompt,
     userMessage,
-    maxTokens: 700,
+    // Room for the model's thinking + a full email (thinking counts here).
+    maxTokens: emailModelExtras(model) ? 4000 : 700,
+    modelOverride: model,
+    extraBody: emailModelExtras(model),
     metadata: {
       kind: "other",
       tracking_number: ship.tracking_number,
@@ -125,8 +140,9 @@ export async function generateCarrierGroupEmail({ carrier, items, notes, callMet
   const result = await callClaude({
     systemPrompt,
     userMessage,
-    maxTokens: 2000,
+    maxTokens: emailModelExtras(modelOverride) ? 8000 : 2000,
     modelOverride,
+    extraBody: emailModelExtras(modelOverride),
     metadata: {
       kind: "other",
       ...(callMeta || {}),
@@ -172,8 +188,9 @@ export async function generateCustomerGroupEmail({ customer, items, notes, callM
   const result = await callClaude({
     systemPrompt,
     userMessage,
-    maxTokens: 2000,
+    maxTokens: emailModelExtras(modelOverride) ? 8000 : 2000,
     modelOverride,
+    extraBody: emailModelExtras(modelOverride),
     metadata: {
       kind: "other",
       ...(callMeta || {}),
