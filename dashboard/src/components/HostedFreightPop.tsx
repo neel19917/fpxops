@@ -115,6 +115,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     let disposed = false;
     let attempt = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let watchRetries = 0;
     // Frames can arrive faster than we decode them; only draw the latest.
     let decoding = false;
     let queued: Blob | null = null;
@@ -155,14 +156,21 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       const wsUrl = HOSTED_BROWSER_URL.replace(/^http/, "ws") + "/ws";
       const ws = new WebSocket(wsUrl);
       ws.binaryType = "blob";
+      // Did THIS connection get going? A scrape watch that's refused before
+      // it ever went live usually means the scrape's window is still opening
+      // (the page shows "Running" the moment the job is claimed) → retry.
+      let liveThisConn = false;
       wsRef.current = ws;
       ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token, viewport: viewport(), target }));
       ws.onmessage = (ev) => {
         if (typeof ev.data !== "string") { draw(ev.data as Blob); return; }
         let m: { type?: string; ready?: boolean; url?: string; id?: number; ack?: BridgeAck; error?: string; reason?: string };
         try { m = JSON.parse(ev.data); } catch { return; }
-        if (m.type === "ready") { attempt = 0; setStatus("live"); setError(null); lastPauseSent.current = null; syncPause.current(); }
-        else if (m.type === "ended") { setStatus("ended"); setError(m.reason || "Ended"); cbRef.current.onEnded?.(m.reason || "Ended"); }
+        if (m.type === "ready") { liveThisConn = true; attempt = 0; setStatus("live"); setError(null); lastPauseSent.current = null; syncPause.current(); }
+        else if (m.type === "ended") {
+          if (watchOnly && !liveThisConn) return; // not open yet — the close handler retries
+          setStatus("ended"); setError(m.reason || "Ended"); cbRef.current.onEnded?.(m.reason || "Ended");
+        }
         else if (m.type === "bridgeReady") cbRef.current.onBridgeReady?.(!!m.ready);
         else if (m.type === "url" && m.url) cbRef.current.onUrl?.(m.url);
         else if (m.type === "bridgeAck" && typeof m.id === "number") {
@@ -176,7 +184,18 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         for (const r of pendingRef.current.values()) r({ ok: false, error: "Hosted browser disconnected" });
         pendingRef.current.clear();
         if (disposed) return;
-        if (ev.code === 4004) { setStatus("ended"); return; } // watched scrape ended / none running
+        if (ev.code === 4004) {
+          // Scrape window not open yet → keep trying for about a minute.
+          if (watchOnly && !liveThisConn && watchRetries < 30) {
+            watchRetries++;
+            setStatus("connecting");
+            setError("Waiting for the scrape window to open…");
+            retryTimer = setTimeout(connect, 2000);
+            return;
+          }
+          setStatus("ended");
+          return;
+        }
         if (ev.code === 4010) {
           // Closed by the admin "close a view after inactivity" setting.
           setStatus("ended");
