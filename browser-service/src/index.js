@@ -1,0 +1,303 @@
+import http from "node:http";
+import crypto from "node:crypto";
+import { WebSocketServer } from "ws";
+import { config } from "./config.js";
+import { poolStats, closeAll, userStatus, selfTest } from "./browser.js";
+import { summary as usageSummary, flush as flushUsage } from "./usage.js";
+import { ViewerSession } from "./session.js";
+import { startScrapeWorker, workerBusy, workerState, requestStop, fullLog } from "./worker.js";
+import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
+import { chat, assistantEnabled } from "./assistant.js";
+
+// 20 assistant messages per person per minute.
+const chatHits = new Map();
+function allowChat(email) {
+  const now = Date.now();
+  const hits = (chatHits.get(email) || []).filter((t) => now - t < 60_000);
+  if (hits.length >= 20) return false;
+  hits.push(now); chatHits.set(email, hits);
+  return true;
+}
+import { listSchedules, createSchedule, updateSchedule, deleteSchedule, runScheduleNow, startScheduler } from "./schedules.js";
+
+const sessions = new Set();
+
+const bootedAt = new Date().toISOString();
+let selfTestResult = { ok: null, pending: true };
+
+function json(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify(body));
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://x");
+  // CORS for the dashboard's fetch() calls (WS has its own Origin check).
+  const origin = req.headers.origin || "";
+  if (config.devNoAuth || config.allowedOrigins.includes(origin)) {
+    res.setHeader("access-control-allow-origin", origin || "*");
+    res.setHeader("vary", "origin");
+    res.setHeader("access-control-allow-headers", "authorization, content-type");
+    res.setHeader("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
+  }
+  if (req.method === "OPTIONS") { res.writeHead(204).end(); return; }
+
+  // Authenticated JSON API for the dashboard (Scraping page, admin logs).
+  if (API_PATH.test(url.pathname)) {
+    const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    const who = await verifyUser(token, url.searchParams.get("devUser"));
+    if (!who) return json(res, 401, { error: "unauthorized" });
+    try {
+      return await handleApi(req, res, url, who);
+    } catch (e) {
+      return json(res, e.status || 400, { error: e.message });
+    }
+  }
+
+  if (url.pathname === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      sessions: sessions.size,
+      // Count only — never list whose browsers are running on an unauthenticated endpoint.
+      browsers: poolStats().length,
+      scrapeWorker: config.scrapeWorker ? (workerBusy() ? "busy" : "idle") : "off",
+      selfTest: selfTestResult,
+      runHistory: supabaseEnabled ? "supabase" : "local",
+      assistant: assistantEnabled,
+    }));
+    return;
+  }
+  res.writeHead(404).end();
+});
+
+const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/log|runs|schedules|assistant)(\/|$)/;
+
+async function readJson(req, maxBytes = 64 * 1024) {
+  let body = "";
+  for await (const chunk of req) { body += chunk; if (body.length > maxBytes) throw new Error("body too large"); }
+  try { return body ? JSON.parse(body) : {}; } catch { throw new Error("invalid JSON"); }
+}
+
+function sendLog(res, filename, text) {
+  res.writeHead(200, {
+    "content-type": "text/plain; charset=utf-8",
+    "content-disposition": `attachment; filename="${filename}"`,
+    "cache-control": "no-store",
+  });
+  res.end(text.endsWith("\n") ? text : text + "\n");
+}
+
+// Run history visible to `who`: admins see everyone's, others their own.
+function runsFor(who, { limit = 20, user, source, ok } = {}) {
+  let rows = listRuns(200);
+  if (!who.isAdmin) rows = rows.filter((r) => r.user === who.email);
+  else if (user) rows = rows.filter((r) => r.user === user);
+  if (source) rows = rows.filter((r) => r.source === source);
+  if (ok === "true" || ok === "false") rows = rows.filter((r) => String(r.ok) === ok);
+  return rows.slice(0, Math.min(200, Math.max(1, Number(limit) || 20)));
+}
+
+async function handleApi(req, res, url, who) {
+  const p = url.pathname;
+  const m = req.method;
+
+  if (p === "/me" && m === "GET") {
+    return json(res, 200, { user: who.email, isAdmin: who.isAdmin, browser: userStatus(who.email) });
+  }
+  if (p === "/stats" && m === "GET") {
+    const days = Math.min(30, Math.max(1, Number(url.searchParams.get("days")) || 30));
+    const browsers = poolStats();
+    return json(res, 200, {
+      bootedAt,
+      now: new Date().toISOString(),
+      isAdmin: who.isAdmin,
+      limits: { maxBrowsers: config.maxBrowsers, maxSessions: config.maxSessions, maxTabsPerUser: config.maxTabsPerUser, idleCloseMin: config.idleCloseMs / 60_000 },
+      live: {
+        sessions: sessions.size,
+        browsers: browsers.length,
+        memoryMb: browsers.reduce((t, b) => t + (b.memoryMb || 0), 0),
+        perBrowser: browsers,
+      },
+      me: userStatus(who.email),
+      worker: workerState(),
+      usage: usageSummary(days),
+      runs: runsFor(who, { limit: 10 }),
+      schedules: listSchedules(who),
+    });
+  }
+  if (p === "/scrape/stop" && m === "POST") {
+    const cur = workerState().current;
+    if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can stop this scrape" });
+    return json(res, 200, { stopping: requestStop(who.email) });
+  }
+  if (p === "/scrape/log" && m === "GET") {
+    const runId = url.searchParams.get("run");
+    if (runId) {
+      const got = await readRunLog(runId);
+      if (!got) return json(res, 404, { error: "run not found" });
+      if (got.run.user !== who.email && !who.isAdmin) return json(res, 403, { error: "not your run" });
+      return sendLog(res, `scrape-${runId.slice(0, 12)}.log`, got.text);
+    }
+    const job = fullLog();
+    if (!job) return json(res, 404, { error: "no scrape log yet" });
+    if (job.user !== who.email && !who.isAdmin) return json(res, 403, { error: "not your run" });
+    return sendLog(res, `scrape-${String(job.requestId).slice(0, 12)}.log`, job.log.map((l) => `${l.t}\t${l.level}\t${l.text}`).join("\n"));
+  }
+  if (p === "/runs" && m === "GET") {
+    const q = Object.fromEntries(url.searchParams);
+    return json(res, 200, { isAdmin: who.isAdmin, runs: runsFor(who, q) });
+  }
+  if (p === "/assistant/chat" && m === "POST") {
+    if (!assistantEnabled) return json(res, 503, { error: "Assistant isn't configured on this service" });
+    if (!allowChat(who.email)) return json(res, 429, { error: "Slow down — too many questions in the last minute" });
+    const body = await readJson(req, 2 * 1024 * 1024); // history carries tool results
+    const message = String(body.message || "").trim().slice(0, 4000);
+    if (!message) return json(res, 400, { error: "message required" });
+    const history = Array.isArray(body.history) ? body.history.slice(-60) : [];
+    const t0 = Date.now();
+    try {
+      const out = await chat({ history, message, who, context: body.context || null });
+      console.log(`[assistant] ${who.email}: ${out.actions.length} action(s), ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), ${Date.now() - t0}ms`);
+      return json(res, 200, out);
+    } catch (e) {
+      console.warn("[assistant] error:", e.status || "", e.message);
+      return json(res, e.status === 429 ? 429 : 502, { error: e.status === 429 ? "Claude is rate-limited right now — try again in a moment" : `Assistant error: ${e.message}` });
+    }
+  }
+  if (p === "/schedules" && m === "GET") return json(res, 200, { schedules: listSchedules(who) });
+  if (p === "/schedules" && m === "POST") return json(res, 201, { schedule: createSchedule(who, await readJson(req)) });
+  const sm = /^\/schedules\/([0-9a-f-]{36})(\/run)?$/.exec(p);
+  if (sm) {
+    const [, id, run] = sm;
+    if (run && m === "POST") return json(res, 200, runScheduleNow(who, id));
+    if (!run && m === "PUT") return json(res, 200, { schedule: updateSchedule(who, id, await readJson(req)) });
+    if (!run && m === "DELETE") { deleteSchedule(who, id); return json(res, 200, { deleted: true }); }
+  }
+  return json(res, 405, { error: "method not allowed" });
+}
+
+// Verify the dashboard user's Supabase JWT against the existing API, which
+// already enforces "enabled" profiles. /api/ops/rescrape is a cheap read-only
+// GET behind the same requireAuth gate (deliberately NOT /api/me, which has a
+// side effect: it clears the user's pending extension API key).
+// Successful verifications are cached for 60s (keyed by token hash) so the
+// Scraping page's polling doesn't hit the API on every tick. Failures aren't.
+const verified = new Map(); // sha256(token) -> { who, exp }
+
+async function verifyUser(token, devUser) {
+  if (config.devNoAuth) return { email: devUser || "dev@local", isAdmin: !devUser || /admin/.test(devUser) };
+  if (!token || typeof token !== "string") return null;
+  const key = crypto.createHash("sha256").update(token).digest("hex");
+  const hit = verified.get(key);
+  if (hit && hit.exp > Date.now()) return hit.who;
+  const who = await verifyUserUncached(token);
+  if (who) {
+    verified.set(key, { who, exp: Date.now() + 60_000 });
+    if (verified.size > 500) verified.delete(verified.keys().next().value);
+  }
+  return who;
+}
+
+async function verifyUserUncached(token) {
+  const res = await fetch(`${config.apiUrl}/api/ops/rescrape`, {
+    headers: { authorization: `Bearer ${token}` },
+  }).catch(() => null);
+  if (!res || !res.ok) return null;
+  // Admin = can read the API's admin-only users list (same gate the dashboard's
+  // Admin menu uses). Cached with the rest of the identity for 60s.
+  const adm = await fetch(`${config.apiUrl}/api/users`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
+  const isAdmin = !!adm?.ok;
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+    return { email: payload.email || payload.sub || "unknown", isAdmin };
+  } catch { return { email: "unknown", isAdmin }; }
+}
+
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 64 * 1024 });
+
+wss.on("connection", (ws, req) => {
+  const origin = req.headers.origin || "";
+  if (!config.devNoAuth && !config.allowedOrigins.includes(origin)) {
+    ws.close(4003, "origin not allowed");
+    return;
+  }
+  let session = null;
+  // First message must be { type: "auth", token }. Token in the first frame
+  // (not the URL) keeps it out of proxy access logs.
+  const authTimer = setTimeout(() => ws.close(4001, "auth timeout"), 10_000);
+
+  ws.on("message", async (raw, isBinary) => {
+    if (isBinary) return;
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try {
+      if (!session) {
+        if (msg.type !== "auth") return;
+        clearTimeout(authTimer);
+        const who = await verifyUser(msg.token, msg.devUser);
+        if (!who) { ws.close(4001, "unauthorized"); return; }
+        const target = msg.target === "scrape" ? "scrape" : "tab";
+        // Tracking views: many allowed, but each person is capped. Their
+        // OLDEST view is closed (not the new one — that's the tab they're
+        // looking at). Watching a scrape doesn't count.
+        if (target === "tab") {
+          const mine = [...sessions].filter((s) => s.who.email === who.email && !s.watchOnly);
+          mine.sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
+          while (mine.length >= config.maxTabsPerUser) {
+            const old = mine.shift();
+            try { old.ws.close(4009, "replaced by a newer tab"); } catch {}
+            sessions.delete(old);
+            await old.close();
+          }
+        }
+        if (sessions.size >= config.maxSessions) { ws.close(4029, "too many sessions"); return; }
+        session = new ViewerSession(ws, who, { target });
+        sessions.add(session);
+        if (msg.viewport) session.viewport = {
+          width: msg.viewport.width || 1280, height: msg.viewport.height || 800, dpr: 1,
+        };
+        console.log(`[ws] session opened for ${who.email} (${sessions.size} active)`);
+        try {
+          await session.start();
+        } catch (e) {
+          if (e.code === "CAPACITY") { ws.close(4029, "capacity"); return; }
+          throw e;
+        }
+        return;
+      }
+      await session.handle(msg);
+    } catch (e) {
+      console.warn("[ws] handler error:", e.message);
+      try { ws.send(JSON.stringify({ type: "error", error: e.message })); } catch {}
+    }
+  });
+
+  ws.on("close", async () => {
+    clearTimeout(authTimer);
+    if (session) {
+      sessions.delete(session);
+      console.log(`[ws] session closed for ${session.who.email} (${sessions.size} active)`);
+      await session.close();
+    }
+  });
+});
+
+server.listen(config.port, async () => {
+  console.log(`[fpx-browser] listening on :${config.port}${config.devNoAuth ? " (DEV: auth disabled)" : ""}`);
+  initRuns().catch((e) => console.warn("[runs] init failed:", e.message));
+  if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); }
+  selfTest().then((r) => {
+    selfTestResult = r;
+    console.log(`[selftest] ${r.ok ? "OK" : "FAILED"} ${JSON.stringify(r)}`);
+  });
+});
+
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, async () => {
+    for (const s of sessions) await s.close();
+    await closeAll();
+    flushUsage();
+    process.exit(0);
+  });
+}

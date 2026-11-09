@@ -1,0 +1,18 @@
+{
+  "name": "fpx-browser-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hosted Chromium with the FPXpress extension loaded. Streams per-user FreightPOP tabs to the dashboard over WebSocket and consumes the rescrape queue, so nobody needs the extension installed locally.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
+    "puppeteer-core": "^23.0.0",
+    "ws": "^8.18.0"
+  }
+}

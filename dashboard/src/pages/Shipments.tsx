@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, Pencil } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
@@ -130,6 +131,22 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   const [q, setQ] = useState("");
   const [actionFilter, setActionFilter] = useState<string>("");
   const [customerFilter, setCustomerFilter] = useState<string>("");
+  // Filters can arrive in the URL (/tracking?q=…&action=YES&customer=…) —
+  // the assistant uses this, and it makes a filtered view shareable as a link.
+  // Applied whenever the query string changes; absent params leave filters as-is
+  // unless `reset=1`.
+  const location = useLocation();
+  useEffect(() => {
+    const p = new URLSearchParams(location.search);
+    if (![...p.keys()].length) return;
+    const reset = p.get("reset") === "1";
+    if (p.has("q") || reset) setQ(p.get("q") || "");
+    if (p.has("action") || reset) {
+      const a = (p.get("action") || "").toUpperCase();
+      setActionFilter(["YES", "NO", "ERROR"].includes(a) ? a : "");
+    }
+    if (p.has("customer") || reset) setCustomerFilter(p.get("customer") || "");
+  }, [location.search]);
   const [sourceFilter, setSourceFilter] = useState<string>("");
   const [modeFilter, setModeFilter] = useState<string>(() => {
     try { return localStorage.getItem("fpx.shipments.modeFilter") ?? ""; } catch { return ""; }

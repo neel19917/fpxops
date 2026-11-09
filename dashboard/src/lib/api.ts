@@ -71,7 +71,7 @@ function refreshSessionOnce(): Promise<string | null> {
   return _refreshInflight;
 }
 
-async function getAccessTokenOrWait(): Promise<string> {
+export async function getAccessTokenOrWait(): Promise<string> {
   // getSession() is usually a local read, but it can block on the SDK's
   // internal initialize (and on the auth lock while a refresh is in flight) —
   // same deadline treatment as the boot path in auth.tsx.

@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { api } from "./lib/api";
 import type { ShipmentTask } from "./lib/types";
 import { FreightPopOverlay } from "./components/FreightPopOverlay";
+import { AssistantPanel } from "./components/AssistantPanel";
 import { requestAutoFilter } from "./lib/freightpopFrame";
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams, Outlet } from "react-router-dom";
 import { Layout, type TabId } from "./components/Layout";
@@ -33,6 +34,8 @@ const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default:
 const ServicesPage    = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServicesPage })));
 const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServiceDetailPage })));
 const InstallPage     = lazy(() => import("./pages/Install").then((m) => ({ default: m.InstallPage })));
+const ScrapeLogsPage  = lazy(() => import("./pages/ScrapeLogs").then((m) => ({ default: m.ScrapeLogsPage })));
+const ScrapingPage    = lazy(() => import("./pages/Scraping").then((m) => ({ default: m.ScrapingPage })));
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
@@ -40,6 +43,7 @@ const TAB_PATH: Record<TabId, string> = {
   tracking: "/tracking",
   tasks: "/tasks",
   ops: "/ops",
+  scraping: "/scraping",
   notes: "/notes",
   analyses: "/analyses",
   gp: "/audits/gp",
@@ -53,9 +57,10 @@ const TAB_PATH: Record<TabId, string> = {
   settings: "/admin/settings",
   services: "/admin/services",
   ai_export: "/admin/ai-export",
+  scrape_logs: "/admin/scrape-logs",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -66,10 +71,12 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/settings")) return "settings";
   if (pathname.startsWith("/admin/services")) return "services";
   if (pathname.startsWith("/admin/ai-export")) return "ai_export";
+  if (pathname.startsWith("/admin/scrape-logs")) return "scrape_logs";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
+  if (pathname.startsWith("/scraping")) return "scraping";
   if (pathname.startsWith("/notes")) return "notes";
   if (pathname.startsWith("/analyses")) return "analyses";
   if (pathname.startsWith("/shares")) return "shares";
@@ -212,6 +219,7 @@ function AuthedApp() {
           login session survives every route change. Pages drive its
           visibility/context via the freightpopFrame pub/sub store. */}
       <FreightPopOverlay />
+      <AssistantPanel />
       <Layout
         tab={tab}
         onTab={(t) => navigate(TAB_PATH[t])}
@@ -240,6 +248,7 @@ function AuthedApp() {
             <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
             <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
             <Route path="/ops" element={<OpsPage />} />
+            <Route path="/scraping" element={<ScrapingPage />} />
             <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
@@ -257,6 +266,7 @@ function AuthedApp() {
                 <Route path="/admin/services" element={<ServicesPage />} />
                 <Route path="/admin/services/:slug" element={<ServiceDetailPage />} />
                 <Route path="/admin/ai-export" element={<AiExportPage />} />
+                <Route path="/admin/scrape-logs" element={<ScrapeLogsPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tracking" replace />} />

@@ -137,8 +137,29 @@ function shortTitle(title: string): string {
     .trim();
 }
 
-interface Prefs { seg: SegFilter; flags: TaskFlag[]; groupBy: GroupBy; sortBy: SortBy; triageOpen: boolean; dailyOpen: boolean; includeClosed: boolean }
-const DEFAULT_PREFS: Prefs = { seg: "all", flags: [], groupBy: "none", sortBy: "smart", triageOpen: true, dailyOpen: true, includeClosed: false };
+interface Prefs { seg: SegFilter; flags: TaskFlag[]; groupBy: GroupBy; sortBy: SortBy; triageOpen: boolean; dailyOpen: boolean; includeClosed: boolean; onDashboardOnly: boolean }
+const DEFAULT_PREFS: Prefs = { seg: "all", flags: [], groupBy: "none", sortBy: "smart", triageOpen: true, dailyOpen: true, includeClosed: false, onDashboardOnly: true };
+
+// A shipment has "left the FreightPOP dashboard" when it wasn't seen within
+// this long of the NEWEST scrape on the board. Relative to the latest scrape,
+// not to now, so a quiet day without scraping doesn't hide every task.
+// (Delivered shipments drop off FreightPOP's dashboard; the full-sweep
+// auto-archive only runs when a Refresh All completes unfiltered.)
+const OFF_DASHBOARD_WINDOW_MS = 24 * 3600_000;
+
+// Delivered shipments FreightPOP still lists as "In Transit" (signed POD, no
+// status flip yet): the tracking comment or the AI's read says delivered and
+// nothing's wrong. Claim / damage / return / redelivery tasks stay — those
+// are exactly the post-delivery work.
+const POST_DELIVERY_WORK = /\b(claim|damage|shortage|overage|refus|return|redeliver|storage|osd)\w*/i;
+function looksDelivered(r: TaskBoardRow): boolean {
+  const s = r.shipment;
+  if (!s) return false;
+  if (POST_DELIVERY_WORK.test(`${r.task.title || ""} ${r.task.description || ""}`)) return false;
+  if (s.delivery_date) return true;
+  if (/^\s*delivered\b/i.test(s.tracking_comments || "")) return true;
+  return String(s.action_required || "").toUpperCase() === "NO" && /\bdelivered (on|at)\b/i.test(s.ai_issue || "");
+}
 function loadPrefs(): Prefs {
   try {
     const raw = localStorage.getItem(PREF_KEY);
@@ -231,8 +252,26 @@ export function TasksV2Page() {
   }, [triage]);
   const closeCandidateIds = useMemo(() => new Set((triage?.triage?.close_candidates ?? []).map((c) => c.task_id)), [triage]);
 
+  // Newest scrape across the board, and which rows' shipments weren't seen
+  // near it (= no longer on FreightPOP's dashboard).
+  // Tasks to skip: shipment left the dashboard, or it's delivered and the
+  // task isn't post-delivery work.
+  const { offDashboardIds, offCounts } = useMemo(() => {
+    const seen = rows.map((r) => (r.shipment?.scraped_at ? Date.parse(r.shipment.scraped_at) : NaN)).filter(Number.isFinite);
+    const cutoff = seen.length ? Math.max(...seen) - OFF_DASHBOARD_WINDOW_MS : -Infinity;
+    const ids = new Set<string>();
+    let left = 0, delivered = 0;
+    for (const r of rows) {
+      if (!isActive(r.task.status)) continue;
+      if (r.shipment?.scraped_at && Date.parse(r.shipment.scraped_at) < cutoff) { ids.add(r.task.id); left++; }
+      else if (looksDelivered(r)) { ids.add(r.task.id); delivered++; }
+    }
+    return { offDashboardIds: ids, offCounts: { left, delivered } };
+  }, [rows]);
+
   const visible = useMemo(() => {
     let list = rows;
+    if (prefs.onDashboardOnly) list = list.filter((r) => !offDashboardIds.has(r.task.id));
     if (prefs.seg === "attention") {
       list = list.filter((r) => isActive(r.task.status) && !r.seg.flags.includes("resolved_upstream")
         && (r.seg.segment === "redelivery" || r.seg.segment === "return_claim" || r.seg.segment === "storage_risk" || r.seg.flags.includes("repeat")));
@@ -270,7 +309,7 @@ export function TasksV2Page() {
       sorted.sort((a, b) => score(a) - score(b) || age(a) - age(b));
     }
     return sorted;
-  }, [rows, prefs.seg, prefs.flags, prefs.sortBy, assigneeFilter, carrierFilter, search, triageRank]);
+  }, [rows, prefs.seg, prefs.flags, prefs.sortBy, prefs.onDashboardOnly, offDashboardIds, assigneeFilter, carrierFilter, search, triageRank]);
 
   // Open a task in the drawer. Router state tells the /tasks/:id route we
   // came from v2 and hands it the board's current active order, so the
@@ -556,7 +595,14 @@ export function TasksV2Page() {
               <option value="age">Sort: oldest first</option>
               <option value="scrape">Sort: stalest data first</option>
             </select>
-            <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 select-none cursor-pointer px-2 py-2 rounded-lg ring-1 ring-slate-200 bg-white hover:bg-slate-50 ml-auto" title="Include tasks completed or dismissed in the last 7 days">
+            <label
+              className="inline-flex items-center gap-1.5 text-xs text-slate-600 select-none cursor-pointer px-2 py-2 rounded-lg ring-1 ring-slate-200 bg-white hover:bg-slate-50 ml-auto"
+              title={`Hides tasks whose shipment left the FreightPOP dashboard (${offCounts.left}) or is delivered (${offCounts.delivered}). Claim, damage, return and redelivery tasks are kept.`}
+            >
+              <input type="checkbox" checked={prefs.onDashboardOnly} onChange={(e) => setPref("onDashboardOnly", e.target.checked)} className="h-3.5 w-3.5 accent-violet-600 cursor-pointer" />
+              <span>Hide delivered &amp; off-dashboard{offDashboardIds.size ? <span className="text-slate-400"> ({offDashboardIds.size})</span> : null}</span>
+            </label>
+            <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 select-none cursor-pointer px-2 py-2 rounded-lg ring-1 ring-slate-200 bg-white hover:bg-slate-50" title="Include tasks completed or dismissed in the last 7 days">
               <input type="checkbox" checked={prefs.includeClosed} onChange={(e) => setPref("includeClosed", e.target.checked)} className="h-3.5 w-3.5 accent-violet-600 cursor-pointer" />
               <span>Show recently closed</span>
             </label>

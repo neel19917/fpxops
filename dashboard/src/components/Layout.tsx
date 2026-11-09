@@ -1,11 +1,11 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs";
 
 interface TabDef {
   id: TabId;
@@ -25,6 +25,7 @@ const ALL_TABS: TabDef[] = [
   { id: "tracking", label: "Tracking",       Icon: Package,      group: "primary" },
   { id: "tasks",    label: "Tasks",          Icon: ListChecks,   group: "primary" },
   { id: "ops",      label: "Ops",            Icon: Activity,     group: "primary" },
+  { id: "scraping", label: "Scraping",       Icon: MonitorPlay,  group: "primary" },
   { id: "gp",       label: "GP Audits",      Icon: TrendingUp,   group: "primary" },
   { id: "invoice",  label: "Invoice Audits", Icon: ReceiptText,  group: "primary" },
   { id: "notes",    label: "Notes",          Icon: NotebookPen,  group: "more" },
@@ -38,6 +39,7 @@ const ALL_TABS: TabDef[] = [
   { id: "settings",  label: "Settings",       Icon: SettingsIcon, group: "admin" },
   { id: "services",  label: "Services",       Icon: Database,     group: "admin" },
   { id: "ai_export", label: "AI Export",      Icon: BarChart3,    group: "admin" },
+  { id: "scrape_logs", label: "Scrape Logs",  Icon: ScrollText,   group: "admin" },
 ];
 
 interface Props {
