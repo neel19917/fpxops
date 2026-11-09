@@ -287,7 +287,12 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     // only ignore real <input>s), so typing "o" in the FreightPOP login opened
     // "Override action", Esc closed the drawer, j/k walked tasks, etc.
     e.stopPropagation();
-    const mod = e.metaKey || e.ctrlKey;
+    // AltGr (how many non-US keyboards type @ # € [ ] { } \ |) arrives on
+    // Windows as Ctrl+Alt. That's a character, not a shortcut: send the
+    // character with no modifiers, or Chrome treats it as Ctrl+Alt+2 and
+    // types nothing.
+    const altGr = e.getModifierState?.("AltGraph") || (e.ctrlKey && e.altKey && !e.metaKey && e.key.length === 1);
+    const mod = !altGr && (e.metaKey || e.ctrlKey);
     // Leave Cmd/Ctrl+V to the native paste event on the key target (onPaste).
     if (mod && (e.key === "v" || e.key === "V")) return;
     e.preventDefault();
@@ -295,7 +300,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       type: "key", event,
       key: e.key, code: e.code, keyCode: e.keyCode,
       text: event === "keyDown" && e.key.length === 1 && !mod ? e.key : (e.key === "Enter" && event === "keyDown" ? "\r" : undefined),
-      modifiers: modifiers(e),
+      modifiers: altGr ? (e.shiftKey ? 8 : 0) : modifiers(e),
     });
   }
 
