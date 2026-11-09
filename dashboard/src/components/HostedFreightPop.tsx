@@ -166,7 +166,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token, viewport: viewport(), target }));
       ws.onmessage = (ev) => {
         if (typeof ev.data !== "string") { draw(ev.data as Blob); return; }
-        let m: { type?: string; ready?: boolean; url?: string; id?: number; ack?: BridgeAck; error?: string; reason?: string };
+        let m: { type?: string; ready?: boolean; url?: string; id?: number; ack?: BridgeAck; error?: string; reason?: string; value?: boolean };
         try { m = JSON.parse(ev.data); } catch { return; }
         if (m.type === "ready") { liveThisConn = true; attempt = 0; setStatus("live"); setError(null); lastPauseSent.current = null; syncPause.current(); }
         else if (m.type === "ended") {
