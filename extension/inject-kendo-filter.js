@@ -114,13 +114,17 @@
     var ds = g.dataSource;
     var prev = ds.filter() || {};
     var v = op === "contains" ? String(value) : typedValue(g, field);
+    var before = typeof ds.total === "function" ? ds.total() : ds.view().length;
     await afterLoad(ds, function () { ds.filter({ field: field, operator: op, value: v }); }, 8000);
     var total = typeof ds.total === "function" ? ds.total() : ds.view().length;
-    if (total > 0 && (op === "eq" || total === 1)) {
+    // An exact ID/tracking match is a handful of rows at most. Hundreds means
+    // the filter didn't take (or another reload raced it) — not a match.
+    var plausible = op === "eq" ? total <= 25 && !(before > 25 && total === before) : total === 1;
+    if (total > 0 && plausible) {
       note("grid " + gi + ": '" + field + "' " + op + " " + JSON.stringify(v) + " → " + total + " row(s)");
       return total;
     }
-    note("grid " + gi + ": '" + field + "' " + op + " " + JSON.stringify(v) + " → " + total + " row(s)" + (total ? " (not unique)" : "") + ", restoring previous filter");
+    note("grid " + gi + ": '" + field + "' " + op + " " + JSON.stringify(v) + " → " + total + " row(s)" + (total ? (op === "eq" ? " (filter didn't take)" : " (not unique)") : "") + ", restoring previous filter");
     await afterLoad(ds, function () { ds.filter(prev && prev.filters ? prev : {}); }, 8000);
     return 0;
   }
@@ -130,13 +134,16 @@
       var g = grids[gi];
       var known = knownFields(g);
       var tries = [];
-      fields.forEach(function (f) { var real = known[String(f).toLowerCase()]; if (real && tries.indexOf(real) < 0) tries.push(real); });
+      // The visible column titled "Shipment Id" / "Tracking Number" first —
+      // it's what FreightPOP filters on. Field-name guesses ("Id" is an
+      // internal key on this grid) come after.
       if (titleRe) {
         (g.columns || []).forEach(function (c) {
           var t = String(c.title || "");
           if (c.field && titleRe.test(t) && !/comment/i.test(t) && tries.indexOf(c.field) < 0) tries.push(c.field);
         });
       }
+      fields.forEach(function (f) { var real = known[String(f).toLowerCase()]; if (real && tries.indexOf(real) < 0) tries.push(real); });
       note("grid " + gi + " candidates: " + (tries.join(", ") || "(none present)"));
       if (keepEmpty && tries.length) {
         // Prefer the column whose title names it ("Shipment Id"), not an
