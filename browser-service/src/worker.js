@@ -47,9 +47,12 @@ export function startScrapeWorker() {
   }
   enabled = true;
   console.log(`[worker] polling rescrape queue every ${config.scrapePollMs / 1000}s`);
-  const tick = () => poll().catch((e) => console.error("[worker] poll error:", e.message));
-  setInterval(tick, config.scrapePollMs);
-  tick();
+  // setTimeout loop so an admin change to the poll interval applies live.
+  const loop = async () => {
+    await poll().catch((e) => console.error("[worker] poll error:", e.message));
+    setTimeout(loop, config.scrapePollMs);
+  };
+  loop();
 }
 
 export function workerBusy() { return busy; }
@@ -140,6 +143,8 @@ async function runJob(job) {
     startedAt: new Date(startedAt).toISOString(), status: "Starting…", statusAt: new Date().toISOString(), log: [],
     counts: { scraped: 0, partial: 0, saved: 0, changed: 0, uploadErrors: 0, archived: 0, processed: 0 },
     total: null, // shipments in the grid, from the Kendo pager ("1 - 10 of 659 items")
+    fpCounts: null, // FreightPOP's dashboard tiles: { TOTAL, BOOKED, "IN TRANSIT", ISSUES, "OUT FOR DELIVERY" }
+    fpCountsAt: null,
   };
   logLine(job.source === "schedule"
     ? `Scheduled run${job.scheduleName ? ` "${job.scheduleName}"` : ""} — running as ${email}`
@@ -298,6 +303,8 @@ async function runIn(browser, url) {
     }
     const total = await readGridTotal(page);
     if (current && total != null) current.total = total;
+    const counts = await readDashboardCounts(page);
+    if (current && counts) { current.fpCounts = counts; current.fpCountsAt = new Date().toISOString(); }
     logLine(total != null ? `Grid loaded — ${total} shipment(s) in the grid. Starting Refresh All` : "Grid loaded — starting Refresh All");
     await ext.evaluate("run(); 'started'", { awaitPromise: false });
 
@@ -326,8 +333,14 @@ async function runIn(browser, url) {
         if (current && !stopFlag) { current.status = status; current.statusAt = new Date().toISOString(); }
       }
       if (done) return stopFlag ? `Stopped by user. ${done}` : done;
-      // Keep the grid total fresh (shipments get added/delivered mid-run).
-      if (++tick % 15 === 0 && current) {
+      // Keep the totals fresh (shipments get added/delivered mid-run):
+      // FreightPOP's dashboard tiles every ~10s, the grid pager every ~30s.
+      ++tick;
+      if (tick % 5 === 0 && current) {
+        const c = await readDashboardCounts(page);
+        if (c) { current.fpCounts = c; current.fpCountsAt = new Date().toISOString(); }
+      }
+      if (tick % 15 === 0 && current) {
         const t = await readGridTotal(page);
         if (t != null) current.total = t;
       }
@@ -350,6 +363,40 @@ async function runIn(browser, url) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// FreightPOP's dashboard tiles (TOTAL / BOOKED / IN TRANSIT / ISSUES /
+// OUT FOR DELIVERY) with the number shown under each. Matched by geometry —
+// the number is the nearest numeric text directly below its label — so it
+// doesn't depend on FreightPOP's class names.
+async function readDashboardCounts(page) {
+  try {
+    return await page.evaluate(() => {
+      const LABELS = ["TOTAL", "BOOKED", "IN TRANSIT", "ISSUES", "OUT FOR DELIVERY"];
+      const all = [...document.querySelectorAll("body *")].filter((el) => el.offsetParent !== null && el.children.length === 0);
+      const labels = all.filter((el) => LABELS.includes((el.textContent || "").trim().toUpperCase()));
+      const nums = all.filter((el) => /^\d[\d,]*$/.test((el.textContent || "").trim()));
+      const out = {};
+      for (const lab of labels) {
+        const key = lab.textContent.trim().toUpperCase();
+        if (out[key] != null) continue;
+        const r = lab.getBoundingClientRect();
+        const cx = r.left + r.width / 2;
+        let best = null, bestD = Infinity;
+        for (const n of nums) {
+          const nr = n.getBoundingClientRect();
+          const dy = nr.top - r.bottom;
+          if (dy < -2 || dy > 90) continue;                  // must sit just below the label
+          const dx = Math.abs(nr.left + nr.width / 2 - cx);
+          if (dx > Math.max(60, r.width / 2)) continue;     // and roughly under it
+          const d = dy + dx;
+          if (d < bestD) { bestD = d; best = n; }
+        }
+        if (best) out[key] = Number(best.textContent.trim().replace(/,/g, ""));
+      }
+      return Object.keys(out).length ? out : null;
+    });
+  } catch { return null; }
+}
 
 // Total shipments in the Kendo grid, from its pager ("1 - 10 of 659 items").
 // Read in the page's main world — the pager is plain DOM. Null if not found.

@@ -236,6 +236,7 @@ export function ScrapingPage() {
               </span>
             </div>
             <div className="text-sm text-violet-900 break-words">{running.status}</div>
+            {running.fpCounts ? <FpTiles counts={running.fpCounts} at={running.fpCountsAt ?? null} /> : null}
             <ProgressBar processed={running.counts?.processed ?? 0} total={running.total ?? null} startedAt={running.startedAt} now={now} />
             {running.counts ? <CountsStrip counts={running.counts} /> : null}
             <div className="flex items-center gap-3">
@@ -442,6 +443,25 @@ function ProgressBar({ processed, total, startedAt, now }: { processed: number; 
       <div className="h-1.5 rounded-full bg-violet-100 overflow-hidden">
         <div className="h-full bg-violet-500 transition-all" style={{ width: `${pct}%` }} />
       </div>
+    </div>
+  );
+}
+
+// FreightPOP's own dashboard tiles, read live from the page being scraped
+// (refreshed every ~10s), so the team sees today's real shipment totals.
+const FP_TILE_ORDER = ["TOTAL", "BOOKED", "IN TRANSIT", "ISSUES", "OUT FOR DELIVERY"];
+function FpTiles({ counts, at }: { counts: Record<string, number>; at: string | null }) {
+  return (
+    <div>
+      <div className="grid grid-cols-5 gap-2">
+        {FP_TILE_ORDER.filter((k) => counts[k] != null).map((k) => (
+          <div key={k} className={"rounded-lg px-2 py-1.5 text-center ring-1 " + (k === "ISSUES" ? "bg-rose-50 ring-rose-200" : k === "OUT FOR DELIVERY" ? "bg-emerald-50 ring-emerald-200" : "bg-white ring-violet-200")}>
+            <div className="text-[10px] font-semibold tracking-wide text-slate-500 truncate">{k}</div>
+            <div className="text-lg font-semibold tabular-nums text-slate-900">{fmtNum(counts[k])}</div>
+          </div>
+        ))}
+      </div>
+      {at ? <div className="text-[10px] text-violet-700 mt-1">FreightPOP dashboard totals · live · updated {fmtRelative(at)}</div> : null}
     </div>
   );
 }

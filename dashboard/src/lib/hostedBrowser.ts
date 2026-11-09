@@ -23,7 +23,8 @@ export interface HostedWorkerState {
   enabled: boolean;
   reason: string | null;
   pollSeconds: number;
-  current: { requestId: string; user: string; scope: string; source?: "manual" | "schedule"; scheduleName?: string | null; startedAt: string; status: string; statusAt: string; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null; total?: number | null } | null;
+  current: { requestId: string; user: string; scope: string; source?: "manual" | "schedule"; scheduleName?: string | null; startedAt: string; status: string; statusAt: string; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null; total?: number | null;
+    fpCounts?: Record<string, number> | null; fpCountsAt?: string | null } | null;
   lastResult: { requestId: string; user: string; ok: boolean; note: string; finishedAt: string; durationMs: number; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null } | null;
 }
 
@@ -120,7 +121,21 @@ export interface AssistantReply {
   actions: AssistantAction[];
 }
 
+// Admin-adjustable hosted browser settings (browser-service/src/settings.js).
+export interface BrowserSetting {
+  key: string; label: string; help: string; unit: string;
+  min: number; max: number; step: number; default: number; value: number;
+  updated_by?: string | null; updated_at?: string | null;
+}
+export interface BrowserSettingsResponse {
+  settings: BrowserSetting[];
+  live?: { sessions: number; browsers: number; memoryMb: number; egress: { mbLastHour: number; mbLast5Min: number } };
+}
+
 export const hostedBrowser = {
+  adminSettings: () => call<BrowserSettingsResponse>("/admin/settings"),
+  saveAdminSettings: (settings: Record<string, number>) =>
+    call<BrowserSettingsResponse>("/admin/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ settings }) }),
   assistantChat: (body: { history: unknown[]; message: string; context?: Record<string, unknown> }) =>
     call<AssistantReply>("/assistant/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   enabled: !!HOSTED_BROWSER_URL,

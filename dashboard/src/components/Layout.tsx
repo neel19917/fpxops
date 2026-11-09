@@ -5,7 +5,7 @@ import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser";
 
 interface TabDef {
   id: TabId;
@@ -40,6 +40,7 @@ const ALL_TABS: TabDef[] = [
   { id: "services",  label: "Services",       Icon: Database,     group: "admin" },
   { id: "ai_export", label: "AI Export",      Icon: BarChart3,    group: "admin" },
   { id: "scrape_logs", label: "Scrape Logs",  Icon: ScrollText,   group: "admin" },
+  { id: "hosted_browser", label: "Hosted Browser", Icon: MonitorPlay, group: "admin" },
 ];
 
 interface Props {
