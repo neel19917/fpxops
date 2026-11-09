@@ -1,6 +1,24 @@
 import { acquireUserBrowser, openWindowPage, ExtensionContexts, noteUrl, dashboardUrlFor } from "./browser.js";
 import { recordSession } from "./usage.js";
 import { scrapePageFor } from "./worker.js";
+import { get as setting, onChange as onSettingsChange } from "./settings.js";
+
+// Live-view data sent, in 1-minute buckets for the last hour (admin cost view).
+const egress = new Map(); // minute -> bytes
+export function egressStats() {
+  const now = Math.floor(Date.now() / 60_000);
+  let lastHour = 0, last5 = 0;
+  for (const [m, b] of egress) {
+    if (m < now - 60) { egress.delete(m); continue; }
+    lastHour += b;
+    if (m >= now - 5) last5 += b;
+  }
+  return { mbLastHour: +(lastHour / 1e6).toFixed(1), mbLast5Min: +(last5 / 1e6).toFixed(1) };
+}
+function countEgress(bytes) {
+  const m = Math.floor(Date.now() / 60_000);
+  egress.set(m, (egress.get(m) || 0) + bytes);
+}
 import { config } from "./config.js";
 
 const FP_HOST = /^https:\/\/([a-z0-9-]+\.)*freightpop\.com(\/|$)/i;
@@ -107,7 +125,9 @@ export class ViewerSession {
       // is backed up (slow client) instead of queueing unboundedly.
       this.cdp.send("Page.screencastFrameAck", { sessionId }).catch(() => {});
       if (this.ws.readyState === 1 && this.ws.bufferedAmount < 2_000_000) {
-        this.ws.send(Buffer.from(data, "base64"), { binary: true });
+        const buf = Buffer.from(data, "base64");
+        countEgress(buf.length);
+        this.ws.send(buf, { binary: true });
       }
     });
     // Page-level listeners only on pages we own — a watcher must not change
@@ -133,6 +153,20 @@ export class ViewerSession {
 
     if (!this.watchOnly) await this.applyViewport();
     await this.startCast();
+    // Admin changed picture quality / frame skipping → re-apply live.
+    this.offSettings = onSettingsChange(() => { if (!this.paused && !this.closed) this.startCast().catch(() => {}); });
+    // Close the view after N minutes without clicks/keys (admin setting; 0 = off).
+    this.lastInputAt = Date.now();
+    if (!this.watchOnly) {
+      this.idleTimer = setInterval(() => {
+        const min = setting("browser.view_idle_min");
+        if (!min || this.closed) return;
+        if (Date.now() - this.lastInputAt > min * 60_000) {
+          this.send({ type: "ended", reason: `Closed after ${min} min without activity` });
+          try { this.ws.close(4010, "idle"); } catch {}
+        }
+      }, 30_000);
+    }
     this.send({ type: "ready", watchOnly: this.watchOnly });
     if (this.watchOnly || this.resumed) { this.send({ type: "url", url: this.page.url() }); return; }
     // Open on the user's dashboard so the shipment grid is there for
@@ -151,7 +185,9 @@ export class ViewerSession {
     const run = async () => {
       await this.cdp.send("Page.stopScreencast").catch(() => {});
       await this.cdp.send("Page.startScreencast", {
-        format: "jpeg", quality: 60, everyNthFrame: 1,
+        format: "jpeg",
+        quality: setting("browser.stream_quality"),
+        everyNthFrame: setting("browser.stream_every_nth_frame"),
         maxWidth: this.viewport.width, maxHeight: this.viewport.height,
       }).catch((e) => { if (!/already active/i.test(e.message)) throw e; });
     };
@@ -188,6 +224,7 @@ export class ViewerSession {
       return;
     }
     if (this.watchOnly) return; // read-only: no input, no resizing, no bridge
+    if (["mouse", "key", "insertText", "nav", "bridge"].includes(msg.type)) this.lastInputAt = Date.now();
     if (!this.cdp) {
       if (msg.type === "viewport") {
         this.viewport = {
@@ -282,6 +319,8 @@ export class ViewerSession {
   async close() {
     this.closed = true;
     clearInterval(this.readyTimer);
+    clearInterval(this.idleTimer);
+    this.offSettings?.();
     try { await this.cdp?.send("Page.stopScreencast"); } catch {}
     try { await this.cdp?.detach(); } catch {}
     if (this.lease) recordSession(this.who.email, Date.now() - (this.startedAt || Date.now()));

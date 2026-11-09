@@ -67,6 +67,8 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   const pendingRef = useRef(new Map<number, (ack: BridgeAck) => void>());
   const nextIdRef = useRef(1);
   const [status, setStatus] = useState<Status>("connecting");
+  // Bumped by the Reconnect button to re-run the connection effect.
+  const [reconnectKey, setReconnectKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   // Keep latest callbacks without re-running the connection effect.
   // Effective pause = caller says hidden OR the browser tab is in the background.
@@ -175,6 +177,12 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         pendingRef.current.clear();
         if (disposed) return;
         if (ev.code === 4004) { setStatus("ended"); return; } // watched scrape ended / none running
+        if (ev.code === 4010) {
+          // Closed by the admin "close a view after inactivity" setting.
+          setStatus("ended");
+          setError(ev.reason === "idle" ? "This FreightPOP view was closed after inactivity." : "This FreightPOP view was closed.");
+          return;
+        }
         if (ev.code === 4009) {
           // Too many of this user's tabs were open; this (older) one was closed.
           // Don't auto-reconnect, or two tabs would keep evicting each other.
@@ -214,7 +222,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       ro.disconnect();
       wsRef.current?.close();
     };
-  }, [target]);
+  }, [target, reconnectKey]);
 
   // Tell the service to stop/start streaming. Re-sent after every reconnect.
   useEffect(() => {
@@ -324,6 +332,14 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
               : status === "reconnecting" ? "Reconnecting to hosted FreightPOP…"
               : null}
             {error ? <span className={status === "live" ? "" : "ml-1"}>{error}</span> : null}
+            {status === "ended" && !watchOnly ? (
+              <button
+                onClick={() => { setError(null); setStatus("connecting"); setReconnectKey((k) => k + 1); }}
+                className="ml-2 font-semibold text-violet-700 hover:text-violet-900 underline"
+              >
+                Reconnect
+              </button>
+            ) : null}
           </div>
         </div>
       ) : null}

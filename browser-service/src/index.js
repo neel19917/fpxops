@@ -4,7 +4,8 @@ import { WebSocketServer } from "ws";
 import { config } from "./config.js";
 import { poolStats, closeAll, userStatus, selfTest } from "./browser.js";
 import { summary as usageSummary, flush as flushUsage } from "./usage.js";
-import { ViewerSession } from "./session.js";
+import { ViewerSession, egressStats } from "./session.js";
+import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
 import { startScrapeWorker, workerBusy, workerState, requestStop, fullLog } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
 import { chat, assistantEnabled } from "./assistant.js";
@@ -71,7 +72,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404).end();
 });
 
-const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/log|runs|schedules|assistant)(\/|$)/;
+const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/log|runs|schedules|assistant|admin)(\/|$)/;
 
 async function readJson(req, maxBytes = 64 * 1024) {
   let body = "";
@@ -117,6 +118,7 @@ async function handleApi(req, res, url, who) {
         sessions: sessions.size,
         browsers: browsers.length,
         memoryMb: browsers.reduce((t, b) => t + (b.memoryMb || 0), 0),
+        egress: egressStats(),
         perBrowser: browsers,
       },
       me: userStatus(who.email),
@@ -147,6 +149,11 @@ async function handleApi(req, res, url, who) {
   if (p === "/runs" && m === "GET") {
     const q = Object.fromEntries(url.searchParams);
     return json(res, 200, { isAdmin: who.isAdmin, runs: runsFor(who, q) });
+  }
+  if (p === "/admin/settings") {
+    if (!who.isAdmin) return json(res, 403, { error: "Admins only" });
+    if (m === "GET") return json(res, 200, { settings: listSettings(), live: { sessions: sessions.size, browsers: poolStats().length, memoryMb: poolStats().reduce((t, b) => t + (b.memoryMb || 0), 0), egress: egressStats() } });
+    if (m === "PUT") return json(res, 200, { settings: await updateSettings((await readJson(req)).settings, who.email) });
   }
   if (p === "/assistant/chat" && m === "POST") {
     if (!assistantEnabled) return json(res, 503, { error: "Assistant isn't configured on this service" });
@@ -285,6 +292,7 @@ wss.on("connection", (ws, req) => {
 
 server.listen(config.port, async () => {
   console.log(`[fpx-browser] listening on :${config.port}${config.devNoAuth ? " (DEV: auth disabled)" : ""}`);
+  startSettings();
   initRuns().catch((e) => console.warn("[runs] init failed:", e.message));
   if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); }
   selfTest().then((r) => {
