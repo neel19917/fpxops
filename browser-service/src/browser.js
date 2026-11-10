@@ -49,10 +49,14 @@ export function watchAuth(page, email, onExpired) {
   const handler = (res) => {
     let url; try { url = res.url(); } catch { return; }
     if (!FP_API.test(url)) return;
-    const s = authState.get(key) || { fails: [], expiredAt: 0 };
+    const s = authState.get(key) || { fails: [], expiredAt: 0, paths: new Set() };
     const status = res.status();
-    if (status >= 200 && status < 300) { authState.delete(key); return; }
+    const path = url.replace(/[?#].*$/, "");
+    // Some FreightPOP calls answer 200 without a login; only a success on a
+    // call that was refused proves the user signed back in.
+    if (status >= 200 && status < 300) { if (s.paths.has(path)) authState.delete(key); return; }
     if (status !== 401) return;
+    s.paths.add(path);
     const now = Date.now();
     s.fails = s.fails.filter((t) => now - t < 20_000).concat(now);
     if (s.fails.length >= 3 && !s.expiredAt) {
