@@ -1,4 +1,4 @@
-import { acquireUserBrowser, hasProfile, getServiceWorker, openWindowPage, ExtensionContexts, dashboardUrlFor } from "./browser.js";
+import { acquireUserBrowser, hasProfile, getServiceWorker, openWindowPage, ExtensionContexts, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
 import { config } from "./config.js";
 import { recordScrape } from "./usage.js";
 import { recordRun } from "./runs.js";
@@ -191,13 +191,13 @@ async function runJob(job) {
 async function runRefreshAll(email) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runIn(lease.browser, dashboardUrlFor(email));
+    return await runIn(lease.browser, dashboardUrlFor(email), email);
   } finally {
     lease.release();
   }
 }
 
-async function runIn(browser, url) {
+async function runIn(browser, url, who) {
   const worker = await getServiceWorker(browser);
   // Same sentinel trick as extension-headless/run.js: content.js reports
   // progress/completion to the service worker via chrome.runtime.sendMessage.
@@ -277,8 +277,11 @@ async function runIn(browser, url) {
     });
   });
 
+  clearAuthExpired(who);
   const page = await openWindowPage(browser, url);
   currentPage = page;
+  const offAuth = watchAuth(page, who);
+  const EXPIRED = "Your FreightPOP login expired (FreightPOP rejects it) — open More → FreightPOP login, sign in again, then re-run";
   try {
     if (/\/login/i.test(page.url())) {
       throw new Error("Your FreightPOP session expired — log in again through the dashboard's hosted view");
@@ -296,8 +299,10 @@ async function runIn(browser, url) {
     let gridReady = false;
     for (let i = 0; i < 6 && !gridReady; i++) {
       if (/#\/login|\/login\b/i.test(page.url())) throw new Error("Your FreightPOP session expired — open FreightPOP on the Scraping page and log in again");
+      if (isAuthExpired(who)) throw new Error(EXPIRED);
       gridReady = (await ext.evaluate("fpxEnsureGridReady(10000)").catch(() => ({ value: false }))).value === true;
     }
+    if (!gridReady && isAuthExpired(who)) throw new Error(EXPIRED);
     if (!gridReady) {
       const why = (await ext.evaluate("fpxDescribeFrameState()").catch(() => ({ value: "" }))).value;
       throw new Error(`FreightPOP's shipment grid never loaded on ${page.url()}${why ? ` (${why})` : ""}`);
@@ -360,6 +365,7 @@ async function runIn(browser, url) {
     await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
     throw new Error(`Timed out after ${config.scrapeTimeoutMs / 60000} min (last status: ${lastStatus || "none"})`);
   } finally {
+    offAuth();
     currentPage = null;
     await page.close().catch(() => {});
   }
