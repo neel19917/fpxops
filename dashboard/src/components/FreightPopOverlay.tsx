@@ -217,6 +217,10 @@ export function FreightPopOverlay() {
       }
       const tnForAck = p.type === "fpxFindShipment" ? p.trackingNumber || "" : "";
       hostedRef.current?.bridge(p).then((ack) => {
+        // A newer lookup replaced this one, or the user has already moved
+        // on to another shipment — don't flash an old result.
+        if (ack.reason === "superseded") return;
+        if (tnForAck && frameRef.current.trackingNumber && frameRef.current.trackingNumber !== tnForAck) return;
         handleFilterAckRef.current({ ...ack, column: "Tracking Number", value: tnForAck });
       });
       return;
@@ -299,13 +303,18 @@ export function FreightPopOverlay() {
     if (!frame.trackingNumber) return;
     const key = `${frame.trackingNumber}#${frame.autoFilterTick}`;
     if (lastAutoFilteredKeyRef.current === key) return;
-    lastAutoFilteredKeyRef.current = key;
     // Hosted pane: find the shipment AND open FreightPOP's tracking popup, so
     // clicking a task lands straight on its details. (Extension iframe path
-    // keeps the plain grid filter.)
-    sendBridgeRef.current(hosted
-      ? { type: "fpxOpenTracking", trackingNumber: frame.trackingNumber }
-      : { type: "fpxFilter", column: "Tracking Number", value: frame.trackingNumber });
+    // keeps the plain grid filter.) Wait a moment first: walking through
+    // tasks quickly (j / →) should only look up where the user stops.
+    const tn = frame.trackingNumber;
+    const t = setTimeout(() => {
+      lastAutoFilteredKeyRef.current = key;
+      sendBridgeRef.current(hosted
+        ? { type: "fpxOpenTracking", trackingNumber: tn }
+        : { type: "fpxFilter", column: "Tracking Number", value: tn });
+    }, hosted ? 500 : 0);
+    return () => clearTimeout(t);
   }, [bridgeReady, frame.trackingNumber, frame.autoFilterTick]);
 
   // Open-tracking-modal trigger. Same keying pattern as auto-filter so a

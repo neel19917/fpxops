@@ -383,9 +383,17 @@ export class ViewerSession {
     if (last && last.key === key && (last.open || !wantsOpen) && (!last.done || Date.now() - last.done < 8000)) {
       return last.promise;
     }
+    // Latest wins: clicking through tasks quickly used to queue every
+    // lookup, so the grid kept flipping through old shipments for a minute.
+    // A lookup still waiting when a newer one arrives is skipped.
+    const gen = (this.findGen = (this.findGen || 0) + 1);
     const entry = { key, open: wantsOpen, done: 0 };
     const run = async () => {
-      const ack = await this.bridgeWithRetry(payload);
+      if (gen !== this.findGen) {
+        entry.done = Date.now();
+        return { ok: false, reason: "superseded", error: "Skipped — a newer lookup replaced this one." };
+      }
+      const ack = await this.bridgeWithRetry(payload, () => gen !== this.findGen);
       entry.done = Date.now();
       return ack;
     };
@@ -394,7 +402,7 @@ export class ViewerSession {
     return entry.promise;
   }
 
-  async bridgeWithRetry(payload) {
+  async bridgeWithRetry(payload, superseded = () => false) {
     if (!["fpxFindShipment", "fpxFilter", "fpxOpenTracking", "fpxPing"].includes(payload.type)) {
       return { ok: false, error: `Unsupported bridge command ${payload.type}` };
     }
@@ -409,6 +417,7 @@ export class ViewerSession {
       ack = await this.ext.bridge(payload);
       const waiting = ack.reason === "grid-not-ready" || ack.reason === "no-extension";
       if (!waiting || Date.now() > deadline) break;
+      if (superseded()) return { ok: false, reason: "superseded", error: "Skipped — a newer lookup replaced this one." };
       // The window is on a page with no shipment grid (an error page, a
       // shipment detail, settings…) — waiting won't help. Go to the user's
       // dashboard once, then keep retrying while the grid renders. Not on
