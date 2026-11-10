@@ -166,6 +166,11 @@ export class ViewerSession {
           console.log(`[auth] ${this.who.email} → sign-in page`);
           await this.page.goto(SIGN_IN_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
         } catch {}
+      }, () => {
+        // Signed back in: tell the dashboard now, not on the next page load.
+        this.signedInLast = true;
+        this.send({ type: "signedIn", value: true });
+        noteUrl(this.who.email, this.page.url(), true);
       });
       // Poll for the content script so the dashboard's "Ext" pill is accurate.
       this.readyTimer = setInterval(() => this.reportBridgeReady(), 1000);

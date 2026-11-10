@@ -44,7 +44,7 @@ export function clearAuthExpired(email) {
   authState.delete(String(email).toLowerCase());
 }
 // onExpired fires once when this page's calls start failing.
-export function watchAuth(page, email, onExpired) {
+export function watchAuth(page, email, onExpired, onRestored) {
   const key = String(email).toLowerCase();
   const handler = (res) => {
     let url; try { url = res.url(); } catch { return; }
@@ -54,7 +54,7 @@ export function watchAuth(page, email, onExpired) {
     const path = url.replace(/[?#].*$/, "");
     // Some FreightPOP calls answer 200 without a login; only a success on a
     // call that was refused proves the user signed back in.
-    if (status >= 200 && status < 300) { if (s.paths.has(path)) authState.delete(key); return; }
+    if (status >= 200 && status < 300) { if (s.paths.has(path)) { const was = s.expiredAt; authState.delete(key); if (was) { console.log(`[auth] ${email}: FreightPOP accepts the login again`); try { onRestored?.(); } catch {} } } return; }
     if (status !== 401) return;
     s.paths.add(path);
     const now = Date.now();
