@@ -31,6 +31,43 @@ const stateFile = (email) => path.join(profileDirFor(email), "fpx-state.json");
 
 // Remember where the user's FreightPOP tab last was, so we can say "logged in"
 // vs "needs login" even while their browser is closed.
+// FreightPOP keeps its "user" record in localStorage after the API token
+// behind it expires; the Broker page then draws its menu and every API call
+// (appbe.freightpop.com) answers 401. Watch those answers: several 401s and
+// no successful call in between = the login is gone.
+const authState = new Map(); // email -> { fails: [ts], expiredAt }
+const FP_API = /^https:\/\/appbe\.freightpop\.com\//i;
+export function isAuthExpired(email) {
+  return !!authState.get(String(email).toLowerCase())?.expiredAt;
+}
+export function clearAuthExpired(email) {
+  authState.delete(String(email).toLowerCase());
+}
+// onExpired fires once when this page's calls start failing.
+export function watchAuth(page, email, onExpired) {
+  const key = String(email).toLowerCase();
+  const handler = (res) => {
+    let url; try { url = res.url(); } catch { return; }
+    if (!FP_API.test(url)) return;
+    const s = authState.get(key) || { fails: [], expiredAt: 0 };
+    const status = res.status();
+    if (status >= 200 && status < 300) { authState.delete(key); return; }
+    if (status !== 401) return;
+    const now = Date.now();
+    s.fails = s.fails.filter((t) => now - t < 20_000).concat(now);
+    if (s.fails.length >= 3 && !s.expiredAt) {
+      s.expiredAt = now;
+      authState.set(key, s);
+      console.log(`[auth] ${email}: FreightPOP API answers 401 — login expired`);
+      try { onExpired?.(); } catch {}
+      return;
+    }
+    authState.set(key, s);
+  };
+  page.on("response", handler);
+  return () => page.off("response", handler);
+}
+
 export function noteUrl(email, url, signedIn = true) {
   if (!/^https:\/\/([a-z0-9-]+\.)*freightpop\.com/i.test(url || "")) return;
   const loggedIn = signedIn && !/#\/login|\/login\b|\/Account\/Login/i.test(url);

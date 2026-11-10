@@ -1,4 +1,4 @@
-import { acquireUserBrowser, openWindowPage, ExtensionContexts, noteUrl, dashboardUrlFor } from "./browser.js";
+import { acquireUserBrowser, openWindowPage, ExtensionContexts, noteUrl, dashboardUrlFor, watchAuth, isAuthExpired } from "./browser.js";
 import { recordSession } from "./usage.js";
 import { scrapePageFor } from "./worker.js";
 import { get as setting, onChange as onSettingsChange } from "./settings.js";
@@ -153,6 +153,20 @@ export class ViewerSession {
       };
       this.page.on("framenavigated", this.onNav);
       this.page.on("popup", this.onPopup);
+      // Expired FreightPOP login: drop the stale "user" record (otherwise
+      // FreightPOP's sign-in page bounces straight back to the blank
+      // dashboard) and show the sign-in form.
+      this.offAuth = watchAuth(this.page, this.who.email, async () => {
+        try {
+          this.send({ type: "signedIn", value: false });
+          this.signedInLast = false;
+          await this.page.evaluate(() => { try { localStorage.removeItem("user"); } catch {} }).catch(() => {});
+          noteUrl(this.who.email, this.page.url(), false);
+          this.lastSignInRedirect = Date.now();
+          console.log(`[auth] ${this.who.email} → sign-in page`);
+          await this.page.goto(SIGN_IN_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+        } catch {}
+      });
       // Poll for the content script so the dashboard's "Ext" pill is accurate.
       this.readyTimer = setInterval(() => this.reportBridgeReady(), 1000);
     }
@@ -315,6 +329,7 @@ export class ViewerSession {
   // only its menu and the Angular app throws on a null user.) Errs toward
   // "signed in": anything unknown never blocks a lookup.
   async signedIn() {
+    if (isAuthExpired(this.who.email)) return false;
     try {
       const { cookies } = await this.cdp.send("Network.getCookies", { urls: FP_COOKIE_URLS });
       if (cookies.length) return true;
@@ -444,6 +459,7 @@ export class ViewerSession {
     if (this.lease) recordSession(this.who.email, Date.now() - (this.startedAt || Date.now()));
     if (this.ownsPage && this.page && this.lease) {
       if (this.onNav) this.page.off("framenavigated", this.onNav);
+      this.offAuth?.();
       if (this.onPopup) this.page.off("popup", this.onPopup);
       if (!this.page.isClosed() && this.lease.browser.connected) {
         // Keep the window (and the browser lease) for this user's next connection.
