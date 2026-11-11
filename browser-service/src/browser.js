@@ -75,7 +75,14 @@ export function watchAuth(page, email, onExpired, onRestored) {
 export function noteUrl(email, url, signedIn = true) {
   if (!/^https:\/\/([a-z0-9-]+\.)*freightpop\.com/i.test(url || "")) return;
   const loggedIn = signedIn && !/#\/login|\/login\b|\/Account\/Login/i.test(url);
-  try { fs.writeFileSync(stateFile(email), JSON.stringify({ loggedIn, url, at: new Date().toISOString() })); } catch {}
+  writeState(email, { loggedIn, url, at: new Date().toISOString() });
+}
+
+// Merge into the user's fpx-state.json (keeps the email so background jobs —
+// the login keep-alive — can find whose profile a folder is).
+export function writeState(email, patch) {
+  const prev = readState(email) || {};
+  try { fs.writeFileSync(stateFile(email), JSON.stringify({ ...prev, ...patch, email: String(email).toLowerCase() })); } catch {}
 }
 
 // The account's dashboard (where the shipment grid lives):
