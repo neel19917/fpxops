@@ -166,7 +166,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token, viewport: viewport(), target }));
       ws.onmessage = (ev) => {
         if (typeof ev.data !== "string") { draw(ev.data as Blob); return; }
-        let m: { type?: string; ready?: boolean; url?: string; id?: number; ack?: BridgeAck; error?: string; reason?: string; value?: boolean };
+        let m: { type?: string; ready?: boolean; url?: string; id?: number; ack?: BridgeAck; error?: string; reason?: string; value?: boolean; text?: string };
         try { m = JSON.parse(ev.data); } catch { return; }
         if (m.type === "ready") { liveThisConn = true; attempt = 0; setStatus("live"); setError(null); lastPauseSent.current = null; syncPause.current(); }
         else if (m.type === "ended") {
@@ -176,6 +176,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         else if (m.type === "bridgeReady") cbRef.current.onBridgeReady?.(!!m.ready);
         else if (m.type === "url" && m.url) cbRef.current.onUrl?.(m.url);
         else if (m.type === "signedIn") cbRef.current.onSignedIn?.(!!m.value);
+        else if (m.type === "copyResult") copyToClipboard(m.text || "");
         else if (m.type === "bridgeAck" && typeof m.id === "number") {
           const r = pendingRef.current.get(m.id);
           if (r) { pendingRef.current.delete(m.id); r(m.ack || { ok: false }); }
@@ -262,6 +263,31 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   }, []);
   useEffect(() => { pausedRef.current = paused; syncPause.current(); }, [paused]);
 
+  const [copyNote, setCopyNote] = useState<string | null>(null);
+  const copyNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function showCopyNote(text: string) {
+    setCopyNote(text);
+    if (copyNoteTimer.current) clearTimeout(copyNoteTimer.current);
+    copyNoteTimer.current = setTimeout(() => setCopyNote(null), 1800);
+  }
+  async function copyToClipboard(text: string) {
+    if (!text.trim()) { showCopyNote("Nothing selected — drag over text (or double-click a number) first"); return; }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback for browsers that refuse async clipboard writes.
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      keyTargetRef.current?.focus();
+      if (!ok) { showCopyNote("Couldn't copy — your browser blocked the clipboard"); return; }
+    }
+    const one = text.replace(/\s+/g, " ").trim();
+    showCopyNote(`Copied “${one.length > 40 ? one.slice(0, 40) + "…" : one}”`);
+  }
+
   function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
     e.preventDefault();
     e.stopPropagation();
@@ -276,7 +302,8 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     send({
       type: "mouse", event,
       x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY,
-      button: event === "mouseMoved" ? "none" : BUTTONS[e.button] || "left",
+      // A move with the left button held is a drag (selects text).
+      button: event === "mouseMoved" ? (e.buttons & 1 ? "left" : "none") : BUTTONS[e.button] || "left",
       buttons: e.buttons, clickCount, modifiers: modifiers(e),
     });
   }
@@ -295,6 +322,13 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     const mod = !altGr && (e.metaKey || e.ctrlKey);
     // Leave Cmd/Ctrl+V to the native paste event on the key target (onPaste).
     if (mod && (e.key === "v" || e.key === "V")) return;
+    // Cmd/Ctrl+C: copy FreightPOP's selected text to the user's clipboard
+    // (the remote browser's own clipboard is useless to them).
+    if (mod && !e.shiftKey && !e.altKey && (e.key === "c" || e.key === "C")) {
+      e.preventDefault();
+      if (event === "keyDown") send({ type: "copy", id: Date.now() });
+      return;
+    }
     e.preventDefault();
     send({
       type: "key", event,
@@ -322,6 +356,11 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         // but clear defensively so IME/dead keys can't leave text behind.
         onInput={(e) => { e.currentTarget.value = ""; }}
       />
+      {copyNote ? (
+        <div className="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 z-20 rounded-lg bg-slate-900/90 text-white text-xs px-3 py-1.5 shadow">
+          {copyNote}
+        </div>
+      ) : null}
       {watchOnly ? (
         // Read-only: the scrape window keeps its own size, so letterbox it.
         <canvas ref={canvasRef} className="block w-full h-full bg-slate-900" style={{ objectFit: "contain" }} />

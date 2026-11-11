@@ -5,6 +5,7 @@ import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
 import type { UserProfileRow } from "../lib/types";
 import { useAuth } from "../lib/auth";
+import { reloadPreferences } from "../lib/prefs";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
 
@@ -106,6 +107,13 @@ export function UsersPage() {
       setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
     } catch (e) { alert((e as Error).message); }
   }
+  async function toggleAutoOpen(u: UserProfileRow) {
+    try {
+      const r = await api.users.update(u.id, { auto_open_tracking: u.auto_open_tracking === false });
+      setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
+      if (r.user.id === profile?.id) reloadPreferences();
+    } catch (e) { alert((e as Error).message); }
+  }
   async function setRole(u: UserProfileRow, role: string) {
     try {
       const r = await api.users.update(u.id, { role });
@@ -193,6 +201,7 @@ export function UsersPage() {
             <th className="px-5 py-2.5 font-medium">Email</th>
             <th className="px-5 py-2.5 font-medium">Role</th>
             {hostedBrowser.enabled ? <th className="px-5 py-2.5 font-medium" title="FreightPOP login inside the hosted browser (FPX's built-in FreightPOP pane)">Hosted FreightPOP</th> : null}
+            {hostedBrowser.enabled ? <th className="px-5 py-2.5 font-medium" title="Hosted FreightPOP lookups also open the shipment's tracking details. Off = the grid is only filtered and the user clicks it (faster when moving between shipments). Users can also change it themselves in the FreightPOP pane.">Auto-open details</th> : null}
             <th className="px-5 py-2.5 font-medium">Last login</th>
             <th className="px-5 py-2.5 font-medium">Joined</th>
             <th className="px-5 py-2.5 font-medium text-right">Access</th>
@@ -239,6 +248,24 @@ export function UsersPage() {
                   <td className="px-5 py-3 whitespace-nowrap">
                     <HostedLoginCell login={logins?.get(u.email.toLowerCase()) || null} loading={!logins && !loginsErr} error={loginsErr}
                       resetting={resettingEmail === u.email.toLowerCase()} onReset={() => resetLogin(u.email.toLowerCase())} />
+                  </td>
+                ) : null}
+                {hostedBrowser.enabled ? (
+                  <td className="px-5 py-3 whitespace-nowrap">
+                    <button
+                      role="switch"
+                      aria-checked={u.auto_open_tracking !== false}
+                      onClick={() => toggleAutoOpen(u)}
+                      title={u.auto_open_tracking !== false
+                        ? "On: lookups open the FreightPOP tracking details. Click to turn off (grid is only filtered; they click the shipment)."
+                        : "Off: lookups only filter the grid; they click the shipment. Click to turn on."}
+                      className="inline-flex items-center gap-2 text-sm text-slate-700"
+                    >
+                      <span className={"relative inline-block h-5 w-9 rounded-full transition " + (u.auto_open_tracking !== false ? "bg-violet-600" : "bg-slate-300")}>
+                        <span className={"absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all " + (u.auto_open_tracking !== false ? "left-[18px]" : "left-0.5")} />
+                      </span>
+                      {u.auto_open_tracking !== false ? "On" : "Off"}
+                    </button>
                   </td>
                 ) : null}
                 <td className="px-5 py-3 text-slate-500">{fmtRelative(u.last_login_at)}</td>

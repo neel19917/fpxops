@@ -89,6 +89,34 @@ meRouter.get("/", requireAuth({ requireEnabled: false }), async (req, res) => {
   res.status(401).json({ error: "No identity" });
 });
 
+// GET/PATCH /api/me/preferences — the caller's own FPX preferences.
+// auto_open_tracking: hosted FreightPOP lookups also open the tracking popup
+// (false = only filter the grid to the shipment; the user clicks it).
+meRouter.get("/preferences", requireAuth(), async (req, res) => {
+  if (!req.user) return res.status(403).json({ error: "User sign-in required" });
+  const { data, error } = await supabase
+    .from("fpx_user_profiles")
+    .select("auto_open_tracking")
+    .eq("id", req.user.id)
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ auto_open_tracking: data?.auto_open_tracking !== false });
+});
+
+meRouter.patch("/preferences", requireAuth(), async (req, res) => {
+  if (!req.user) return res.status(403).json({ error: "User sign-in required" });
+  if (typeof req.body?.auto_open_tracking !== "boolean") return res.status(400).json({ error: "auto_open_tracking must be true or false" });
+  const { data, error } = await supabase
+    .from("fpx_user_profiles")
+    .update({ auto_open_tracking: req.body.auto_open_tracking })
+    .eq("id", req.user.id)
+    .select("auto_open_tracking")
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: "Profile not found" });
+  res.json({ auto_open_tracking: data.auto_open_tracking });
+});
+
 // POST /api/me/impersonate-start  { target_id, writes? }
 // Called by the dashboard when an admin starts impersonating. We don't trust
 // the client to attribute correctly — the action is logged here against the

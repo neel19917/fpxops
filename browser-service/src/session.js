@@ -298,6 +298,25 @@ export class ViewerSession {
           modifiers: Number(msg.modifiers) || 0,
         });
       }
+      case "copy": {
+        // Ctrl/Cmd+C in the dashboard: hand back the text selected in
+        // FreightPOP (any frame, incl. popups, or the focused input) so the
+        // dashboard can put it on the user's own clipboard.
+        if (this.watchOnly || !this.page) return;
+        let text = "";
+        for (const f of this.page.frames()) {
+          text = await f.evaluate(() => {
+            const el = document.activeElement;
+            if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") && typeof el.selectionStart === "number" && el.selectionEnd > el.selectionStart) {
+              return el.value.slice(el.selectionStart, el.selectionEnd);
+            }
+            return String(window.getSelection?.() || "");
+          }).catch(() => "");
+          if (text && text.trim()) break;
+        }
+        this.send({ type: "copyResult", id: msg.id, text: String(text || "").slice(0, 100_000) });
+        return;
+      }
       case "insertText":
         if (typeof msg.text === "string" && msg.text.length <= 10_000) {
           return this.cdp.send("Input.insertText", { text: msg.text });

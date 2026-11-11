@@ -216,6 +216,9 @@ export const api = {
       pending_api_key?: string | null;
       client_config?: ClientConfig;
     }>("/api/me"),
+    preferences: () => request<{ auto_open_tracking: boolean }>("/api/me/preferences"),
+    setPreferences: (body: { auto_open_tracking: boolean }) =>
+      request<{ auto_open_tracking: boolean }>("/api/me/preferences", { method: "PATCH", body: JSON.stringify(body) }),
   },
 
   impersonate: {
@@ -362,7 +365,7 @@ export const api = {
   },
   users: {
     list: () => request<{ data: UserProfileRow[] }>("/api/users"),
-    update: (id: string, body: { enabled?: boolean; role?: string; full_name?: string | null }) =>
+    update: (id: string, body: { enabled?: boolean; role?: string; full_name?: string | null; auto_open_tracking?: boolean }) =>
       request<{ user: UserProfileRow }>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
     issueKey: (id: string) =>
       request<{
