@@ -799,6 +799,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try { await flushPendingUploads(); } catch { /* fall through */ }
       const result = await callApi("/api/shipments/sweep-complete", {
         tracking_numbers: msg.trackingNumbers || [],
+        // Mode-limited run: only shipments of these modes may be archived.
+        modes: Array.isArray(msg.modes) && msg.modes.length ? msg.modes : undefined,
       });
       sendResponse(result.error
         ? { ok: false, error: result.error }

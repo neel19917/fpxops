@@ -9,7 +9,7 @@ import { lastRunFor } from "./runs.js";
 // THEIR hosted browser with THEIR FreightPOP login.
 //
 //   { id, owner, name, enabled, days: [0..6] (0=Sun), times: ["07:00", ...],
-//     tz: "America/Los_Angeles", createdAt, updatedAt }
+//     tz: "America/Los_Angeles", modes: ["LTL","Truckload"] | null (= all), createdAt, updatedAt }
 //
 // A 20s tick compares each schedule's local wall-clock time (in its own time
 // zone) to its times; a firing is remembered per date+time so it runs once.
@@ -50,6 +50,13 @@ function clean(input, existing) {
     if (bad) throw new Error(`"${bad}" isn't a time (use HH:MM, 24-hour)`);
     if (times.length > 12) throw new Error("At most 12 times per schedule");
     out.times = times.sort();
+  }
+  if (input.modes !== undefined) {
+    // null / all three = every mode.
+    const KNOWN = ["LTL", "Truckload", "Parcel"];
+    const modes = input.modes == null ? [] : [...new Set((Array.isArray(input.modes) ? input.modes : []).map(String).filter((m) => KNOWN.includes(m)))];
+    if (Array.isArray(input.modes) && !modes.length) throw new Error("Pick at least one mode");
+    out.modes = modes.length && modes.length < KNOWN.length ? modes : null;
   }
   if (input.tz !== undefined) {
     if (!validTz(input.tz)) throw new Error(`Unknown time zone "${input.tz}"`);

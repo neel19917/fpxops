@@ -12,6 +12,8 @@ import { carrierTrackingUrl, fmtDate, fmtDateTime, fmtRelative, fmtUsd } from ".
 import { KPI } from "../components/KPI";
 import { LoadingState } from "../components/LoadingState";
 import { FpTotalsTrend } from "../components/FpTotalsTrend";
+import { TaskRulesButton } from "../components/TaskRulesDialog";
+import { useAuth } from "../lib/auth";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { UserPicker } from "../components/UserPicker";
 import { swrGet, swrSet } from "../lib/swrCache";
@@ -169,6 +171,8 @@ function loadPrefs(): Prefs {
 }
 
 export function TasksV2Page() {
+  const { profile: me } = useAuth();
+  const isAdmin = me?.role === "admin";
   const navigate = useNavigate();
   const [board, setBoard] = useState<TaskBoard | null>(null);
   const [loading, setLoading] = useState(true);
@@ -461,6 +465,7 @@ export function TasksV2Page() {
           >
             <Undo2 className="h-4 w-4" /> Legacy view
           </button>
+          {isAdmin ? <TaskRulesButton /> : null}
           <button onClick={() => load()} className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50" title="Reload board">
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh
           </button>

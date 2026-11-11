@@ -50,6 +50,11 @@ const FALLBACKS = {
   "prompt.email_draft.customer_group.model": "claude-opus-5-5",
   "action.threshold": 0.7,
   "action.auto_draft_enabled": true,
+  // Auto-task generation filters (Tasks board → Task rules). modes null =
+  // the legacy rule (LTL + Truckload; Parcel only with ui.tracking.show_parcels).
+  "tasks.generate.modes": null,
+  "tasks.generate.skip_carriers": [],
+  "tasks.generate.skip_customers": [],
   // AI governance trail (prompt/model changes, rewrites, reviews). On by default.
   "ai.governance.logging": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",

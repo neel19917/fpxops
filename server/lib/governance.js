@@ -21,6 +21,7 @@ export async function governanceLoggingEnabled() {
 export function featureForKey(key) {
   const k = String(key || "");
   if (k.startsWith("model.")) return "all (default model)";
+  if (k.startsWith("tasks.generate.")) return "task generation";
   if (!k.startsWith("prompt.")) return null;
   const parts = k.slice(7).split(".");
   if (parts.length > 1) parts.pop();
@@ -29,7 +30,7 @@ export function featureForKey(key) {
 
 // Setting keys that govern AI behaviour.
 export function isAiSettingKey(key) {
-  return /^(prompt\.|model\.|ai\.)/.test(String(key || "")) || key === "action.threshold";
+  return /^(prompt\.|model\.|ai\.|tasks\.generate\.)/.test(String(key || "")) || key === "action.threshold";
 }
 
 export function eventTypeForKey(key) {

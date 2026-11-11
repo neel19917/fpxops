@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ModePicker, ALL_MODES, modesText } from "./ModePicker";
 import { CalendarClock, CheckCircle2, Pencil, Play, Plus, Trash2, X, XCircle } from "lucide-react";
 import { hostedBrowser, type ScheduleInput, type ScrapeSchedule } from "../lib/hostedBrowser";
 import { fmtRelative } from "../lib/format";
@@ -114,6 +115,7 @@ export function SchedulesPane({ schedules, me, isAdmin, onChanged }: {
                   <div className="text-sm text-slate-900">
                     {s.name ? <span className="font-medium">{s.name} · </span> : null}
                     {fmtDays(s.days)} at {s.times.map(fmtTime).join(", ")} <span className="text-slate-500">({tzShort(s.tz)})</span>
+                    {s.modes?.length ? <span className="ml-1 text-[11px] px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 ring-1 ring-violet-200">{modesText(s.modes)}</span> : null}
                   </div>
                   <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap gap-x-3">
                     {!own ? <span className="text-slate-700">{s.owner}</span> : null}
@@ -172,6 +174,7 @@ function ScheduleEditor({ initial, onCancel, onSaved }: {
   const [days, setDays] = useState<number[]>(initial?.days || WEEKDAYS);
   const [times, setTimes] = useState<string[]>(initial?.times || ["07:00"]);
   const [tz, setTz] = useState(initial?.tz || LOCAL_TZ);
+  const [modes, setModes] = useState<string[]>(initial?.modes?.length ? initial.modes : ALL_MODES);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -179,7 +182,7 @@ function ScheduleEditor({ initial, onCancel, onSaved }: {
 
   async function save() {
     setSaving(true); setErr(null);
-    const input: ScheduleInput = { name: name.trim(), days, times: times.filter(Boolean), tz };
+    const input: ScheduleInput = { name: name.trim(), days, times: times.filter(Boolean), tz, modes: modes.length === ALL_MODES.length ? null : modes };
     try {
       if (initial) await hostedBrowser.updateSchedule(initial.id, input);
       else await hostedBrowser.createSchedule(input);
@@ -234,6 +237,14 @@ function ScheduleEditor({ initial, onCancel, onSaved }: {
               <Plus className="h-3 w-3" /> Add time
             </button>
           ) : null}
+        </div>
+      </div>
+
+      <div>
+        <label className="text-[11px] uppercase font-semibold text-slate-500">Shipment modes</label>
+        <div className="mt-1 flex items-center gap-2">
+          <ModePicker value={modes} onChange={setModes} size="sm" />
+          <span className="text-xs text-slate-500">{modes.length === ALL_MODES.length ? "Every mode" : `Only ${modesText(modes)}`}</span>
         </div>
       </div>
 

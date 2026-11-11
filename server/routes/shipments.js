@@ -284,6 +284,28 @@ function buildRedeliveryTasks(s, changeLog, attempt, assignee = null) {
   ];
 }
 
+// Which shipments may get auto-tasks (Tasks board → Task rules):
+//   modes          — FreightPOP modes that generate tasks; unset = the legacy
+//                    rule (everything but Parcel, unless show_parcels is on)
+//   skip_carriers  — carrier names (case-insensitive, partial) that never do
+//   skip_customers — same, for customers
+export function taskGenerationFilter({ showParcels, genModes, skipCarriers, skipCustomers }) {
+  const lc = (v) => String(v || "").trim().toLowerCase();
+  const modes = Array.isArray(genModes) && genModes.length ? genModes.map(lc) : null;
+  const carriers = (Array.isArray(skipCarriers) ? skipCarriers : []).map(lc).filter(Boolean);
+  const customers = (Array.isArray(skipCustomers) ? skipCustomers : []).map(lc).filter(Boolean);
+  return (s) => {
+    const mode = lc(s.mode);
+    if (modes) { if (!modes.includes(mode)) return false; }
+    else if (showParcels !== true && mode === "parcel") return false;
+    const carrier = lc(s.carrier_name || s.carrier);
+    if (carrier && carriers.some((c) => carrier.includes(c))) return false;
+    const customer = lc(s.customer_name);
+    if (customer && customers.some((c) => customer.includes(c))) return false;
+    return true;
+  };
+}
+
 async function autoCreateActionTasks(
   req,
   upsertedRows,
@@ -302,7 +324,11 @@ async function autoCreateActionTasks(
     "storage.carriers": storageCarriers,
     "storage.assignee": storageAssignee,
     "tasks.default_assignee": defaultAssignee,
-  } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers", "storage.assignee", "tasks.default_assignee");
+    "tasks.generate.modes": genModes,
+    "tasks.generate.skip_carriers": skipCarriers,
+    "tasks.generate.skip_customers": skipCustomers,
+  } = await getSettings("ui.tracking.show_parcels", "storage.hold_hours", "storage.carriers", "storage.assignee", "tasks.default_assignee",
+    "tasks.generate.modes", "tasks.generate.skip_carriers", "tasks.generate.skip_customers");
   const storageOpts = { asOfMs: Date.now(), holdHours: storageHoldHours, carriers: storageCarriers };
   // Owners are stored as the profile email. created_by is the runner's
   // display name from the extension ("Victor Zarate"); resolve it here so
@@ -312,9 +338,9 @@ async function autoCreateActionTasks(
   // tasks.default_assignee (Victor) owns auto-tasks; the runner is the
   // fallback only when the setting is blank.
   const defaultOwner = (s) => owner(defaultAssignee) || owner(s.created_by);
+  const passes = taskGenerationFilter({ showParcels, genModes, skipCarriers, skipCustomers });
   const candidates = (upsertedRows || []).filter(
-    (s) => String(s.action_required || "").toUpperCase() === "YES"
-        && (showParcels === true || String(s.mode || "").trim().toLowerCase() !== "parcel")
+    (s) => String(s.action_required || "").toUpperCase() === "YES" && passes(s)
   );
   if (!candidates.length) return 0;
   const ids = candidates.map((s) => s.id);
@@ -763,14 +789,30 @@ shipmentsRouter.post("/sweep-complete", async (req, res) => {
     return res.status(400).json({ error: "tracking_numbers is empty — refusing to archive" });
   }
 
-  // Pull this runner's currently-active shipments. Only id + tracking_number
-  // here — we'll only update the rows we actually need to archive.
-  const { data: active, error: fetchErr } = await supabase
-    .from("fpx_shipments")
-    .select("id, tracking_number")
-    .eq("created_by", runner)
-    .is("archived_at", null);
-  if (fetchErr) return res.status(500).json({ error: fetchErr.message });
+  // A mode-limited Refresh All (e.g. LTL + Truckload only) only saw those
+  // modes, so only those may be archived.
+  const KNOWN_MODES = ["LTL", "Truckload", "Parcel"];
+  const modes = Array.isArray(req.body?.modes)
+    ? req.body.modes.map(String).filter((m) => KNOWN_MODES.includes(m))
+    : null;
+  if (Array.isArray(req.body?.modes) && !modes.length) {
+    return res.status(400).json({ error: "modes given but none recognised — refusing to archive" });
+  }
+
+  // Pull this runner's currently-active shipments (id + tracking_number), in
+  // pages: a single select stops at 1,000 rows, which silently left most of
+  // a big book unchecked.
+  const active = [];
+  for (let from = 0; ; from += 1000) {
+    let q = supabase.from("fpx_shipments").select("id, tracking_number")
+      .eq("created_by", runner).is("archived_at", null)
+      .order("id").range(from, from + 999);
+    if (modes) q = q.in("mode", modes);
+    const { data: page, error: fetchErr } = await q;
+    if (fetchErr) return res.status(500).json({ error: fetchErr.message });
+    active.push(...(page || []));
+    if (!page || page.length < 1000) break;
+  }
 
   const stale = (active || []).filter(
     (r) => r.tracking_number && !seenSet.has(r.tracking_number),
@@ -784,27 +826,38 @@ shipmentsRouter.post("/sweep-complete", async (req, res) => {
 
   // Archive shipments — set archived_at + a reason so we can tell apart
   // operator-deleted rows (hard delete) from auto-archived (soft).
-  const { error: shipErr } = await supabase
-    .from("fpx_shipments")
-    .update({ archived_at: archivedAt, archived_reason: "absent_from_dashboard" })
-    .in("id", staleIds);
-  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  // In batches so a big archive never builds an over-long request.
+  const chunks = [];
+  for (let i = 0; i < staleIds.length; i += 300) chunks.push(staleIds.slice(i, i + 300));
+  for (const ids of chunks) {
+    const { error: shipErr } = await supabase
+      .from("fpx_shipments")
+      .update({ archived_at: archivedAt, archived_reason: "absent_from_dashboard" })
+      .in("id", ids);
+    if (shipErr) return res.status(500).json({ error: shipErr.message });
+  }
 
   // Archive open/in-progress/blocked tasks for those shipments. We mark the
   // task done + completed_at + archived_at so it disappears from the open
   // list AND the kanban "completed" lane shows when it landed and why.
   // Tasks already in 'done' or 'cancelled' are left alone.
-  const { data: archivedTasks, error: taskErr } = await supabase
-    .from("fpx_shipment_tasks")
-    .update({
-      status: "done",
-      completed_at: archivedAt,
-      archived_at: archivedAt,
-      archived_reason: "shipment_delivered",
-    })
-    .in("shipment_id", staleIds)
-    .in("status", ["open", "in_progress", "blocked"])
-    .select("id");
+  const archivedTasks = [];
+  let taskErr = null;
+  for (const ids of chunks) {
+    const { data, error } = await supabase
+      .from("fpx_shipment_tasks")
+      .update({
+        status: "done",
+        completed_at: archivedAt,
+        archived_at: archivedAt,
+        archived_reason: "shipment_delivered",
+      })
+      .in("shipment_id", ids)
+      .in("status", ["open", "in_progress", "blocked"])
+      .select("id");
+    if (error) { taskErr = error; break; }
+    archivedTasks.push(...(data || []));
+  }
   if (taskErr) {
     // Shipments are already archived — surface the task error but don't
     // unwind. Operator can re-run the sweep and the task update will
@@ -822,6 +875,7 @@ shipmentsRouter.post("/sweep-complete", async (req, res) => {
       scanned: active.length,
       archived_shipments: staleIds.length,
       archived_tasks: archivedTasks?.length || 0,
+      modes: modes || "all",
       sample_tracking: stale.slice(0, 10).map((r) => r.tracking_number),
     },
   });

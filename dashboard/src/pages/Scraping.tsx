@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, Clock, ExternalLink, LogIn, Maximize2, Min
 import { api, type ScrapeRequest } from "../lib/api";
 import { hostedBrowser, type HostedStats, type ScrapeLogLine, type ScrapeCounts, type FpTotals, type TaskSnapshot } from "../lib/hostedBrowser";
 import { FpTotalsTrend, FpBeforeAfter } from "../components/FpTotalsTrend";
+import { ModePicker, ALL_MODES, modesText } from "../components/ModePicker";
 import { useAuth } from "../lib/auth";
 import { showFrame, hideFrame, useFrameState } from "../lib/freightpopFrame";
 import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
@@ -92,6 +93,12 @@ export function ScrapingPage() {
   const worker = stats?.worker;
   const me = stats?.me;
   const pending = requests.filter((r) => r.status === "pending" || r.status === "claimed");
+  // Which FreightPOP modes "Refresh all shipments" covers (remembered per browser).
+  const [modes, setModes] = useState<string[]>(() => {
+    try { const v = JSON.parse(localStorage.getItem("fpx.scrape.modes") || "null"); if (Array.isArray(v) && v.length) return v; } catch { /* ignore */ }
+    return ALL_MODES;
+  });
+  useEffect(() => { try { localStorage.setItem("fpx.scrape.modes", JSON.stringify(modes)); } catch { /* ignore */ } }, [modes]);
   const running = worker?.current || null;
   const loggedIn = me?.freightpop?.loggedIn === true;
   const canStart = !!worker?.enabled && loggedIn && !running && !pending.length && !worker?.queued?.length && !starting;
@@ -99,7 +106,7 @@ export function ScrapingPage() {
   async function start() {
     setStarting(true); setNotice(null);
     try {
-      await api.ops.requestRescrape({ scope: "all" });
+      await api.ops.requestRescrape(modes.length === ALL_MODES.length ? { scope: "all" } : { scope: "all", modes });
       await load();
     } catch (e) { setNotice((e as Error).message); }
     finally { setStarting(false); }
@@ -137,13 +144,13 @@ export function ScrapingPage() {
   const recentRuns = useMemo(() => {
     type Row = { id: string; status: ScrapeRequest["status"]; note: string; at: string; user: string | null;
       source: "manual" | "schedule"; scheduleName?: string | null; durationMs: number | null; saved: number | null; hasLog: boolean;
-      fpBefore?: FpTotals | null; fpAfter?: FpTotals | null; tasksBefore?: TaskSnapshot | null; tasksAfter?: TaskSnapshot | null };
+      fpBefore?: FpTotals | null; fpAfter?: FpTotals | null; tasksBefore?: TaskSnapshot | null; tasksAfter?: TaskSnapshot | null; modes?: string[] | null };
     const rows = new Map<string, Row>();
     for (const r of stats?.runs || []) {
       rows.set(r.id, {
         id: r.id, status: r.ok ? "done" : "error", note: r.note || "—", at: r.startedAt, user: r.user,
         source: r.source, scheduleName: r.scheduleName, durationMs: r.durationMs, saved: r.counts?.saved ?? null, hasLog: true,
-        fpBefore: r.fpBefore ?? null, fpAfter: r.fpAfter ?? null, tasksBefore: r.tasksBefore ?? null, tasksAfter: r.tasksAfter ?? null,
+        fpBefore: r.fpBefore ?? null, fpAfter: r.fpAfter ?? null, tasksBefore: r.tasksBefore ?? null, tasksAfter: r.tasksAfter ?? null, modes: r.modes ?? null,
       });
     }
     for (const q of requests) {
@@ -215,14 +222,17 @@ export function ScrapingPage() {
               <Square className="h-4 w-4" /> {stopping ? "Stopping…" : "Stop"}
             </button>
           ) : (
+            <div className="flex items-center gap-2 flex-wrap justify-end">
+            <ModePicker value={modes} onChange={setModes} disabled={starting} />
             <button
               onClick={start}
               disabled={!canStart}
               title={startDisabledReason || undefined}
               className="px-4 py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              <Play className="h-4 w-4" /> {starting ? "Queuing…" : "Refresh all shipments"}
+              <Play className="h-4 w-4" /> {starting ? "Queuing…" : modes.length === ALL_MODES.length ? "Refresh all shipments" : `Refresh ${modesText(modes)}`}
             </button>
+            </div>
           )}
         </div>
 
@@ -345,6 +355,7 @@ export function ScrapingPage() {
                     <span>{fmtRelative(r.at)}</span>
                     <span>· {r.source === "schedule" ? `Scheduled${r.scheduleName ? ` (${r.scheduleName})` : ""}` : "Manual"}</span>
                     {r.user && r.user !== me?.user ? <span>· {r.user}</span> : null}
+                    {r.modes?.length ? <span className="text-violet-700">· {modesText(r.modes)}</span> : null}
                     {r.durationMs != null ? <span>· took {fmtDuration(r.durationMs)}</span> : null}
                     {r.saved != null ? <span>· {fmtNum(r.saved)} saved</span> : null}
                     {r.hasLog ? (

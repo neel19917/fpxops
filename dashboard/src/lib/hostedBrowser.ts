@@ -54,6 +54,7 @@ export interface ScrapeRun {
   fpAfter?: FpTotals | null;
   tasksBefore?: TaskSnapshot | null;
   tasksAfter?: TaskSnapshot | null;
+  modes?: string[] | null;
 }
 
 // FreightPOP's dashboard tiles, captured at the start / end of a run.
@@ -86,13 +87,14 @@ export interface ScrapeSchedule {
   days: number[];      // 0 = Sunday
   times: string[];     // "HH:MM", 24h, in tz
   tz: string;
+  modes?: string[] | null; // LTL / Truckload / Parcel; null = every mode
   createdAt: string;
   updatedAt: string;
   nextRunAt: string | null;
   lastRun: { id: string; ok: boolean; finishedAt: string; durationMs: number; note: string; counts: ScrapeCounts | null } | null;
 }
 
-export type ScheduleInput = Pick<ScrapeSchedule, "name" | "days" | "times" | "tz"> & { enabled?: boolean };
+export type ScheduleInput = Pick<ScrapeSchedule, "name" | "days" | "times" | "tz"> & { enabled?: boolean; modes?: string[] | null };
 
 export interface HostedStats {
   bootedAt: string;
