@@ -34,6 +34,7 @@ const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default:
 const ServicesPage    = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServicesPage })));
 const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServiceDetailPage })));
 const InstallPage     = lazy(() => import("./pages/Install").then((m) => ({ default: m.InstallPage })));
+const ConnectClaudePage = lazy(() => import("./pages/ConnectClaude").then((m) => ({ default: m.ConnectClaudePage })));
 const DataFlowPage = lazy(() => import("./pages/DataFlow").then((m) => ({ default: m.DataFlowPage })));
 const AIGovernancePage = lazy(() => import("./pages/AIGovernance").then((m) => ({ default: m.AIGovernancePage })));
 const EmailStudioPage = lazy(() => import("./pages/EmailStudio").then((m) => ({ default: m.EmailStudioPage })));
@@ -68,6 +69,7 @@ const TAB_PATH: Record<TabId, string> = {
   email_studio: "/admin/email-studio",
   ai_governance: "/admin/ai-governance",
   data_flow: "/admin/data-flow",
+  claude: "/claude",
 };
 
 const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "email_studio", "ai_governance", "data_flow"]);
@@ -86,6 +88,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/email-studio")) return "email_studio";
   if (pathname.startsWith("/admin/ai-governance")) return "ai_governance";
   if (pathname.startsWith("/admin/data-flow")) return "data_flow";
+  if (pathname.startsWith("/claude")) return "claude";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
   if (pathname.startsWith("/tasks")) return "tasks";
@@ -272,6 +275,7 @@ function AuthedApp() {
             <Route path="/shares" element={<ShareLinksPage />} />
             <Route path="/feedback" element={<FeedbackPage />} />
             <Route path="/install" element={<InstallPage />} />
+            <Route path="/claude" element={<ConnectClaudePage />} />
             {isAdmin ? (
               <>
                 <Route path="/admin/users" element={<UsersPage />} />

@@ -5,7 +5,7 @@ import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "email_studio" | "ai_governance" | "data_flow";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "email_studio" | "ai_governance" | "data_flow" | "claude";
 
 interface TabDef {
   id: TabId;
@@ -34,6 +34,7 @@ const ALL_TABS: TabDef[] = [
   { id: "shares",   label: "Share Links",    Icon: Link2,        group: "more" },
   { id: "feedback", label: "Feedback",       Icon: MessageSquare, group: "more" },
   { id: "install",  label: "Install Extension", Icon: Puzzle,     group: "more" },
+  { id: "claude",   label: "Connect Claude", Icon: Sparkles,     group: "more" },
   { id: "users",     label: "Users",          Icon: Users,        group: "admin" },
   { id: "keys",      label: "API Keys",       Icon: KeyRound,     group: "admin" },
   { id: "audit",     label: "Audit Log",      Icon: ScrollText,   group: "admin" },

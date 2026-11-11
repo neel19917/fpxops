@@ -216,6 +216,9 @@ export const api = {
       pending_api_key?: string | null;
       client_config?: ClientConfig;
     }>("/api/me"),
+    connector: () => request<{ active: boolean; key_prefix: string | null; created_at: string | null; last_used_at: string | null }>("/api/me/connector", { noImpersonate: true }),
+    createConnector: () => request<{ url: string; key: string; key_prefix: string; created_at: string }>("/api/me/connector", { method: "POST", noImpersonate: true }),
+    revokeConnector: () => request<{ revoked: number }>("/api/me/connector", { method: "DELETE", noImpersonate: true }),
     preferences: () => request<{ auto_open_tracking: boolean }>("/api/me/preferences"),
     setPreferences: (body: { auto_open_tracking: boolean }) =>
       request<{ auto_open_tracking: boolean }>("/api/me/preferences", { method: "PATCH", body: JSON.stringify(body) }),

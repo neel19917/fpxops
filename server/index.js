@@ -23,6 +23,7 @@ import { apiKeysRouter } from "./routes/apiKeys.js";
 import { meRouter } from "./routes/me.js";
 import { emailStudioRouter } from "./routes/emailStudio.js";
 import { governanceRouter } from "./routes/governance.js";
+import { mcpRouter } from "./routes/mcp.js";
 import { usersRouter } from "./routes/users.js";
 import { shareLinksRouter } from "./routes/shareLinks.js";
 import { publicShareRouter } from "./routes/publicShare.js";
@@ -120,6 +121,8 @@ app.use("/share", publicShareRouter);
 
 // Identity probe for the dashboard/extension — accepts either auth method.
 app.use("/api/me", meRouter);
+// FPX for Claude — read-only MCP server (own key check; see routes/mcp.js).
+app.use("/mcp", mcpRouter);
 
 // Authenticated API (API key OR JWT with enabled=true).
 const api = express.Router();

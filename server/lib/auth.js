@@ -8,6 +8,11 @@ export function hashApiKey(plaintext) {
   return crypto.createHash("sha256").update(plaintext).digest("hex");
 }
 
+// A Claude connector key: read-only, scope "mcp" and nothing else.
+export function isConnectorOnlyKey(k) {
+  return Array.isArray(k?.scopes) && k.scopes.length > 0 && k.scopes.every((x) => x === "mcp");
+}
+
 export function generateApiKey() {
   const raw = crypto.randomBytes(32).toString("base64url");
   return `fpx_live_${raw}`;
@@ -264,6 +269,10 @@ export function requireAuth(options = {}) {
     if (apiKey) {
       const k = await resolveApiKey(apiKey);
       if (!k) return res.status(401).json({ error: "Invalid or revoked API key" });
+      // Claude connector keys (scope "mcp" only) work on /mcp and nowhere else.
+      if (isConnectorOnlyKey(k) && options.scope !== "mcp") {
+        return res.status(403).json({ error: "This key only works for the Claude connector" });
+      }
       if (options.scope && !k.scopes.includes(options.scope)) {
         return res.status(403).json({ error: `API key lacks '${options.scope}' scope` });
       }

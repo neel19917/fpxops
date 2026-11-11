@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth } from "../lib/auth.js";
+import { requireAuth, generateApiKey, hashApiKey } from "../lib/auth.js";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { decidePendingApiKey } from "../lib/pendingApiKey.js";
@@ -115,6 +115,58 @@ meRouter.patch("/preferences", requireAuth(), async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: "Profile not found" });
   res.json({ auto_open_tracking: data.auto_open_tracking });
+});
+
+// Claude connector (MCP, read-only): each person makes their own key.
+// GET  → is there an active one; POST → make a new one (revokes the old,
+// returns the URL once); DELETE → revoke. Signed-in users only (no API keys).
+const CONNECTOR_SCOPES = ["mcp"];
+async function activeConnectorKeys(userId) {
+  const { data, error } = await supabase.from("fpx_api_keys")
+    .select("id, key_prefix, created_at, last_used_at")
+    .eq("user_id", userId).is("revoked_at", null).contains("scopes", CONNECTOR_SCOPES);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+meRouter.get("/connector", requireAuth({ acceptApiKey: false }), async (req, res) => {
+  if (!req.user || req.impersonating) return res.status(403).json({ error: "Sign in as yourself to manage your Claude connector" });
+  try {
+    const keys = await activeConnectorKeys(req.user.id);
+    const k = keys[0] || null;
+    res.json({ active: !!k, key_prefix: k?.key_prefix || null, created_at: k?.created_at || null, last_used_at: k?.last_used_at || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+meRouter.post("/connector", requireAuth({ acceptApiKey: false }), async (req, res) => {
+  if (!req.user || req.impersonating) return res.status(403).json({ error: "Sign in as yourself to manage your Claude connector" });
+  try {
+    const old = await activeConnectorKeys(req.user.id);
+    if (old.length) await supabase.from("fpx_api_keys").update({ revoked_at: new Date().toISOString() }).in("id", old.map((k) => k.id));
+    const plaintext = generateApiKey();
+    const { data, error } = await supabase.from("fpx_api_keys").insert({
+      name: `Claude connector · ${req.user.email}`, key_hash: hashApiKey(plaintext), key_prefix: plaintext.slice(0, 12),
+      scopes: CONNECTOR_SCOPES, created_by: req.user.email, user_id: req.user.id,
+    }).select("id, key_prefix, created_at").single();
+    if (error) throw new Error(error.message);
+    const base = `${req.protocol === "http" && !/localhost|127\.0\.0\.1/.test(req.get("host")) ? "https" : req.protocol}://${req.get("host")}`;
+    logAudit(req, {
+      action: "create", entity_type: "api_key", entity_id: data.id,
+      summary: `Created a Claude connector key (${data.key_prefix}…)${old.length ? `, replacing ${old.length} older one(s)` : ""}`,
+      metadata: { kind: "claude_connector", replaced: old.map((k) => k.key_prefix) },
+    });
+    res.json({ url: `${base}/mcp/${plaintext}`, key: plaintext, key_prefix: data.key_prefix, created_at: data.created_at });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+meRouter.delete("/connector", requireAuth({ acceptApiKey: false }), async (req, res) => {
+  if (!req.user || req.impersonating) return res.status(403).json({ error: "Sign in as yourself to manage your Claude connector" });
+  try {
+    const old = await activeConnectorKeys(req.user.id);
+    if (old.length) await supabase.from("fpx_api_keys").update({ revoked_at: new Date().toISOString() }).in("id", old.map((k) => k.id));
+    logAudit(req, { action: "revoke", entity_type: "api_key", summary: `Revoked their Claude connector (${old.length} key(s))`, metadata: { kind: "claude_connector" } });
+    res.json({ revoked: old.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // POST /api/me/impersonate-start  { target_id, writes? }
