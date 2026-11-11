@@ -1,0 +1,1 @@
+-- Exact dashboard counts for Ask FPX / MCP (applied 2026-11-11 as assistant_summary_rpc); see fpx_assistant_summary() in the database.

@@ -338,6 +338,13 @@ async function ixGetShipment(args = {}) {
 }
 
 async function ixSummary() {
+  // Counted in the database — a plain select is capped at 1,000 rows.
+  try {
+    const s = await sbPost("rpc/fpx_assistant_summary", {});
+    if (s && typeof s.on_dashboard === "number") {
+      return { ...s, action_needed_by_carrier: Object.fromEntries(Object.entries(s.action_needed_by_carrier || {}).sort((a, b) => b[1] - a[1]).slice(0, 8)) };
+    }
+  } catch { /* fall through to the row count */ }
   const rows = await sb("fpx_assistant_index?select=status,action_needed,carrier&on_dashboard=eq.true&limit=5000");
   const by = {};
   const carriers = {};

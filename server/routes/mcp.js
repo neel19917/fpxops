@@ -163,17 +163,11 @@ function buildServer(who) {
     description: "Shipments on the FreightPOP dashboard by status, how many need action, and which carriers have the most action-needed shipments.",
     inputSchema: {},
   }, async () => {
-    const { data, error } = await supabase.from("fpx_assistant_index").select("status, action_needed, carrier").eq("on_dashboard", true).limit(5000);
+    // Counted in the database (a plain select is capped at 1,000 rows).
+    const { data, error } = await supabase.rpc("fpx_assistant_summary");
     if (error) throw new Error(error.message);
-    const by = {}, carriers = {};
-    for (const r of data || []) {
-      by[r.status || "(none)"] = (by[r.status || "(none)"] || 0) + 1;
-      if (r.action_needed) carriers[r.carrier || "(unknown)"] = (carriers[r.carrier || "(unknown)"] || 0) + 1;
-    }
-    return json({
-      on_dashboard: (data || []).length, by_status: by, action_needed: (data || []).filter((r) => r.action_needed).length,
-      action_needed_by_carrier: Object.fromEntries(Object.entries(carriers).sort((a, b) => b[1] - a[1]).slice(0, 10)),
-    });
+    const s = data || {};
+    return json({ ...s, action_needed_by_carrier: Object.fromEntries(Object.entries(s.action_needed_by_carrier || {}).sort((a, b) => b[1] - a[1])) });
   });
 
   tool("task_board", {
