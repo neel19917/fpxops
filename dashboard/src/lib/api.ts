@@ -513,6 +513,14 @@ export const api = {
       }),
     refresh: () => request<{ ok: boolean }>("/api/settings/refresh", { method: "POST" }),
   },
+  governance: {
+    summary: (days = 30) => request<{ days: number; logging: boolean; features: GovFeature[]; changes: number }>("/api/governance/summary", { params: { days } }),
+    events: (params: { type?: string; limit?: number; before?: string } = {}) =>
+      request<{ data: GovEvent[] }>("/api/governance/events", { params }),
+    calls: (params: { feature?: string; by?: string; user?: string; errors?: string; limit?: number; before?: string } = {}) =>
+      request<{ data: GovCall[] }>("/api/governance/calls", { params }),
+    call: (id: string) => request<{ call: GovCall & { system_prompt: string | null; user_message: string | null; response_text: string | null } }>(`/api/governance/calls/${id}`),
+  },
   emailStudio: {
     samples: () => request<{ data: EmailStudioSample[] }>("/api/email-studio/samples"),
     rewrite: (body: { key: string; text: string; instructions: string }) =>
@@ -606,6 +614,22 @@ export interface OpsMetrics {
   last7: { shipments_analyzed: number; tasks_completed: number; emails_generated: number; cost_usd: number };
   daily: OpsDailyRow[];
   byOperator: { operator: string; tasks_completed: number; emails_generated: number }[];
+}
+
+export interface GovFeature {
+  feature: string; by: "kind" | "subkind"; calls: number; users: number; system_calls: number; errors: number;
+  cost_usd: number | string; input_tokens: number; output_tokens: number; rated_up: number; rated_down: number;
+  models: string[]; last_at: string;
+}
+export interface GovEvent {
+  id: string; created_at: string; event_type: string; feature: string | null; setting_key: string | null;
+  actor_email: string | null; actor_source: string | null; summary: string | null;
+  before: unknown; after: unknown; analysis_id: string | null; metadata: Record<string, unknown> | null;
+}
+export interface GovCall {
+  id: string; created_at: string; kind: string; model: string | null; tracking_number: string | null; user_email: string | null;
+  cost_usd: number | string | null; input_tokens: number | null; output_tokens: number | null; duration_ms: number | null;
+  error: string | null; rating: string | null; rated_by: string | null; metadata: Record<string, unknown> | null;
 }
 
 export type EmailStudioType = "carrier" | "customer" | "carrier_group" | "customer_group";

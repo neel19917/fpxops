@@ -4,6 +4,7 @@ import { supabase } from "../lib/supabase.js";
 import { callClaude } from "../lib/anthropic.js";
 import { getSettings } from "../lib/settings.js";
 import { logAudit } from "../lib/audit.js";
+import { logGovernance, featureForKey } from "../lib/governance.js";
 import {
   generateEmailDraft, generateCarrierGroupEmail, generateCustomerGroupEmail, emailModelExtras,
 } from "../lib/emailDraft.js";
@@ -104,6 +105,12 @@ emailStudioRouter.post("/rewrite", async (req, res) => {
   if (result.error) return res.status(500).json({ error: result.error });
   let out = String(result.text || "").trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/, "").trim();
   if (!out) return res.status(500).json({ error: "Claude returned nothing" });
+  logGovernance(req, {
+    event_type: "ai_rewrite", feature: featureForKey(key), setting_key: key,
+    summary: `AI rewrote ${key} (suggestion — not saved): ${instructions.slice(0, 140)}`,
+    before: text, after: out, analysis_id: result.analysis_id || null,
+    metadata: { instructions, model: result.model || model || null },
+  });
   const lost = [...text.matchAll(/\{\{\s*\w+\s*\}\}/g)].map((m) => m[0]).filter((ph) => !out.includes(ph));
   res.json({ text: out, model: result.model || model || null, warnings: lost.length ? [`Placeholder ${[...new Set(lost)].join(", ")} was dropped — the email won't get that part.`] : [] });
 });
@@ -147,6 +154,12 @@ emailStudioRouter.post("/preview", async (req, res) => {
     }
   }
   if (result.error) return res.status(500).json({ error: result.error });
+  logGovernance(req, {
+    event_type: "ai_preview", feature: `email_draft.${type}`,
+    summary: `Previewed ${type.replace("_", " ")} email on ${ships.length} shipment(s)${Object.keys(overrides).length ? " with unsaved prompt edits" : ""}`,
+    after: { subject: result.subject, body: result.body },
+    metadata: { tracking_numbers: trackings, overridden: Object.keys(overrides), model: result.model || null },
+  });
   logAudit(req, {
     action: "create", entity_type: "email_draft",
     summary: `Email Studio preview (${type}) on ${ships.length} shipment(s)`,

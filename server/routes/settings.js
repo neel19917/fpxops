@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../lib/auth.js";
-import { getAllSettingsForAdmin, setSetting, invalidateSettingsCache } from "../lib/settings.js";
+import { getAllSettingsForAdmin, setSetting, invalidateSettingsCache, getSettings } from "../lib/settings.js";
+import { logGovernance, isAiSettingKey, eventTypeForKey, featureForKey } from "../lib/governance.js";
 import { logAudit } from "../lib/audit.js";
 import { sendCachedJson } from "../lib/httpCache.js";
 
@@ -30,7 +31,26 @@ settingsRouter.put("/:key", async (req, res) => {
   const value = req.body.value;
   const updatedBy = req.user?.email || req.apiKey?.name || "unknown";
   try {
+    let before = null;
+    if (isAiSettingKey(key)) {
+      try { before = (await getSettings(key))[key] ?? null; } catch {}
+    }
     const row = await setSetting(key, value, updatedBy);
+    if (isAiSettingKey(key) && JSON.stringify(before) !== JSON.stringify(value)) {
+      const type = eventTypeForKey(key);
+      logGovernance(req, {
+        event_type: type,
+        feature: featureForKey(key),
+        setting_key: key,
+        summary: type === "logging_change"
+          ? `AI governance logging turned ${value === false ? "OFF" : "ON"}`
+          : type === "model_change"
+            ? `Model for ${featureForKey(key) || key}: ${before ?? "(default)"} → ${value}`
+            : `Changed ${key}`,
+        before, after: value,
+        metadata: { source: String(req.header("x-fpx-source") || "settings") },
+      }, { force: type === "logging_change" });
+    }
     logAudit(req, {
       action: "update",
       entity_type: "setting",
