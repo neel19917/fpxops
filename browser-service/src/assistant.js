@@ -268,7 +268,18 @@ async function indexFocusRows() {
   return rows;
 }
 
-async function ixFocusList({ limit = 40, assignee } = {}) {
+// What the model needs to rank and act — keeps tool results small (cost + speed).
+function slimFacts(f = {}) {
+  return {
+    id: f.id, shipment: f.shipment, tracking: f.tracking, customer: f.customer, carrier: f.carrier, mode: f.mode,
+    status: f.status, action_needed: f.action_needed, issue: trim(f.issue, 160), eta: f.eta, delivered: f.delivered,
+    appointment: f.appointment, destination: trim(f.destination, 60),
+    latest_note: f.latest_note ? trim(f.latest_note.note, 120) : undefined,
+    open_tasks: (f.tasks || []).length || undefined,
+  };
+}
+
+async function ixFocusList({ limit = 20, assignee } = {}) {
   const rows = await indexFocusRows();
   const onDash = rows.filter((r) => r.on_dashboard);
   const who = assignee ? String(assignee).toLowerCase() : null;
@@ -276,19 +287,18 @@ async function ixFocusList({ limit = 40, assignee } = {}) {
   for (const r of onDash) {
     for (const t of r.facts.tasks || []) {
       if (who && !String(t.assigned_to || "").toLowerCase().includes(who)) continue;
-      const { tasks, ...ship } = r.facts;
-      picked.push({ task_id: t.task_id, task: t.task, task_status: t.status, assigned_to: t.assigned_to, task_age_days: t.age_days, shipment: ship });
+      picked.push({ task_id: t.task_id, task: trim(t.task, 120), task_status: t.status, assigned_to: t.assigned_to, task_age_days: t.age_days, shipment: slimFacts(r.facts) });
     }
   }
   return {
     open_tasks_on_dashboard: picked.length,
     left_dashboard_excluded: rows.length - onDash.length,
-    candidates: picked.slice(0, Math.min(60, limit)),
+    candidates: picked.slice(0, Math.min(40, limit)),
   };
 }
 
-async function ixSearch({ query, status, action_needed, carrier, customer, include_off_dashboard = false, limit = 25 } = {}) {
-  const n = Math.min(50, limit);
+async function ixSearch({ query, status, action_needed, carrier, customer, include_off_dashboard = false, limit = 12 } = {}) {
+  const n = Math.min(30, limit);
   let list;
   if (query && String(query).trim()) {
     const embedding = await queryEmbedding(query);
@@ -313,7 +323,7 @@ async function ixSearch({ query, status, action_needed, carrier, customer, inclu
     (action_needed == null || !!f.action_needed === action_needed) &&
     (!carrier || lc(f.carrier).includes(lc(carrier))) &&
     (!customer || lc(f.customer).includes(lc(customer))));
-  return { count: list.length, shipments: list.slice(0, n).map(({ tasks, latest_note, tracking_comments, pickup_response, recommendation, ...f }) => ({ ...f, open_tasks: (tasks || []).length })) };
+  return { count: list.length, shown: Math.min(n, list.length), shipments: list.slice(0, n).map(slimFacts) };
 }
 
 async function ixGetShipment(args = {}) {
@@ -362,15 +372,7 @@ async function preloadedBrief() {
   try {
     const [focus, summary] = await Promise.all([ixFocusList({ limit: 8 }), ixSummary()]);
     // Lean: just what's needed to rank and say the next step (≈2–3k tokens).
-    const slim = focus.candidates.map((c) => {
-      const f = c.shipment || {};
-      return {
-        task_id: c.task_id, task: trim(c.task, 120), status: c.task_status, assigned_to: c.assigned_to, age_days: c.task_age_days,
-        id: f.id, shipment: f.shipment, tracking: f.tracking, customer: f.customer, carrier: f.carrier, ship_status: f.status,
-        action_needed: f.action_needed, issue: trim(f.issue, 160), eta: f.eta, appointment: f.appointment,
-        latest_note: f.latest_note ? trim(f.latest_note.note, 120) : undefined,
-      };
-    });
+    const slim = focus.candidates;
     return { built: new Date(indexState.at).toISOString(), dashboard: summary, open_tasks_on_dashboard: focus.open_tasks_on_dashboard, top_focus: slim };
   } catch { return null; }
 }
@@ -388,7 +390,7 @@ const TOOLS = [
     name: "focus_list",
     description: "Open tasks whose shipment is still on the FreightPOP dashboard, pre-ranked by urgency signals (action needed, Issue status, past-ETA undelivered, task age). Use for 'what should I focus on' questions. Returns candidates with their shipment facts.",
     input_schema: obj({
-      limit: { type: "integer", description: "How many candidates (max 60). Default 40." },
+      limit: { type: "integer", description: "How many candidates (max 40). Default 20." },
       assignee: { type: "string", description: "Only tasks assigned to this person (email or name fragment)." },
     }),
   },
@@ -402,7 +404,7 @@ const TOOLS = [
       carrier: { type: "string" },
       customer: { type: "string" },
       include_off_dashboard: { type: "boolean", description: "Also search shipments that left the dashboard (usually delivered). Default false." },
-      limit: { type: "integer", description: "Max 50. Default 25." },
+      limit: { type: "integer", description: "Max 30. Default 12 — ask for more only if needed." },
     }),
   },
   {
