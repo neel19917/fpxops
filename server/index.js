@@ -21,6 +21,7 @@ import { analyzeRouter } from "./routes/analyze.js";
 import { auditsRouter } from "./routes/audits.js";
 import { apiKeysRouter } from "./routes/apiKeys.js";
 import { meRouter } from "./routes/me.js";
+import { emailStudioRouter } from "./routes/emailStudio.js";
 import { usersRouter } from "./routes/users.js";
 import { shareLinksRouter } from "./routes/shareLinks.js";
 import { publicShareRouter } from "./routes/publicShare.js";
@@ -135,6 +136,7 @@ app.use("/api", api);
 
 // Admin routes (admin scope OR admin role).
 app.use("/api/settings", settingsRouter);
+app.use("/api/email-studio", emailStudioRouter);
 app.use("/api/users", usersRouter);
 app.use("/api-keys", apiKeysRouter);
 

@@ -1,11 +1,11 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "email_studio";
 
 interface TabDef {
   id: TabId;
@@ -38,6 +38,7 @@ const ALL_TABS: TabDef[] = [
   { id: "keys",      label: "API Keys",       Icon: KeyRound,     group: "admin" },
   { id: "audit",     label: "Audit Log",      Icon: ScrollText,   group: "admin" },
   { id: "settings",  label: "Settings",       Icon: SettingsIcon, group: "admin" },
+  { id: "email_studio", label: "Email Studio", Icon: Mail,       group: "admin" },
   { id: "services",  label: "Services",       Icon: Database,     group: "admin" },
   { id: "ai_export", label: "AI Export",      Icon: BarChart3,    group: "admin" },
   { id: "scrape_logs", label: "Scrape Logs",  Icon: ScrollText,   group: "admin" },
