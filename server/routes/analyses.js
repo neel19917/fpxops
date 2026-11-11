@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
+import { logGovernance } from "../lib/governance.js";
 
 export const analysesRouter = Router();
 
@@ -104,6 +105,15 @@ analysesRouter.post("/:id/rating", async (req, res) => {
       : `Cleared rating on analysis`,
     before, after: data,
     metadata: { rating, model: before.model, kind: before.kind },
+  });
+  logGovernance(req, {
+    event_type: "human_review",
+    feature: before.kind,
+    analysis_id: data.id,
+    summary: rating ? `Rated AI output ${rating === "up" ? "👍" : "👎"}${reason ? ` — ${reason.slice(0, 120)}` : ""}` : "Cleared a rating on AI output",
+    before: { rating: before.rating, reason: before.rating_reason, by: before.rated_by },
+    after: { rating: data.rating, reason: data.rating_reason, by: data.rated_by },
+    metadata: { model: before.model },
   });
   res.json({ analysis: data });
 });

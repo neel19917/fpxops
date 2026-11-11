@@ -50,6 +50,8 @@ const FALLBACKS = {
   "prompt.email_draft.customer_group.model": "claude-opus-5-5",
   "action.threshold": 0.7,
   "action.auto_draft_enabled": true,
+  // AI governance trail (prompt/model changes, rewrites, reviews). On by default.
+  "ai.governance.logging": true,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   // Large = long prompts (≥ ~12k chars) and any board-level synthesis.
   // Bumped to Opus 5 on 2026-09-22: the tasks page moved to heavier

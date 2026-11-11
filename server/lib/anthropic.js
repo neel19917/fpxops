@@ -162,6 +162,8 @@ export async function callClaude({
     output_tokens: outTok,
     cost_usd: costUsd,
     duration_ms: durationMs,
+    // Why the response ended (end_turn / max_tokens = cut off / refusal).
+    metadata: { ...(metadata.metadata || {}), stop_reason: stopReason },
     // Calibration: the continuous score is overwritten on the shipment row
     // every re-analysis, so this log row is the only durable per-run record of
     // (confidence, target, threshold-in-effect). Retaining it is what lets
