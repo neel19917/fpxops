@@ -12,7 +12,9 @@ import Anthropic from "@anthropic-ai/sdk";
 // The browser keeps the conversation and sends it back each turn exactly as
 // returned (append-only — required so thinking blocks stay valid).
 
-const MODEL = "claude-opus-5-5";
+// Sonnet 5.5: fast and about half Opus's price — right for a chat that
+// mostly looks things up. ASSISTANT_MODEL=claude-opus-5-5 switches back.
+const MODEL = process.env.ASSISTANT_MODEL || "claude-sonnet-5-5";
 const MAX_STEPS = 8;              // tool round-trips per user message
 const OFF_DASHBOARD_MS = 24 * 3600_000;
 
@@ -456,11 +458,22 @@ Data notes:
 - Every open task is marked "high" priority, so priority alone doesn't rank anything — use the shipment facts.
 - The first message of a conversation may carry a pre-loaded brief: dashboard counts and only the TOP 8 focus items. Answer "what should I focus on" / "how are we doing" from it directly. For anything else — a category ("stuck at a terminal", "waiting on appointments", a carrier, a customer), a specific shipment, or more than the top items — call search_shipments or focus_list; the brief is not the whole board.
 
+Links: the reply is rendered with Markdown links. Link every shipment you mention to its page in FPX — [15496050](/tracking/<id>) using the internal id from tool results — and tasks as [task](/tasks/v2/<task_id>). You may also use full https:// links that appear in the data. Never invent URLs.
+
 Style: short and scannable — reps read this between calls. Default to under 120 words. For lists, at most 5 items, ONE line each: shipment number · customer · carrier — the problem — the next step. Offer "want more?" instead of listing everything. Use names and numbers, not internal ids. No preamble, no closing summary.`;
 
 // One user turn. history: prior Anthropic.MessageParam[] exactly as returned
 // by previous calls. Returns { messages, reply, actions, usage }.
-export async function chat({ history = [], message, who, context }) {
+// onEvent (optional) streams progress to the browser:
+//   { type: "text", delta }      words of the answer as they're written
+//   { type: "status", text }     a lookup is running ("Searching shipments…")
+//   { type: "reset" }            discard the draft (the model went to look something up)
+const STATUS = {
+  focus_list: "Ranking open tasks…", search_shipments: "Searching shipments…",
+  get_shipment: "Opening the shipment…", dashboard_summary: "Counting the dashboard…",
+};
+
+export async function chat({ history = [], message, who, context, onEvent }) {
   if (!assistantEnabled) throw new Error("Assistant not configured (ANTHROPIC_API_KEY / Supabase)");
   const t0 = Date.now();
   const messages = [...history];
@@ -475,7 +488,7 @@ export async function chat({ history = [], message, who, context }) {
   const done = (out) => { logChatCost({ who, message, reply: out.reply, usage, ms: Date.now() - t0, actions, preloaded: !!brief }); return out; };
 
   for (let step = 0; step < MAX_STEPS; step++) {
-    const response = await client.beta.messages.create({
+    const params = {
       model: MODEL,
       max_tokens: 16000,
       // Opt-in server-side fallback if a request is declined by a safeguard.
@@ -486,7 +499,15 @@ export async function chat({ history = [], message, who, context }) {
       system: `${SYSTEM}\n\nThe rep you're helping is ${who?.email || "a team member"}. Today is ${new Date().toISOString().slice(0, 10)}.`,
       tools: TOOLS,
       messages,
-    });
+    };
+    let response;
+    if (onEvent) {
+      const stream = client.beta.messages.stream(params);
+      stream.on("text", (delta) => onEvent({ type: "text", delta }));
+      response = await stream.finalMessage();
+    } else {
+      response = await client.beta.messages.create(params);
+    }
     usage.input += response.usage?.input_tokens || 0;
     usage.output += response.usage?.output_tokens || 0;
     usage.cache_read += response.usage?.cache_read_input_tokens || 0;
@@ -505,6 +526,11 @@ export async function chat({ history = [], message, who, context }) {
 
     // UI actions are recorded in order; data lookups run in parallel.
     const blocks = response.content.filter((b) => b.type === "tool_use");
+    if (onEvent) {
+      onEvent({ type: "reset" });
+      const look = blocks.map((b) => STATUS[b.name]).filter(Boolean);
+      if (look.length) onEvent({ type: "status", text: [...new Set(look)].join(" ") });
+    }
     const results = await Promise.all(blocks.map(async (block) => {
       usage.tools.push(block.name);
       try {
@@ -536,7 +562,12 @@ export async function chat({ history = [], message, who, context }) {
 // Every chat turn goes to the AI log (fpx_ai_analyses, subkind "ask_fpx"), so
 // AI Governance shows Ask FPX usage and cost per person. Prices per 1M tokens
 // for MODEL; cache reads bill at 10% of input, 5-minute cache writes at 125%.
-const PRICE = { input: 4.0, output: 20.0 };
+const PRICES = {
+  "claude-opus-5-5": { input: 4.0, output: 20.0 },
+  "claude-sonnet-5-5": { input: 2.0, output: 10.0 },
+  "claude-haiku-5-5": { input: 0.1, output: 0.5 },
+};
+const PRICE = PRICES[MODEL] || PRICES["claude-opus-5-5"];
 
 function chatCost(u) {
   return (u.input * PRICE.input + u.cache_read * PRICE.input * 0.1 + u.cache_write * PRICE.input * 1.25 + u.output * PRICE.output) / 1_000_000;
