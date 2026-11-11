@@ -216,6 +216,29 @@ async function handleApi(req, res, url, who) {
     if (m === "GET") return json(res, 200, { settings: listSettings(), live: { sessions: sessions.size, browsers: poolStats().length, memoryMb: poolStats().reduce((t, b) => t + (b.memoryMb || 0), 0), egress: egressStats() } });
     if (m === "PUT") return json(res, 200, { settings: await updateSettings((await readJson(req)).settings, who.email) });
   }
+  // Streaming chat: newline-delimited JSON events — {type:"text",delta},
+  // {type:"status",text}, {type:"reset"}, then {type:"done", ...reply} or
+  // {type:"error",error}. Words show as they're written.
+  if (p === "/assistant/chat/stream" && m === "POST") {
+    if (!assistantEnabled) return json(res, 503, { error: "Assistant isn't configured on this service" });
+    if (!allowChat(who.email)) return json(res, 429, { error: "Slow down — too many questions in the last minute" });
+    const body = await readJson(req, 2 * 1024 * 1024);
+    const message = String(body.message || "").trim().slice(0, 4000);
+    if (!message) return json(res, 400, { error: "message required" });
+    const history = Array.isArray(body.history) ? body.history.slice(-60) : [];
+    res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-store", "x-accel-buffering": "no" });
+    const emit = (ev) => { if (!res.writableEnded) res.write(JSON.stringify(ev) + "\n"); };
+    const t0 = Date.now();
+    try {
+      const out = await chat({ history, message, who, context: body.context || null, onEvent: emit });
+      console.log(`[assistant] ${who.email} (stream): ${out.usage.steps} step(s) [${out.usage.tools.join(",")}], ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), cost ${(out.usage.cost_usd || 0).toFixed(4)} USD, ${Date.now() - t0}ms`);
+      emit({ type: "done", ...out });
+    } catch (e) {
+      console.warn("[assistant] stream error:", e.status || "", e.message);
+      emit({ type: "error", error: e.status === 429 ? "Claude is rate-limited right now — try again in a moment" : `Assistant error: ${e.message}` });
+    }
+    return res.end();
+  }
   if (p === "/assistant/chat" && m === "POST") {
     if (!assistantEnabled) return json(res, 503, { error: "Assistant isn't configured on this service" });
     if (!allowChat(who.email)) return json(res, 429, { error: "Slow down — too many questions in the last minute" });

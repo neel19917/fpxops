@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ArrowUp, Filter, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Sparkles, X } from "lucide-react";
+import { ArrowUp, ExternalLink, Filter, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Sparkles, X } from "lucide-react";
 import { hostedBrowser, type AssistantAction } from "../lib/hostedBrowser";
 
 // "Ask FPX" — a chat panel on every signed-in page. Claude (via the hosted
@@ -50,12 +50,40 @@ function ActionIcon({ a }: { a: AssistantAction }) {
   return <PackageOpen className={cls} />;
 }
 
-// Minimal formatting for the assistant's replies: **bold**, numbered and
-// bulleted lists, paragraphs. (No HTML injection — everything is text nodes.)
-function Rich({ text }: { text: string }) {
+// Minimal formatting for the assistant's replies: **bold**, [links](url),
+// bare https:// links, numbered and bulleted lists, paragraphs. No HTML
+// injection — everything is text nodes / React elements. Links: FPX pages
+// ("/tracking/…", "/tasks/…") open in the app; only http(s) goes elsewhere.
+const LINK_RE = /(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|https?:\/\/[^\s)]+)/g;
+
+function safeHref(href: string): { internal: boolean; href: string } | null {
+  const h = href.trim();
+  if (/^\/(?!\/)[\w\-/?=&.%#]*$/.test(h)) return { internal: true, href: h };
+  try {
+    const u = new URL(h);
+    if (u.protocol === "https:" || u.protocol === "http:") return { internal: false, href: u.toString() };
+  } catch { /* not a URL */ }
+  return null;
+}
+
+function Rich({ text, onInternal }: { text: string; onInternal: (href: string) => void }) {
   const lines = text.split("\n");
-  const bold = (s: string) => s.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
-    part.startsWith("**") && part.endsWith("**") ? <strong key={i} className="font-semibold text-slate-900">{part.slice(2, -2)}</strong> : <Fragment key={i}>{part}</Fragment>);
+  const link = (label: string, href: string, key: number) => {
+    const ok = safeHref(href);
+    if (!ok) return <Fragment key={key}>{label}</Fragment>;
+    const cls = "text-violet-700 underline decoration-violet-300 underline-offset-2 hover:decoration-violet-700 font-medium";
+    return ok.internal
+      ? <a key={key} href={ok.href} className={cls} onClick={(e) => { e.preventDefault(); onInternal(ok.href); }}>{label}</a>
+      : <a key={key} href={ok.href} target="_blank" rel="noopener noreferrer" className={cls}>{label}<ExternalLink className="inline h-3 w-3 ml-0.5 -mt-0.5" /></a>;
+  };
+  const inline = (s: string) => s.split(LINK_RE).map((part, i) => {
+    if (!part) return null;
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={i} className="font-semibold text-slate-900">{inline(part.slice(2, -2))}</strong>;
+    const md = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(part);
+    if (md) return link(md[1], md[2], i);
+    if (/^https?:\/\//.test(part)) return link(part.replace(/^https?:\/\//, "").slice(0, 48), part, i);
+    return <Fragment key={i}>{part}</Fragment>;
+  });
   return (
     <div className="space-y-1.5">
       {lines.map((raw, i) => {
@@ -65,12 +93,12 @@ function Rich({ text }: { text: string }) {
         if (num) return (
           <div key={i} className="flex gap-2">
             <span className="shrink-0 h-5 w-5 rounded-full bg-violet-100 text-violet-700 text-[11px] font-semibold flex items-center justify-center mt-px">{num[1]}</span>
-            <div>{bold(num[2])}</div>
+            <div>{inline(num[2])}</div>
           </div>
         );
         const bullet = /^\s*[-•]\s+(.*)$/.exec(line);
-        if (bullet) return <div key={i} className="flex gap-2 pl-7"><span className="text-slate-400">•</span><div>{bold(bullet[1])}</div></div>;
-        return <p key={i}>{bold(line)}</p>;
+        if (bullet) return <div key={i} className="flex gap-2 pl-7"><span className="text-slate-400">•</span><div>{inline(bullet[1])}</div></div>;
+        return <p key={i}>{inline(line)}</p>;
       })}
     </div>
   );
@@ -83,11 +111,13 @@ export function AssistantPanel() {
   const [state, setState] = useState<Stored>(load);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState("");      // answer streaming in
+  const [status, setStatus] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => { try { sessionStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* quota */ } }, [state]);
-  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }); }, [state.turns.length, busy, open]);
+  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }); }, [state.turns.length, busy, open, draft.length > 0, status]);
   useEffect(() => { if (open) setTimeout(() => inputRef.current?.focus(), 50); }, [open]);
 
   // Ctrl/Cmd+K toggles the panel.
@@ -119,15 +149,20 @@ export function AssistantPanel() {
     setBusy(true);
     const turns: Turn[] = [...state.turns, { role: "user", text: message }];
     setState((s) => ({ ...s, turns }));
+    setDraft(""); setStatus(null);
     try {
-      const r = await hostedBrowser.assistantChat({ history: state.history, message, context: { page: location.pathname } });
+      const r = await hostedBrowser.assistantStream({ history: state.history, message, context: { page: location.pathname } }, (ev) => {
+        if (ev.type === "text") { setStatus(null); setDraft((d) => d + ev.delta); }
+        else if (ev.type === "reset") setDraft("");
+        else if (ev.type === "status") setStatus(ev.text);
+      });
       setState({ turns: [...turns, { role: "assistant", text: r.reply || "(no answer)", actions: r.actions }], history: r.messages });
       // Do what it said, in order (the last navigation wins).
       for (const a of r.actions) perform(a);
     } catch (e) {
       setState((s) => ({ ...s, turns: [...turns, { role: "assistant", text: (e as Error).message, error: true }] }));
     } finally {
-      setBusy(false);
+      setBusy(false); setDraft(""); setStatus(null);
     }
   }
 
@@ -189,7 +224,7 @@ export function AssistantPanel() {
             ) : (
               <div key={i} className="space-y-2">
                 <div className={"text-sm leading-relaxed rounded-2xl rounded-bl-md px-3.5 py-2.5 ring-1 " + (t.error ? "bg-rose-50 text-rose-800 ring-rose-200" : "bg-white text-slate-700 ring-slate-200")}>
-                  {t.error ? t.text : <Rich text={t.text} />}
+                  {t.error ? t.text : <Rich text={t.text} onInternal={(href) => navigate(href)} />}
                 </div>
                 {t.actions?.length ? (
                   <div className="flex flex-wrap gap-1.5">
@@ -204,9 +239,15 @@ export function AssistantPanel() {
               </div>
             ))}
 
-            {busy ? (
+            {busy && draft ? (
+              <div className="text-sm leading-relaxed rounded-2xl rounded-bl-md px-3.5 py-2.5 ring-1 bg-white text-slate-700 ring-slate-200">
+                <Rich text={draft} onInternal={(href) => navigate(href)} />
+                <span className="inline-block w-1.5 h-4 align-middle bg-violet-400 animate-pulse ml-0.5" />
+              </div>
+            ) : null}
+            {busy && !draft ? (
               <div className="flex items-center gap-2 text-xs text-slate-500">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Looking at your shipments…
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> {status || "Thinking…"}
               </div>
             ) : null}
           </div>

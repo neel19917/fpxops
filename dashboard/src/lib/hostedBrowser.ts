@@ -141,6 +141,11 @@ export type AssistantAction =
   | { type: "filter_shipments"; query?: string; action?: "YES" | "NO" | "ERROR"; customer?: string }
   | { type: "navigate"; page: string };
 
+export type AssistantStreamEvent =
+  | { type: "text"; delta: string }
+  | { type: "status"; text: string }
+  | { type: "reset" };
+
 export interface AssistantReply {
   messages: unknown[];   // conversation, returned verbatim and sent back next turn
   reply: string;
@@ -181,6 +186,49 @@ export const hostedBrowser = {
     call<BrowserSettingsResponse>("/admin/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ settings }) }),
   assistantChat: (body: { history: unknown[]; message: string; context?: Record<string, unknown> }) =>
     call<AssistantReply>("/assistant/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+  /** Streams the answer as it's written; falls back to the one-shot call on an older service. */
+  assistantStream: async (
+    body: { history: unknown[]; message: string; context?: Record<string, unknown> },
+    onEvent: (e: AssistantStreamEvent) => void,
+  ): Promise<AssistantReply> => {
+    if (!HOSTED_BROWSER_URL) throw new Error("Hosted browser not configured (VITE_FPX_BROWSER_URL)");
+    const token = await getAccessTokenOrWait();
+    const res = await fetch(`${HOSTED_BROWSER_URL}/assistant/chat/stream`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 404 || res.status === 405) return hostedBrowser.assistantChat(body);
+    if (!res.ok || !res.body) {
+      const j = await res.json().catch(() => null);
+      throw new Error(j?.error ? `Hosted browser: ${j.error}` : `Hosted browser returned ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let final: AssistantReply | null = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) buf += dec.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        type Wire = AssistantStreamEvent
+          | ({ type: "done" } & Partial<AssistantReply>)
+          | { type: "error"; error?: string };
+        let ev: Wire;
+        try { ev = JSON.parse(line) as Wire; } catch { continue; }
+        if (ev.type === "done") final = { messages: ev.messages || [], reply: ev.reply || "", actions: ev.actions || [] };
+        else if (ev.type === "error") throw new Error(ev.error || "Assistant error");
+        else onEvent(ev);
+      }
+      if (done) break;
+    }
+    if (!final) throw new Error("The answer was cut off — try again");
+    return final;
+  },
   enabled: !!HOSTED_BROWSER_URL,
   stats: (days = 30) => call<HostedStats>(`/stats?days=${days}`),
   stopScrape: () => call<{ stopping: boolean }>("/scrape/stop", { method: "POST" }),
