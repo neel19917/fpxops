@@ -114,6 +114,7 @@ export function enqueueScheduled(schedule) {
     id: `sch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
     email: schedule.owner, source: "schedule",
     scheduleId: schedule.id, scheduleName: schedule.name || null,
+    modes: Array.isArray(schedule.modes) && schedule.modes.length ? schedule.modes : null,
     queuedAt: new Date().toISOString(),
   };
   localQueue.push(job);
@@ -134,7 +135,7 @@ async function poll() {
   }
   const { request } = await api(`/api/ops/rescrape/pending?claim=1&by=${encodeURIComponent("fpx-browser")}`);
   if (!request) return;
-  return runJob({ id: request.id, apiRequestId: request.id, email: String(request.requested_by || ""), source: "manual", scope: request.scope });
+  return runJob({ id: request.id, apiRequestId: request.id, email: String(request.requested_by || ""), source: "manual", scope: request.scope, modes: Array.isArray(request.modes) && request.modes.length ? request.modes : null });
 }
 
 // Run one job (manual or scheduled) end to end, then record it in the
@@ -145,7 +146,7 @@ async function runJob(job) {
   const email = job.email;
   const startedAt = Date.now();
   current = {
-    requestId: job.id, user: email, scope: job.scope || "all", source: job.source,
+    requestId: job.id, user: email, scope: job.scope || "all", source: job.source, modes: job.modes || null,
     scheduleId: job.scheduleId || null, scheduleName: job.scheduleName || null,
     startedAt: new Date(startedAt).toISOString(), status: "Starting…", statusAt: new Date().toISOString(), log: [],
     counts: { scraped: 0, partial: 0, saved: 0, changed: 0, uploadErrors: 0, archived: 0, processed: 0 },
@@ -155,6 +156,7 @@ async function runJob(job) {
     fpBefore: null, // first complete tile reading of the run
     fpAfter: null,  // tile reading when the run ended
   };
+  if (job.modes) logLine(`Limited to ${job.modes.join(" + ")} shipments`);
   logLine(job.source === "schedule"
     ? `Scheduled run${job.scheduleName ? ` "${job.scheduleName}"` : ""} — running as ${email}`
     : `Claimed request — running as ${email || "unknown user"}`);
@@ -165,7 +167,7 @@ async function runJob(job) {
     if (!email.includes("@")) throw new Error(`Request has no user (requested_by="${email}") — rescrapes must come from a signed-in rep`);
     if (!hasProfile(email)) throw new Error(`${email} hasn't logged in to FreightPOP in the hosted view yet`);
     if (current) current.tasksBefore = await taskSnapshot();
-    const result = await runRefreshAll(email);
+    const result = await runRefreshAll(email, job.modes || null);
     ok = true; note = result;
     console.log(`[worker] ${job.id} done: ${result}`);
   } catch (e) {
@@ -186,7 +188,7 @@ async function runJob(job) {
       id: job.id, source: job.source, user: email,
       scheduleId: job.scheduleId || null, scheduleName: job.scheduleName || null,
       startedAt: new Date(startedAt).toISOString(), finishedAt, durationMs: Date.now() - startedAt,
-      ok, note: String(note).slice(0, 500),
+      ok, note: String(note).slice(0, 500), modes: job.modes || null,
       counts: current?.counts ? { ...current.counts, total: current.total ?? null } : null,
       // FreightPOP dashboard totals at the start and end of the run (trends).
       fpBefore: current?.fpBefore || null,
@@ -207,16 +209,16 @@ async function runJob(job) {
   }
 }
 
-async function runRefreshAll(email) {
+async function runRefreshAll(email, modes = null) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runIn(lease.browser, dashboardUrlFor(email), email);
+    return await runIn(lease.browser, dashboardUrlFor(email), email, modes);
   } finally {
     lease.release();
   }
 }
 
-async function runIn(browser, url, who) {
+async function runIn(browser, url, who, modes = null) {
   const worker = await getServiceWorker(browser);
   // Same sentinel trick as extension-headless/run.js: content.js reports
   // progress/completion to the service worker via chrome.runtime.sendMessage.
@@ -334,6 +336,8 @@ async function runIn(browser, url, who) {
     logLine(total != null ? `Grid loaded — ${total} shipment(s) in the grid. Starting Refresh All` : "Grid loaded — starting Refresh All");
     const pageSize = Number(setting("browser.scrape_page_size")) || 50;
     await ext.evaluate(`fpxScrapePageSize = ${pageSize}; 'ok'`).catch(() => {});
+    // Mode filter (LTL / Truckload / Parcel) — content.js applies it on the grid.
+    await ext.evaluate(`fpxScrapeModes = ${JSON.stringify(modes && modes.length ? modes : null)}; 'ok'`).catch(() => {});
     await ext.evaluate("run(); 'started'", { awaitPromise: false });
 
     const deadline = Date.now() + config.scrapeTimeoutMs;

@@ -1185,6 +1185,23 @@ async function run(filterCol, filterVal) {
     sendStatus("No filter set — proceeding with current grid view.");
   }
 
+  // Mode filter (LTL / Truckload / Parcel). Only the modes that were actually
+  // applied scope the delivered-archive pass below; if the filter can't be
+  // applied the run covers every mode, so a full archive is still right.
+  let appliedModes = null;
+  const modes = Array.isArray(fpxScrapeModes) ? fpxScrapeModes.map(String).filter(Boolean) : [];
+  if (modes.length && modes.length < 3) {
+    sendStatus(`Limiting to ${modes.join(" + ")} shipments...`);
+    const ok = await fpxFilterViaKendoApi(JSON.stringify(modes), [], { mode: "modes" });
+    if (ok) {
+      appliedModes = modes;
+      sendStatus(`Grid limited to ${modes.join(" + ")} (${fpxLastInjectDetail.split("|").pop().trim()}).`);
+    } else {
+      sendStatus(`Couldn't limit the grid to ${modes.join(" + ")} — refreshing every mode instead.`);
+    }
+    await humanDelay(800, 1300);
+  }
+
   // Fewer, bigger pages. Changing the page size returns the grid to page 1,
   // so do it BEFORE reading the starting page below (the delivered-archive
   // guard depends on that read).
@@ -1339,11 +1356,13 @@ async function run(filterCol, filterVal) {
   // visited every page so its set is incomplete.
   let archiveSummary = "";
   if (!filterCol && !filterVal && startedOnFirstPage && sweepTrackingNumbers.size > 0) {
-    sendStatus(`Reconciling delivered shipments (${sweepTrackingNumbers.size} seen)…`);
+    sendStatus(`Reconciling delivered ${appliedModes ? appliedModes.join(" + ") + " " : ""}shipments (${sweepTrackingNumbers.size} seen)…`);
     try {
       const r = await chrome.runtime.sendMessage({
         type: "sweepComplete",
         trackingNumbers: Array.from(sweepTrackingNumbers),
+        // A mode-limited run only archives within the modes it covered.
+        modes: appliedModes,
       });
       if (r && r.ok && (r.archived_shipments > 0 || r.archived_tasks > 0)) {
         archiveSummary = `, archived ${r.archived_shipments} delivered shipment${r.archived_shipments === 1 ? "" : "s"}` +
@@ -2415,6 +2434,8 @@ function invClearSession() {
 // this from its admin setting before calling run(); 10 or less leaves the
 // grid as it is.
 let fpxScrapePageSize = 50;
+// Limit Refresh All to these FreightPOP modes (e.g. ["LTL","Truckload"]); null = every mode.
+let fpxScrapeModes = null;
 
 function invoiceSetPageSize(target) { return setGridPageSize(target, sendInvStatus); }
 

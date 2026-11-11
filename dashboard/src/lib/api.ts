@@ -546,7 +546,7 @@ export const api = {
     metrics: (days = 30) =>
       request<OpsMetrics>("/api/ops/metrics", { params: { days } }),
     // Enqueue a rescrape for the Chrome extension to fulfill on its next cycle.
-    requestRescrape: (body?: { scope?: "all" | "selected"; tracking_numbers?: string[] }) =>
+    requestRescrape: (body?: { scope?: "all" | "selected"; tracking_numbers?: string[]; modes?: string[] }) =>
       request<{ request: ScrapeRequest; coalesced?: boolean }>("/api/ops/rescrape", {
         method: "POST",
         body: JSON.stringify(body || { scope: "all" }),

@@ -129,6 +129,35 @@
     return 0;
   }
 
+  // mode "modes": keep only these shipment modes (data-fpx-value = JSON array,
+  // e.g. ["LTL","Truckload"]) on the Mode column — an OR filter, kept even if
+  // the grid comes back short. Used by Refresh All when it's limited to modes.
+  if (mode === "modes") {
+    var wanted;
+    try { wanted = JSON.parse(value || "[]"); } catch (_e) { wanted = []; }
+    wanted = (wanted || []).map(String).filter(Boolean);
+    if (!wanted.length) { note("no modes given"); reply(false); return; }
+    (async function () {
+      var g = grids[0];
+      var known = knownFields(g);
+      var col = (g.columns || []).filter(function (c) {
+        var title = String(c.title || "").replace(/<[^>]*>/g, "").trim();
+        return c.field && /^(ship(ment)?\s*)?mode$/i.test(title);
+      })[0];
+      var field = (col && col.field) || known["mode"] || known["shipmode"] || known["shipmentmode"] || known["modename"];
+      if (!field) { note("no Mode column/field on this grid"); reply(false); return; }
+      var ds = g.dataSource;
+      var before = typeof ds.total === "function" ? ds.total() : ds.view().length;
+      await afterLoad(ds, function () {
+        ds.filter({ logic: "or", filters: wanted.map(function (m) { return { field: field, operator: "eq", value: m }; }) });
+      }, 15000);
+      var total = typeof ds.total === "function" ? ds.total() : ds.view().length;
+      note("grid 0: '" + field + "' in " + JSON.stringify(wanted) + " → " + total + " of " + before + " row(s)");
+      reply(true, { strategy: "modes", field: field, total: total, before: before });
+    })();
+    return;
+  }
+
   (async function run() {
     for (var gi = 0; gi < grids.length; gi++) {
       var g = grids[gi];

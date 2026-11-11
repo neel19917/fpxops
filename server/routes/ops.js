@@ -11,7 +11,7 @@ export const opsRouter = Router();
 // All routes are under the dual-auth /api router, so the extension authenticates
 // with its x-api-key just like it does for POST /api/shipments.
 
-// POST /ops/rescrape  { scope?: "all" | "selected", tracking_numbers?: string[] }
+// POST /ops/rescrape  { scope?: "all" | "selected", tracking_numbers?: string[], modes?: ("LTL"|"Truckload"|"Parcel")[] }
 // Operator clicks "Rescrape". Coalesces an existing pending full rescrape so we
 // don't stack duplicates the extension would run twice.
 opsRouter.post("/rescrape", async (req, res) => {
@@ -22,17 +22,24 @@ opsRouter.post("/rescrape", async (req, res) => {
   if (scope === "selected" && (!tns || !tns.length)) {
     return res.status(400).json({ error: "selected scope requires tracking_numbers" });
   }
+  // Optional: only these FreightPOP modes. All three (or none) = every mode.
+  const KNOWN = ["LTL", "Truckload", "Parcel"];
+  let modes = Array.isArray(req.body?.modes) ? [...new Set(req.body.modes.map(String).filter((m) => KNOWN.includes(m)))] : null;
+  if (Array.isArray(req.body?.modes) && !modes.length) return res.status(400).json({ error: "Pick at least one mode" });
+  if (modes && modes.length === KNOWN.length) modes = null;
   if (scope === "all") {
     const { data: existing } = await supabase
       .from("fpx_scrape_requests")
       .select("*").eq("status", "pending").eq("scope", "all")
-      .order("requested_at", { ascending: false }).limit(1);
-    if (existing?.[0]) return res.json({ request: existing[0], coalesced: true });
+      .order("requested_at", { ascending: false }).limit(5);
+    const same = (existing || []).find((r) => JSON.stringify((r.modes || []).slice().sort()) === JSON.stringify((modes || []).slice().sort()));
+    if (same) return res.json({ request: same, coalesced: true });
   }
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
     .insert({
       scope,
+      modes,
       tracking_numbers: tns,
       requested_by: req.user?.email || req.apiKey?.name || null,
     })
@@ -42,8 +49,8 @@ opsRouter.post("/rescrape", async (req, res) => {
     action: "rescrape_request",
     entity_type: "scrape_request",
     entity_id: data.id,
-    summary: `Requested ${scope} rescrape`,
-    metadata: { scope, count: tns?.length || null },
+    summary: `Requested ${scope} rescrape${modes ? ` (${modes.join(" + ")})` : ""}`,
+    metadata: { scope, modes, count: tns?.length || null },
   });
   res.json({ request: data });
 });

@@ -55,7 +55,7 @@ const toRow = (r, logText) => ({
   started_at: r.startedAt, finished_at: r.finishedAt, duration_ms: Math.round(r.durationMs || 0),
   ok: !!r.ok, note: r.note || null, counts: r.counts || null,
   fp_before: r.fpBefore || null, fp_after: r.fpAfter || null,
-  tasks_before: r.tasksBefore || null, tasks_after: r.tasksAfter || null,
+  tasks_before: r.tasksBefore || null, tasks_after: r.tasksAfter || null, modes: r.modes || null,
   ...(logText !== undefined ? { log: logText, log_lines: logText ? logText.split("\n").filter(Boolean).length : 0 } : {}),
 });
 
@@ -65,7 +65,7 @@ const fromRow = (x) => ({
   startedAt: x.started_at, finishedAt: x.finished_at, durationMs: x.duration_ms,
   ok: x.ok, note: x.note || "", counts: x.counts || null,
   fpBefore: x.fp_before || null, fpAfter: x.fp_after || null,
-  tasksBefore: x.tasks_before || null, tasksAfter: x.tasks_after || null, synced: true,
+  tasksBefore: x.tasks_before || null, tasksAfter: x.tasks_after || null, modes: x.modes || null, synced: true,
 });
 
 async function pushToSupabase(r) {
@@ -143,7 +143,7 @@ export async function initRuns() {
     return;
   }
   try {
-    const rows = await sb(`fpx_scrape_runs?select=id,source,user_email,schedule_id,schedule_name,started_at,finished_at,duration_ms,ok,note,counts,fp_before,fp_after,tasks_before,tasks_after&order=started_at.desc&limit=${MAX_RUNS}`);
+    const rows = await sb(`fpx_scrape_runs?select=id,source,user_email,schedule_id,schedule_name,started_at,finished_at,duration_ms,ok,note,counts,fp_before,fp_after,tasks_before,tasks_after,modes&order=started_at.desc&limit=${MAX_RUNS}`);
     const byId = new Map(runs.map((r) => [r.id, r]));
     for (const row of rows || []) if (!byId.has(row.id)) byId.set(row.id, fromRow(row));
     runs = [...byId.values()].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, MAX_RUNS);
