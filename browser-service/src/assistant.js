@@ -360,8 +360,18 @@ const DATA_TOOLS = {
 async function preloadedBrief() {
   if (!indexFresh()) return null;
   try {
-    const [focus, summary] = await Promise.all([ixFocusList({ limit: 12 }), ixSummary()]);
-    return { built: new Date(indexState.at).toISOString(), dashboard: summary, top_focus: focus };
+    const [focus, summary] = await Promise.all([ixFocusList({ limit: 8 }), ixSummary()]);
+    // Lean: just what's needed to rank and say the next step (≈2–3k tokens).
+    const slim = focus.candidates.map((c) => {
+      const f = c.shipment || {};
+      return {
+        task_id: c.task_id, task: trim(c.task, 120), status: c.task_status, assigned_to: c.assigned_to, age_days: c.task_age_days,
+        id: f.id, shipment: f.shipment, tracking: f.tracking, customer: f.customer, carrier: f.carrier, ship_status: f.status,
+        action_needed: f.action_needed, issue: trim(f.issue, 160), eta: f.eta, appointment: f.appointment,
+        latest_note: f.latest_note ? trim(f.latest_note.note, 120) : undefined,
+      };
+    });
+    return { built: new Date(indexState.at).toISOString(), dashboard: summary, open_tasks_on_dashboard: focus.open_tasks_on_dashboard, top_focus: slim };
   } catch { return null; }
 }
 
@@ -442,9 +452,9 @@ Data notes:
 - "On the dashboard" means seen in FreightPOP's dashboard grid recently. Shipments that left it are usually delivered; ignore them unless asked.
 - Shipment numbers (e.g. 15665897) and tracking numbers are different identifiers. open_shipment and open_task need internal ids from tool results.
 - Every open task is marked "high" priority, so priority alone doesn't rank anything — use the shipment facts.
-- The first message of a conversation may carry a pre-loaded brief (top focus items + dashboard counts). When it answers the question, answer from it directly without calling focus_list or dashboard_summary.
+- The first message of a conversation may carry a pre-loaded brief: dashboard counts and only the TOP 8 focus items. Answer "what should I focus on" / "how are we doing" from it directly. For anything else — a category ("stuck at a terminal", "waiting on appointments", a carrier, a customer), a specific shipment, or more than the top items — call search_shipments or focus_list; the brief is not the whole board.
 
-Style: short and scannable. For focus lists, a numbered list of at most 5–7 items: shipment number · customer · carrier — the problem — the next step. Use names and numbers, not internal ids. No preamble.`;
+Style: short and scannable — reps read this between calls. Default to under 120 words. For lists, at most 5 items, ONE line each: shipment number · customer · carrier — the problem — the next step. Offer "want more?" instead of listing everything. Use names and numbers, not internal ids. No preamble, no closing summary.`;
 
 // One user turn. history: prior Anthropic.MessageParam[] exactly as returned
 // by previous calls. Returns { messages, reply, actions, usage }.
