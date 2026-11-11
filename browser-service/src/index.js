@@ -19,6 +19,7 @@ function allowChat(email) {
   hits.push(now); chatHits.set(email, hits);
   return true;
 }
+import { startLoginKeepAlive } from "./keepalive.js";
 import { listSchedules, createSchedule, updateSchedule, deleteSchedule, runScheduleNow, startScheduler } from "./schedules.js";
 
 const sessions = new Set();
@@ -338,6 +339,7 @@ server.listen(config.port, async () => {
   startSettings();
   initRuns().catch((e) => console.warn("[runs] init failed:", e.message));
   if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); }
+  startLoginKeepAlive();
   selfTest().then((r) => {
     selfTestResult = r;
     console.log(`[selftest] ${r.ok ? "OK" : "FAILED"} ${JSON.stringify(r)}`);

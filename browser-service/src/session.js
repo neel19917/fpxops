@@ -1,4 +1,4 @@
-import { acquireUserBrowser, openWindowPage, ExtensionContexts, noteUrl, dashboardUrlFor, watchAuth, isAuthExpired } from "./browser.js";
+import { acquireUserBrowser, openWindowPage, ExtensionContexts, noteUrl, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
 import { recordSession } from "./usage.js";
 import { scrapePageFor } from "./worker.js";
 import { get as setting, onChange as onSettingsChange } from "./settings.js";
@@ -158,6 +158,18 @@ export class ViewerSession {
       // dashboard) and show the sign-in form.
       this.offAuth = watchAuth(this.page, this.who.email, async () => {
         try {
+          // The keep-alive may have renewed the login while this page kept
+          // using its old token: a saved login that's still good → reload.
+          const left = await this.page.evaluate(() => {
+            try { return Date.parse(JSON.parse(localStorage.getItem("user") || "{}").User_State?.AccessTokenExpiryTime || "") - Date.now(); } catch { return NaN; }
+          }).catch(() => NaN);
+          if (left > 5 * 60_000 && Date.now() - (this.lastRenewReload || 0) > 60_000) {
+            this.lastRenewReload = Date.now();
+            clearAuthExpired(this.who.email);
+            console.log(`[auth] ${this.who.email}: page had an old token, saved login is renewed → reload`);
+            await this.page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+            return;
+          }
           this.send({ type: "signedIn", value: false });
           this.signedInLast = false;
           await this.page.evaluate(() => { try { localStorage.removeItem("user"); } catch {} }).catch(() => {});
