@@ -37,6 +37,7 @@ const EVENT_LABELS: Record<string, { label: string; tone: string }> = {
   ai_rewrite: { label: "AI rewrite (suggested)", tone: "bg-fuchsia-50 text-fuchsia-700 ring-fuchsia-200" },
   ai_preview: { label: "Preview", tone: "bg-slate-50 text-slate-600 ring-slate-200" },
   human_review: { label: "Human review", tone: "bg-emerald-50 text-emerald-700 ring-emerald-200" },
+  mcp_call: { label: "Claude connector", tone: "bg-indigo-50 text-indigo-700 ring-indigo-200" },
 };
 
 const money = (v: number | string | null | undefined) => {

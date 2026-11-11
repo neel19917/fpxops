@@ -73,13 +73,13 @@ usersRouter.post("/:id/issue-key", async (req, res) => {
     .from("fpx_api_keys")
     .select("id, name, key_prefix")
     .eq("user_id", id)
-    .is("revoked_at", null);
+    .is("revoked_at", null)
+    .not("scopes", "cs", "{mcp}"); // their Claude connector key is separate — keep it
   if (priors && priors.length) {
     await supabase
       .from("fpx_api_keys")
       .update({ revoked_at: new Date().toISOString() })
-      .eq("user_id", id)
-      .is("revoked_at", null);
+      .in("id", priors.map((p) => p.id));
     for (const p of priors) {
       logAudit(req, {
         action: "revoke",
