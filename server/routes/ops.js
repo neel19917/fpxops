@@ -80,6 +80,22 @@ opsRouter.get("/rescrape/pending", async (req, res) => {
   res.json({ request: claimed || null });
 });
 
+// POST /ops/rescrape/release-orphans { by } — the worker calls this when it
+// starts: anything it had claimed can't still be running (the process just
+// restarted), so close it out instead of leaving it "claimed" forever (the
+// Scraping page treats claimed as running and disables Refresh).
+opsRouter.post("/rescrape/release-orphans", async (req, res) => {
+  const by = String(req.body?.by || req.apiKey?.name || "").trim();
+  if (!by) return res.status(400).json({ error: "by required" });
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .update({ status: "error", completed_at: new Date().toISOString(), note: "Interrupted — the hosted browser restarted mid-run. Re-run if needed." })
+    .eq("status", "claimed").eq("claimed_by", by)
+    .select("id");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ released: (data || []).map((r) => r.id) });
+});
+
 // POST /ops/rescrape/:id/complete  { result_count?, note?, error? } — extension
 // reports back after fulfilling (or failing) a request.
 opsRouter.post("/rescrape/:id/complete", async (req, res) => {
