@@ -18,13 +18,13 @@ usersRouter.use(requireAuth({ role: "admin", scope: "admin" }));
 usersRouter.get("/", async (req, res) => {
   const { data, error } = await supabase
     .from("fpx_user_profiles")
-    .select("id, email, full_name, avatar_url, role, enabled, last_login_at, created_at")
+    .select("id, email, full_name, avatar_url, role, enabled, last_login_at, created_at, auto_open_tracking")
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   sendCachedJson(req, res, { data: data || [] });
 });
 
-// PATCH /api/users/:id  { enabled?, role?, full_name? }
+// PATCH /api/users/:id  { enabled?, role?, full_name?, auto_open_tracking? }
 usersRouter.patch("/:id", async (req, res) => {
   const updates = {};
   if (typeof req.body?.enabled === "boolean") updates.enabled = req.body.enabled;
@@ -35,12 +35,13 @@ usersRouter.patch("/:id", async (req, res) => {
     const trimmed = req.body.full_name.trim();
     updates.full_name = trimmed === "" ? null : trimmed.slice(0, 200);
   }
+  if (typeof req.body?.auto_open_tracking === "boolean") updates.auto_open_tracking = req.body.auto_open_tracking;
   if (Object.keys(updates).length === 0) return res.status(400).json({ error: "No valid fields to update" });
   const { data, error } = await supabase
     .from("fpx_user_profiles")
     .update(updates)
     .eq("id", req.params.id)
-    .select("id, email, full_name, avatar_url, role, enabled, last_login_at, created_at")
+    .select("id, email, full_name, avatar_url, role, enabled, last_login_at, created_at, auto_open_tracking")
     .maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: "User not found" });

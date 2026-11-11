@@ -213,6 +213,8 @@ export interface UserProfileRow {
   enabled: boolean;
   last_login_at: string | null;
   created_at: string;
+  // Hosted FreightPOP lookups also open the tracking popup (false = the user clicks).
+  auto_open_tracking?: boolean;
 }
 
 export interface ShareLink {

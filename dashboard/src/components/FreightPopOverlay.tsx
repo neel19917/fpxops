@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Copy, Check, ExternalLink, Filter, X as XIcon, ArrowLeft, ArrowRight, RotateCw, Maximize2, Minimize2 } from "lucide-react";
 import { useFrameState, hideFrame } from "../lib/freightpopFrame";
 import { useAuth } from "../lib/auth";
+import { getAutoOpenTracking, setAutoOpenTracking, useAutoOpenTracking } from "../lib/prefs";
 import { ErrorBlock } from "./ErrorBlock";
 import { HostedFreightPop, HOSTED_BROWSER_URL, type BridgeAck, type BridgePayload, type HostedFreightPopHandle } from "./HostedFreightPop";
 
@@ -117,6 +118,7 @@ export function FreightPopOverlay() {
   const { clientConfig } = useAuth();
   const cfg = clientConfig?.embed_freightpop;
   const frame = useFrameState();
+  const autoOpenTracking = useAutoOpenTracking();
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   // Hosted mode (VITE_FPX_BROWSER_URL set): FreightPOP runs in the hosted
   // browser service with the extension preloaded, so nobody needs the
@@ -310,7 +312,9 @@ export function FreightPopOverlay() {
     const tn = frame.trackingNumber;
     const t = setTimeout(() => {
       lastAutoFilteredKeyRef.current = key;
-      sendBridgeRef.current(hosted
+      // Users can turn the auto-open off (their preference): then the grid
+      // is only filtered to the shipment and they click it themselves.
+      sendBridgeRef.current(hosted && getAutoOpenTracking()
         ? { type: "fpxOpenTracking", trackingNumber: tn }
         : { type: "fpxFilter", column: "Tracking Number", value: tn });
     }, hosted ? 500 : 0);
@@ -472,6 +476,20 @@ export function FreightPopOverlay() {
               {isFilteredToCurrent ? <Check className="h-3.5 w-3.5" /> : <Filter className="h-3.5 w-3.5" />}
               {isFilteredToCurrent ? "Filtered" : "Filter shipment"}
             </button>
+          ) : null}
+          {hosted ? (
+            <label
+              className="text-xs px-2 py-1 rounded ring-1 ring-slate-200 bg-white text-slate-700 inline-flex items-center gap-1.5 cursor-pointer select-none"
+              title="On: each shipment opens its FreightPOP tracking details. Off: the grid is only filtered to the shipment — click it yourself (faster when moving between shipments)."
+            >
+              <input
+                type="checkbox"
+                className="accent-violet-600"
+                checked={autoOpenTracking}
+                onChange={(e) => { setAutoOpenTracking(e.target.checked).catch((err: Error) => alert(`Couldn't save: ${err.message}`)); }}
+              />
+              Auto-open details
+            </label>
           ) : null}
           <button
             onClick={() => setCredsOpen((v) => !v)}
