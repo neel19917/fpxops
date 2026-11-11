@@ -11,6 +11,16 @@ export function emailModelExtras(model) {
   return { output_config: { effort: "low" }, fallbacks: "default" };
 }
 
+// Email Studio previews: swap in unsaved prompt text / model for the keys
+// this generator reads. Copies — never mutates the shared settings cache.
+function withOverrides(settings, overrides) {
+  const out = { ...settings };
+  if (overrides && typeof overrides === "object") {
+    for (const k of Object.keys(out)) if (typeof overrides[k] === "string") out[k] = overrides[k];
+  }
+  return out;
+}
+
 // Build the slim shipment context the email prompt sees. Centralized so the
 // manual draft route and the auto-drafter agree on what's available.
 export function slimShipmentForEmail(ship, notes) {
@@ -38,14 +48,14 @@ export function slimShipmentForEmail(ship, notes) {
 // Generate a single email draft. Returns { subject, body, raw } on success,
 // or { error } on failure. The system prompt and audience copy are pulled
 // from fpx_settings so admins can edit them.
-export async function generateEmailDraft({ ship, audience, notes, callMeta }) {
+export async function generateEmailDraft({ ship, audience, notes, callMeta, overrides }) {
   const aud = audience === "customer" ? "customer" : "carrier";
-  const settings = await getSettings(
+  const settings = withOverrides(await getSettings(
     "prompt.email_draft.system_base",
     "prompt.email_draft.audience_carrier",
     "prompt.email_draft.audience_customer",
     "prompt.email_draft.model",
-  );
+  ), overrides);
   const model = settings["prompt.email_draft.model"] || undefined;
   const audienceCopy = aud === "carrier"
     ? settings["prompt.email_draft.audience_carrier"]
@@ -80,7 +90,7 @@ export async function generateEmailDraft({ ship, audience, notes, callMeta }) {
   if (!parsed?.subject || !parsed?.body) {
     return { subject: "(draft)", body: result.text, raw: result.text };
   }
-  return { subject: parsed.subject, body: parsed.body };
+  return { subject: parsed.subject, body: parsed.body, model: result.model };
 }
 
 // Slim per-shipment context for the carrier-group email. Mirrors
@@ -116,13 +126,13 @@ function slimShipmentForGroup(ship, taskTitle, taskDescription) {
 // Pulls the carrier_group prompt + model from settings so admins can
 // tune the wording and the model tier. Returns { subject, body } on
 // success, { error } on failure (matches generateEmailDraft contract).
-export async function generateCarrierGroupEmail({ carrier, items, notes, callMeta }) {
+export async function generateCarrierGroupEmail({ carrier, items, notes, callMeta, overrides }) {
   if (!Array.isArray(items) || items.length === 0) return { error: "No shipments supplied" };
-  const settings = await getSettings(
+  const settings = withOverrides(await getSettings(
     "prompt.email_draft.carrier_group.system_base",
     "prompt.email_draft.carrier_group.audience",
     "prompt.email_draft.carrier_group.model",
-  );
+  ), overrides);
   const audienceCopy = settings["prompt.email_draft.carrier_group.audience"];
   const systemPrompt = String(settings["prompt.email_draft.carrier_group.system_base"] || "")
     .replace("{{audienceCopy}}", audienceCopy);
@@ -167,13 +177,13 @@ export async function generateCarrierGroupEmail({ carrier, items, notes, callMet
 // reads its prompts from the customer_group settings keys. The slim
 // shape is identical because the model still benefits from the same
 // per-shipment context regardless of who's reading.
-export async function generateCustomerGroupEmail({ customer, items, notes, callMeta }) {
+export async function generateCustomerGroupEmail({ customer, items, notes, callMeta, overrides }) {
   if (!Array.isArray(items) || items.length === 0) return { error: "No shipments supplied" };
-  const settings = await getSettings(
+  const settings = withOverrides(await getSettings(
     "prompt.email_draft.customer_group.system_base",
     "prompt.email_draft.customer_group.audience",
     "prompt.email_draft.customer_group.model",
-  );
+  ), overrides);
   const audienceCopy = settings["prompt.email_draft.customer_group.audience"];
   const systemPrompt = String(settings["prompt.email_draft.customer_group.system_base"] || "")
     .replace("{{audienceCopy}}", audienceCopy);

@@ -513,6 +513,13 @@ export const api = {
       }),
     refresh: () => request<{ ok: boolean }>("/api/settings/refresh", { method: "POST" }),
   },
+  emailStudio: {
+    samples: () => request<{ data: EmailStudioSample[] }>("/api/email-studio/samples"),
+    rewrite: (body: { key: string; text: string; instructions: string }) =>
+      request<{ text: string; model: string | null; warnings: string[] }>("/api/email-studio/rewrite", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
+    preview: (body: { type: EmailStudioType; tracking_numbers: string[]; notes?: string; group?: string; overrides?: Record<string, string> }) =>
+      request<{ subject: string; body: string; model: string | null; count: number }>("/api/email-studio/preview", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
+  },
   ops: {
     metrics: (days = 30) =>
       request<OpsMetrics>("/api/ops/metrics", { params: { days } }),
@@ -599,6 +606,18 @@ export interface OpsMetrics {
   last7: { shipments_analyzed: number; tasks_completed: number; emails_generated: number; cost_usd: number };
   daily: OpsDailyRow[];
   byOperator: { operator: string; tasks_completed: number; emails_generated: number }[];
+}
+
+export type EmailStudioType = "carrier" | "customer" | "carrier_group" | "customer_group";
+export interface EmailStudioSample {
+  tracking_number: string;
+  shipment_id: string | null;
+  carrier: string | null;
+  customer: string | null;
+  status: string | null;
+  task: string;
+  carrier_followup: boolean;
+  customer_followup: boolean;
 }
 
 export interface SettingRow {
