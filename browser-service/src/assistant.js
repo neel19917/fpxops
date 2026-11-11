@@ -600,3 +600,52 @@ function logChatCost({ who, message, reply, usage, ms, actions, preloaded }) {
   }, "return=minimal").catch((e) => console.warn("[assistant] cost log failed:", e.message));
   usage.cost_usd = cost;
 }
+
+// ---------------- chat history ----------------
+// One row per conversation in fpx_assistant_chats, per person. The server
+// saves after every answer (the browser sends a chat id); people only ever
+// read, list or delete their own.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_HISTORY_BYTES = 1_500_000;
+
+async function sbReq(method, path, body, prefer) {
+  const res = await fetch(`${SB_URL}/rest/v1/${path}`, {
+    method,
+    headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": "application/json", ...(prefer ? { prefer } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Supabase ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.status === 204 ? null : res.json().catch(() => null);
+}
+
+export async function saveChatTurn({ chatId, email, message, reply, actions, messages }) {
+  if (!assistantEnabled || !UUID_RE.test(String(chatId || "")) || !email) return;
+  const owner = String(email).toLowerCase();
+  const rows = await sbReq("GET", `fpx_assistant_chats?id=eq.${chatId}&select=user_email,turns,title`);
+  const prev = rows?.[0];
+  if (prev && prev.user_email !== owner) return; // never write into someone else's chat
+  const turns = [...(prev?.turns || []), { role: "user", text: message }, { role: "assistant", text: reply, actions }];
+  let history = messages || [];
+  // Keep the transcript bounded; the oldest turns drop first (as in the panel).
+  while (history.length > 2 && JSON.stringify(history).length > MAX_HISTORY_BYTES) history = history.slice(2);
+  await sbReq("POST", "fpx_assistant_chats?on_conflict=id", {
+    id: chatId, user_email: owner,
+    title: prev?.title || trim(message.replace(/\s+/g, " "), 80),
+    turns, history, turn_count: turns.length / 2, updated_at: new Date().toISOString(),
+  }, "resolution=merge-duplicates,return=minimal");
+}
+
+export async function listChats(email, limit = 40) {
+  return sbReq("GET", `fpx_assistant_chats?user_email=eq.${enc(String(email).toLowerCase())}&select=id,title,turn_count,updated_at&order=updated_at.desc&limit=${Math.min(100, limit)}`);
+}
+
+export async function getChat(email, id) {
+  if (!UUID_RE.test(String(id))) return null;
+  const rows = await sbReq("GET", `fpx_assistant_chats?id=eq.${id}&user_email=eq.${enc(String(email).toLowerCase())}&select=id,title,turns,history,updated_at`);
+  return rows?.[0] || null;
+}
+
+export async function deleteChat(email, id) {
+  if (!UUID_RE.test(String(id))) return;
+  await sbReq("DELETE", `fpx_assistant_chats?id=eq.${id}&user_email=eq.${enc(String(email).toLowerCase())}`, undefined, "return=minimal");
+}

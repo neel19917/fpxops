@@ -1,7 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ArrowUp, ExternalLink, Filter, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Sparkles, X } from "lucide-react";
-import { hostedBrowser, type AssistantAction } from "../lib/hostedBrowser";
+import { ArrowLeft, ArrowUp, ExternalLink, Filter, History, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Sparkles, Trash2, X } from "lucide-react";
+import { hostedBrowser, type AssistantAction, type AssistantChatSummary } from "../lib/hostedBrowser";
+import { fmtRelative } from "../lib/format";
 
 // "Ask FPX" — a chat panel on every signed-in page. Claude (via the hosted
 // browser service) answers from live shipment/task data and can drive the
@@ -10,7 +11,7 @@ import { hostedBrowser, type AssistantAction } from "../lib/hostedBrowser";
 // The conversation lives in sessionStorage (this tab only). `history` is the
 // API-format transcript, sent back verbatim each turn.
 
-const STORE_KEY = "fpx.assistant.v1";
+const STORE_KEY = "fpx.assistant.v2";
 const SUGGESTIONS = [
   "What should I focus on today?",
   "Which carriers have the most shipments needing action?",
@@ -24,11 +25,14 @@ const PAGE_PATHS: Record<string, string> = {
 };
 
 interface Turn { role: "user" | "assistant"; text: string; actions?: AssistantAction[]; error?: boolean }
-interface Stored { turns: Turn[]; history: unknown[] }
+interface Stored { id: string; turns: Turn[]; history: unknown[] }
+
+const newId = () => (crypto.randomUUID ? crypto.randomUUID() : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) => (Number(c) ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (Number(c) / 4)))).toString(16)));
+const fresh = (): Stored => ({ id: newId(), turns: [], history: [] });
 
 function load(): Stored {
-  try { const raw = sessionStorage.getItem(STORE_KEY); if (raw) return JSON.parse(raw); } catch { /* ignore */ }
-  return { turns: [], history: [] };
+  try { const raw = sessionStorage.getItem(STORE_KEY); if (raw) { const v = JSON.parse(raw); if (v?.id) return v; } } catch { /* ignore */ }
+  return fresh();
 }
 
 function actionLabel(a: AssistantAction): string {
@@ -113,6 +117,29 @@ export function AssistantPanel() {
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState("");      // answer streaming in
   const [status, setStatus] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
+  const [chats, setChats] = useState<AssistantChatSummary[] | null>(null);
+  const [historyErr, setHistoryErr] = useState<string | null>(null);
+
+  async function openHistory() {
+    setShowHistory(true); setHistoryErr(null);
+    try { setChats((await hostedBrowser.listChats()).chats); } catch (e) { setHistoryErr((e as Error).message); }
+  }
+  async function resume(id: string) {
+    try {
+      const { chat } = await hostedBrowser.getChat(id);
+      setState({ id: chat.id, turns: chat.turns, history: chat.history });
+      setShowHistory(false);
+    } catch (e) { setHistoryErr((e as Error).message); }
+  }
+  async function remove(id: string) {
+    if (!confirm("Delete this chat?")) return;
+    try {
+      await hostedBrowser.deleteChat(id);
+      setChats((c) => (c || []).filter((x) => x.id !== id));
+      if (state.id === id) setState(fresh());
+    } catch (e) { setHistoryErr((e as Error).message); }
+  }
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -151,12 +178,12 @@ export function AssistantPanel() {
     setState((s) => ({ ...s, turns }));
     setDraft(""); setStatus(null);
     try {
-      const r = await hostedBrowser.assistantStream({ history: state.history, message, context: { page: location.pathname } }, (ev) => {
+      const r = await hostedBrowser.assistantStream({ history: state.history, message, context: { page: location.pathname }, chatId: state.id }, (ev) => {
         if (ev.type === "text") { setStatus(null); setDraft((d) => d + ev.delta); }
         else if (ev.type === "reset") setDraft("");
         else if (ev.type === "status") setStatus(ev.text);
       });
-      setState({ turns: [...turns, { role: "assistant", text: r.reply || "(no answer)", actions: r.actions }], history: r.messages });
+      setState((s) => ({ id: s.id, turns: [...turns, { role: "assistant", text: r.reply || "(no answer)", actions: r.actions }], history: r.messages }));
       // Do what it said, in order (the last navigation wins).
       for (const a of r.actions) perform(a);
     } catch (e) {
@@ -189,8 +216,11 @@ export function AssistantPanel() {
               </div>
             </div>
             <div className="flex items-center gap-1">
+              <button onClick={() => (showHistory ? setShowHistory(false) : openHistory())} className={"p-1.5 rounded-md hover:bg-white/15 " + (showHistory ? "bg-white/20" : "")} title="Chat history" aria-label="Chat history">
+                <History className="h-4 w-4" />
+              </button>
               {state.turns.length ? (
-                <button onClick={() => setState({ turns: [], history: [] })} className="p-1.5 rounded-md hover:bg-white/15" title="New chat" aria-label="New chat">
+                <button onClick={() => { setState(fresh()); setShowHistory(false); }} className="p-1.5 rounded-md hover:bg-white/15" title="New chat" aria-label="New chat">
                   <RotateCcw className="h-4 w-4" />
                 </button>
               ) : null}
@@ -200,6 +230,31 @@ export function AssistantPanel() {
             </div>
           </div>
 
+          {showHistory ? (
+            <div className="flex-1 overflow-y-auto bg-slate-50/60">
+              <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-100 bg-white">
+                <button onClick={() => setShowHistory(false)} className="inline-flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900"><ArrowLeft className="h-3.5 w-3.5" /> Back to chat</button>
+                <button onClick={() => { setState(fresh()); setShowHistory(false); }} className="text-xs text-violet-700 hover:underline">+ New chat</button>
+              </div>
+              {historyErr ? <div className="m-3 text-xs text-rose-700">{historyErr}</div> : null}
+              {!chats && !historyErr ? <div className="p-4 text-xs text-slate-500 flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading your chats…</div> : null}
+              {chats && !chats.length ? <div className="p-4 text-sm text-slate-500">No saved chats yet — they're saved here automatically after each answer.</div> : null}
+              <ul className="divide-y divide-slate-100">
+                {(chats || []).map((c) => (
+                  <li key={c.id} className={"group flex items-start gap-2 px-4 py-2.5 hover:bg-white cursor-pointer " + (c.id === state.id ? "bg-violet-50/60" : "")} onClick={() => resume(c.id)}>
+                    <MessageCircle className="h-4 w-4 mt-0.5 text-violet-500 shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm text-slate-800 truncate">{c.title}</div>
+                      <div className="text-[11px] text-slate-500">{fmtRelative(c.updated_at)} · {c.turn_count} question{c.turn_count === 1 ? "" : "s"}</div>
+                    </div>
+                    <button onClick={(e) => { e.stopPropagation(); remove(c.id); }} className="p-1 rounded text-slate-400 hover:text-rose-600 opacity-0 group-hover:opacity-100 focus:opacity-100" title="Delete chat" aria-label="Delete chat">
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-4 bg-slate-50/60">
             {state.turns.length === 0 ? (
               <div className="space-y-3">
@@ -252,7 +307,9 @@ export function AssistantPanel() {
             ) : null}
           </div>
 
-          <form onSubmit={(e) => { e.preventDefault(); send(input); }} className="border-t border-slate-100 p-3 bg-white">
+          )}
+
+          <form onSubmit={(e) => { e.preventDefault(); setShowHistory(false); send(input); }} className="border-t border-slate-100 p-3 bg-white">
             <div className="flex items-end gap-2 rounded-xl ring-1 ring-slate-200 focus-within:ring-violet-400 px-3 py-2">
               <textarea
                 ref={inputRef}

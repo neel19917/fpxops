@@ -146,6 +146,13 @@ export type AssistantStreamEvent =
   | { type: "status"; text: string }
   | { type: "reset" };
 
+export interface AssistantChatSummary { id: string; title: string; turn_count: number; updated_at: string }
+export interface AssistantChat {
+  id: string; title: string; updated_at: string;
+  turns: { role: "user" | "assistant"; text: string; actions?: AssistantAction[] }[];
+  history: unknown[];
+}
+
 export interface AssistantReply {
   messages: unknown[];   // conversation, returned verbatim and sent back next turn
   reply: string;
@@ -184,11 +191,11 @@ export const hostedBrowser = {
   adminSettings: () => call<BrowserSettingsResponse>("/admin/settings"),
   saveAdminSettings: (settings: Record<string, number>) =>
     call<BrowserSettingsResponse>("/admin/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ settings }) }),
-  assistantChat: (body: { history: unknown[]; message: string; context?: Record<string, unknown> }) =>
+  assistantChat: (body: { history: unknown[]; message: string; context?: Record<string, unknown>; chatId?: string }) =>
     call<AssistantReply>("/assistant/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   /** Streams the answer as it's written; falls back to the one-shot call on an older service. */
   assistantStream: async (
-    body: { history: unknown[]; message: string; context?: Record<string, unknown> },
+    body: { history: unknown[]; message: string; context?: Record<string, unknown>; chatId?: string },
     onEvent: (e: AssistantStreamEvent) => void,
   ): Promise<AssistantReply> => {
     if (!HOSTED_BROWSER_URL) throw new Error("Hosted browser not configured (VITE_FPX_BROWSER_URL)");
@@ -229,6 +236,10 @@ export const hostedBrowser = {
     if (!final) throw new Error("The answer was cut off — try again");
     return final;
   },
+  /** Ask FPX history — the signed-in person's own conversations. */
+  listChats: () => call<{ chats: AssistantChatSummary[] }>("/assistant/chats"),
+  getChat: (id: string) => call<{ chat: AssistantChat }>(`/assistant/chats/${id}`),
+  deleteChat: (id: string) => call<{ deleted: boolean }>(`/assistant/chats/${id}`, { method: "DELETE" }),
   enabled: !!HOSTED_BROWSER_URL,
   stats: (days = 30) => call<HostedStats>(`/stats?days=${days}`),
   stopScrape: () => call<{ stopping: boolean }>("/scrape/stop", { method: "POST" }),
