@@ -3,6 +3,7 @@ import { config } from "./config.js";
 import { recordScrape } from "./usage.js";
 import { recordRun } from "./runs.js";
 import { reindexAssistant } from "./assistant.js";
+import { notifyRunDone } from "./notify.js";
 import { get as setting } from "./settings.js";
 
 // Consumer for the fpx_scrape_requests queue (server/routes/ops.js). Until now
@@ -201,6 +202,8 @@ async function runJob(job) {
     recordRun(summary, current?.log || []);
     // Fresh data → rebuild the Ask FPX search index and embed what changed.
     reindexAssistant("scrape").catch(() => {});
+    // Email everyone subscribed to "scrape finished" (Scraping page).
+    notifyRunDone(summary).catch(() => {});
     lastResult = { ...summary, requestId: job.id, log: current?.log || [] };
     current = null;
     busy = false;

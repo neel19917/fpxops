@@ -97,25 +97,32 @@ meRouter.get("/preferences", requireAuth(), async (req, res) => {
   if (!req.user) return res.status(403).json({ error: "User sign-in required" });
   const { data, error } = await supabase
     .from("fpx_user_profiles")
-    .select("auto_open_tracking")
+    .select("auto_open_tracking, scrape_email")
     .eq("id", req.user.id)
     .maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ auto_open_tracking: data?.auto_open_tracking !== false });
+  res.json({ auto_open_tracking: data?.auto_open_tracking !== false, scrape_email: data?.scrape_email || "off" });
 });
 
+// PATCH { auto_open_tracking?: boolean, scrape_email?: "off" | "all" | "failed" }
 meRouter.patch("/preferences", requireAuth(), async (req, res) => {
   if (!req.user) return res.status(403).json({ error: "User sign-in required" });
-  if (typeof req.body?.auto_open_tracking !== "boolean") return res.status(400).json({ error: "auto_open_tracking must be true or false" });
+  const updates = {};
+  if (typeof req.body?.auto_open_tracking === "boolean") updates.auto_open_tracking = req.body.auto_open_tracking;
+  if (req.body?.scrape_email !== undefined) {
+    if (!["off", "all", "failed"].includes(req.body.scrape_email)) return res.status(400).json({ error: "scrape_email must be off, all or failed" });
+    updates.scrape_email = req.body.scrape_email;
+  }
+  if (!Object.keys(updates).length) return res.status(400).json({ error: "Nothing to update" });
   const { data, error } = await supabase
     .from("fpx_user_profiles")
-    .update({ auto_open_tracking: req.body.auto_open_tracking })
+    .update(updates)
     .eq("id", req.user.id)
-    .select("auto_open_tracking")
+    .select("auto_open_tracking, scrape_email")
     .maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: "Profile not found" });
-  res.json({ auto_open_tracking: data.auto_open_tracking });
+  res.json({ auto_open_tracking: data.auto_open_tracking, scrape_email: data.scrape_email });
 });
 
 // Claude connector (MCP, read-only): each person makes their own key.
