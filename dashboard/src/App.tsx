@@ -34,6 +34,7 @@ const OpsPage         = lazy(() => import("./pages/Ops").then((m) => ({ default:
 const ServicesPage    = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServicesPage })));
 const ServiceDetailPage = lazy(() => import("./pages/Services").then((m) => ({ default: m.ServiceDetailPage })));
 const InstallPage     = lazy(() => import("./pages/Install").then((m) => ({ default: m.InstallPage })));
+const DataFlowPage = lazy(() => import("./pages/DataFlow").then((m) => ({ default: m.DataFlowPage })));
 const AIGovernancePage = lazy(() => import("./pages/AIGovernance").then((m) => ({ default: m.AIGovernancePage })));
 const EmailStudioPage = lazy(() => import("./pages/EmailStudio").then((m) => ({ default: m.EmailStudioPage })));
 const HostedBrowserSettingsPage = lazy(() => import("./pages/HostedBrowserSettings").then((m) => ({ default: m.HostedBrowserSettingsPage })));
@@ -66,9 +67,10 @@ const TAB_PATH: Record<TabId, string> = {
   hosted_browser: "/admin/hosted-browser",
   email_studio: "/admin/email-studio",
   ai_governance: "/admin/ai-governance",
+  data_flow: "/admin/data-flow",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "email_studio", "ai_governance"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "email_studio", "ai_governance", "data_flow"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -83,6 +85,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/hosted-browser")) return "hosted_browser";
   if (pathname.startsWith("/admin/email-studio")) return "email_studio";
   if (pathname.startsWith("/admin/ai-governance")) return "ai_governance";
+  if (pathname.startsWith("/admin/data-flow")) return "data_flow";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
   if (pathname.startsWith("/tasks")) return "tasks";
@@ -283,6 +286,7 @@ function AuthedApp() {
                 <Route path="/admin/hosted-browser" element={<HostedBrowserSettingsPage />} />
                 <Route path="/admin/email-studio" element={<EmailStudioPage />} />
                 <Route path="/admin/ai-governance" element={<AIGovernancePage />} />
+                <Route path="/admin/data-flow" element={<DataFlowPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tracking" replace />} />

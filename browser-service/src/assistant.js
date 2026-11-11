@@ -30,6 +30,16 @@ async function sb(pathAndQuery) {
   return res.json();
 }
 
+async function sbPost(path, body, prefer) {
+  const res = await fetch(`${SB_URL}/rest/v1/${path}`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": "application/json", ...(prefer ? { prefer } : {}) },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Supabase ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.status === 204 ? null : res.json().catch(() => null);
+}
+
 const enc = encodeURIComponent;
 const trim = (s, n = 280) => (s == null ? null : String(s).length > n ? String(s).slice(0, n) + "…" : String(s));
 
@@ -155,12 +165,197 @@ async function toolSummary() {
   return { on_dashboard: rows.length, by_status: by("shipment_status"), action_needed: by("action_required").YES || 0, action_needed_by_carrier: Object.fromEntries(carriers) };
 }
 
-const DATA_TOOLS = {
-  focus_list: toolFocusList,
-  search_shipments: toolSearchShipments,
-  get_shipment: toolGetShipment,
-  dashboard_summary: toolSummary,
+// ---------------- retrieval index (RAG) ----------------
+// fpx_assistant_index holds one compact record per shipment that's on the
+// dashboard or has open tasks (facts + open tasks + latest note), full-text +
+// trigram searchable, with a precomputed focus score. Rebuilt in the database
+// by fpx_assistant_reindex() every few minutes and after each scrape. Every
+// lookup is then one indexed query instead of several round trips; the
+// original queries above remain as the fallback.
+
+const INDEX_STALE_MS = 30 * 60_000;
+let indexState = { at: 0, ok: false, rows: 0, ms: 0 };
+
+export async function reindexAssistant(reason = "timer") {
+  if (!assistantEnabled) return null;
+  const t0 = Date.now();
+  try {
+    const rows = await sbPost("rpc/fpx_assistant_reindex", {});
+    indexState = { at: Date.now(), ok: true, rows: Number(rows) || 0, ms: Date.now() - t0 };
+    focusCache = { at: 0, rows: null };
+    if (reason !== "timer") console.log(`[assistant] index rebuilt (${reason}): ${indexState.rows} shipments in ${indexState.ms}ms`);
+    // Embed whatever changed (runs in the background; no-op when nothing did).
+    embedPending(reason).catch(() => {});
+  } catch (e) {
+    indexState = { ...indexState, ok: false };
+    console.warn("[assistant] reindex failed:", e.message);
+  }
+  return indexState;
+}
+
+// ---- embeddings (Supabase edge function fpx-embed, built-in gte-small) ----
+// After every rebuild, embed the records whose text changed. The function
+// caps CPU per request, so it embeds ~5 per call and we loop (2 in parallel).
+let embedState = { running: false, at: 0, embedded: 0, lastError: null };
+const embedFn = (body) => fetch(`${SB_URL}/functions/v1/fpx-embed`, {
+  method: "POST",
+  headers: { apikey: SB_KEY, "content-type": "application/json" },
+  body: JSON.stringify(body),
+}).then(async (r) => {
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(`fpx-embed ${r.status}: ${j?.error || j?.message || ""}`);
+  return j;
+});
+
+export async function embedPending(reason = "") {
+  if (!assistantEnabled || embedState.running) return embedState;
+  embedState = { ...embedState, running: true, lastError: null };
+  const t0 = Date.now();
+  let total = 0;
+  try {
+    const worker = async () => {
+      for (let i = 0; i < 400 && Date.now() - t0 < 20 * 60_000; i++) {
+        const r = await embedFn({ mode: "pending", limit: 5 });
+        total += r.embedded || 0;
+        if (!r.more) return;
+      }
+    };
+    await Promise.all([worker(), worker()]);
+  } catch (e) {
+    embedState.lastError = e.message;
+    console.warn("[assistant] embedding stopped:", e.message);
+  } finally {
+    embedState = { ...embedState, running: false, at: Date.now(), embedded: total };
+    if (total) console.log(`[assistant] embedded ${total} record(s)${reason ? ` (${reason})` : ""} in ${Math.round((Date.now() - t0) / 1000)}s`);
+  }
+  return embedState;
+}
+
+export function assistantIndexStatus() {
+  return { index: indexState, embeddings: embedState };
+}
+
+// Semantic search only for real phrases — ids and short names are matched
+// exactly/fuzzily without it (and skip the ~0.3s embedding call).
+async function queryEmbedding(text) {
+  const t = String(text || "").trim();
+  if (t.length < 6 || /^[\d\s-]+$/.test(t) || t.split(/\s+/).length < 2) return null;
+  try { return (await embedFn({ mode: "query", text: t })).embedding || null; } catch { return null; }
+}
+
+export function startAssistantIndexer() {
+  if (!assistantEnabled) return;
+  setTimeout(() => reindexAssistant("startup"), 15_000);
+  setInterval(() => reindexAssistant(), 5 * 60_000).unref();
+}
+
+const indexFresh = () => indexState.ok && Date.now() - indexState.at < INDEX_STALE_MS;
+
+// All shipments with open tasks, best first (≈ a few hundred rows) — cached briefly.
+let focusCache = { at: 0, rows: null };
+async function indexFocusRows() {
+  if (focusCache.rows && Date.now() - focusCache.at < 60_000) return focusCache.rows;
+  const rows = await sb("fpx_assistant_index?select=facts,focus_score,on_dashboard&open_tasks=gt.0&order=focus_score.desc&limit=1000");
+  focusCache = { at: Date.now(), rows };
+  return rows;
+}
+
+async function ixFocusList({ limit = 40, assignee } = {}) {
+  const rows = await indexFocusRows();
+  const onDash = rows.filter((r) => r.on_dashboard);
+  const who = assignee ? String(assignee).toLowerCase() : null;
+  const picked = [];
+  for (const r of onDash) {
+    for (const t of r.facts.tasks || []) {
+      if (who && !String(t.assigned_to || "").toLowerCase().includes(who)) continue;
+      const { tasks, ...ship } = r.facts;
+      picked.push({ task_id: t.task_id, task: t.task, task_status: t.status, assigned_to: t.assigned_to, task_age_days: t.age_days, shipment: ship });
+    }
+  }
+  return {
+    open_tasks_on_dashboard: picked.length,
+    left_dashboard_excluded: rows.length - onDash.length,
+    candidates: picked.slice(0, Math.min(60, limit)),
+  };
+}
+
+async function ixSearch({ query, status, action_needed, carrier, customer, include_off_dashboard = false, limit = 25 } = {}) {
+  const n = Math.min(50, limit);
+  let list;
+  if (query && String(query).trim()) {
+    const embedding = await queryEmbedding(query);
+    const rows = await sbPost("rpc/fpx_assistant_search", {
+      p_query: String(query), p_include_off_dashboard: !!include_off_dashboard, p_limit: 50,
+      p_embedding: embedding ? JSON.stringify(embedding) : null,
+    });
+    list = (rows || []).map((r) => r.facts);
+  } else {
+    const parts = ["select=facts", "order=focus_score.desc", "limit=200"];
+    if (!include_off_dashboard) parts.push("on_dashboard=eq.true");
+    if (status) parts.push(`status=ilike.${enc(status)}`);
+    if (action_needed === true) parts.push("action_needed=eq.true");
+    if (action_needed === false) parts.push("action_needed=eq.false");
+    if (carrier) parts.push(`carrier=ilike.*${enc(carrier)}*`);
+    if (customer) parts.push(`customer=ilike.*${enc(customer)}*`);
+    list = (await sb(`fpx_assistant_index?${parts.join("&")}`)).map((r) => r.facts);
+  }
+  const lc = (v) => String(v || "").toLowerCase();
+  list = list.filter((f) =>
+    (!status || lc(f.status) === lc(status)) &&
+    (action_needed == null || !!f.action_needed === action_needed) &&
+    (!carrier || lc(f.carrier).includes(lc(carrier))) &&
+    (!customer || lc(f.customer).includes(lc(customer))));
+  return { count: list.length, shipments: list.slice(0, n).map(({ tasks, latest_note, tracking_comments, pickup_response, recommendation, ...f }) => ({ ...f, open_tasks: (tasks || []).length })) };
+}
+
+async function ixGetShipment(args = {}) {
+  const { shipment, tracking, id } = args;
+  const q = id ? `shipment_uuid=eq.${enc(id)}` : shipment ? `shipment_id=eq.${enc(shipment)}` : tracking ? `tracking_number=eq.${enc(tracking)}` : null;
+  if (!q) return { error: "Give shipment, tracking or id" };
+  const rows = await sb(`fpx_assistant_index?select=facts&${q}&limit=1`);
+  if (rows?.[0]) return rows[0].facts;
+  return toolGetShipment(args); // not on the dashboard and no open tasks → original lookup
+}
+
+async function ixSummary() {
+  const rows = await sb("fpx_assistant_index?select=status,action_needed,carrier&on_dashboard=eq.true&limit=5000");
+  const by = {};
+  const carriers = {};
+  for (const r of rows) {
+    const k = r.status || "(none)"; by[k] = (by[k] || 0) + 1;
+    if (r.action_needed) carriers[r.carrier || "(unknown)"] = (carriers[r.carrier || "(unknown)"] || 0) + 1;
+  }
+  return {
+    on_dashboard: rows.length, by_status: by,
+    action_needed: rows.filter((r) => r.action_needed).length,
+    action_needed_by_carrier: Object.fromEntries(Object.entries(carriers).sort((a, b) => b[1] - a[1]).slice(0, 8)),
+  };
+}
+
+// Index first; the original live queries if the index is stale or errors.
+const withFallback = (ix, live) => async (args) => {
+  if (indexFresh()) {
+    try { return await ix(args); } catch (e) { console.warn("[assistant] index lookup failed, using live data:", e.message); }
+  }
+  return live(args);
 };
+
+const DATA_TOOLS = {
+  focus_list: withFallback(ixFocusList, toolFocusList),
+  search_shipments: withFallback(ixSearch, toolSearchShipments),
+  get_shipment: withFallback(ixGetShipment, toolGetShipment),
+  dashboard_summary: withFallback(ixSummary, toolSummary),
+};
+
+// Pre-loaded brief for the first question of a conversation: the top focus
+// items + dashboard counts, so "what should I focus on" needs no tool call.
+async function preloadedBrief() {
+  if (!indexFresh()) return null;
+  try {
+    const [focus, summary] = await Promise.all([ixFocusList({ limit: 12 }), ixSummary()]);
+    return { built: new Date(indexState.at).toISOString(), dashboard: summary, top_focus: focus };
+  } catch { return null; }
+}
 
 // ---------------- UI tools (performed by the browser) ----------------
 
@@ -239,6 +434,7 @@ Data notes:
 - "On the dashboard" means seen in FreightPOP's dashboard grid recently. Shipments that left it are usually delivered; ignore them unless asked.
 - Shipment numbers (e.g. 15665897) and tracking numbers are different identifiers. open_shipment and open_task need internal ids from tool results.
 - Every open task is marked "high" priority, so priority alone doesn't rank anything — use the shipment facts.
+- The first message of a conversation may carry a pre-loaded brief (top focus items + dashboard counts). When it answers the question, answer from it directly without calling focus_list or dashboard_summary.
 
 Style: short and scannable. For focus lists, a numbered list of at most 5–7 items: shipment number · customer · carrier — the problem — the next step. Use names and numbers, not internal ids. No preamble.`;
 
@@ -246,11 +442,17 @@ Style: short and scannable. For focus lists, a numbered list of at most 5–7 it
 // by previous calls. Returns { messages, reply, actions, usage }.
 export async function chat({ history = [], message, who, context }) {
   if (!assistantEnabled) throw new Error("Assistant not configured (ANTHROPIC_API_KEY / Supabase)");
+  const t0 = Date.now();
   const messages = [...history];
   const ctx = context ? `\n\n[Dashboard context: ${trim(JSON.stringify(context), 600)}]` : "";
-  messages.push({ role: "user", content: `${message}${ctx}` });
+  // First question of a conversation: hand over the pre-loaded brief so the
+  // common questions need no tool round trip.
+  const brief = history.length === 0 ? await preloadedBrief() : null;
+  const pre = brief ? `\n\n[Pre-loaded brief — current as of ${brief.built}; use it directly when it answers the question:\n${JSON.stringify(brief)}]` : "";
+  messages.push({ role: "user", content: `${message}${ctx}${pre}` });
   const actions = [];
-  const usage = { input: 0, output: 0, cache_read: 0 };
+  const usage = { input: 0, output: 0, cache_read: 0, cache_write: 0, steps: 0, tools: [] };
+  const done = (out) => { logChatCost({ who, message, reply: out.reply, usage, ms: Date.now() - t0, actions, preloaded: !!brief }); return out; };
 
   for (let step = 0; step < MAX_STEPS; step++) {
     const response = await client.beta.messages.create({
@@ -268,21 +470,25 @@ export async function chat({ history = [], message, who, context }) {
     usage.input += response.usage?.input_tokens || 0;
     usage.output += response.usage?.output_tokens || 0;
     usage.cache_read += response.usage?.cache_read_input_tokens || 0;
+    usage.cache_write += response.usage?.cache_creation_input_tokens || 0;
+    usage.steps++;
     messages.push({ role: "assistant", content: response.content });
 
     if (response.stop_reason === "refusal") {
-      return { messages, reply: "I can't help with that one.", actions, usage };
+      return done({ messages, reply: "I can't help with that one.", actions, usage });
     }
     if (response.stop_reason === "pause_turn") continue;
     if (response.stop_reason !== "tool_use") {
       const reply = response.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-      return { messages, reply, actions, usage };
+      return done({ messages, reply, actions, usage });
     }
 
-    const results = [];
-    for (const block of response.content.filter((b) => b.type === "tool_use")) {
-      let out;
+    // UI actions are recorded in order; data lookups run in parallel.
+    const blocks = response.content.filter((b) => b.type === "tool_use");
+    const results = await Promise.all(blocks.map(async (block) => {
+      usage.tools.push(block.name);
       try {
+        let out;
         if (UI_TOOLS.has(block.name)) {
           const action = { type: block.name, ...block.input };
           // Keep only the latest action of each kind (one filter, one open).
@@ -295,12 +501,51 @@ export async function chat({ history = [], message, who, context }) {
         } else {
           out = { error: `Unknown tool ${block.name}` };
         }
-        results.push({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(out) });
+        return { type: "tool_result", tool_use_id: block.id, content: JSON.stringify(out) };
       } catch (e) {
-        results.push({ type: "tool_result", tool_use_id: block.id, is_error: true, content: String(e.message || e) });
+        return { type: "tool_result", tool_use_id: block.id, is_error: true, content: String(e.message || e) };
       }
-    }
+    }));
     messages.push({ role: "user", content: results });
   }
-  return { messages, reply: "That took more steps than I allow per question — try narrowing it down.", actions, usage };
+  return done({ messages, reply: "That took more steps than I allow per question — try narrowing it down.", actions, usage });
+}
+
+
+// ---------------- cost logging ----------------
+// Every chat turn goes to the AI log (fpx_ai_analyses, subkind "ask_fpx"), so
+// AI Governance shows Ask FPX usage and cost per person. Prices per 1M tokens
+// for MODEL; cache reads bill at 10% of input, 5-minute cache writes at 125%.
+const PRICE = { input: 4.0, output: 20.0 };
+
+function chatCost(u) {
+  return (u.input * PRICE.input + u.cache_read * PRICE.input * 0.1 + u.cache_write * PRICE.input * 1.25 + u.output * PRICE.output) / 1_000_000;
+}
+
+function logChatCost({ who, message, reply, usage, ms, actions, preloaded }) {
+  const cost = chatCost(usage);
+  sbPost("fpx_ai_analyses", {
+    kind: "other",
+    model: MODEL,
+    user_message: trim(message, 4000),
+    response_text: trim(reply, 8000),
+    input_tokens: usage.input + usage.cache_read + usage.cache_write,
+    output_tokens: usage.output,
+    cost_usd: Math.round(cost * 1e6) / 1e6,
+    duration_ms: ms,
+    source: "fpx-browser",
+    user_email: who?.email || null,
+    metadata: {
+      subkind: "ask_fpx",
+      steps: usage.steps,
+      tools: usage.tools,
+      uncached_input_tokens: usage.input,
+      cache_read_tokens: usage.cache_read,
+      cache_write_tokens: usage.cache_write,
+      actions: actions.map((a) => a.type),
+      preloaded_brief: preloaded,
+      index_fresh: indexFresh(),
+    },
+  }, "return=minimal").catch((e) => console.warn("[assistant] cost log failed:", e.message));
+  usage.cost_usd = cost;
 }
