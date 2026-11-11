@@ -48,6 +48,11 @@ export function startScrapeWorker() {
   }
   enabled = true;
   console.log(`[worker] polling rescrape queue every ${config.scrapePollMs / 1000}s`);
+  // Nothing can be running yet: close out anything this worker had claimed
+  // before a restart, or the Scraping page shows it as running forever.
+  api("/api/ops/rescrape/release-orphans", { method: "POST", body: JSON.stringify({ by: "fpx-browser" }) })
+    .then((r) => { if (r?.released?.length) console.log(`[worker] closed ${r.released.length} request(s) interrupted by a restart`); })
+    .catch((e) => console.warn("[worker] release-orphans failed:", e.message));
   // setTimeout loop so an admin change to the poll interval applies live.
   const loop = async () => {
     await poll().catch((e) => console.error("[worker] poll error:", e.message));
