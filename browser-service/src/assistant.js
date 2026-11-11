@@ -213,14 +213,22 @@ export async function embedPending(reason = "") {
   const t0 = Date.now();
   let total = 0;
   try {
-    const worker = async () => {
-      for (let i = 0; i < 400 && Date.now() - t0 < 20 * 60_000; i++) {
-        const r = await embedFn({ mode: "pending", limit: 5 });
-        total += r.embedded || 0;
-        if (!r.more) return;
+    // One caller, small batches: the edge function caps CPU per request and
+    // answers 546 when a batch is too heavy — back off and retry rather than stop.
+    let failures = 0;
+    for (let i = 0; i < 1200 && Date.now() - t0 < 30 * 60_000; i++) {
+      let r;
+      try {
+        r = await embedFn({ mode: "pending", limit: 3 });
+        failures = 0;
+      } catch (e) {
+        if (++failures >= 5) throw e;
+        await new Promise((res) => setTimeout(res, 2000 * failures));
+        continue;
       }
-    };
-    await Promise.all([worker(), worker()]);
+      total += r.embedded || 0;
+      if (!r.more) break;
+    }
   } catch (e) {
     embedState.lastError = e.message;
     console.warn("[assistant] embedding stopped:", e.message);
