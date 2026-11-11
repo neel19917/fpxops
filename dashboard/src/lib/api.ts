@@ -219,9 +219,9 @@ export const api = {
     connector: () => request<{ connector_url: string; signins: number; active: boolean; key_prefix: string | null; created_at: string | null; last_used_at: string | null }>("/api/me/connector", { noImpersonate: true }),
     createConnector: () => request<{ url: string; key: string; key_prefix: string; created_at: string }>("/api/me/connector", { method: "POST", noImpersonate: true }),
     revokeConnector: () => request<{ revoked: number; signins: number }>("/api/me/connector", { method: "DELETE", noImpersonate: true }),
-    preferences: () => request<{ auto_open_tracking: boolean }>("/api/me/preferences"),
-    setPreferences: (body: { auto_open_tracking: boolean }) =>
-      request<{ auto_open_tracking: boolean }>("/api/me/preferences", { method: "PATCH", body: JSON.stringify(body) }),
+    preferences: () => request<{ auto_open_tracking: boolean; scrape_email: ScrapeEmailPref }>("/api/me/preferences"),
+    setPreferences: (body: { auto_open_tracking?: boolean; scrape_email?: ScrapeEmailPref }) =>
+      request<{ auto_open_tracking: boolean; scrape_email: ScrapeEmailPref }>("/api/me/preferences", { method: "PATCH", body: JSON.stringify(body) }),
   },
 
   impersonate: {
@@ -629,6 +629,8 @@ export interface OpsMetrics {
   daily: OpsDailyRow[];
   byOperator: { operator: string; tasks_completed: number; emails_generated: number }[];
 }
+
+export type ScrapeEmailPref = "off" | "all" | "failed";
 
 export interface GovFeature {
   feature: string; by: "kind" | "subkind"; calls: number; users: number; system_calls: number; errors: number;

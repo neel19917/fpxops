@@ -4,6 +4,7 @@ import { api, type ScrapeRequest } from "../lib/api";
 import { hostedBrowser, type HostedStats, type ScrapeLogLine, type ScrapeCounts, type FpTotals, type TaskSnapshot } from "../lib/hostedBrowser";
 import { FpTotalsTrend, FpBeforeAfter } from "../components/FpTotalsTrend";
 import { ModePicker, ALL_MODES, modesText } from "../components/ModePicker";
+import { ScrapeEmailSubscription } from "../components/ScrapeEmailSubscription";
 import { useAuth } from "../lib/auth";
 import { showFrame, hideFrame, useFrameState } from "../lib/freightpopFrame";
 import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
@@ -329,6 +330,11 @@ export function ScrapingPage() {
       {stats && hostedBrowser.enabled ? (
         <SchedulesPane schedules={stats.schedules || []} me={me?.user} isAdmin={!!stats.isAdmin} onChanged={load} />
       ) : null}
+
+      {/* Email when a scrape finishes (per person) */}
+      <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm px-5 py-3">
+        <ScrapeEmailSubscription />
+      </section>
 
       <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-5">
         <FpTotalsTrend />
