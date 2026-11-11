@@ -184,6 +184,10 @@ export const hostedBrowser = {
   enabled: !!HOSTED_BROWSER_URL,
   stats: (days = 30) => call<HostedStats>(`/stats?days=${days}`),
   stopScrape: () => call<{ stopping: boolean }>("/scrape/stop", { method: "POST" }),
+  pipeline: () => call<{
+    scrape: { running: boolean | null; lastRun: { startedAt: string; finishedAt: string; ok: boolean; saved: number | null; note: string } | null };
+    assistant: { index: { at: number; ok: boolean; rows: number; ms: number }; embeddings: { running: boolean; at: number; embedded: number; lastError: string | null } } | null;
+  }>("/admin/pipeline"),
   totals: (limit = 60) => call<{ points: FpTotalsPoint[] }>(`/runs/totals?limit=${limit}`),
   runs: (q: { limit?: number; user?: string; source?: string; ok?: string } = {}) => {
     const qs = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => [k, String(v)]));

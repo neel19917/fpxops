@@ -25,6 +25,39 @@ governanceRouter.get("/summary", async (req, res) => {
   res.json({ days, logging, features: features || [], changes: changes || 0 });
 });
 
+// GET /api/governance/pipeline — live counts for the Data Flow chart.
+governanceRouter.get("/pipeline", async (_req, res) => {
+  const day = new Date(Date.now() - 86400_000).toISOString();
+  const month = new Date(Date.now() - 30 * 86400_000).toISOString();
+  const count = (q) => q.then((r) => r.count ?? 0);
+  try {
+    const [scraped24, analyses24, openTasks, indexRows, embedded, indexMeta, chat30] = await Promise.all([
+      count(supabase.from("fpx_shipments").select("id", { count: "exact", head: true }).gte("scraped_at", day)),
+      count(supabase.from("fpx_ai_analyses").select("id", { count: "exact", head: true }).gte("created_at", day)),
+      count(supabase.from("fpx_shipment_tasks").select("id", { count: "exact", head: true }).is("archived_at", null).in("status", ["open", "in_progress", "blocked"])),
+      count(supabase.from("fpx_assistant_index").select("shipment_uuid", { count: "exact", head: true })),
+      count(supabase.from("fpx_assistant_index").select("shipment_uuid", { count: "exact", head: true }).not("embedding", "is", null)),
+      supabase.from("fpx_assistant_index").select("indexed_at").order("indexed_at", { ascending: false }).limit(1),
+      supabase.from("fpx_ai_analyses").select("cost_usd, user_email, duration_ms").contains("metadata", { subkind: "ask_fpx" }).gte("created_at", month).limit(5000),
+    ]);
+    const chats = chat30.data || [];
+    res.json({
+      scraped_24h: scraped24,
+      analyses_24h: analyses24,
+      open_tasks: openTasks,
+      index: { rows: indexRows, embedded, built_at: indexMeta.data?.[0]?.indexed_at || null },
+      chat_30d: {
+        turns: chats.length,
+        people: new Set(chats.map((c) => c.user_email).filter(Boolean)).size,
+        cost_usd: Math.round(chats.reduce((a, c) => a + Number(c.cost_usd || 0), 0) * 10000) / 10000,
+        avg_ms: chats.length ? Math.round(chats.reduce((a, c) => a + Number(c.duration_ms || 0), 0) / chats.length) : null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/governance/events?type=&limit=100&before=ISO
 governanceRouter.get("/events", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 100, 500);

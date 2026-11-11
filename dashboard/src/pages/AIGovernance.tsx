@@ -21,6 +21,7 @@ const FEATURE_LABELS: Record<string, string> = {
   email_studio_preview: "Email Studio · preview",
   daily_summary: "Daily summary",
   task_triage: "Task triage",
+  ask_fpx: "Ask FPX chat",
   gp: "GP audit",
   invoice: "Invoice audit",
   summary: "Cross-shipment summary",

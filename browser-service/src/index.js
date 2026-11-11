@@ -8,7 +8,7 @@ import { ViewerSession, egressStats, dropAllParked } from "./session.js";
 import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
 import { startScrapeWorker, workerBusy, workerState, requestStop, fullLog } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
-import { chat, assistantEnabled } from "./assistant.js";
+import { chat, assistantEnabled, startAssistantIndexer, assistantIndexStatus } from "./assistant.js";
 
 // 20 assistant messages per person per minute.
 const chatHits = new Map();
@@ -189,6 +189,15 @@ async function handleApi(req, res, url, who) {
     const q = Object.fromEntries(url.searchParams);
     return json(res, 200, { isAdmin: who.isAdmin, runs: runsFor(who, q) });
   }
+  // Admin: live state of the data pipeline (for the Data Flow page).
+  if (p === "/admin/pipeline" && m === "GET") {
+    if (!who.isAdmin) return json(res, 403, { error: "Admins only" });
+    const last = listRuns(1)[0] || null;
+    return json(res, 200, {
+      scrape: { running: workerBusy(), lastRun: last ? { startedAt: last.startedAt, finishedAt: last.finishedAt, ok: last.ok, saved: last.counts?.saved ?? null, note: last.note } : null },
+      assistant: assistantEnabled ? assistantIndexStatus() : null,
+    });
+  }
   // Admin: each person's hosted FreightPOP login (for the Users page).
   if (p === "/admin/logins" && m === "POST") {
     if (!who.isAdmin) return json(res, 403, { error: "Admins only" });
@@ -217,7 +226,7 @@ async function handleApi(req, res, url, who) {
     const t0 = Date.now();
     try {
       const out = await chat({ history, message, who, context: body.context || null });
-      console.log(`[assistant] ${who.email}: ${out.actions.length} action(s), ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), ${Date.now() - t0}ms`);
+      console.log(`[assistant] ${who.email}: ${out.usage.steps} step(s) [${out.usage.tools.join(",")}], ${out.actions.length} action(s), ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), cost ${(out.usage.cost_usd || 0).toFixed(4)} USD, ${Date.now() - t0}ms`);
       return json(res, 200, out);
     } catch (e) {
       console.warn("[assistant] error:", e.status || "", e.message);
@@ -350,6 +359,7 @@ server.listen(config.port, async () => {
   initRuns().catch((e) => console.warn("[runs] init failed:", e.message));
   if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); }
   startLoginKeepAlive();
+  startAssistantIndexer();
   selfTest().then((r) => {
     selfTestResult = r;
     console.log(`[selftest] ${r.ok ? "OK" : "FAILED"} ${JSON.stringify(r)}`);

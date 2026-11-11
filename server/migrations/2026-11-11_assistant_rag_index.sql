@@ -1,0 +1,6 @@
+-- Ask FPX retrieval index (RAG): applied via Supabase migrations
+-- assistant_rag_index + assistant_embeddings on 2026-11-11. See
+-- fpx_assistant_index, fpx_assistant_reindex(), fpx_assistant_search(),
+-- fpx_assistant_embed_queue(), fpx_assistant_set_embeddings(),
+-- fpx_assistant_embed_auth() in the database; the embed function source is
+-- supabase/functions/fpx-embed/index.ts.

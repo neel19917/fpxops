@@ -519,6 +519,11 @@ export const api = {
       request<{ data: GovEvent[] }>("/api/governance/events", { params }),
     calls: (params: { feature?: string; by?: string; user?: string; errors?: string; limit?: number; before?: string } = {}) =>
       request<{ data: GovCall[] }>("/api/governance/calls", { params }),
+    pipeline: () => request<{
+      scraped_24h: number; analyses_24h: number; open_tasks: number;
+      index: { rows: number; embedded: number; built_at: string | null };
+      chat_30d: { turns: number; people: number; cost_usd: number; avg_ms: number | null };
+    }>("/api/governance/pipeline"),
     call: (id: string) => request<{ call: GovCall & { system_prompt: string | null; user_message: string | null; response_text: string | null } }>(`/api/governance/calls/${id}`),
   },
   emailStudio: {
