@@ -24,6 +24,7 @@ import { meRouter } from "./routes/me.js";
 import { emailStudioRouter } from "./routes/emailStudio.js";
 import { governanceRouter } from "./routes/governance.js";
 import { mcpRouter } from "./routes/mcp.js";
+import { oauthRouter } from "./routes/oauth.js";
 import { usersRouter } from "./routes/users.js";
 import { shareLinksRouter } from "./routes/shareLinks.js";
 import { publicShareRouter } from "./routes/publicShare.js";
@@ -123,6 +124,8 @@ app.use("/share", publicShareRouter);
 app.use("/api/me", meRouter);
 // FPX for Claude — read-only MCP server (own key check; see routes/mcp.js).
 app.use("/mcp", mcpRouter);
+// Claude connector sign-in (OAuth 2.1: discovery, registration, token, approve).
+app.use(oauthRouter);
 
 // Authenticated API (API key OR JWT with enabled=true).
 const api = express.Router();

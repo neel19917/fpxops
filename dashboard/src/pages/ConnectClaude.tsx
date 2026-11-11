@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Sparkles, Copy, Check, KeyRound, ShieldCheck, Trash2, AlertTriangle } from "lucide-react";
+import { Sparkles, Copy, Check, KeyRound, ShieldCheck, Trash2, AlertTriangle, Lock } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtRelative } from "../lib/format";
 
@@ -23,6 +23,10 @@ export function ConnectClaudePage() {
   const [made, setMade] = useState<{ url: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copiedBase, setCopiedBase] = useState(false);
+  async function copyBase() {
+    try { await navigator.clipboard.writeText(st?.connector_url || "https://fpxpress.netlify.app/mcp"); setCopiedBase(true); setTimeout(() => setCopiedBase(false), 1500); } catch { /* blocked */ }
+  }
 
   const load = useCallback(() => { api.me.connector().then(setSt).catch((e) => setErr((e as Error).message)); }, []);
   useEffect(() => { load(); }, [load]);
@@ -34,7 +38,7 @@ export function ConnectClaudePage() {
     catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
   }
   async function revoke() {
-    if (!confirm("Disconnect Claude? Your connector URL stops working right away.")) return;
+    if (!confirm("Disconnect Claude? Every Claude sign-in and your personal URL stop working right away.")) return;
     setBusy(true); setErr(null);
     try { await api.me.revokeConnector(); setMade(null); load(); }
     catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
@@ -54,19 +58,41 @@ export function ConnectClaudePage() {
 
       <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-5 space-y-3">
         <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="font-medium text-slate-900 flex items-center gap-2"><Lock className="h-4 w-4 text-violet-600" /> Connect with sign-in (recommended)</div>
+          {st ? (st.signins
+            ? <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200">Connected · {st.signins} sign-in{st.signins === 1 ? "" : "s"}</span>
+            : <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 ring-1 ring-slate-200">Not connected</span>) : null}
+        </div>
+        <div className="flex items-center gap-2">
+          <code className="flex-1 min-w-0 truncate text-sm bg-slate-50 ring-1 ring-slate-200 rounded-lg px-2.5 py-1.5">{st?.connector_url || "https://fpxpress.netlify.app/mcp"}</code>
+          <button onClick={copyBase} className="inline-flex items-center gap-1 text-sm px-2.5 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">
+            {copiedBase ? <><Check className="h-4 w-4" /> Copied</> : <><Copy className="h-4 w-4" /> Copy</>}
+          </button>
+        </div>
+        <ol className="text-sm text-slate-700 list-decimal list-inside space-y-1">
+          <li>In Claude (claude.ai or the desktop app): <b>Settings → Connectors → Add custom connector</b>.</li>
+          <li>Name it <b>FPX</b>, paste the URL above, and click <b>Add</b>, then <b>Connect</b>.</li>
+          <li>FPX opens: sign in with your Microsoft account and click <b>Allow</b>.</li>
+          <li>In a chat, turn on <b>FPX</b> from the tools menu and ask, e.g. <i>"What should Victor focus on today?"</i></li>
+        </ol>
+        <p className="text-xs text-slate-500">The URL is the same for everyone and holds no password — Claude signs in as you. <b>Disconnect</b> below ends every Claude sign-in.</p>
+        {st?.signins || st?.active ? (
+          <button onClick={revoke} disabled={busy} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg ring-1 ring-rose-200 text-rose-700 bg-white hover:bg-rose-50 disabled:opacity-50">
+            <Trash2 className="h-4 w-4" /> Disconnect Claude
+          </button>
+        ) : null}
+      </section>
+
+      <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-5 space-y-3">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-violet-600" />
-            <div className="font-medium text-slate-900">Your connector</div>
+            <div className="font-medium text-slate-900">Or: a personal URL (no sign-in)</div>
             {st ? (st.active
               ? <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200">Active · {st.key_prefix}… · {st.last_used_at ? `last used ${fmtRelative(st.last_used_at)}` : "not used yet"}</span>
               : <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 ring-1 ring-slate-200">Not set up</span>) : null}
           </div>
           <div className="flex items-center gap-2">
-            {st?.active ? (
-              <button onClick={revoke} disabled={busy} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg ring-1 ring-rose-200 text-rose-700 bg-white hover:bg-rose-50 disabled:opacity-50">
-                <Trash2 className="h-4 w-4" /> Disconnect
-              </button>
-            ) : null}
             <button onClick={create} disabled={busy} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-50">
               <Sparkles className="h-4 w-4" /> {st?.active ? "Make a new URL" : "Create my connector URL"}
             </button>
@@ -86,12 +112,7 @@ export function ConnectClaudePage() {
           </div>
         ) : null}
 
-        <ol className="text-sm text-slate-700 list-decimal list-inside space-y-1">
-          <li>Click <b>Create my connector URL</b> and copy it.</li>
-          <li>In Claude (claude.ai or the desktop app): <b>Settings → Connectors → Add custom connector</b>.</li>
-          <li>Name it <b>FPX</b>, paste the URL, and click <b>Add</b>.</li>
-          <li>In a chat, turn on <b>FPX</b> from the tools menu and ask, e.g. <i>"What should Victor focus on today?"</i> or <i>"Which ABF shipments are stuck at a terminal?"</i></li>
-        </ol>
+        <p className="text-xs text-slate-500">Use this only if signing in (above) doesn't work for you — e.g. a client that can't do the sign-in.</p>
       </section>
 
       <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-5">

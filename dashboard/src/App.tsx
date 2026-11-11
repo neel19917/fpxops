@@ -10,6 +10,7 @@ import { AuthProvider, useAuth } from "./lib/auth";
 import { NavCtx, type NavApi } from "./lib/nav";
 import { getTasksView } from "./lib/tasksView";
 import { SignInPage } from "./pages/SignIn";
+import { OAuthAuthorizePage, OAuthReturn } from "./pages/OAuthAuthorize";
 import { PendingApprovalPage } from "./pages/PendingApproval";
 
 // Every page is now lazy-loaded to keep the initial JS payload minimal.
@@ -119,8 +120,11 @@ export default function App() {
               <ExtLoginPage />
             </Suspense>
           } />
+          {/* Claude connector sign-in ("Allow Claude?") — handles its own sign-in. */}
+          <Route path="/oauth/authorize" element={<OAuthAuthorizePage />} />
           <Route path="/*" element={<AuthedApp />} />
         </Routes>
+        <OAuthReturn />
       </AuthProvider>
     </BrowserRouter>
   );

@@ -12,6 +12,60 @@
 [dev]
   port = 8899
 
+# FPX for Claude (MCP connector) — served from this domain, handled by the API
+# server. /oauth/authorize is NOT proxied: it's the dashboard's sign-in +
+# "Allow Claude?" page. Must come before the SPA fallback.
+[[redirects]]
+  from = "/mcp"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/mcp"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/mcp/*"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/mcp/:splat"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/.well-known/oauth-protected-resource"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/.well-known/oauth-protected-resource"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/.well-known/oauth-protected-resource/*"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/.well-known/oauth-protected-resource/:splat"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/.well-known/oauth-authorization-server"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/.well-known/oauth-authorization-server"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/.well-known/oauth-authorization-server/*"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/.well-known/oauth-authorization-server/:splat"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/.well-known/openid-configuration"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/.well-known/openid-configuration"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/oauth/register"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/oauth/register"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/oauth/token"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/oauth/token"
+  status = 200
+  force = true
+[[redirects]]
+  from = "/oauth/revoke"
+  to = "https://fpxtrackingchromeextension-production.up.railway.app/oauth/revoke"
+  status = 200
+  force = true
+
 # SPA fallback — every path falls through to index.html so the client-side router
 # handles it, including the public /share/:token viewer.
 [[redirects]]

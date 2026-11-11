@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { requireAuth, generateApiKey, hashApiKey } from "../lib/auth.js";
+import { revokeOAuthForUser, oauthStatusForUser, MCP_RESOURCE } from "./oauth.js";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { decidePendingApiKey } from "../lib/pendingApiKey.js";
@@ -132,9 +133,9 @@ async function activeConnectorKeys(userId) {
 meRouter.get("/connector", requireAuth({ acceptApiKey: false }), async (req, res) => {
   if (!req.user || req.impersonating) return res.status(403).json({ error: "Sign in as yourself to manage your Claude connector" });
   try {
-    const keys = await activeConnectorKeys(req.user.id);
+    const [keys, signins] = await Promise.all([activeConnectorKeys(req.user.id), oauthStatusForUser(req.user.id)]);
     const k = keys[0] || null;
-    res.json({ active: !!k, key_prefix: k?.key_prefix || null, created_at: k?.created_at || null, last_used_at: k?.last_used_at || null });
+    res.json({ connector_url: MCP_RESOURCE, signins, active: !!k, key_prefix: k?.key_prefix || null, created_at: k?.created_at || null, last_used_at: k?.last_used_at || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -164,8 +165,9 @@ meRouter.delete("/connector", requireAuth({ acceptApiKey: false }), async (req, 
   try {
     const old = await activeConnectorKeys(req.user.id);
     if (old.length) await supabase.from("fpx_api_keys").update({ revoked_at: new Date().toISOString() }).in("id", old.map((k) => k.id));
-    logAudit(req, { action: "revoke", entity_type: "api_key", summary: `Revoked their Claude connector (${old.length} key(s))`, metadata: { kind: "claude_connector" } });
-    res.json({ revoked: old.length });
+    const signins = await revokeOAuthForUser(req.user.id);
+    logAudit(req, { action: "revoke", entity_type: "api_key", summary: `Disconnected Claude (${old.length} connector key(s), ${signins} sign-in(s))`, metadata: { kind: "claude_connector" } });
+    res.json({ revoked: old.length, signins });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
