@@ -50,6 +50,18 @@ export interface ScrapeRun {
   ok: boolean;
   note: string;
   counts: ScrapeCounts | null;
+  fpBefore?: FpTotals | null;
+  fpAfter?: FpTotals | null;
+}
+
+// FreightPOP's dashboard tiles, captured at the start / end of a run.
+export const FP_TILES = ["TOTAL", "BOOKED", "IN TRANSIT", "ISSUES", "OUT FOR DELIVERY"] as const;
+export type FpTile = (typeof FP_TILES)[number];
+export type FpTotals = Partial<Record<FpTile, number>> & { at?: string };
+export interface FpTotalsPoint {
+  id: string; startedAt: string; finishedAt: string; ok: boolean;
+  source: "manual" | "schedule"; scheduleName: string | null;
+  before: FpTotals | null; after: FpTotals | null;
 }
 
 export interface ScrapeSchedule {
@@ -158,6 +170,7 @@ export const hostedBrowser = {
   enabled: !!HOSTED_BROWSER_URL,
   stats: (days = 30) => call<HostedStats>(`/stats?days=${days}`),
   stopScrape: () => call<{ stopping: boolean }>("/scrape/stop", { method: "POST" }),
+  totals: (limit = 60) => call<{ points: FpTotalsPoint[] }>(`/runs/totals?limit=${limit}`),
   runs: (q: { limit?: number; user?: string; source?: string; ok?: string } = {}) => {
     const qs = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => [k, String(v)]));
     return call<{ isAdmin: boolean; runs: ScrapeRun[] }>(`/runs?${qs}`);

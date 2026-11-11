@@ -11,6 +11,7 @@ import type {
 import { carrierTrackingUrl, fmtDate, fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import { KPI } from "../components/KPI";
 import { LoadingState } from "../components/LoadingState";
+import { FpTotalsTrend } from "../components/FpTotalsTrend";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { UserPicker } from "../components/UserPicker";
 import { swrGet, swrSet } from "../lib/swrCache";
@@ -496,6 +497,9 @@ export function TasksV2Page() {
         <KPI label="Stale data" value={kpi.stale} icon={Clock} tone={kpi.stale ? "warn" : "default"} hint={`No scrape in ${staleDays}+ days`} />
         <KPI label="Unassigned" value={kpi.unassigned} icon={UserPlus} tone={kpi.unassigned ? "warn" : "default"} />
       </div>
+
+      {/* FreightPOP dashboard totals from the last scrape runs */}
+      <div className="mb-4"><FpTotalsTrend compact /></div>
 
       {/* Daily executive summary */}
       <DailySummaryPanel

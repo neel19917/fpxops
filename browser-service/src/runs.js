@@ -54,6 +54,7 @@ const toRow = (r, logText) => ({
   schedule_id: r.scheduleId || null, schedule_name: r.scheduleName || null,
   started_at: r.startedAt, finished_at: r.finishedAt, duration_ms: Math.round(r.durationMs || 0),
   ok: !!r.ok, note: r.note || null, counts: r.counts || null,
+  fp_before: r.fpBefore || null, fp_after: r.fpAfter || null,
   ...(logText !== undefined ? { log: logText, log_lines: logText ? logText.split("\n").filter(Boolean).length : 0 } : {}),
 });
 
@@ -61,7 +62,8 @@ const fromRow = (x) => ({
   id: x.id, source: x.source, user: x.user_email,
   scheduleId: x.schedule_id, scheduleName: x.schedule_name,
   startedAt: x.started_at, finishedAt: x.finished_at, durationMs: x.duration_ms,
-  ok: x.ok, note: x.note || "", counts: x.counts || null, synced: true,
+  ok: x.ok, note: x.note || "", counts: x.counts || null,
+  fpBefore: x.fp_before || null, fpAfter: x.fp_after || null, synced: true,
 });
 
 async function pushToSupabase(r) {
@@ -87,7 +89,7 @@ async function syncPending() {
 }
 
 // summary: { id, source: "manual"|"schedule", user, scheduleId?, scheduleName?,
-//            startedAt, finishedAt, durationMs, ok, note, counts }
+//            startedAt, finishedAt, durationMs, ok, note, counts, fpBefore, fpAfter }
 export function recordRun(summary, log) {
   const r = { ...summary, synced: false };
   runs = [r, ...runs.filter((x) => x.id !== r.id)];
@@ -139,7 +141,7 @@ export async function initRuns() {
     return;
   }
   try {
-    const rows = await sb(`fpx_scrape_runs?select=id,source,user_email,schedule_id,schedule_name,started_at,finished_at,duration_ms,ok,note,counts&order=started_at.desc&limit=${MAX_RUNS}`);
+    const rows = await sb(`fpx_scrape_runs?select=id,source,user_email,schedule_id,schedule_name,started_at,finished_at,duration_ms,ok,note,counts,fp_before,fp_after&order=started_at.desc&limit=${MAX_RUNS}`);
     const byId = new Map(runs.map((r) => [r.id, r]));
     for (const row of rows || []) if (!byId.has(row.id)) byId.set(row.id, fromRow(row));
     runs = [...byId.values()].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, MAX_RUNS);
