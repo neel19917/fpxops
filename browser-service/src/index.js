@@ -175,6 +175,16 @@ async function handleApi(req, res, url, who) {
     if (job.user !== who.email && !who.isAdmin) return json(res, 403, { error: "not your run" });
     return sendLog(res, `scrape-${String(job.requestId).slice(0, 12)}.log`, job.log.map((l) => `${l.t}\t${l.level}\t${l.text}`).join("\n"));
   }
+  // FreightPOP dashboard totals at the start / end of every run — company-wide
+  // numbers, so everyone sees the trend (only the totals, not run details).
+  if (p === "/runs/totals" && m === "GET") {
+    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 60));
+    const points = listRuns(200)
+      .filter((r) => r.fpBefore || r.fpAfter)
+      .slice(0, limit)
+      .map((r) => ({ id: r.id, startedAt: r.startedAt, finishedAt: r.finishedAt, ok: r.ok, source: r.source, scheduleName: r.scheduleName || null, before: r.fpBefore || null, after: r.fpAfter || null }));
+    return json(res, 200, { points });
+  }
   if (p === "/runs" && m === "GET") {
     const q = Object.fromEntries(url.searchParams);
     return json(res, 200, { isAdmin: who.isAdmin, runs: runsFor(who, q) });

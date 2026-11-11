@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Clock, ExternalLink, LogIn, Maximize2, Minimize2, MonitorPlay, Play, Square, XCircle } from "lucide-react";
 import { api, type ScrapeRequest } from "../lib/api";
-import { hostedBrowser, type HostedStats, type ScrapeLogLine, type ScrapeCounts } from "../lib/hostedBrowser";
+import { hostedBrowser, type HostedStats, type ScrapeLogLine, type ScrapeCounts, type FpTotals } from "../lib/hostedBrowser";
+import { FpTotalsTrend, FpBeforeAfter } from "../components/FpTotalsTrend";
 import { useAuth } from "../lib/auth";
 import { showFrame, hideFrame, useFrameState } from "../lib/freightpopFrame";
 import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
@@ -135,12 +136,14 @@ export function ScrapingPage() {
   // in both), newest first; queued/running requests stay on top.
   const recentRuns = useMemo(() => {
     type Row = { id: string; status: ScrapeRequest["status"]; note: string; at: string; user: string | null;
-      source: "manual" | "schedule"; scheduleName?: string | null; durationMs: number | null; saved: number | null; hasLog: boolean };
+      source: "manual" | "schedule"; scheduleName?: string | null; durationMs: number | null; saved: number | null; hasLog: boolean;
+      fpBefore?: FpTotals | null; fpAfter?: FpTotals | null };
     const rows = new Map<string, Row>();
     for (const r of stats?.runs || []) {
       rows.set(r.id, {
         id: r.id, status: r.ok ? "done" : "error", note: r.note || "—", at: r.startedAt, user: r.user,
         source: r.source, scheduleName: r.scheduleName, durationMs: r.durationMs, saved: r.counts?.saved ?? null, hasLog: true,
+        fpBefore: r.fpBefore ?? null, fpAfter: r.fpAfter ?? null,
       });
     }
     for (const q of requests) {
@@ -152,6 +155,7 @@ export function ScrapingPage() {
         at: q.requested_at, user: q.requested_by, source: "manual", scheduleName: null,
         durationMs: q.completed_at && q.claimed_at ? new Date(q.completed_at).getTime() - new Date(q.claimed_at).getTime() : null,
         saved: q.result_count, hasLog: prior?.hasLog || false,
+        fpBefore: prior?.fpBefore ?? null, fpAfter: prior?.fpAfter ?? null,
       });
     }
     const active = (r: Row) => (r.status === "pending" || r.status === "claimed" ? 1 : 0);
@@ -316,6 +320,10 @@ export function ScrapingPage() {
         <SchedulesPane schedules={stats.schedules || []} me={me?.user} isAdmin={!!stats.isAdmin} onChanged={load} />
       ) : null}
 
+      <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-5">
+        <FpTotalsTrend />
+      </section>
+
       {/* Recent runs: the hosted browser's saved history (manual + scheduled,
           with logs) merged with the API's request queue, which also holds
           runs from before that history existed and anything queued/running. */}
@@ -343,6 +351,7 @@ export function ScrapingPage() {
                       <button onClick={() => hostedBrowser.downloadLog(r.id).catch(() => {})} className="underline hover:text-slate-800">log</button>
                     ) : null}
                   </div>
+                  <FpBeforeAfter before={r.fpBefore} after={r.fpAfter} />
                 </div>
               </li>
             ))}

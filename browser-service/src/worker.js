@@ -146,6 +146,8 @@ async function runJob(job) {
     total: null, // shipments in the grid, from the Kendo pager ("1 - 10 of 659 items")
     fpCounts: null, // FreightPOP's dashboard tiles: { TOTAL, BOOKED, "IN TRANSIT", ISSUES, "OUT FOR DELIVERY" }
     fpCountsAt: null,
+    fpBefore: null, // first complete tile reading of the run
+    fpAfter: null,  // tile reading when the run ended
   };
   logLine(job.source === "schedule"
     ? `Scheduled run${job.scheduleName ? ` "${job.scheduleName}"` : ""} — running as ${email}`
@@ -178,6 +180,9 @@ async function runJob(job) {
       startedAt: new Date(startedAt).toISOString(), finishedAt, durationMs: Date.now() - startedAt,
       ok, note: String(note).slice(0, 500),
       counts: current?.counts ? { ...current.counts, total: current.total ?? null } : null,
+      // FreightPOP dashboard totals at the start and end of the run (trends).
+      fpBefore: current?.fpBefore || null,
+      fpAfter: current?.fpAfter || (current?.fpCounts ? { ...current.fpCounts, at: current.fpCountsAt } : null),
     };
     recordRun(summary, current?.log || []);
     lastResult = { ...summary, requestId: job.id, log: current?.log || [] };
@@ -309,8 +314,9 @@ async function runIn(browser, url, who) {
     }
     const total = await readGridTotal(page);
     if (current && total != null) current.total = total;
-    const counts = await readDashboardCounts(page);
-    if (current && counts) { current.fpCounts = counts; current.fpCountsAt = new Date().toISOString(); }
+    let counts = await readDashboardCounts(page);
+    if (!counts || Object.keys(counts).length < 5) { await sleep(3000); counts = (await readDashboardCounts(page)) || counts; }
+    noteCounts(counts);
     logLine(total != null ? `Grid loaded — ${total} shipment(s) in the grid. Starting Refresh All` : "Grid loaded — starting Refresh All");
     const pageSize = Number(setting("browser.scrape_page_size")) || 50;
     await ext.evaluate(`fpxScrapePageSize = ${pageSize}; 'ok'`).catch(() => {});
@@ -340,13 +346,17 @@ async function runIn(browser, url, who) {
         console.log(`[worker] ${status}`);
         if (current && !stopFlag) { current.status = status; current.statusAt = new Date().toISOString(); }
       }
-      if (done) return stopFlag ? `Stopped by user. ${done}` : done;
+      if (done) {
+        // The run's "after" snapshot of FreightPOP's dashboard totals.
+        const end = await readDashboardCounts(page);
+        if (current && end) { noteCounts(end); current.fpAfter = { ...end, at: new Date().toISOString() }; }
+        return stopFlag ? `Stopped by user. ${done}` : done;
+      }
       // Keep the totals fresh (shipments get added/delivered mid-run):
       // FreightPOP's dashboard tiles every ~10s, the grid pager every ~30s.
       ++tick;
       if (tick % 5 === 0 && current) {
-        const c = await readDashboardCounts(page);
-        if (c) { current.fpCounts = c; current.fpCountsAt = new Date().toISOString(); }
+        noteCounts(await readDashboardCounts(page));
       }
       if (tick % 15 === 0 && current) {
         const t = await readGridTotal(page);
@@ -372,6 +382,16 @@ async function runIn(browser, url, who) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Remember the latest tile reading; the first complete one (all five tiles)
+// is the run's "before" snapshot — FreightPOP fills the tiles a moment after
+// the grid, so the very first read can be partial.
+function noteCounts(c) {
+  if (!current || !c) return;
+  const at = new Date().toISOString();
+  current.fpCounts = c; current.fpCountsAt = at;
+  if (!current.fpBefore && Object.keys(c).length >= 5) current.fpBefore = { ...c, at };
+}
 
 // FreightPOP's dashboard tiles (TOTAL / BOOKED / IN TRANSIT / ISSUES /
 // OUT FOR DELIVERY) with the number shown under each. Matched by geometry —

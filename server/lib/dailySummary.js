@@ -237,7 +237,7 @@ export async function collectDailyDigest({ hours = 24 } = {}) {
   }
   const notes = (notesRes.data || []).map((n) => ({ ...n, tracking_number: shipmentsById.get(n.shipment_id)?.tracking_number || null }));
 
-  return shapeDigest({
+  const digest = shapeDigest({
     from: fromIso, to: to.toISOString(),
     tasksTouched: tasks, shipmentsById, board,
     scrapedCount: scrapedRes.count ?? 0,
@@ -250,6 +250,33 @@ export async function collectDailyDigest({ hours = 24 } = {}) {
     audit: auditRes.data || [],
     notes,
   });
+  digest.freightpop_dashboard = await freightpopTotals(fromIso).catch(() => null);
+  return digest;
+}
+
+// FreightPOP's own dashboard tiles (TOTAL / BOOKED / IN TRANSIT / ISSUES /
+// OUT FOR DELIVERY), saved at the start and end of every scrape run.
+const FP_TILES = ["TOTAL", "BOOKED", "IN TRANSIT", "ISSUES", "OUT FOR DELIVERY"];
+async function freightpopTotals(fromIso) {
+  const { data, error } = await supabase.from("fpx_scrape_runs")
+    .select("started_at, finished_at, ok, source, fp_before, fp_after")
+    .or("fp_before.not.is.null,fp_after.not.is.null")
+    .order("started_at", { ascending: false }).limit(30);
+  if (error || !data?.length) return null;
+  const pick = (o) => (o ? Object.fromEntries(FP_TILES.filter((k) => o[k] != null).map((k) => [k, o[k]])) : null);
+  const inWindow = data.filter((r) => r.started_at >= fromIso).reverse();
+  const latest = data[0];
+  const latestAfter = pick(latest.fp_after || latest.fp_before);
+  const first = inWindow[0] ? pick(inWindow[0].fp_before || inWindow[0].fp_after) : null;
+  const change = first && latestAfter
+    ? Object.fromEntries(FP_TILES.filter((k) => first[k] != null && latestAfter[k] != null).map((k) => [k, latestAfter[k] - first[k]]))
+    : null;
+  return {
+    note: "FreightPOP's dashboard totals, read at the start (before) and end (after) of each scrape run.",
+    latest: { at: latest.finished_at, totals: latestAfter },
+    change_over_window: change,
+    runs_in_window: inWindow.map((r) => ({ finished_at: r.finished_at, ok: r.ok, source: r.source, before: pick(r.fp_before), after: pick(r.fp_after) })),
+  };
 }
 
 export function stripFences(text) {
@@ -266,6 +293,9 @@ export async function runDailySummary({ digest, notes, callMeta }) {
   const userMessage = [
     `Window: ${digest.window.from} → ${digest.window.to} (${digest.window.hours}h). Generated ${new Date().toISOString()}.`,
     notes ? `Notes from the operator requesting this brief: ${String(notes).slice(0, 1500)}` : null,
+    digest.freightpop_dashboard
+      ? "The digest's freightpop_dashboard holds FreightPOP's own dashboard totals (Total, Booked, In Transit, Issues, Out for Delivery) before and after each scrape run. Add them to the KPIs table with the change over the window, and call out a notable move (especially Issues) in the Headline."
+      : null,
     "Digest (JSON, the only source of facts):",
     JSON.stringify(digest),
     "Write the brief now, Markdown only.",
