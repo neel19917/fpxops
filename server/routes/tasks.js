@@ -413,6 +413,36 @@ tasksRouter.get("/v2/board", async (req, res) => {
   }
 });
 
+// GET /tasks/v2/snapshot — compact picture of the board for trend tracking
+// (the scrape worker records one before and after every run): active tasks,
+// needs attention, tasks by segment, health flags, and the shipment
+// dispositions (status) behind the active tasks.
+tasksRouter.get("/v2/snapshot", async (_req, res) => {
+  try {
+    const board = await loadBoard({ includeClosed: false });
+    const shipStatus = new Map();
+    for (const r of board.rows) {
+      if (r.shipment?.id && !shipStatus.has(r.shipment.id)) {
+        shipStatus.set(r.shipment.id, String(r.shipment.shipment_status || "Unknown").trim().toUpperCase() || "UNKNOWN");
+      }
+    }
+    const dispositions = {};
+    for (const st of shipStatus.values()) dispositions[st] = (dispositions[st] || 0) + 1;
+    res.json({
+      at: new Date().toISOString(),
+      active: board.summary.active,
+      needs_attention: board.summary.needs_attention,
+      shipments: shipStatus.size,
+      by_segment: board.summary.by_segment,
+      by_flag: board.summary.by_flag,
+      by_status: board.summary.by_status,
+      dispositions,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /tasks/v2/triage  { ids?: string[], segment?: string, notes?: string }
 // Heavy-model pass over the active board (or the supplied subset). Returns
 // the normalized triage plus cost; the raw call is on fpx_ai_analyses with
