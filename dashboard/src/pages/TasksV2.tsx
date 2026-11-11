@@ -499,7 +499,7 @@ export function TasksV2Page() {
       </div>
 
       {/* FreightPOP dashboard totals from the last scrape runs */}
-      <div className="mb-4"><FpTotalsTrend compact /></div>
+      <div className="mb-4"><FpTotalsTrend compact groups={["fp", "disp"]} /></div>
 
       {/* Daily executive summary */}
       <DailySummaryPanel

@@ -158,6 +158,7 @@ async function runJob(job) {
   try {
     if (!email.includes("@")) throw new Error(`Request has no user (requested_by="${email}") — rescrapes must come from a signed-in rep`);
     if (!hasProfile(email)) throw new Error(`${email} hasn't logged in to FreightPOP in the hosted view yet`);
+    if (current) current.tasksBefore = await taskSnapshot();
     const result = await runRefreshAll(email);
     ok = true; note = result;
     console.log(`[worker] ${job.id} done: ${result}`);
@@ -172,6 +173,7 @@ async function runJob(job) {
       }).catch((e) => console.warn("[worker] complete failed:", e.message));
     }
     if (email.includes("@")) recordScrape(email, Date.now() - startedAt, ok);
+    const tasksAfter = current?.tasksBefore ? await taskSnapshot() : null;
     logLine(ok ? `Finished: ${note}` : `Failed: ${note}`, ok ? "done" : "error");
     const finishedAt = new Date().toISOString();
     const summary = {
@@ -183,6 +185,10 @@ async function runJob(job) {
       // FreightPOP dashboard totals at the start and end of the run (trends).
       fpBefore: current?.fpBefore || null,
       fpAfter: current?.fpAfter || (current?.fpCounts ? { ...current.fpCounts, at: current.fpCountsAt } : null),
+      // The task board (segments, health flags, shipment dispositions) at the
+      // start and end of the run.
+      tasksBefore: current?.tasksBefore || null,
+      tasksAfter,
     };
     recordRun(summary, current?.log || []);
     lastResult = { ...summary, requestId: job.id, log: current?.log || [] };
@@ -382,6 +388,13 @@ async function runIn(browser, url, who) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The Tasks board in numbers, from the API (null if it can't be read — a
+// missing snapshot must never fail a scrape).
+async function taskSnapshot() {
+  try { return await api("/api/tasks/v2/snapshot"); }
+  catch (e) { console.warn("[worker] task snapshot failed:", e.message); return null; }
+}
 
 // Remember the latest tile reading; the first complete one (all five tiles)
 // is the run's "before" snapshot — FreightPOP fills the tiles a moment after

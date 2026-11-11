@@ -52,16 +52,30 @@ export interface ScrapeRun {
   counts: ScrapeCounts | null;
   fpBefore?: FpTotals | null;
   fpAfter?: FpTotals | null;
+  tasksBefore?: TaskSnapshot | null;
+  tasksAfter?: TaskSnapshot | null;
 }
 
 // FreightPOP's dashboard tiles, captured at the start / end of a run.
 export const FP_TILES = ["TOTAL", "BOOKED", "IN TRANSIT", "ISSUES", "OUT FOR DELIVERY"] as const;
 export type FpTile = (typeof FP_TILES)[number];
 export type FpTotals = Partial<Record<FpTile, number>> & { at?: string };
+// The Tasks board in numbers (API /tasks/v2/snapshot), at the start / end of a run.
+export interface TaskSnapshot {
+  at?: string;
+  active?: number;
+  needs_attention?: number;
+  shipments?: number;
+  by_segment?: Record<string, number>;
+  by_flag?: Record<string, number>;
+  by_status?: Record<string, number>;
+  dispositions?: Record<string, number>; // shipment status behind active tasks
+}
 export interface FpTotalsPoint {
   id: string; startedAt: string; finishedAt: string; ok: boolean;
   source: "manual" | "schedule"; scheduleName: string | null;
   before: FpTotals | null; after: FpTotals | null;
+  tasksBefore?: TaskSnapshot | null; tasksAfter?: TaskSnapshot | null;
 }
 
 export interface ScrapeSchedule {

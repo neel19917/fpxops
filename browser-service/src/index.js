@@ -180,9 +180,9 @@ async function handleApi(req, res, url, who) {
   if (p === "/runs/totals" && m === "GET") {
     const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 60));
     const points = listRuns(200)
-      .filter((r) => r.fpBefore || r.fpAfter)
+      .filter((r) => r.fpBefore || r.fpAfter || r.tasksBefore || r.tasksAfter)
       .slice(0, limit)
-      .map((r) => ({ id: r.id, startedAt: r.startedAt, finishedAt: r.finishedAt, ok: r.ok, source: r.source, scheduleName: r.scheduleName || null, before: r.fpBefore || null, after: r.fpAfter || null }));
+      .map((r) => ({ id: r.id, startedAt: r.startedAt, finishedAt: r.finishedAt, ok: r.ok, source: r.source, scheduleName: r.scheduleName || null, before: r.fpBefore || null, after: r.fpAfter || null, tasksBefore: r.tasksBefore || null, tasksAfter: r.tasksAfter || null }));
     return json(res, 200, { points });
   }
   if (p === "/runs" && m === "GET") {
