@@ -216,9 +216,9 @@ export const api = {
       pending_api_key?: string | null;
       client_config?: ClientConfig;
     }>("/api/me"),
-    connector: () => request<{ active: boolean; key_prefix: string | null; created_at: string | null; last_used_at: string | null }>("/api/me/connector", { noImpersonate: true }),
+    connector: () => request<{ connector_url: string; signins: number; active: boolean; key_prefix: string | null; created_at: string | null; last_used_at: string | null }>("/api/me/connector", { noImpersonate: true }),
     createConnector: () => request<{ url: string; key: string; key_prefix: string; created_at: string }>("/api/me/connector", { method: "POST", noImpersonate: true }),
-    revokeConnector: () => request<{ revoked: number }>("/api/me/connector", { method: "DELETE", noImpersonate: true }),
+    revokeConnector: () => request<{ revoked: number; signins: number }>("/api/me/connector", { method: "DELETE", noImpersonate: true }),
     preferences: () => request<{ auto_open_tracking: boolean }>("/api/me/preferences"),
     setPreferences: (body: { auto_open_tracking: boolean }) =>
       request<{ auto_open_tracking: boolean }>("/api/me/preferences", { method: "PATCH", body: JSON.stringify(body) }),
@@ -528,6 +528,12 @@ export const api = {
       chat_30d: { turns: number; people: number; cost_usd: number; avg_ms: number | null };
     }>("/api/governance/pipeline"),
     call: (id: string) => request<{ call: GovCall & { system_prompt: string | null; user_message: string | null; response_text: string | null } }>(`/api/governance/calls/${id}`),
+  },
+  oauth: {
+    client: (client_id: string, redirect_uri: string) =>
+      request<{ client_name: string; redirect_host: string; scope: string }>("/api/oauth/client", { params: { client_id, redirect_uri }, noImpersonate: true }),
+    approve: (body: Record<string, string>) =>
+      request<{ redirect: string }>("/api/oauth/approve", { method: "POST", body: JSON.stringify(body), noImpersonate: true }),
   },
   emailStudio: {
     samples: () => request<{ data: EmailStudioSample[] }>("/api/email-studio/samples"),

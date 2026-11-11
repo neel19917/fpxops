@@ -7,6 +7,7 @@ import { hashApiKey, isConnectorOnlyKey } from "../lib/auth.js";
 import { loadBoard } from "../lib/taskBoard.js";
 import { TASK_SEGMENTS, TASK_FLAGS } from "../lib/taskSegments.js";
 import { logGovernance } from "../lib/governance.js";
+import { resolveOAuthAccess, PUBLIC_BASE } from "./oauth.js";
 
 // FPX for Claude — a remote MCP server (Streamable HTTP, stateless).
 // Read-only: search and read shipments, the focus list, the task board and
@@ -233,9 +234,12 @@ function buildServer(who) {
 }
 
 async function handle(req, res, key) {
-  const who = await resolveConnector(key);
+  // A signed-in Claude (OAuth access token) or a personal connector key.
+  const who = key?.startsWith("fpx_oat_") ? await resolveOAuthAccess(key) : await resolveConnector(key);
   if (!who) {
-    return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Invalid or revoked FPX connector key — make a new one on FPX → Connect Claude." }, id: null });
+    // Tells Claude where to sign in (OAuth discovery, RFC 9728).
+    res.set("WWW-Authenticate", `Bearer resource_metadata="${PUBLIC_BASE}/.well-known/oauth-protected-resource", scope="fpx.read"`);
+    return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: key ? "Your FPX sign-in has expired or was revoked — reconnect FPX in Claude." : "Sign in to FPX to use this connector." }, id: null });
   }
   if (!allow(who.keyId)) {
     return res.status(429).json({ jsonrpc: "2.0", error: { code: -32002, message: "Too many requests — slow down." }, id: null });

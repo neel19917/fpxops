@@ -1,0 +1,1 @@
+-- Claude connector OAuth 2.1 (applied 2026-11-11 as mcp_oauth): fpx_oauth_clients, fpx_oauth_codes, fpx_oauth_tokens (hashed, server-only).
