@@ -8,7 +8,7 @@ import { ViewerSession, egressStats, dropAllParked } from "./session.js";
 import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
 import { startScrapeWorker, workerBusy, workerState, requestStop, fullLog } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
-import { chat, assistantEnabled, startAssistantIndexer, assistantIndexStatus } from "./assistant.js";
+import { chat, assistantEnabled, startAssistantIndexer, assistantIndexStatus, saveChatTurn, listChats, getChat, deleteChat } from "./assistant.js";
 
 // 20 assistant messages per person per minute.
 const chatHits = new Map();
@@ -216,6 +216,19 @@ async function handleApi(req, res, url, who) {
     if (m === "GET") return json(res, 200, { settings: listSettings(), live: { sessions: sessions.size, browsers: poolStats().length, memoryMb: poolStats().reduce((t, b) => t + (b.memoryMb || 0), 0), egress: egressStats() } });
     if (m === "PUT") return json(res, 200, { settings: await updateSettings((await readJson(req)).settings, who.email) });
   }
+  // Chat history — each person's own conversations only.
+  if (p === "/assistant/chats" && m === "GET") {
+    if (!assistantEnabled) return json(res, 503, { error: "Assistant isn't configured on this service" });
+    return json(res, 200, { chats: await listChats(who.email) });
+  }
+  const cm = /^\/assistant\/chats\/([0-9a-f-]{36})$/i.exec(p);
+  if (cm && assistantEnabled) {
+    if (m === "GET") {
+      const c = await getChat(who.email, cm[1]);
+      return c ? json(res, 200, { chat: c }) : json(res, 404, { error: "Chat not found" });
+    }
+    if (m === "DELETE") { await deleteChat(who.email, cm[1]); return json(res, 200, { deleted: true }); }
+  }
   // Streaming chat: newline-delimited JSON events — {type:"text",delta},
   // {type:"status",text}, {type:"reset"}, then {type:"done", ...reply} or
   // {type:"error",error}. Words show as they're written.
@@ -233,6 +246,8 @@ async function handleApi(req, res, url, who) {
       const out = await chat({ history, message, who, context: body.context || null, onEvent: emit });
       console.log(`[assistant] ${who.email} (stream): ${out.usage.steps} step(s) [${out.usage.tools.join(",")}], ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), cost ${(out.usage.cost_usd || 0).toFixed(4)} USD, ${Date.now() - t0}ms`);
       emit({ type: "done", ...out });
+      if (body.chatId) saveChatTurn({ chatId: body.chatId, email: who.email, message, reply: out.reply, actions: out.actions, messages: out.messages })
+        .catch((e) => console.warn("[assistant] history save failed:", e.message));
     } catch (e) {
       console.warn("[assistant] stream error:", e.status || "", e.message);
       emit({ type: "error", error: e.status === 429 ? "Claude is rate-limited right now — try again in a moment" : `Assistant error: ${e.message}` });
@@ -250,6 +265,8 @@ async function handleApi(req, res, url, who) {
     try {
       const out = await chat({ history, message, who, context: body.context || null });
       console.log(`[assistant] ${who.email}: ${out.usage.steps} step(s) [${out.usage.tools.join(",")}], ${out.actions.length} action(s), ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), cost ${(out.usage.cost_usd || 0).toFixed(4)} USD, ${Date.now() - t0}ms`);
+      if (body.chatId) saveChatTurn({ chatId: body.chatId, email: who.email, message, reply: out.reply, actions: out.actions, messages: out.messages })
+        .catch((e) => console.warn("[assistant] history save failed:", e.message));
       return json(res, 200, out);
     } catch (e) {
       console.warn("[assistant] error:", e.status || "", e.message);
