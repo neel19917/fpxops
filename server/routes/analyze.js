@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
-import { callClaude } from "../lib/anthropic.js";
+import { callClaude, shipmentAnalysisCall } from "../lib/anthropic.js";
 import { mapShipment } from "../lib/shipments.js";
 import { getSettings } from "../lib/settings.js";
 import { detectRedelivery } from "../lib/redelivery.js";
@@ -100,8 +100,7 @@ export async function runShipmentAnalysis(row, { reqContext, modelOverride } = {
   const result = await callClaude({
     systemPrompt: settings["prompt.system"],
     userMessage: userMsg,
-    maxTokens: 512,
-    modelOverride,
+    ...(await shipmentAnalysisCall(modelOverride)),
     metadata: {
       kind: "per_shipment",
       tracking_number: row.tracking_number,
@@ -180,7 +179,7 @@ analyzeRouter.post("/shipment", async (req, res) => {
   const result = await callClaude({
     systemPrompt: system,
     userMessage: userMsg,
-    maxTokens: 512,
+    ...(await shipmentAnalysisCall()),
     metadata: {
       kind: "per_shipment",
       tracking_number: mapped?.tracking_number || null,
