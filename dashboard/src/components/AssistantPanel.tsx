@@ -1,12 +1,15 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ArrowLeft, ArrowUp, ExternalLink, Filter, History, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Sparkles, Trash2, X } from "lucide-react";
+import { ArrowLeft, CornerDownLeft, ExternalLink, Filter, History, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Search, Trash2 } from "lucide-react";
 import { hostedBrowser, type AssistantAction, type AssistantChatSummary } from "../lib/hostedBrowser";
 import { fmtRelative } from "../lib/format";
 
-// "Ask FPX" — a chat panel on every signed-in page. Claude (via the hosted
-// browser service) answers from live shipment/task data and can drive the
-// dashboard: open a shipment or task, filter the Tracking list, change page.
+// "Ask FPX" — one search box for the whole dashboard. Type a tracking number,
+// a name or a plain-English question; Claude (via the hosted browser service)
+// searches the shipment index (keyword + fuzzy + embeddings) and answers, and
+// can drive the dashboard: open a shipment or task, filter Tracking, change
+// page. The box lives in the header (AskSearchTrigger) and opens a centered
+// search overlay (Ctrl/⌘ K, or "/").
 //
 // The conversation lives in sessionStorage (this tab only). `history` is the
 // API-format transcript, sent back verbatim each turn.
@@ -14,10 +17,26 @@ import { fmtRelative } from "../lib/format";
 const STORE_KEY = "fpx.assistant.v2";
 const SUGGESTIONS = [
   "What should I focus on today?",
-  "Which carriers have the most shipments needing action?",
-  "Show me shipments that need action",
-  "What's late and not delivered yet?",
+  "Late shipments not delivered yet",
+  "ABF shipments that need action",
+  "Which carriers have the most problems?",
 ];
+const OPEN_EVENT = "fpx:ask-open";
+
+// The search box shown in the header. Clicking it (or Ctrl/⌘ K) opens the
+// search overlay rendered by <AssistantPanel />.
+export function AskSearchTrigger() {
+  if (!hostedBrowser.enabled) return null;
+  return (
+    <button type="button" onClick={() => window.dispatchEvent(new Event(OPEN_EVENT))}
+      className="flex items-center gap-2 w-64 max-w-full rounded-lg ring-1 ring-slate-200 bg-slate-50 hover:bg-white hover:ring-violet-300 px-3 py-1.5 text-sm text-slate-500 text-left"
+      title="Search shipments and tasks, or ask a question (Ctrl/⌘ K)">
+      <Search className="h-4 w-4 text-slate-400 shrink-0" />
+      <span className="flex-1 truncate">Search or ask anything…</span>
+      <kbd className="text-[10px] font-sans text-slate-400 ring-1 ring-slate-200 rounded px-1 bg-white">⌘K</kbd>
+    </button>
+  );
+}
 
 const PAGE_PATHS: Record<string, string> = {
   tracking: "/tracking", tasks: "/tasks/v2", ops: "/ops", scraping: "/scraping",
@@ -141,19 +160,26 @@ export function AssistantPanel() {
     } catch (e) { setHistoryErr((e as Error).message); }
   }
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => { try { sessionStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* quota */ } }, [state]);
   useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }); }, [state.turns.length, busy, open, draft.length > 0, status]);
   useEffect(() => { if (open) setTimeout(() => inputRef.current?.focus(), 50); }, [open]);
 
-  // Ctrl/Cmd+K toggles the panel.
+  // Ctrl/Cmd+K toggles the search; "/" opens it when not typing elsewhere;
+  // Esc closes it. The header search box opens it via OPEN_EVENT.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); setOpen((v) => !v); }
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); setOpen((v) => !v); return; }
+      if (e.key === "Escape") { setOpen(false); return; }
+      const el = e.target as HTMLElement | null;
+      const typing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
+      if (e.key === "/" && !typing && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); setOpen(true); }
     };
+    const onOpen = () => setOpen(true);
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener(OPEN_EVENT, onOpen);
+    return () => { window.removeEventListener("keydown", onKey); window.removeEventListener(OPEN_EVENT, onOpen); };
   }, []);
 
   function perform(a: AssistantAction) {
@@ -184,8 +210,10 @@ export function AssistantPanel() {
         else if (ev.type === "status") setStatus(ev.text);
       });
       setState((s) => ({ id: s.id, turns: [...turns, { role: "assistant", text: r.reply || "(no answer)", actions: r.actions }], history: r.messages }));
-      // Do what it said, in order (the last navigation wins).
+      // Do what it said, in order (the last navigation wins), and get out of
+      // the way so the page it opened is visible.
       for (const a of r.actions) perform(a);
+      if (r.actions.length) setOpen(false);
     } catch (e) {
       setState((s) => ({ ...s, turns: [...turns, { role: "assistant", text: (e as Error).message, error: true }] }));
     } finally {
@@ -193,98 +221,80 @@ export function AssistantPanel() {
     }
   }
 
-  if (!hostedBrowser.enabled) return null;
+  if (!hostedBrowser.enabled || !open) return null;
 
+  const empty = state.turns.length === 0 && !busy;
   return (
-    <>
-      {!open ? (
-        <button
-          onClick={() => setOpen(true)}
-          className="fixed bottom-5 right-5 z-50 inline-flex items-center gap-2 rounded-full bg-violet-600 text-white pl-3.5 pr-4 py-2.5 shadow-lg shadow-violet-600/30 hover:bg-violet-700 text-sm font-medium"
-          title="Ask FPX (Ctrl/⌘ K)"
-        >
-          <Sparkles className="h-4 w-4" /> Ask FPX
-        </button>
-      ) : (
-        <div className="fixed bottom-5 right-5 z-50 w-[min(440px,calc(100vw-2.5rem))] h-[min(640px,calc(100vh-2.5rem))] rounded-2xl bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col overflow-hidden">
-          <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-slate-100 bg-gradient-to-r from-violet-600 to-violet-500 text-white">
-            <div className="flex items-center gap-2">
-              <Sparkles className="h-4 w-4" />
-              <div>
-                <div className="text-sm font-semibold leading-tight">Ask FPX</div>
-                <div className="text-[11px] text-violet-100 leading-tight">Finds, filters and opens shipments for you</div>
-              </div>
+    <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-start justify-center p-4 pt-[10vh]" onClick={() => setOpen(false)}>
+      <div className="w-full max-w-2xl max-h-[78vh] rounded-2xl bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Search FPX">
+        {/* The search box */}
+        <form onSubmit={(e) => { e.preventDefault(); setShowHistory(false); send(input); }} className="flex items-center gap-3 px-4 py-3 border-b border-slate-100">
+          {busy ? <Loader2 className="h-5 w-5 text-violet-600 animate-spin shrink-0" /> : <Search className="h-5 w-5 text-slate-400 shrink-0" />}
+          <input
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key !== "Escape") e.stopPropagation(); }}
+            placeholder={state.turns.length ? "Ask a follow-up, or search again…" : "Search a tracking number, customer, carrier, or ask a question…"}
+            className="flex-1 text-base outline-none bg-transparent placeholder:text-slate-400"
+            aria-label="Search or ask"
+            autoComplete="off"
+          />
+          <button type="submit" disabled={busy || !input.trim()} className="text-[11px] text-slate-500 inline-flex items-center gap-1 ring-1 ring-slate-200 rounded px-1.5 py-0.5 disabled:opacity-40 hover:bg-slate-50" title="Search (Enter)">
+            <CornerDownLeft className="h-3 w-3" /> Enter
+          </button>
+        </form>
+
+        {showHistory ? (
+          <div className="flex-1 overflow-y-auto">
+            <div className="flex items-center justify-between px-4 py-2 border-b border-slate-100">
+              <button onClick={() => setShowHistory(false)} className="inline-flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900"><ArrowLeft className="h-3.5 w-3.5" /> Back</button>
+              <span className="text-xs text-slate-500">Past searches</span>
             </div>
-            <div className="flex items-center gap-1">
-              <button onClick={() => (showHistory ? setShowHistory(false) : openHistory())} className={"p-1.5 rounded-md hover:bg-white/15 " + (showHistory ? "bg-white/20" : "")} title="Chat history" aria-label="Chat history">
-                <History className="h-4 w-4" />
-              </button>
-              {state.turns.length ? (
-                <button onClick={() => { setState(fresh()); setShowHistory(false); }} className="p-1.5 rounded-md hover:bg-white/15" title="New chat" aria-label="New chat">
-                  <RotateCcw className="h-4 w-4" />
-                </button>
-              ) : null}
-              <button onClick={() => setOpen(false)} className="p-1.5 rounded-md hover:bg-white/15" title="Close (Ctrl/⌘ K)" aria-label="Close">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
+            {historyErr ? <div className="m-3 text-xs text-rose-700">{historyErr}</div> : null}
+            {!chats && !historyErr ? <div className="p-4 text-xs text-slate-500 flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</div> : null}
+            {chats && !chats.length ? <div className="p-4 text-sm text-slate-500">Nothing yet. Searches are saved here automatically.</div> : null}
+            <ul className="divide-y divide-slate-100">
+              {(chats || []).map((c) => (
+                <li key={c.id} className={"group flex items-start gap-2 px-4 py-2.5 hover:bg-slate-50 cursor-pointer " + (c.id === state.id ? "bg-violet-50/60" : "")} onClick={() => resume(c.id)}>
+                  <MessageCircle className="h-4 w-4 mt-0.5 text-violet-500 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm text-slate-800 truncate">{c.title}</div>
+                    <div className="text-[11px] text-slate-500">{fmtRelative(c.updated_at)} · {c.turn_count} question{c.turn_count === 1 ? "" : "s"}</div>
+                  </div>
+                  <button onClick={(e) => { e.stopPropagation(); remove(c.id); }} className="p-1 rounded text-slate-400 hover:text-rose-600 opacity-0 group-hover:opacity-100 focus:opacity-100" title="Delete" aria-label="Delete">
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
           </div>
-
-          {showHistory ? (
-            <div className="flex-1 overflow-y-auto bg-slate-50/60">
-              <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-100 bg-white">
-                <button onClick={() => setShowHistory(false)} className="inline-flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900"><ArrowLeft className="h-3.5 w-3.5" /> Back to chat</button>
-                <button onClick={() => { setState(fresh()); setShowHistory(false); }} className="text-xs text-violet-700 hover:underline">+ New chat</button>
-              </div>
-              {historyErr ? <div className="m-3 text-xs text-rose-700">{historyErr}</div> : null}
-              {!chats && !historyErr ? <div className="p-4 text-xs text-slate-500 flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading your chats…</div> : null}
-              {chats && !chats.length ? <div className="p-4 text-sm text-slate-500">No saved chats yet — they're saved here automatically after each answer.</div> : null}
-              <ul className="divide-y divide-slate-100">
-                {(chats || []).map((c) => (
-                  <li key={c.id} className={"group flex items-start gap-2 px-4 py-2.5 hover:bg-white cursor-pointer " + (c.id === state.id ? "bg-violet-50/60" : "")} onClick={() => resume(c.id)}>
-                    <MessageCircle className="h-4 w-4 mt-0.5 text-violet-500 shrink-0" />
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm text-slate-800 truncate">{c.title}</div>
-                      <div className="text-[11px] text-slate-500">{fmtRelative(c.updated_at)} · {c.turn_count} question{c.turn_count === 1 ? "" : "s"}</div>
-                    </div>
-                    <button onClick={(e) => { e.stopPropagation(); remove(c.id); }} className="p-1 rounded text-slate-400 hover:text-rose-600 opacity-0 group-hover:opacity-100 focus:opacity-100" title="Delete chat" aria-label="Delete chat">
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-          <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-4 bg-slate-50/60">
-            {state.turns.length === 0 ? (
-              <div className="space-y-3">
-                <div className="flex items-start gap-2 text-sm text-slate-700">
-                  <MessageCircle className="h-4 w-4 mt-0.5 text-violet-600 shrink-0" />
-                  <p>Ask what to work on, or tell me to find, filter or open a shipment — e.g. <em>"open 15665897"</em> or <em>"show ABF shipments that need action"</em>.</p>
-                </div>
-                <div className="flex flex-col gap-2">
-                  {SUGGESTIONS.map((s) => (
-                    <button key={s} onClick={() => send(s)} className="text-left text-sm px-3 py-2 rounded-xl bg-white ring-1 ring-slate-200 hover:ring-violet-300 hover:bg-violet-50 text-slate-800">
-                      {s}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-
+        ) : empty ? (
+          <div className="px-4 py-3">
+            <div className="text-[11px] uppercase font-semibold text-slate-400 mb-1.5">Try</div>
+            <ul>
+              {SUGGESTIONS.map((s) => (
+                <li key={s}>
+                  <button onClick={() => send(s)} className="w-full text-left text-sm px-2 py-1.5 rounded-lg hover:bg-violet-50 text-slate-700 inline-flex items-center gap-2">
+                    <Search className="h-3.5 w-3.5 text-slate-400" /> {s}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
             {state.turns.map((t, i) => t.role === "user" ? (
-              <div key={i} className="flex justify-end">
-                <div className="max-w-[85%] rounded-2xl rounded-br-md bg-violet-600 text-white text-sm px-3.5 py-2 whitespace-pre-wrap break-words">{t.text}</div>
-              </div>
+              <div key={i} className="text-xs font-medium text-slate-500 inline-flex items-center gap-1.5 pt-1"><Search className="h-3 w-3" /> {t.text}</div>
             ) : (
               <div key={i} className="space-y-2">
-                <div className={"text-sm leading-relaxed rounded-2xl rounded-bl-md px-3.5 py-2.5 ring-1 " + (t.error ? "bg-rose-50 text-rose-800 ring-rose-200" : "bg-white text-slate-700 ring-slate-200")}>
-                  {t.error ? t.text : <Rich text={t.text} onInternal={(href) => navigate(href)} />}
+                <div className={"text-sm leading-relaxed " + (t.error ? "rounded-lg px-3 py-2 bg-rose-50 text-rose-800 ring-1 ring-rose-200" : "text-slate-700")}>
+                  {t.error ? t.text : <Rich text={t.text} onInternal={(href) => { navigate(href); setOpen(false); }} />}
                 </div>
                 {t.actions?.length ? (
                   <div className="flex flex-wrap gap-1.5">
                     {t.actions.map((a, j) => (
-                      <button key={j} onClick={() => perform(a)} title="Do this again"
+                      <button key={j} onClick={() => { perform(a); setOpen(false); }} title="Go there again"
                         className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-violet-50 text-violet-800 ring-1 ring-violet-200 hover:bg-violet-100">
                         <ActionIcon a={a} /> {actionLabel(a)}
                       </button>
@@ -293,41 +303,25 @@ export function AssistantPanel() {
                 ) : null}
               </div>
             ))}
-
             {busy && draft ? (
-              <div className="text-sm leading-relaxed rounded-2xl rounded-bl-md px-3.5 py-2.5 ring-1 bg-white text-slate-700 ring-slate-200">
-                <Rich text={draft} onInternal={(href) => navigate(href)} />
+              <div className="text-sm leading-relaxed text-slate-700">
+                <Rich text={draft} onInternal={(href) => { navigate(href); setOpen(false); }} />
                 <span className="inline-block w-1.5 h-4 align-middle bg-violet-400 animate-pulse ml-0.5" />
               </div>
             ) : null}
-            {busy && !draft ? (
-              <div className="flex items-center gap-2 text-xs text-slate-500">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" /> {status || "Thinking…"}
-              </div>
-            ) : null}
+            {busy && !draft ? <div className="text-xs text-slate-500">{status || "Searching…"}</div> : null}
           </div>
+        )}
 
-          )}
-
-          <form onSubmit={(e) => { e.preventDefault(); setShowHistory(false); send(input); }} className="border-t border-slate-100 p-3 bg-white">
-            <div className="flex items-end gap-2 rounded-xl ring-1 ring-slate-200 focus-within:ring-violet-400 px-3 py-2">
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } e.stopPropagation(); }}
-                rows={1}
-                placeholder="Ask about shipments, tasks, carriers…"
-                className="flex-1 resize-none text-sm outline-none max-h-32 bg-transparent"
-              />
-              <button type="submit" disabled={busy || !input.trim()} aria-label="Send"
-                className="h-8 w-8 rounded-lg bg-violet-600 text-white flex items-center justify-center disabled:opacity-40 hover:bg-violet-700 shrink-0">
-                <ArrowUp className="h-4 w-4" />
-              </button>
-            </div>
-          </form>
+        <div className="flex items-center gap-3 px-4 py-2 border-t border-slate-100 bg-slate-50/60 text-[11px] text-slate-500">
+          <span>Searches shipments and tasks by number, name or meaning</span>
+          <span className="ml-auto inline-flex items-center gap-3">
+            {state.turns.length ? <button onClick={() => { setState(fresh()); setShowHistory(false); setInput(""); inputRef.current?.focus(); }} className="inline-flex items-center gap-1 hover:text-slate-900"><RotateCcw className="h-3 w-3" /> New search</button> : null}
+            <button onClick={() => (showHistory ? setShowHistory(false) : openHistory())} className="inline-flex items-center gap-1 hover:text-slate-900"><History className="h-3 w-3" /> History</button>
+            <span>Esc to close</span>
+          </span>
         </div>
-      )}
-    </>
+      </div>
+    </div>
   );
 }

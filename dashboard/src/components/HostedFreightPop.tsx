@@ -38,6 +38,8 @@ export interface HostedFreightPopHandle {
   nav(action: "back" | "forward" | "reload"): void;
 }
 
+type HostedTab = { id: string; title: string; url: string; main?: boolean };
+
 type Status = "connecting" | "live" | "reconnecting" | "denied" | "ended";
 
 // CDP modifier bitmask.
@@ -45,6 +47,7 @@ function modifiers(e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shi
   return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
 }
 const BUTTONS = ["left", "middle", "right"] as const;
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
 
 export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   onBridgeReady?: (ready: boolean) => void;
@@ -68,6 +71,12 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   const wsRef = useRef<WebSocket | null>(null);
   const pendingRef = useRef(new Map<number, (ack: BridgeAck) => void>());
   const nextIdRef = useRef(1);
+  const cutIdsRef = useRef(new Set<number>());
+  // The service reports what is selected in FreightPOP ("selection"), so
+  // Cmd/Ctrl+C can fill the clipboard inside the browser's own copy event.
+  // Older service versions don't report it: then we ask and write afterwards.
+  const selTextRef = useRef("");
+  const selKnownRef = useRef(false);
   const [status, setStatus] = useState<Status>("connecting");
   // Bumped by the Reconnect button to re-run the connection effect.
   const [reconnectKey, setReconnectKey] = useState(0);
@@ -166,7 +175,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token, viewport: viewport(), target }));
       ws.onmessage = (ev) => {
         if (typeof ev.data !== "string") { draw(ev.data as Blob); return; }
-        let m: { type?: string; ready?: boolean; url?: string; id?: number; ack?: BridgeAck; error?: string; reason?: string; value?: boolean; text?: string };
+        let m: { type?: string; ready?: boolean; url?: string; id?: number; ack?: BridgeAck; error?: string; reason?: string; value?: boolean; text?: string; at?: boolean; active?: string; tabs?: HostedTab[] };
         try { m = JSON.parse(ev.data); } catch { return; }
         if (m.type === "ready") { liveThisConn = true; attempt = 0; setStatus("live"); setError(null); lastPauseSent.current = null; syncPause.current(); }
         else if (m.type === "ended") {
@@ -176,7 +185,15 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         else if (m.type === "bridgeReady") cbRef.current.onBridgeReady?.(!!m.ready);
         else if (m.type === "url" && m.url) cbRef.current.onUrl?.(m.url);
         else if (m.type === "signedIn") cbRef.current.onSignedIn?.(!!m.value);
-        else if (m.type === "copyResult") copyToClipboard(m.text || "");
+        else if (m.type === "selection") { selTextRef.current = m.text || ""; selKnownRef.current = true; }
+        else if (m.type === "copyResult") {
+          copyToClipboard(m.text || "", !!m.at);
+          // Cmd/Ctrl+X: the text is on the clipboard — now delete the selection there.
+          if (typeof m.id === "number" && cutIdsRef.current.delete(m.id) && m.text) {
+            for (const event of ["keyDown", "keyUp"]) ws.send(JSON.stringify({ type: "key", event, key: "Delete", code: "Delete", keyCode: 46, modifiers: 0 }));
+          }
+        }
+        else if (m.type === "tabs") { setTabs(Array.isArray(m.tabs) ? m.tabs : []); setActiveTab(m.active || "main"); }
         else if (m.type === "bridgeAck" && typeof m.id === "number") {
           const r = pendingRef.current.get(m.id);
           if (r) { pendingRef.current.delete(m.id); r(m.ack || { ok: false }); }
@@ -184,6 +201,8 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       };
       ws.onclose = (ev) => {
         if (wsRef.current === ws) wsRef.current = null;
+        setTabs([]); setActiveTab("main");
+        selKnownRef.current = false; selTextRef.current = "";
         cbRef.current.onBridgeReady?.(false);
         for (const r of pendingRef.current.values()) r({ ok: false, error: "Hosted browser disconnected" });
         pendingRef.current.clear();
@@ -263,6 +282,14 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   }, []);
   useEffect(() => { pausedRef.current = paused; syncPause.current(); }, [paused]);
 
+  // Tabs in the hosted browser: the FreightPOP tab, windows FreightPOP opened
+  // from it (labels, documents, carrier links) and tabs added with "+".
+  const [tabs, setTabs] = useState<HostedTab[]>([]);
+  const [activeTab, setActiveTab] = useState("main");
+  function tabAction(action: "select" | "close" | "new", id?: string) {
+    send({ type: "tab", action, id });
+    keyTargetRef.current?.focus({ preventScroll: true });
+  }
   const [copyNote, setCopyNote] = useState<string | null>(null);
   const copyNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   function showCopyNote(text: string) {
@@ -270,8 +297,12 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     if (copyNoteTimer.current) clearTimeout(copyNoteTimer.current);
     copyNoteTimer.current = setTimeout(() => setCopyNote(null), 1800);
   }
-  async function copyToClipboard(text: string) {
-    if (!text.trim()) { showCopyNote("Nothing selected — drag over text (or double-click a number) first"); return; }
+  async function copyToClipboard(text: string, atPointer = false) {
+    if (!text.trim()) {
+      showCopyNote(atPointer ? "Nothing to copy there — right-click a number or word, or drag over text first"
+        : "Nothing selected — right-click a number, or drag over text first");
+      return;
+    }
     try {
       await navigator.clipboard.writeText(text);
     } catch {
@@ -286,6 +317,27 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     }
     const one = text.replace(/\s+/g, " ").trim();
     showCopyNote(`Copied “${one.length > 40 ? one.slice(0, 40) + "…" : one}”`);
+  }
+
+  // The browser's own copy/cut (Cmd/Ctrl+C/X, or its Edit menu) while the
+  // hosted view has focus: hand it the text selected in FreightPOP.
+  function onCopy(e: React.ClipboardEvent<HTMLTextAreaElement>, cut: boolean) {
+    e.preventDefault();
+    e.stopPropagation();
+    const text = selTextRef.current;
+    if (selKnownRef.current && text.trim()) {
+      e.clipboardData.setData("text/plain", text);
+      const one = text.replace(/\s+/g, " ").trim();
+      showCopyNote(`${cut ? "Cut" : "Copied"} “${one.length > 40 ? one.slice(0, 40) + "…" : one}”`);
+      if (cut) {
+        for (const event of ["keyDown", "keyUp"]) send({ type: "key", event, key: "Delete", code: "Delete", keyCode: 46, modifiers: 0 });
+        selTextRef.current = "";
+      }
+      return;
+    }
+    const id = Date.now();
+    if (cut) cutIdsRef.current.add(id);
+    send({ type: "copy", id });
   }
 
   function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
@@ -322,24 +374,88 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     const mod = !altGr && (e.metaKey || e.ctrlKey);
     // Leave Cmd/Ctrl+V to the native paste event on the key target (onPaste).
     if (mod && (e.key === "v" || e.key === "V")) return;
-    // Cmd/Ctrl+C: copy FreightPOP's selected text to the user's clipboard
-    // (the remote browser's own clipboard is useless to them).
-    if (mod && !e.shiftKey && !e.altKey && (e.key === "c" || e.key === "C")) {
+    const k = e.key.toLowerCase();
+    // Cmd/Ctrl+C and +X: FreightPOP's selected text goes to the user's own
+    // clipboard (the remote browser's clipboard is useless to them); X also
+    // removes it there.
+    if (mod && !e.shiftKey && !e.altKey && (k === "c" || k === "x")) {
+      // Selection known → don't cancel the key: the browser then fires its
+      // copy/cut event on the key target, and onCopy fills the clipboard.
+      if (selKnownRef.current && selTextRef.current.trim()) return;
       e.preventDefault();
-      if (event === "keyDown") send({ type: "copy", id: Date.now() });
+      if (event === "keyDown") {
+        const id = Date.now();
+        if (k === "x") cutIdsRef.current.add(id);
+        send({ type: "copy", id });
+      }
       return;
     }
     e.preventDefault();
+    // The hosted browser runs on Linux, where shortcuts use Ctrl. Translate
+    // the Mac ones so they do the same thing there:
+    //   Cmd+key → Ctrl+key · Cmd+←/→ → Home/End · Cmd+↑/↓ → Ctrl+Home/End
+    //   Option+←/→/Backspace/Delete → Ctrl+same (move / delete by word)
+    let key = e.key, code = e.code, keyCode = e.keyCode;
+    let mods = altGr ? (e.shiftKey ? 8 : 0) : modifiers(e);
+    if (IS_MAC && !altGr) {
+      const shift = e.shiftKey ? 8 : 0;
+      if (key === "Meta") { key = "Control"; code = "ControlLeft"; keyCode = 17; mods = shift | (event === "keyDown" ? 2 : 0); }
+      else if (e.metaKey && (key === "ArrowLeft" || key === "ArrowRight")) {
+        const home = key === "ArrowLeft";
+        key = code = home ? "Home" : "End"; keyCode = home ? 36 : 35; mods = shift;
+      } else if (e.metaKey && (key === "ArrowUp" || key === "ArrowDown")) {
+        const home = key === "ArrowUp";
+        key = code = home ? "Home" : "End"; keyCode = home ? 36 : 35; mods = shift | 2;
+      } else if (e.metaKey) mods = shift | 2 | (e.altKey ? 1 : 0);
+      else if (e.altKey && !e.ctrlKey && ["ArrowLeft", "ArrowRight", "Backspace", "Delete"].includes(key)) mods = shift | 2;
+    }
+    // Editing shortcuts need naming: a forwarded key press doesn't run them.
+    let commands: string[] | undefined;
+    if (mod && !e.altKey) {
+      if (k === "a" && !e.shiftKey) commands = ["selectAll"];
+      else if (k === "z") commands = [e.shiftKey ? "redo" : "undo"];
+      else if (k === "y" && !e.shiftKey) commands = ["redo"];
+    }
     send({
       type: "key", event,
-      key: e.key, code: e.code, keyCode: e.keyCode,
+      key, code, keyCode,
       text: event === "keyDown" && e.key.length === 1 && !mod ? e.key : (e.key === "Enter" && event === "keyDown" ? "\r" : undefined),
-      modifiers: altGr ? (e.shiftKey ? 8 : 0) : modifiers(e),
+      modifiers: mods,
+      commands,
     });
   }
 
+  const shownTab = tabs.find((t) => t.id === activeTab);
   return (
-    <div ref={wrapRef} className="relative w-full h-full overflow-hidden bg-white">
+    <div className="flex flex-col w-full h-full bg-white">
+      {!watchOnly && tabs.length ? (
+        <div className="shrink-0 flex items-end gap-0.5 px-1.5 pt-1 bg-slate-100 border-b border-slate-200 overflow-x-auto" role="tablist" aria-label="Hosted browser tabs">
+          {tabs.map((t) => {
+            const on = t.id === activeTab;
+            return (
+              <div key={t.id} role="tab" aria-selected={on} title={t.url || t.title}
+                onClick={() => { if (!on) tabAction("select", t.id); }}
+                className={"group flex items-center gap-1.5 min-w-0 max-w-[200px] rounded-t-md pl-2.5 pr-1.5 py-1 text-xs cursor-pointer select-none " +
+                  (on ? "bg-white text-slate-900 font-medium border border-b-0 border-slate-200 -mb-px" : "text-slate-600 hover:bg-slate-200")}>
+                <span className="truncate">{t.title || "New window"}</span>
+                {t.main ? null : (
+                  <button type="button" aria-label={`Close ${t.title || "tab"}`}
+                    onClick={(e) => { e.stopPropagation(); tabAction("close", t.id); }}
+                    className="shrink-0 rounded px-1 leading-none text-slate-400 hover:text-slate-900 hover:bg-slate-300">×</button>
+                )}
+              </div>
+            );
+          })}
+          {tabs.length < 9 ? (
+            <button type="button" onClick={() => tabAction("new")} title="New FreightPOP tab" aria-label="New FreightPOP tab"
+              className="shrink-0 mb-0.5 ml-0.5 rounded px-2 py-0.5 text-sm leading-none text-slate-500 hover:text-slate-900 hover:bg-slate-200">+</button>
+          ) : null}
+          {shownTab && !shownTab.main && /^https?:/i.test(shownTab.url) ? (
+            <a href={shownTab.url} target="_blank" rel="noreferrer" className="ml-auto shrink-0 mb-1 px-1.5 text-[11px] text-sky-700 hover:underline whitespace-nowrap">Open in my browser</a>
+          ) : null}
+        </div>
+      ) : null}
+    <div ref={wrapRef} className="relative flex-1 min-h-0 w-full overflow-hidden bg-white">
       <textarea
         ref={keyTargetRef}
         aria-label="Hosted FreightPOP keyboard input"
@@ -352,6 +468,8 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         onKeyUp={(e) => key(e, "keyUp")}
         onKeyPress={(e) => e.stopPropagation()}
         onPaste={onPaste}
+        onCopy={(e) => onCopy(e, false)}
+        onCut={(e) => onCopy(e, true)}
         // Nothing should ever accumulate here (keys are preventDefault'ed),
         // but clear defensively so IME/dead keys can't leave text behind.
         onInput={(e) => { e.currentTarget.value = ""; }}
@@ -372,9 +490,16 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
           // preventDefault keeps the browser from moving focus to the canvas.
           e.preventDefault();
           keyTargetRef.current?.focus({ preventScroll: true });
+          // Right-click = copy: the selected text, or the number/word under
+          // the pointer. Not forwarded — the remote browser's own right-click
+          // menu can't be seen or used from here.
+          if (e.button === 2) {
+            send({ type: "copyAt", id: Date.now(), x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY });
+            return;
+          }
           mouse(e, "mousePressed", e.detail || 1);
         }}
-        onMouseUp={(e) => mouse(e, "mouseReleased", e.detail || 1)}
+        onMouseUp={(e) => { if (e.button !== 2) mouse(e, "mouseReleased", e.detail || 1); }}
         onMouseMove={(e) => {
           const now = performance.now();
           if (now - lastMoveRef.current < 16 && e.buttons === 0) return;
@@ -409,6 +534,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
           </div>
         </div>
       ) : null}
+    </div>
     </div>
   );
 });

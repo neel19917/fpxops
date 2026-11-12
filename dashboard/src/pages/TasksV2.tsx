@@ -1,14 +1,13 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  AlertTriangle, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, ExternalLink, Filter, Layers, ListChecks,
-  Loader2, Play, RefreshCw, Search, Sparkles, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, Copy, Check, FileText,
+  AlertTriangle, Ban, CheckCircle2, Clock, Filter, Layers, ListChecks,
+  Loader2, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
-  DailySummaryResult, TaskBoard, TaskBoardRow, TaskFlag, TaskPriority, TaskSegment, TaskStatus, TaskTriage, TaskTriageResult,
+  DailySummaryResult, TaskBoard, TaskBoardRow, TaskStatus, TaskTriageResult,
 } from "../lib/types";
-import { carrierTrackingUrl, fmtDate, fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import { KPI } from "../components/KPI";
 import { LoadingState } from "../components/LoadingState";
 import { FpTotalsTrend } from "../components/FpTotalsTrend";
@@ -18,6 +17,18 @@ import { ErrorBlock } from "../components/ErrorBlock";
 import { UserPicker } from "../components/UserPicker";
 import { swrGet, swrSet } from "../lib/swrCache";
 import { setTasksView } from "../lib/tasksView";
+import {
+  BOARD_KEY, OFF_DASHBOARD_WINDOW_MS, PREF_KEY, PRIORITY_WEIGHT, SEGMENT_SHORT, isActive, loadPrefs, looksDelivered,
+  type GroupBy, type Prefs, type SortBy,
+  taskMode,
+} from "../components/tasksV2/shared";
+import { modeLabel } from "../components/ModePicker";
+import { RailItem, RailSection } from "../components/tasksV2/Rail";
+import { GroupRows } from "../components/tasksV2/Rows";
+import { TriagePanel } from "../components/tasksV2/TriagePanel";
+import { DailySummaryPanel } from "../components/tasksV2/DailySummaryPanel";
+import { DismissModal } from "../components/tasksV2/DismissModal";
+import { PromptsDialog, loadAiNotes, saveAiNotes, type AiNotes } from "../components/tasksV2/PromptsDialog";
 
 // ---------------------------------------------------------------------------
 // Tasks v2
@@ -29,146 +40,14 @@ import { setTasksView } from "../lib/tasksView";
 // from stale carrier data, which are stacked on the same shipment, and which
 // are repeat failures — and then to have the heavy model say what to work
 // first. The server does the classification (lib/taskSegments.js); this page
-// is the rail + board + triage panel over it.
+// is the rail + board + triage panel over it. The pieces live in
+// components/tasksV2/ (shared, Rail, Rows, TriagePanel, DailySummaryPanel,
+// DismissModal); this file owns the state and the layout.
 //
 // Deliberately no hard-delete here. "Dismiss" cancels with a reason so the
 // row stays as a dedup tombstone — a deleted task on a still-flagged
 // shipment respawns on the next scrape, which is what produced the
 // "duplicates" complaint in the first place.
-
-type SegFilter = "all" | "attention" | TaskSegment;
-type GroupBy = "none" | "segment" | "carrier" | "customer" | "assignee" | "shipment";
-type SortBy = "smart" | "age" | "priority" | "scrape";
-
-const BOARD_KEY = "tasks.v2.board";
-const PREF_KEY = "fpx.tasks.v2.prefs";
-
-const PRIORITY_WEIGHT: Record<TaskPriority, number> = { urgent: 0, high: 1, normal: 2, low: 3 };
-const PRIORITY_CLS: Record<TaskPriority, string> = {
-  urgent: "bg-rose-100 text-rose-800 ring-rose-200",
-  high: "bg-amber-100 text-amber-800 ring-amber-200",
-  normal: "bg-sky-50 text-sky-800 ring-sky-200",
-  low: "bg-slate-100 text-slate-600 ring-slate-200",
-};
-const STATUS_CLS: Record<TaskStatus, string> = {
-  open: "bg-slate-100 text-slate-700 ring-slate-200",
-  in_progress: "bg-indigo-100 text-indigo-800 ring-indigo-200",
-  blocked: "bg-amber-100 text-amber-800 ring-amber-200",
-  done: "bg-emerald-100 text-emerald-800 ring-emerald-200",
-  cancelled: "bg-slate-100 text-slate-500 ring-slate-200 line-through",
-};
-const STATUS_LABEL: Record<TaskStatus, string> = {
-  open: "Open", in_progress: "In progress", blocked: "Blocked", done: "Done", cancelled: "Dismissed",
-};
-const SEGMENT_CLS: Record<TaskSegment, string> = {
-  redelivery: "bg-rose-50 text-rose-800 ring-rose-200",
-  return_claim: "bg-fuchsia-50 text-fuchsia-800 ring-fuchsia-200",
-  storage_risk: "bg-amber-50 text-amber-900 ring-amber-300",
-  carrier: "bg-sky-50 text-sky-800 ring-sky-200",
-  customer: "bg-teal-50 text-teal-800 ring-teal-200",
-  other: "bg-slate-100 text-slate-700 ring-slate-200",
-};
-const SEGMENT_SHORT: Record<TaskSegment, string> = {
-  redelivery: "Redelivery", return_claim: "Return / claim", storage_risk: "Storage risk", carrier: "Carrier", customer: "Customer", other: "Other",
-};
-const FLAG_CLS: Record<string, string> = {
-  emerald: "bg-emerald-50 text-emerald-800 ring-emerald-200",
-  amber: "bg-amber-50 text-amber-800 ring-amber-200",
-  violet: "bg-violet-50 text-violet-800 ring-violet-200",
-  rose: "bg-rose-50 text-rose-800 ring-rose-200",
-  orange: "bg-orange-50 text-orange-800 ring-orange-200",
-  slate: "bg-slate-100 text-slate-600 ring-slate-200",
-};
-const DISPOSITION_LABEL: Record<string, string> = {
-  resolved: "Resolved upstream", stale: "Stale data", duplicate: "Duplicate", superseded: "Superseded", not_actionable: "Not actionable",
-};
-
-function isActive(s: TaskStatus) { return s === "open" || s === "in_progress" || s === "blocked"; }
-
-// Same bucketing rule as the classic page so a status reads the same color
-// on both boards.
-function shipmentStatusTone(status: string | null | undefined): { label: string; cls: string } {
-  const raw = (status || "").trim();
-  const s = raw.toLowerCase();
-  if (!s) return { label: "no status", cls: "bg-slate-100 text-slate-500 ring-slate-200" };
-  if (s.includes("deliver")) return { label: raw, cls: "bg-emerald-50 text-emerald-800 ring-emerald-200" };
-  if (s.includes("out for")) return { label: raw, cls: "bg-teal-50 text-teal-800 ring-teal-200" };
-  if (s.includes("transit") || s.includes("en route") || s.includes("moving")) return { label: raw, cls: "bg-sky-50 text-sky-800 ring-sky-200" };
-  if (s.includes("issue") || s.includes("exception") || s.includes("problem") || s.includes("delay")) return { label: raw, cls: "bg-rose-50 text-rose-800 ring-rose-200" };
-  if (s.includes("pickup") || s.includes("booked") || s.includes("scheduled") || s.includes("dispatch")) return { label: raw, cls: "bg-amber-50 text-amber-800 ring-amber-200" };
-  return { label: raw, cls: "bg-slate-100 text-slate-700 ring-slate-200" };
-}
-
-function Pill({ children, cls, title }: { children: ReactNode; cls: string; title?: string }) {
-  return (
-    <span className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded ring-1 whitespace-nowrap ${cls}`} title={title}>
-      {children}
-    </span>
-  );
-}
-
-// Tracking number as a link: click opens the task/shipment in the drawer,
-// the small arrow opens the carrier's public tracking page in a new tab.
-function TrackingLink({ tracking, carrier, onOpen, className = "" }: {
-  tracking: string | null | undefined; carrier?: string | null; onOpen?: () => void; className?: string;
-}) {
-  const tn = (tracking || "").trim();
-  if (!tn) return <span className={`font-mono text-slate-400 ${className}`}>—</span>;
-  const ext = carrierTrackingUrl(carrier, tn);
-  return (
-    <span className={`inline-flex items-center gap-0.5 ${className}`}>
-      {onOpen ? (
-        <button type="button" onClick={onOpen} className="font-mono text-sky-700 hover:text-sky-900 hover:underline" title="Open in FPX">{tn}</button>
-      ) : (
-        <span className="font-mono text-slate-800">{tn}</span>
-      )}
-      {ext ? (
-        <a href={ext} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className="text-slate-400 hover:text-sky-700" title={`Track on ${carrier || "carrier site"}`} aria-label="Carrier tracking page">
-          <ExternalLink className="h-3 w-3" />
-        </a>
-      ) : null}
-    </span>
-  );
-}
-
-// Strip the "Carrier followup: Redelivery — " scaffolding so the title
-// column shows the actual ask; the segment badge already says the rest.
-function shortTitle(title: string): string {
-  return title
-    .replace(/^(carrier|customer) followup:\s*/i, "")
-    .replace(/^(redelivery|return\/claim|storage risk) — /i, "")
-    .trim();
-}
-
-interface Prefs { seg: SegFilter; flags: TaskFlag[]; groupBy: GroupBy; sortBy: SortBy; triageOpen: boolean; dailyOpen: boolean; includeClosed: boolean; onDashboardOnly: boolean }
-const DEFAULT_PREFS: Prefs = { seg: "all", flags: [], groupBy: "none", sortBy: "smart", triageOpen: true, dailyOpen: true, includeClosed: false, onDashboardOnly: true };
-
-// A shipment has "left the FreightPOP dashboard" when it wasn't seen within
-// this long of the NEWEST scrape on the board. Relative to the latest scrape,
-// not to now, so a quiet day without scraping doesn't hide every task.
-// (Delivered shipments drop off FreightPOP's dashboard; the full-sweep
-// auto-archive only runs when a Refresh All completes unfiltered.)
-const OFF_DASHBOARD_WINDOW_MS = 24 * 3600_000;
-
-// Delivered shipments FreightPOP still lists as "In Transit" (signed POD, no
-// status flip yet): the tracking comment or the AI's read says delivered and
-// nothing's wrong. Claim / damage / return / redelivery tasks stay — those
-// are exactly the post-delivery work.
-const POST_DELIVERY_WORK = /\b(claim|damage|shortage|overage|refus|return|redeliver|storage|osd)\w*/i;
-function looksDelivered(r: TaskBoardRow): boolean {
-  const s = r.shipment;
-  if (!s) return false;
-  if (POST_DELIVERY_WORK.test(`${r.task.title || ""} ${r.task.description || ""}`)) return false;
-  if (s.delivery_date) return true;
-  if (/^\s*delivered\b/i.test(s.tracking_comments || "")) return true;
-  return String(s.action_required || "").toUpperCase() === "NO" && /\bdelivered (on|at)\b/i.test(s.ai_issue || "");
-}
-function loadPrefs(): Prefs {
-  try {
-    const raw = localStorage.getItem(PREF_KEY);
-    return raw ? { ...DEFAULT_PREFS, ...JSON.parse(raw) } : DEFAULT_PREFS;
-  } catch { return DEFAULT_PREFS; }
-}
 
 export function TasksV2Page() {
   const { profile: me } = useAuth();
@@ -184,6 +63,7 @@ export function TasksV2Page() {
   const [search, setSearch] = useState("");
   const [assigneeFilter, setAssigneeFilter] = useState<string>("");
   const [carrierFilter, setCarrierFilter] = useState<string>("");
+  const [modeFilter, setModeFilter] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [assignTo, setAssignTo] = useState<string | null>(null);
@@ -196,6 +76,12 @@ export function TasksV2Page() {
   const [daily, setDaily] = useState<DailySummaryResult | null>(null);
   const [dailyBusy, setDailyBusy] = useState(false);
   const [dailyError, setDailyError] = useState<string | null>(null);
+  // Per-user extra instructions sent with each AI run (AI prompts dialog).
+  const [aiNotes, setAiNotes] = useState<AiNotes>(loadAiNotes);
+  useEffect(() => { saveAiNotes(aiNotes); }, [aiNotes]);
+  const [promptsOpen, setPromptsOpen] = useState(false);
+  const [guideOpen, setGuideOpen] = useState(() => { try { return localStorage.getItem("fpx.tasks.v2.guide") !== "hidden"; } catch { return true; } });
+  const setGuide = (open: boolean) => { setGuideOpen(open); try { localStorage.setItem("fpx.tasks.v2.guide", open ? "shown" : "hidden"); } catch { /* ignore */ } };
 
   async function load(silent = false) {
     if (!silent) setLoading(true);
@@ -220,7 +106,7 @@ export function TasksV2Page() {
     if (dailyBusy) return;
     setDailyBusy(true); setDailyError(null);
     try {
-      const r = await api.tasks.v2DailySummary({ hours });
+      const r = await api.tasks.v2DailySummary({ hours, notes: aiNotes.daily.trim() || undefined });
       setDaily(r);
       setPref("dailyOpen", true);
     } catch (e) { setDailyError((e as Error).message); }
@@ -285,6 +171,7 @@ export function TasksV2Page() {
     }
     for (const f of prefs.flags) list = list.filter((r) => r.seg.flags.includes(f));
     if (assigneeFilter) list = list.filter((r) => ((r.task.assigned_to || "").trim() || "(unassigned)") === assigneeFilter);
+    if (modeFilter) list = list.filter((r) => (taskMode(r) || "(none)") === modeFilter);
     if (carrierFilter) list = list.filter((r) => ((r.shipment?.carrier_name || r.shipment?.carrier || "").trim() || "(unknown)") === carrierFilter);
     const q = search.trim().toLowerCase();
     if (q) {
@@ -314,7 +201,7 @@ export function TasksV2Page() {
       sorted.sort((a, b) => score(a) - score(b) || age(a) - age(b));
     }
     return sorted;
-  }, [rows, prefs.seg, prefs.flags, prefs.sortBy, prefs.onDashboardOnly, offDashboardIds, assigneeFilter, carrierFilter, search, triageRank]);
+  }, [rows, prefs.seg, prefs.flags, prefs.sortBy, prefs.onDashboardOnly, offDashboardIds, assigneeFilter, carrierFilter, modeFilter, search, triageRank]);
 
   // Open a task in the drawer. Router state tells the /tasks/:id route we
   // came from v2 and hands it the board's current active order, so the
@@ -332,6 +219,7 @@ export function TasksV2Page() {
         case "carrier": return (r.shipment?.carrier_name || r.shipment?.carrier || "").trim() || "(unknown carrier)";
         case "customer": return (r.shipment?.customer_name || "").trim() || "(unknown customer)";
         case "assignee": return nameOf(r.task.assigned_to) || "(unassigned)";
+        case "mode": return taskMode(r) ? modeLabel(taskMode(r)) : "(no mode)";
         case "shipment": return r.shipment ? `${r.shipment.tracking_number || "?"} · ${r.shipment.customer_name || ""}` : "(no shipment)";
         default: return "";
       }
@@ -342,6 +230,26 @@ export function TasksV2Page() {
       .sort((a, b) => b.rows.length - a.rows.length || a.label.localeCompare(b.label));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, prefs.groupBy, people]);
+
+  // Shipment mode: counts for the filter (active tasks) and bulk-complete of
+  // whatever the mode filter currently shows.
+  const modeCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of rows) if (isActive(r.task.status)) { const k = taskMode(r) || "(none)"; m.set(k, (m.get(k) || 0) + 1); }
+    return Array.from(m.entries()).sort((a, b) => b[1] - a[1]);
+  }, [rows]);
+  const modeActiveIds = useMemo(() => (modeFilter ? visible.filter((r) => isActive(r.task.status)).map((r) => r.task.id) : []), [visible, modeFilter]);
+  async function completeMode() {
+    if (!modeActiveIds.length || bulkBusy) return;
+    const label = modeFilter === "(none)" ? "no-mode" : modeLabel(modeFilter);
+    if (!window.confirm(`Mark ${modeActiveIds.length} ${label} task${modeActiveIds.length === 1 ? "" : "s"} as done?\n\nThis covers the tasks currently listed (other filters and search apply). You can reopen them from "Show recently closed".`)) return;
+    setBulkBusy(true); setError(null);
+    try {
+      for (let i = 0; i < modeActiveIds.length; i += 200) await api.tasks.bulkUpdate({ ids: modeActiveIds.slice(i, i + 200), status: "done" });
+      setSelected(new Set()); await load(true);
+    } catch (e) { setError((e as Error).message); }
+    finally { setBulkBusy(false); }
+  }
 
   const visibleIds = useMemo(() => visible.map((r) => r.task.id), [visible]);
   const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
@@ -392,7 +300,7 @@ export function TasksV2Page() {
     if (triageBusy) return;
     setTriageBusy(true); setTriageError(null);
     try {
-      const r = await api.tasks.v2Triage(scope);
+      const r = await api.tasks.v2Triage({ ...scope, notes: aiNotes.triage.trim() || undefined });
       setTriage(r);
       setPref("triageOpen", true);
     } catch (e) {
@@ -443,6 +351,8 @@ export function TasksV2Page() {
   const assignees = useMemo(() => Object.entries(summary?.by_assignee ?? {}).sort((a, b) => b[1] - a[1]), [summary]);
   const carriers = useMemo(() => Object.entries(summary?.by_carrier ?? {}).sort((a, b) => b[1] - a[1]), [summary]);
 
+  const segmentHelp = useMemo(() => Object.fromEntries((board?.segments ?? []).map((x) => [x.id, x.description])), [board]);
+
   const selectedActive = Array.from(selected).filter((id) => { const r = rowById.get(id); return r && isActive(r.task.status); });
 
   return (
@@ -454,7 +364,8 @@ export function TasksV2Page() {
             <Layers className="h-6 w-6 text-slate-700" /> Tasks <span className="text-xs font-semibold uppercase tracking-wide bg-violet-100 text-violet-800 ring-1 ring-violet-200 rounded px-1.5 py-0.5">v2</span>
           </h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Segmented board with health flags. Stale = no scrape in {staleDays}d. Dismiss keeps a record so tasks don't respawn.
+            Follow-ups the AI raised from the latest scrapes. Filter on the left, open a row to see why it exists, then start, finish or dismiss it.
+            {!guideOpen ? <button onClick={() => setGuide(true)} className="ml-2 text-violet-700 hover:underline inline-flex items-center gap-1"><HelpCircle className="h-3.5 w-3.5" /> How this works</button> : null}
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
@@ -466,6 +377,11 @@ export function TasksV2Page() {
             <Undo2 className="h-4 w-4" /> Legacy view
           </button>
           {isAdmin ? <TaskRulesButton /> : null}
+          <button onClick={() => setPromptsOpen(true)} className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50"
+            title={aiNotes.triage || aiNotes.daily ? "Your extra instructions are on for the next AI run" : "See or change what the AI is told for triage and the daily summary"}>
+            <MessageSquareText className="h-4 w-4" /> AI prompts
+            {aiNotes.triage || aiNotes.daily ? <span className="h-2 w-2 rounded-full bg-violet-500" aria-label="Extra instructions on" /> : null}
+          </button>
           <button onClick={() => load()} className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50" title="Reload board">
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh
           </button>
@@ -493,6 +409,23 @@ export function TasksV2Page() {
       </div>
 
       {error ? <div className="mb-4"><ErrorBlock>{error}</ErrorBlock></div> : null}
+
+      {/* First-visit guide */}
+      {guideOpen ? (
+        <div className="mb-4 rounded-2xl ring-1 ring-violet-200 bg-violet-50/60 p-4">
+          <div className="flex items-center justify-between mb-2">
+            <div className="font-semibold text-slate-900 text-sm inline-flex items-center gap-1.5"><HelpCircle className="h-4 w-4 text-violet-600" /> How this board works</div>
+            <button onClick={() => setGuide(false)} className="text-xs text-slate-600 hover:text-slate-900 inline-flex items-center gap-1"><X className="h-3.5 w-3.5" /> Got it, hide</button>
+          </div>
+          <ol className="grid md:grid-cols-4 gap-3 text-xs text-slate-700">
+            <li><span className="font-semibold text-slate-900">1. Pick what to look at.</span> The left side filters by task type, health and owner. "Needs attention" is redeliveries, returns/claims, storage risk and repeat failures.</li>
+            <li><span className="font-semibold text-slate-900">2. See why.</span> Click "Why this task?" on a row for the AI's finding, the suggested next step, what each badge means, and a box to add a note.</li>
+            <li><span className="font-semibold text-slate-900">3. Act.</span> ▶ starts a task, ✓ marks it done, ⊘ dismisses it with a reason. Dismissed tasks stay on record, so they aren't created again on the next scrape.</li>
+            <li><span className="font-semibold text-slate-900">4. Let the AI sort it.</span> "AI triage" ranks what to work first and lists tasks that are probably no longer needed. "AI prompts" lets you add your own instructions.</li>
+          </ol>
+          <div className="text-[11px] text-slate-500 mt-2">Stale = the shipment hasn't been scraped in {staleDays}+ days, so the task may be working from old data.</div>
+        </div>
+      ) : null}
 
       {/* KPI strip */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
@@ -587,6 +520,17 @@ export function TasksV2Page() {
               <option value="">All carriers</option>
               {carriers.map(([c, n]) => <option key={c} value={c}>{c} ({n})</option>)}
             </select>
+            <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value)} className="rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white" aria-label="Shipment mode">
+              <option value="">All modes</option>
+              {modeCounts.map(([m, n]) => <option key={m} value={m}>{m === "(none)" ? "No mode" : modeLabel(m)} ({n})</option>)}
+            </select>
+            {modeFilter && modeActiveIds.length ? (
+              <button type="button" disabled={bulkBusy} onClick={completeMode}
+                title="Marks every open, in-progress or blocked task in the list below as done"
+                className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 text-white px-3 py-2 text-sm hover:bg-emerald-700 disabled:opacity-50">
+                <CheckCircle2 className="h-4 w-4" /> Complete all {modeActiveIds.length} {modeFilter === "(none)" ? "no-mode" : modeLabel(modeFilter)} shown
+              </button>
+            ) : null}
             <label className="inline-flex items-center gap-1.5 text-sm text-slate-600">
               <Filter className="h-4 w-4 text-slate-400" />
               <select value={prefs.groupBy} onChange={(e) => setPref("groupBy", e.target.value as GroupBy)} className="rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white" aria-label="Group by">
@@ -595,11 +539,12 @@ export function TasksV2Page() {
                 <option value="carrier">Group: carrier</option>
                 <option value="customer">Group: customer</option>
                 <option value="assignee">Group: owner</option>
+                <option value="mode">Group: mode</option>
                 <option value="shipment">Group: shipment</option>
               </select>
             </label>
             <select value={prefs.sortBy} onChange={(e) => setPref("sortBy", e.target.value as SortBy)} className="rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white" aria-label="Sort">
-              <option value="smart">Sort: smart (triage → attention → priority)</option>
+              <option value="smart">Sort: recommended (AI rank, then urgent)</option>
               <option value="priority">Sort: priority</option>
               <option value="age">Sort: oldest first</option>
               <option value="scrape">Sort: stalest data first</option>
@@ -643,7 +588,8 @@ export function TasksV2Page() {
                   <th className="px-3 py-2 w-8"><input type="checkbox" checked={allChecked} onChange={toggleAll} aria-label="Select all visible" className="accent-violet-600" /></th>
                   <th className="text-left px-3 py-2">Task</th>
                   <th className="text-left px-3 py-2">Shipment</th>
-                  <th className="text-left px-3 py-2 w-28">Data</th>
+                  <th className="text-left px-3 py-2 w-20" title="Shipment mode from FreightPOP (LTL, FTL, Parcel)">Mode</th>
+                  <th className="text-left px-3 py-2 w-28" title="When this shipment was last read from FreightPOP">Last scraped</th>
                   <th className="text-left px-3 py-2 w-20">Age</th>
                   <th className="text-left px-3 py-2 w-32">Owner</th>
                   <th className="text-left px-3 py-2 w-24">Status</th>
@@ -651,9 +597,9 @@ export function TasksV2Page() {
                 </tr>
               </thead>
               <tbody>
-                {loading && !rows.length ? <LoadingState variant="row" colSpan={8} /> : null}
+                {loading && !rows.length ? <LoadingState variant="row" colSpan={9} /> : null}
                 {!loading && !visible.length ? (
-                  <tr><td colSpan={8} className="p-10 text-center text-slate-500">
+                  <tr><td colSpan={9} className="p-10 text-center text-slate-500">
                     {rows.length ? "No tasks match these filters." : "No active tasks. 🎉"}
                     {(prefs.flags.length || prefs.seg !== "all" || assigneeFilter || carrierFilter || search) ? (
                       <div className="mt-2"><button onClick={() => { setPref("seg", "all"); setPref("flags", []); setAssigneeFilter(""); setCarrierFilter(""); setSearch(""); }} className="text-sky-700 hover:underline inline-flex items-center gap-1 text-sm"><RotateCcw className="h-3.5 w-3.5" /> Reset filters</button></div>
@@ -676,6 +622,7 @@ export function TasksV2Page() {
                       closeCandidateIds={closeCandidateIds}
                       staleDays={staleDays}
                       flagsMeta={board?.flags ?? []}
+                      segmentHelp={segmentHelp}
                       people={people}
                       onOpen={(id) => openTask(id)}
                       onStatus={setStatus}
@@ -689,6 +636,8 @@ export function TasksV2Page() {
         </div>
       </div>
 
+      {promptsOpen ? <PromptsDialog notes={aiNotes} onNotes={setAiNotes} isAdmin={isAdmin} onClose={() => setPromptsOpen(false)} /> : null}
+
       {dismissing ? (
         <DismissModal
           count={dismissing.ids.length}
@@ -700,527 +649,6 @@ export function TasksV2Page() {
           busy={bulkBusy}
         />
       ) : null}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Rail
-// ---------------------------------------------------------------------------
-function RailSection({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
-  return (
-    <div className="rounded-2xl ring-1 ring-slate-200 bg-white p-2 shadow-sm">
-      <div className="px-2 pt-1 pb-1.5 flex items-baseline justify-between">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{title}</div>
-        {hint ? <div className="text-[10px] text-slate-400">{hint}</div> : null}
-      </div>
-      <div className="space-y-0.5">{children}</div>
-    </div>
-  );
-}
-
-function RailItem({ active, onClick, label, count, title, tone, checkbox }: {
-  active: boolean; onClick: () => void; label: string; count: number; title?: string; tone?: string; checkbox?: boolean;
-}) {
-  const dot = tone ? (FLAG_CLS[tone] || FLAG_CLS.slate) : "";
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      className={`w-full flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-sm text-left transition ${active ? "bg-violet-50 text-violet-900 ring-1 ring-violet-200" : "text-slate-700 hover:bg-slate-50"}`}
-    >
-      <span className="inline-flex items-center gap-2 min-w-0">
-        {checkbox ? <span className={`h-3.5 w-3.5 rounded ring-1 inline-flex items-center justify-center ${active ? "bg-violet-600 ring-violet-600 text-white" : "bg-white ring-slate-300"}`}>{active ? <CheckCircle2 className="h-3 w-3" /> : null}</span> : null}
-        {tone && !checkbox ? <span className={`h-2 w-2 rounded-full ring-1 ${dot}`} /> : null}
-        <span className="truncate">{label}</span>
-      </span>
-      <span className={`text-xs tabular-nums ${count ? "text-slate-600" : "text-slate-300"}`}>{count}</span>
-    </button>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Rows
-// ---------------------------------------------------------------------------
-function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, selected, toggle, triageRank, closeCandidateIds, staleDays, flagsMeta, people, onOpen, onStatus, onDismiss }: {
-  group: { key: string; label: string; rows: TaskBoardRow[] };
-  showHeader: boolean; collapsed: boolean; onToggle: () => void; onSelectGroup: () => void;
-  selected: Set<string>; toggle: (id: string) => void;
-  triageRank: Map<string, number>; closeCandidateIds: Set<string>; staleDays: number;
-  flagsMeta: { id: TaskFlag; label: string; tone: string; description: string }[];
-  people: Record<string, string>;
-  onOpen: (id: string) => void; onStatus: (id: string, s: TaskStatus, opts?: { open?: boolean }) => void; onDismiss: (id: string) => void;
-}) {
-  const flagMeta = useMemo(() => new Map(flagsMeta.map((f) => [f.id, f])), [flagsMeta]);
-  return (
-    <>
-      {showHeader ? (
-        <tr className="bg-slate-50/70 border-t border-slate-200">
-          <td colSpan={8} className="px-3 py-1.5">
-            <div className="flex items-center gap-2 text-sm">
-              <button onClick={onToggle} className="inline-flex items-center gap-1 font-medium text-slate-800 hover:text-slate-950">
-                {collapsed ? <ChevronRight className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
-                {group.label}
-              </button>
-              <span className="text-xs text-slate-500">{group.rows.length}</span>
-              <button onClick={onSelectGroup} className="ml-auto text-xs text-sky-700 hover:underline">Select group</button>
-            </div>
-          </td>
-        </tr>
-      ) : null}
-      {!collapsed ? group.rows.map((r) => (
-        <TaskRow
-          key={r.task.id}
-          row={r}
-          checked={selected.has(r.task.id)}
-          onCheck={() => toggle(r.task.id)}
-          rank={triageRank.get(r.task.id)}
-          closeCandidate={closeCandidateIds.has(r.task.id)}
-          staleDays={staleDays}
-          flagMeta={flagMeta}
-          people={people}
-          onOpen={() => onOpen(r.task.id)}
-          onStatus={(s, opts) => onStatus(r.task.id, s, opts)}
-          onDismiss={() => onDismiss(r.task.id)}
-        />
-      )) : null}
-    </>
-  );
-}
-
-function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagMeta, people, onOpen, onStatus, onDismiss }: {
-  row: TaskBoardRow; checked: boolean; onCheck: () => void; rank?: number; closeCandidate: boolean; staleDays: number;
-  flagMeta: Map<string, { id: TaskFlag; label: string; tone: string; description: string }>;
-  people: Record<string, string>;
-  onOpen: () => void; onStatus: (s: TaskStatus, opts?: { open?: boolean }) => void; onDismiss: () => void;
-}) {
-  const { task: t, shipment: s, seg } = row;
-  const active = isActive(t.status);
-  const moot = seg.flags.includes("resolved_upstream");
-  const stale = seg.flags.includes("stale");
-  const st = shipmentStatusTone(s?.shipment_status);
-  return (
-    <tr className={`border-t border-slate-100 align-top ${checked ? "bg-violet-50/40" : moot ? "bg-emerald-50/20" : ""} ${!active ? "opacity-60" : ""}`}>
-      <td className="px-3 py-2.5"><input type="checkbox" checked={checked} onChange={onCheck} aria-label="Select task" className="accent-violet-600 mt-0.5" /></td>
-      <td className="px-3 py-2.5 min-w-[22rem]">
-        <div className="flex items-center gap-1.5 flex-wrap mb-1">
-          {rank !== undefined ? <Pill cls="bg-violet-600 text-white ring-violet-600" title="AI triage priority rank">#{rank}</Pill> : null}
-          <Pill cls={SEGMENT_CLS[seg.segment]}>{SEGMENT_SHORT[seg.segment]}{seg.attempt && seg.attempt > 1 ? ` · attempt ${seg.attempt}` : ""}</Pill>
-          <Pill cls={PRIORITY_CLS[t.priority]}>{t.priority}</Pill>
-          {seg.flags.filter((f) => f !== "unassigned" && f !== "blocked").map((f) => {
-            const m = flagMeta.get(f);
-            return <Pill key={f} cls={FLAG_CLS[m?.tone || "slate"]} title={m?.description}>{m?.label || f}</Pill>;
-          })}
-          {closeCandidate ? <Pill cls="bg-emerald-600 text-white ring-emerald-600" title="AI triage suggests dismissing this task">AI: close</Pill> : null}
-        </div>
-        <button onClick={onOpen} className="text-left font-medium text-slate-900 hover:text-sky-700 leading-snug line-clamp-2" title={t.title}>{shortTitle(t.title)}</button>
-        {seg.health ? <div className="text-xs text-slate-500 mt-0.5">{seg.health}</div> : null}
-      </td>
-      <td className="px-3 py-2.5 min-w-[14rem]">
-        {s ? (
-          <div className="space-y-0.5">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <TrackingLink tracking={s.tracking_number} carrier={s.carrier_name || s.carrier} onOpen={onOpen} className="text-xs" />
-              {s.shipment_id ? <span className="text-[11px] text-slate-400">#{s.shipment_id}</span> : null}
-              {s.mode ? <span className="text-[10px] uppercase tracking-wide text-slate-400">{s.mode}</span> : null}
-            </div>
-            <div className="text-xs text-slate-700 truncate max-w-[16rem]" title={s.customer_name || ""}>{s.customer_name || "—"}</div>
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-xs text-slate-500 truncate max-w-[9rem]" title={s.carrier_name || s.carrier || ""}>{s.carrier_name || s.carrier || "—"}</span>
-              <Pill cls={st.cls}>{st.label}</Pill>
-              {s.delivery_date ? <Pill cls="bg-emerald-100 text-emerald-800 ring-emerald-200" title={`Delivered ${fmtDate(s.delivery_date)}`}>delivered</Pill>
-                : s.updated_eta ? <span className="text-[11px] text-slate-500">ETA {fmtDate(s.updated_eta)}</span> : null}
-            </div>
-          </div>
-        ) : <span className="text-xs text-slate-400">no shipment</span>}
-      </td>
-      <td className="px-3 py-2.5">
-        {s ? (
-          <div className={`text-xs ${stale ? "text-amber-700 font-medium" : "text-slate-600"}`} title={s.scraped_at ? `Scraped ${fmtDate(s.scraped_at)} · stale after ${staleDays}d` : "Never scraped"}>
-            <div>{s.scraped_at ? fmtRelative(s.scraped_at) : "never"}</div>
-            <div className="text-[11px] text-slate-400">scraped</div>
-          </div>
-        ) : null}
-      </td>
-      <td className="px-3 py-2.5 text-xs text-slate-600" title={`Created ${fmtDate(t.created_at)}`}>{seg.age_days === null ? "—" : seg.age_days === 0 ? "today" : `${seg.age_days}d`}</td>
-      <td className="px-3 py-2.5 text-xs">
-        {t.assigned_to ? <span className="text-slate-800" title={t.assigned_to}>{people[t.assigned_to] || t.assigned_to}</span> : <Pill cls={FLAG_CLS.slate}>unassigned</Pill>}
-      </td>
-      <td className="px-3 py-2.5"><Pill cls={STATUS_CLS[t.status]}>{STATUS_LABEL[t.status]}</Pill></td>
-      <td className="px-3 py-2.5">
-        <div className="flex items-center justify-end gap-1">
-          {t.status === "open" ? (
-            <IconBtn title="Start and open" onClick={() => onStatus("in_progress", { open: true })} cls="text-indigo-700 hover:bg-indigo-50"><Play className="h-4 w-4" /></IconBtn>
-          ) : null}
-          {active ? (
-            <IconBtn title="Mark done" onClick={() => onStatus("done")} cls="text-emerald-700 hover:bg-emerald-50"><CheckCircle2 className="h-4 w-4" /></IconBtn>
-          ) : (
-            <IconBtn title="Reopen" onClick={() => onStatus("open")} cls="text-slate-600 hover:bg-slate-100"><RotateCcw className="h-4 w-4" /></IconBtn>
-          )}
-          {active ? <IconBtn title="Dismiss with reason" onClick={onDismiss} cls="text-slate-500 hover:bg-slate-100"><Ban className="h-4 w-4" /></IconBtn> : null}
-          <IconBtn title="Open shipment" onClick={onOpen} cls="text-sky-700 hover:bg-sky-50"><ExternalLink className="h-4 w-4" /></IconBtn>
-        </div>
-      </td>
-    </tr>
-  );
-}
-
-function IconBtn({ children, title, onClick, cls }: { children: ReactNode; title: string; onClick: () => void; cls: string }) {
-  return <button type="button" title={title} aria-label={title} onClick={onClick} className={`p-1.5 rounded-md transition ${cls}`}>{children}</button>;
-}
-
-// ---------------------------------------------------------------------------
-// Triage panel
-// ---------------------------------------------------------------------------
-function TriagePanel({ result, busy, error, open, onToggle, rowById, people, onOpen, onStart, onDismissOne, onDismissAll, onSelectBatch }: {
-  result: TaskTriageResult | null; busy: boolean; error: string | null; open: boolean; onToggle: () => void;
-  rowById: Map<string, TaskBoardRow>; people: Record<string, string>;
-  onOpen: (id: string) => void; onStart: (id: string) => void;
-  onDismissOne: (id: string, disposition: string, reason: string) => void; onDismissAll: () => void;
-  onSelectBatch: (ids: string[]) => void;
-}) {
-  const tri: TaskTriage | null = result?.triage ?? null;
-  const has = !!tri && (tri.priority_queue.length || tri.close_candidates.length || tri.batches.length || tri.summary);
-  const liveClose = (tri?.close_candidates ?? []).filter((c) => { const r = rowById.get(c.task_id); return r && isActive(r.task.status); });
-  return (
-    <div className="rounded-2xl ring-1 ring-violet-200 bg-gradient-to-br from-violet-50/70 to-white shadow-sm mb-4">
-      <button onClick={onToggle} className="w-full flex items-center gap-2 px-4 py-3 text-left">
-        {open ? <ChevronDown className="h-4 w-4 text-violet-500" /> : <ChevronRight className="h-4 w-4 text-violet-500" />}
-        <Sparkles className="h-4 w-4 text-violet-600" />
-        <span className="font-semibold text-slate-900">AI triage</span>
-        {result?.created_at ? (
-          <span className="text-xs text-slate-500">
-            {fmtRelative(result.created_at)} · {result.model || "model"} · {result.count ?? "?"} tasks{result.cost_usd != null ? ` · ${fmtUsd(result.cost_usd)}` : ""}{result.scope ? ` · ${result.scope}` : ""}
-          </span>
-        ) : <span className="text-xs text-slate-500">No triage run yet</span>}
-        {busy ? <span className="ml-auto text-xs text-violet-700 inline-flex items-center gap-1"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Running the heavy model over the board… this can take a minute</span> : null}
-      </button>
-      {open ? (
-        <div className="px-4 pb-4">
-          {error ? <div className="mb-3"><ErrorBlock>{error}</ErrorBlock></div> : null}
-          {!has && !busy ? (
-            <div className="text-sm text-slate-600">
-              Run <span className="font-medium">AI triage board</span> to have the heavy model rank what to work first, flag tasks that are probably moot, and batch tasks that should be handled in one call.
-            </div>
-          ) : null}
-          {tri?.summary ? <p className="text-sm text-slate-800 mb-3 leading-relaxed">{tri.summary}</p> : null}
-          {tri?.risks?.length ? (
-            <ul className="mb-3 space-y-1">
-              {tri.risks.map((r, i) => <li key={i} className="text-xs text-amber-900 bg-amber-50 ring-1 ring-amber-200 rounded-md px-2 py-1 inline-flex items-start gap-1.5 mr-1.5"><AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />{r}</li>)}
-            </ul>
-          ) : null}
-          {has ? (
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
-              <TriageColumn title={`Work first (${tri!.priority_queue.length})`} tone="violet">
-                {tri!.priority_queue.map((p) => {
-                  const r = rowById.get(p.task_id);
-                  if (!r) return null;
-                  return (
-                    <div key={p.task_id} className="rounded-lg bg-white ring-1 ring-slate-200 p-2.5 text-xs">
-                      <div className="flex items-center gap-1.5 mb-1">
-                        <Pill cls="bg-violet-600 text-white ring-violet-600">#{p.rank}</Pill>
-                        <Pill cls={SEGMENT_CLS[r.seg.segment]}>{SEGMENT_SHORT[r.seg.segment]}</Pill>
-                        <TrackingLink tracking={r.shipment?.tracking_number} carrier={r.shipment?.carrier_name || r.shipment?.carrier} onOpen={() => onOpen(p.task_id)} />
-                        <span className="text-slate-500 truncate">{r.shipment?.customer_name || ""}</span>
-                      </div>
-                      <div className="text-slate-800 font-medium line-clamp-2">{shortTitle(r.task.title)}</div>
-                      {p.reason ? <div className="text-slate-600 mt-1"><span className="font-medium text-slate-700">Why:</span> {p.reason}</div> : null}
-                      {p.first_action ? <div className="text-slate-600 mt-0.5"><span className="font-medium text-slate-700">First:</span> {p.first_action}</div> : null}
-                      <div className="flex items-center gap-1 mt-1.5">
-                        {r.task.status === "open" ? <button onClick={() => onStart(p.task_id)} className="inline-flex items-center gap-1 rounded-md bg-indigo-600 text-white px-2 py-1 hover:bg-indigo-700"><Play className="h-3 w-3" /> Start</button> : null}
-                        <button onClick={() => onOpen(p.task_id)} className="inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2 py-1 hover:bg-slate-50 text-slate-700"><ExternalLink className="h-3 w-3" /> Open</button>
-                        <span className="ml-auto text-slate-400">{r.task.assigned_to ? (people[r.task.assigned_to] || r.task.assigned_to) : "unassigned"}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </TriageColumn>
-              <TriageColumn
-                title={`Probably moot (${liveClose.length})`}
-                tone="emerald"
-                action={liveClose.length ? <button onClick={onDismissAll} className="text-xs inline-flex items-center gap-1 rounded-md bg-emerald-600 text-white px-2 py-1 hover:bg-emerald-700"><Ban className="h-3 w-3" /> Dismiss all {liveClose.length}</button> : undefined}
-              >
-                {liveClose.map((c) => {
-                  const r = rowById.get(c.task_id)!;
-                  return (
-                    <div key={c.task_id} className="rounded-lg bg-white ring-1 ring-slate-200 p-2.5 text-xs">
-                      <div className="flex items-center gap-1.5 mb-1">
-                        <Pill cls="bg-emerald-100 text-emerald-800 ring-emerald-200">{DISPOSITION_LABEL[c.disposition] || c.disposition}</Pill>
-                        <TrackingLink tracking={r.shipment?.tracking_number} carrier={r.shipment?.carrier_name || r.shipment?.carrier} onOpen={() => onOpen(c.task_id)} />
-                        <span className="text-slate-500 truncate">{r.shipment?.customer_name || ""}</span>
-                      </div>
-                      <div className="text-slate-800 line-clamp-2">{shortTitle(r.task.title)}</div>
-                      {c.reason ? <div className="text-slate-600 mt-1">{c.reason}</div> : null}
-                      <div className="flex items-center gap-1 mt-1.5">
-                        <button onClick={() => onDismissOne(c.task_id, c.disposition, c.reason)} className="inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2 py-1 hover:bg-slate-50 text-slate-700"><Ban className="h-3 w-3" /> Dismiss</button>
-                        <button onClick={() => onOpen(c.task_id)} className="inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2 py-1 hover:bg-slate-50 text-slate-700"><ExternalLink className="h-3 w-3" /> Check</button>
-                      </div>
-                    </div>
-                  );
-                })}
-                {tri!.close_candidates.length > liveClose.length ? <div className="text-[11px] text-slate-400">{tri!.close_candidates.length - liveClose.length} already closed since this run.</div> : null}
-              </TriageColumn>
-              <TriageColumn title={`Work together (${tri!.batches.length})`} tone="sky">
-                {tri!.batches.map((b, i) => {
-                  const live = b.task_ids.filter((id) => rowById.has(id));
-                  return (
-                    <div key={i} className="rounded-lg bg-white ring-1 ring-slate-200 p-2.5 text-xs">
-                      <div className="font-medium text-slate-800">{b.label} <span className="text-slate-400 font-normal">· {live.length} tasks</span></div>
-                      {b.reason ? <div className="text-slate-600 mt-0.5">{b.reason}</div> : null}
-                      <div className="mt-1 flex flex-wrap gap-1">
-                        {live.slice(0, 8).map((id) => {
-                          const r = rowById.get(id)!;
-                          return (
-                            <span key={id} className="inline-flex items-center bg-slate-50 ring-1 ring-slate-200 rounded px-1 text-[11px]">
-                              <TrackingLink tracking={r.shipment?.tracking_number || id.slice(0, 6)} carrier={r.shipment?.carrier_name || r.shipment?.carrier} onOpen={() => onOpen(id)} />
-                            </span>
-                          );
-                        })}
-                        {live.length > 8 ? <span className="text-[11px] text-slate-400">+{live.length - 8}</span> : null}
-                      </div>
-                      <button onClick={() => onSelectBatch(live)} className="mt-1.5 inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2 py-1 hover:bg-slate-50 text-slate-700"><Layers className="h-3 w-3" /> Select batch</button>
-                    </div>
-                  );
-                })}
-              </TriageColumn>
-            </div>
-          ) : null}
-          {result?.truncated ? <div className="text-[11px] text-slate-500 mt-2">Board exceeded the per-run cap; only the first {result.count} tasks were triaged. Narrow to a segment for full coverage.</div> : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function TriageColumn({ title, tone, action, children }: { title: string; tone: "violet" | "emerald" | "sky"; action?: ReactNode; children: ReactNode }) {
-  const head = tone === "violet" ? "text-violet-800" : tone === "emerald" ? "text-emerald-800" : "text-sky-800";
-  return (
-    <div className="min-w-0">
-      <div className="flex items-center justify-between mb-1.5">
-        <div className={`text-xs font-semibold uppercase tracking-wide ${head}`}>{title}</div>
-        {action}
-      </div>
-      <div className="space-y-1.5 max-h-[28rem] overflow-y-auto pr-0.5">{children}</div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Daily executive summary
-// ---------------------------------------------------------------------------
-function DailySummaryPanel({ result, busy, error, open, onToggle, onRun, rows, onOpenTask }: {
-  result: DailySummaryResult | null; busy: boolean; error: string | null; open: boolean; onToggle: () => void;
-  onRun: (hours: number) => void; rows: TaskBoardRow[]; onOpenTask: (taskId: string) => void;
-}) {
-  const [hours, setHours] = useState(24);
-  const [copied, setCopied] = useState(false);
-  const digest = result?.digest ?? null;
-  // Tracking numbers on the active board → task id, so numbers cited in the
-  // brief become links into the drawer.
-  const trackingIndex = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const r of rows) { const tn = (r.shipment?.tracking_number || r.task.tracking_number || "").trim(); if (tn && !m.has(tn)) m.set(tn, r.task.id); }
-    return m;
-  }, [rows]);
-  async function copy() {
-    if (!result?.markdown) return;
-    try { await navigator.clipboard.writeText(result.markdown); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ }
-  }
-  const chips = digest ? [
-    ["Created", digest.tasks.created_count], ["Completed", digest.tasks.completed_count], ["Dismissed", digest.tasks.dismissed_count],
-    ["Active", digest.board.active], ["Needs attention", digest.board.needs_attention_count], ["Likely resolved", digest.board.likely_resolved_count],
-    ["Scraped", digest.shipments.scraped_in_window], ["Newly flagged", digest.shipments.newly_flagged_count],
-    ["AI spend", fmtUsd(digest.ai.cost_usd)],
-  ] as [string, string | number][] : [];
-  return (
-    <div className="rounded-2xl ring-1 ring-slate-200 bg-white shadow-sm mb-4">
-      <div className="flex items-center gap-2 px-4 py-3">
-        <button onClick={onToggle} className="flex items-center gap-2 text-left min-w-0">
-          {open ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
-          <FileText className="h-4 w-4 text-slate-700" />
-          <span className="font-semibold text-slate-900">Daily exec summary</span>
-          {result?.created_at ? (
-            <span className="text-xs text-slate-500 truncate">
-              {fmtRelative(result.created_at)} · {result.model || "model"}{result.cost_usd != null ? ` · ${fmtUsd(result.cost_usd)}` : ""}{digest ? ` · ${digest.window.hours}h window` : ""}{result.user_email ? ` · by ${result.user_email}` : ""}
-            </span>
-          ) : <span className="text-xs text-slate-500">Not generated yet</span>}
-        </button>
-        <div className="ml-auto flex items-center gap-1.5">
-          <select value={hours} onChange={(e) => setHours(Number(e.target.value))} className="rounded-md border border-slate-200 px-2 py-1 text-xs bg-white" aria-label="Window">
-            <option value={24}>Last 24h</option>
-            <option value={48}>Last 48h</option>
-            <option value={72}>Last 72h</option>
-            <option value={168}>Last 7 days</option>
-          </select>
-          <button onClick={() => onRun(hours)} disabled={busy} className="text-xs inline-flex items-center gap-1 rounded-md bg-violet-600 text-white px-2.5 py-1.5 hover:bg-violet-700 disabled:opacity-50">
-            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />} {busy ? "Writing…" : result?.markdown ? "Regenerate" : "Generate"}
-          </button>
-          {result?.markdown ? (
-            <button onClick={copy} className="text-xs inline-flex items-center gap-1 rounded-md ring-1 ring-slate-200 px-2.5 py-1.5 hover:bg-slate-50 text-slate-700" title="Copy as Markdown (paste into Teams / email)">
-              {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />} {copied ? "Copied" : "Copy"}
-            </button>
-          ) : null}
-        </div>
-      </div>
-      {open ? (
-        <div className="px-4 pb-4">
-          {error ? <div className="mb-3"><ErrorBlock>{error}</ErrorBlock></div> : null}
-          {busy ? <div className="text-xs text-violet-700 mb-3 inline-flex items-center gap-1.5"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Collecting the day's digest and writing a ~1,200-word brief with the heavy model. This takes a minute or two.</div> : null}
-          {chips.length ? (
-            <div className="flex flex-wrap gap-1.5 mb-3">
-              {chips.map(([label, value]) => (
-                <span key={label} className="inline-flex items-baseline gap-1 rounded-md bg-slate-50 ring-1 ring-slate-200 px-2 py-1 text-xs"><span className="text-slate-500">{label}</span><span className="font-semibold text-slate-900 tabular-nums">{value}</span></span>
-              ))}
-              {digest?.window ? <span className="text-[11px] text-slate-400 self-center">{fmtDateTime(digest.window.from)} → {fmtDateTime(digest.window.to)}</span> : null}
-            </div>
-          ) : null}
-          {result?.markdown ? (
-            <MarkdownLite text={result.markdown} trackingIndex={trackingIndex} onOpenTask={onOpenTask} />
-          ) : !busy ? (
-            <div className="text-sm text-slate-600">
-              Generates a detailed operations brief for the director: headline, KPI table, what moved today, live exposures ranked with next actions, carrier and customer hotspots, per-operator throughput, data health, tomorrow's plan and open questions. Copy it straight into Teams.
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-// Minimal Markdown renderer for the brief: headings, paragraphs, bullet and
-// numbered lists, pipe tables, blockquotes, rules, **bold**, `code`. Tracking
-// numbers that exist on the board become links into the task drawer. Kept
-// deliberately small rather than pulling in a Markdown library for one panel.
-function MarkdownLite({ text, trackingIndex, onOpenTask }: { text: string; trackingIndex: Map<string, string>; onOpenTask: (taskId: string) => void }) {
-  const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
-  const inline = (s: string, key: string) => renderInline(s, key, trackingIndex, onOpenTask);
-  return (
-    <div className="text-sm text-slate-800 leading-relaxed space-y-2 max-w-none">
-      {blocks.map((b, i) => {
-        const k = `b${i}`;
-        switch (b.type) {
-          case "h1": return <h2 key={k} className="text-lg font-semibold text-slate-900 mt-2">{inline(b.text, k)}</h2>;
-          case "h2": return <h3 key={k} className="text-sm font-semibold uppercase tracking-wide text-violet-800 mt-4 border-b border-violet-100 pb-1">{inline(b.text, k)}</h3>;
-          case "h3": return <h4 key={k} className="text-sm font-semibold text-slate-900 mt-2">{inline(b.text, k)}</h4>;
-          case "hr": return <hr key={k} className="border-slate-200" />;
-          case "quote": return <blockquote key={k} className="border-l-2 border-slate-300 pl-3 text-slate-600 italic">{inline(b.text, k)}</blockquote>;
-          case "ul": return <ul key={k} className="list-disc pl-5 space-y-0.5">{b.items.map((it, j) => <li key={j}>{inline(it, `${k}-${j}`)}</li>)}</ul>;
-          case "ol": return <ol key={k} className="list-decimal pl-5 space-y-0.5">{b.items.map((it, j) => <li key={j}>{inline(it, `${k}-${j}`)}</li>)}</ol>;
-          case "table": return (
-            <div key={k} className="overflow-x-auto">
-              <table className="text-xs w-full ring-1 ring-slate-200 rounded-lg overflow-hidden">
-                <thead className="bg-slate-50 text-slate-600 uppercase tracking-wide text-[10px]"><tr>{b.header.map((h, j) => <th key={j} className="text-left px-2 py-1.5 font-semibold">{inline(h, `${k}h${j}`)}</th>)}</tr></thead>
-                <tbody>{b.rows.map((r, ri) => <tr key={ri} className="border-t border-slate-100">{r.map((c, ci) => <td key={ci} className="px-2 py-1.5 align-top">{inline(c, `${k}r${ri}c${ci}`)}</td>)}</tr>)}</tbody>
-              </table>
-            </div>
-          );
-          default: return <p key={k}>{inline(b.text, k)}</p>;
-        }
-      })}
-    </div>
-  );
-}
-
-type MdBlock =
-  | { type: "h1" | "h2" | "h3" | "p" | "quote"; text: string }
-  | { type: "hr" }
-  | { type: "ul" | "ol"; items: string[] }
-  | { type: "table"; header: string[]; rows: string[][] };
-
-function parseMarkdownBlocks(text: string): MdBlock[] {
-  const lines = text.replace(/\r/g, "").split("\n");
-  const out: MdBlock[] = [];
-  let i = 0;
-  const splitRow = (l: string) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
-  while (i < lines.length) {
-    const line = lines[i];
-    const t = line.trim();
-    if (!t) { i++; continue; }
-    if (/^-{3,}$|^\*{3,}$/.test(t)) { out.push({ type: "hr" }); i++; continue; }
-    const h = t.match(/^(#{1,3})\s+(.*)$/);
-    if (h) { out.push({ type: h[1].length === 1 ? "h1" : h[1].length === 2 ? "h2" : "h3", text: h[2] }); i++; continue; }
-    if (t.startsWith(">")) { out.push({ type: "quote", text: t.replace(/^>\s?/, "") }); i++; continue; }
-    if (t.startsWith("|")) {
-      const header = splitRow(t); i++;
-      if (i < lines.length && /^\|?\s*:?-{2,}/.test(lines[i].trim())) i++;
-      const rows: string[][] = [];
-      while (i < lines.length && lines[i].trim().startsWith("|")) { rows.push(splitRow(lines[i])); i++; }
-      out.push({ type: "table", header, rows });
-      continue;
-    }
-    if (/^[-*•]\s+/.test(t)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) { items.push(lines[i].trim().replace(/^[-*•]\s+/, "")); i++; }
-      out.push({ type: "ul", items }); continue;
-    }
-    if (/^\d+[.)]\s+/.test(t)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) { items.push(lines[i].trim().replace(/^\d+[.)]\s+/, "")); i++; }
-      out.push({ type: "ol", items }); continue;
-    }
-    const para: string[] = [];
-    while (i < lines.length && lines[i].trim() && !/^(#{1,3}\s|[-*•]\s|\d+[.)]\s|\||>)/.test(lines[i].trim())) { para.push(lines[i].trim()); i++; }
-    out.push({ type: "p", text: para.join(" ") });
-  }
-  return out;
-}
-
-// **bold**, `code`, and tracking-number links. Tracking numbers are matched
-// as 6-14 digit runs (optionally "-N" suffix) that exist on the board.
-function renderInline(s: string, key: string, trackingIndex: Map<string, string>, onOpenTask: (id: string) => void): ReactNode[] {
-  const out: ReactNode[] = [];
-  const re = /(\*\*[^*]+\*\*|`[^`]+`|\b\d{6,14}(?:-\d)?\b)/g;
-  let last = 0, m: RegExpExecArray | null, n = 0;
-  while ((m = re.exec(s))) {
-    if (m.index > last) out.push(s.slice(last, m.index));
-    const tok = m[0];
-    const k = `${key}-${n++}`;
-    if (tok.startsWith("**")) out.push(<strong key={k} className="font-semibold text-slate-900">{tok.slice(2, -2)}</strong>);
-    else if (tok.startsWith("`")) out.push(<code key={k} className="font-mono text-[12px] bg-slate-100 rounded px-1">{tok.slice(1, -1)}</code>);
-    else if (trackingIndex.has(tok)) out.push(<button key={k} type="button" onClick={() => onOpenTask(trackingIndex.get(tok)!)} className="font-mono text-sky-700 hover:underline" title="Open in FPX">{tok}</button>);
-    else out.push(tok);
-    last = m.index + tok.length;
-  }
-  if (last < s.length) out.push(s.slice(last));
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Dismiss modal
-// ---------------------------------------------------------------------------
-function DismissModal({ count, disposition, reason, onChange, onCancel, onConfirm, busy }: {
-  count: number; disposition: string; reason: string;
-  onChange: (patch: { disposition?: string; reason?: string }) => void;
-  onCancel: () => void; onConfirm: () => void; busy: boolean;
-}) {
-  return (
-    <div className="fixed inset-0 z-40 bg-slate-900/40 flex items-center justify-center p-4" onClick={onCancel}>
-      <div className="w-full max-w-md rounded-2xl bg-white shadow-xl ring-1 ring-slate-200 p-5" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="font-semibold text-slate-900 inline-flex items-center gap-2"><Ban className="h-4 w-4 text-slate-500" /> Dismiss {count} task{count === 1 ? "" : "s"}</h2>
-          <button onClick={onCancel} className="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100" aria-label="Close"><X className="h-4 w-4" /></button>
-        </div>
-        <p className="text-sm text-slate-600 mb-3">
-          Marks the task cancelled and stamps the reason on it. It stays on record, so the auto-task builder won't create the same task again on the next scrape. Nothing is deleted.
-        </p>
-        <label className="block text-xs font-medium text-slate-600 mb-1">Reason category</label>
-        <select value={disposition} onChange={(e) => onChange({ disposition: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm bg-white mb-3">
-          <option value="dismissed">Dismissed</option>
-          <option value="resolved">Resolved upstream (delivered / no longer an issue)</option>
-          <option value="stale">Stale data (shipment no longer tracked)</option>
-          <option value="duplicate">Duplicate of another task</option>
-          <option value="superseded">Superseded by a newer task</option>
-          <option value="not_actionable">Not actionable</option>
-        </select>
-        <label className="block text-xs font-medium text-slate-600 mb-1">Note (optional)</label>
-        <textarea value={reason} onChange={(e) => onChange({ reason: e.target.value })} rows={3} placeholder="e.g. Delivered 6/16 per carrier; confirmed with Victor" className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-400 focus:ring-1 focus:ring-sky-200 focus:outline-none" />
-        <div className="flex items-center justify-end gap-2 mt-4">
-          <button onClick={onCancel} className="rounded-lg px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50">Cancel</button>
-          <button onClick={onConfirm} disabled={busy} className="rounded-lg px-3 py-2 text-sm bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 inline-flex items-center gap-1.5">
-            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />} Dismiss
-          </button>
-        </div>
-      </div>
     </div>
   );
 }

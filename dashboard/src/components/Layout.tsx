@@ -1,4 +1,5 @@
 import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail } from "lucide-react";
+import { AskSearchTrigger } from "./AssistantPanel";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
 import { setImpersonate } from "../lib/impersonate";
@@ -22,10 +23,12 @@ interface TabDef {
 // the always-visible row tight (5 items) instead of fanning out 11 across
 // the header.
 const ALL_TABS: TabDef[] = [
-  { id: "tracking", label: "Tracking",       Icon: Package,      group: "primary" },
   { id: "tasks",    label: "Tasks",          Icon: ListChecks,   group: "primary" },
-  { id: "ops",      label: "Ops",            Icon: Activity,     group: "primary" },
   { id: "scraping", label: "Scraping",       Icon: MonitorPlay,  group: "primary" },
+  { id: "ops",      label: "Ops",            Icon: Activity,     group: "primary" },
+  // Tracking is out of the main row (Tasks is the landing page); it stays
+  // reachable under More, and shipment links still open it.
+  { id: "tracking", label: "Tracking",       Icon: Package,      group: "more" },
   { id: "freightpop", label: "FreightPOP login", Icon: LogIn,     group: "more" },
   { id: "gp",       label: "GP Audits",      Icon: TrendingUp,   group: "primary" },
   { id: "invoice",  label: "Invoice Audits", Icon: ReceiptText,  group: "primary" },
@@ -136,6 +139,7 @@ export function Layout({ tab, onTab, children }: Props) {
             ) : null}
           </nav>
           <div className="ml-auto flex items-center gap-3">
+            <AskSearchTrigger />
             {profile ? (
               <div className="flex items-center gap-2">
                 {profile.avatarUrl ? (

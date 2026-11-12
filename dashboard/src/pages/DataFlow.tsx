@@ -141,7 +141,7 @@ export function DataFlowPage() {
 
       <Step icon={Search} title="Search index + embeddings (RAG)"
         tone={emb?.running ? "busy" : p ? (p.index.rows && embeddedPct != null && embeddedPct >= 95 ? "ok" : "warn") : "off"}
-        what="One compact record per shipment on the dashboard or with open tasks — searchable by id, keyword, fuzzy name and meaning (gte-small embeddings)."
+        what="One record per shipment (all of them, not only the ones on the dashboard) with its notes, open and closed tasks and tracking history — searchable by id, keyword, fuzzy name and meaning (gte-small embeddings, split into chunks so long records are embedded in full)."
         stats={[
           { label: "Records", value: num(p?.index.rows) },
           { label: "Embedded", value: p ? `${num(p.index.embedded)}${embeddedPct != null ? ` (${embeddedPct}%)` : ""}` : "—" },

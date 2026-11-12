@@ -233,6 +233,9 @@ async function launch(entry) {
       "--disable-background-timer-throttling",
       "--disable-features=CalculateNativeWinOcclusion,DialMediaRouteProvider",
       "--password-store=basic",
+      // FreightPOP opens labels/documents with window.open after a request
+      // finishes, which Chrome's pop-up blocker would otherwise swallow.
+      "--disable-popup-blocking",
     ],
   });
   entry.browser = browser;

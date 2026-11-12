@@ -4,6 +4,7 @@ import { api, type ScrapeRequest } from "../lib/api";
 import { hostedBrowser, type HostedStats, type ScrapeLogLine, type ScrapeCounts, type FpTotals, type TaskSnapshot } from "../lib/hostedBrowser";
 import { FpTotalsTrend, FpBeforeAfter } from "../components/FpTotalsTrend";
 import { ModePicker, ALL_MODES, modesText } from "../components/ModePicker";
+import { TaskModesInline } from "../components/TaskRulesDialog";
 import { ScrapeEmailSubscription } from "../components/ScrapeEmailSubscription";
 import { useAuth } from "../lib/auth";
 import { showFrame, hideFrame, useFrameState } from "../lib/freightpopFrame";
@@ -223,8 +224,18 @@ export function ScrapingPage() {
               <Square className="h-4 w-4" /> {stopping ? "Stopping…" : "Stop"}
             </button>
           ) : (
-            <div className="flex items-center gap-2 flex-wrap justify-end">
-            <ModePicker value={modes} onChange={setModes} disabled={starting} />
+            <div className="flex items-center gap-3 flex-wrap justify-end">
+            <div className="grid grid-cols-[auto_auto_auto] items-center gap-x-2 gap-y-1.5">
+              <span className="text-[11px] uppercase font-semibold text-slate-500 text-right">Refresh</span>
+              <ModePicker value={modes} onChange={setModes} disabled={starting} />
+              <span />
+              {stats?.isAdmin ? (
+                <>
+                  <span className="text-[11px] uppercase font-semibold text-slate-500 text-right">Tasks</span>
+                  <TaskModesInline />
+                </>
+              ) : null}
+            </div>
             <button
               onClick={start}
               disabled={!canStart}
