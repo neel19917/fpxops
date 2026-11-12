@@ -4,3 +4,5 @@
 -- fpx_assistant_embed_queue(), fpx_assistant_set_embeddings(),
 -- fpx_assistant_embed_auth() in the database; the embed function source is
 -- supabase/functions/fpx-embed/index.ts.
+-- Superseded in part by 2026-11-12_assistant_index_everything.sql (all
+-- shipments, all notes, closed tasks, history, chunked embeddings).

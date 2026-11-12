@@ -74,8 +74,11 @@ function takeParked(email) {
 //   { type: "viewport", width, height, dpr }
 //   { type: "mouse", event: "mousePressed"|"mouseReleased"|"mouseMoved"|"mouseWheel",
 //     x, y, button, clickCount, deltaX, deltaY, modifiers }
-//   { type: "key", event: "keyDown"|"keyUp", key, code, keyCode, text, modifiers }
+//   { type: "key", event: "keyDown"|"keyUp", key, code, keyCode, text, modifiers, commands }
 //   { type: "insertText", text }                 // paste
+//   { type: "copy", id }                         // Ctrl/Cmd+C / +X: selected text (for X the dashboard then sends Delete)
+//   { type: "copyAt", id, x, y }                 // right-click: selection, or the word under the pointer
+//   { type: "tab", action: "select"|"close"|"new", id }   // tabs: "main" or an id from the tabs list
 //   { type: "nav", action: "back"|"forward"|"reload"|"goto", url }
 //   { type: "bridge", id, payload: { type: "fpxFilter", column, value } | { type: "fpxOpenTracking", trackingNumber } }
 //
@@ -83,6 +86,9 @@ function takeParked(email) {
 //   binary frames: JPEG screencast frames
 //   { type: "ready" } | { type: "url", url } | { type: "bridgeReady", ready }
 //   { type: "bridgeAck", id, ack } | { type: "error", error }
+//   { type: "copyResult", id, text }
+//   { type: "selection", text }                  // what is selected now (for instant copy)
+//   { type: "tabs", active, tabs: [{ id, title, url, main }] }   // the FreightPOP tab + windows opened from it
 export class ViewerSession {
   // target "scrape": attach read-only to the user's running scrape window
   // instead of opening a new one. Input and viewport changes are ignored so a
@@ -98,10 +104,150 @@ export class ViewerSession {
     this.closed = false;
     this.viewport = { width: 1280, height: 800, dpr: 1 };
     this.bridgeReadyLast = null;
+    // Extra tabs next to the FreightPOP tab: windows FreightPOP opened
+    // (labels, documents, carrier links) and tabs the user added. `active`
+    // is the one on show; null = the FreightPOP tab itself.
+    this.popups = [];
+    this.active = null;
+    this.tabSeq = 0;
   }
 
   send(obj) {
     if (this.ws.readyState === 1) this.ws.send(JSON.stringify(obj));
+  }
+
+  // The tab on show.
+  get vpage() { return this.active ? this.active.page : this.page; }
+  get vcdp() { return this.active ? this.active.cdp : this.cdp; }
+
+  // Forward screencast frames from `cdp`, but only while it is the tab on show.
+  attachCast(cdp) {
+    cdp.on("Page.screencastFrame", ({ data, sessionId }) => {
+      // Ack first so Chrome keeps producing frames; drop frames if the socket
+      // is backed up (slow client) instead of queueing unboundedly.
+      cdp.send("Page.screencastFrameAck", { sessionId }).catch(() => {});
+      if (cdp !== this.vcdp) return;
+      if (this.ws.readyState === 1 && this.ws.bufferedAmount < 2_000_000) {
+        const buf = Buffer.from(data, "base64");
+        countEgress(buf.length);
+        this.ws.send(buf, { binary: true });
+      }
+    });
+  }
+
+  // Put a tab on show (null = the FreightPOP tab): stop streaming the old
+  // one, size and stream the new one. Serialized so quick clicks can't interleave.
+  showTab(tab) {
+    const run = async () => {
+      if (this.closed) return;
+      if (tab && !this.popups.includes(tab)) tab = null;
+      if (tab !== this.active) {
+        await this.vcdp.send("Page.stopScreencast").catch(() => {});
+        this.active = tab;
+      }
+      await this.applyViewport().catch(() => {});
+      await this.vpage.bringToFront().catch(() => {});
+      if (!this.paused) await this.startCast().catch(() => {});
+      this.sendTabs();
+      // A page that isn't repainting sends no screencast frame, which would
+      // leave the previous tab's picture on screen. Send one still now.
+      if (!this.paused) {
+        const cdp = this.vcdp;
+        const shot = await cdp.send("Page.captureScreenshot", { format: "jpeg", quality: setting("browser.stream_quality") }).catch(() => null);
+        if (shot?.data && cdp === this.vcdp && this.ws.readyState === 1) {
+          const buf = Buffer.from(shot.data, "base64");
+          countEgress(buf.length);
+          this.ws.send(buf, { binary: true });
+        }
+      }
+    };
+    this.tabChain = (this.tabChain || Promise.resolve()).then(run, run);
+    return this.tabChain;
+  }
+
+  // FreightPOP opened a new window (print labels / BOL, documents, carrier
+  // links), or the user added a tab. It becomes a tab and is shown.
+  // (Pop-ups used to be closed at once and their URL loaded in the main tab —
+  // but a new window has no URL yet at that moment, so nothing appeared.)
+  async openPopup(p) {
+    if (this.closed || this.watchOnly || this.popups.length >= 8) { p.close().catch(() => {}); return; }
+    try {
+      const cdp = await p.createCDPSession();
+      const tab = { id: `t${++this.tabSeq}`, page: p, cdp };
+      this.attachCast(cdp);
+      p.on("popup", this.onPopup);
+      p.on("framenavigated", (f) => { if (f === p.mainFrame()) this.sendTabs(); });
+      p.on("load", () => this.sendTabs());
+      p.once("close", () => this.popupClosed(tab).catch(() => {}));
+      this.popups.push(tab);
+      await this.showTab(tab);
+      console.log(`[tab] ${this.who.email} opened ${p.url().slice(0, 120)} (${this.popups.length + 1} tabs)`);
+    } catch (e) {
+      console.warn(`[tab] ${this.who.email}: ${e.message}`);
+      this.popups = this.popups.filter((x) => x.page !== p);
+      this.sendTabs();
+    }
+  }
+
+  async popupClosed(tab) {
+    const i = this.popups.indexOf(tab);
+    if (i < 0) return;
+    this.popups.splice(i, 1);
+    try { await tab.cdp.detach(); } catch {}
+    if (this.closed) return;
+    if (this.active === tab) {
+      // Its window is gone: fall back to the tab on its left.
+      this.active = null;
+      await this.showTab(this.popups[i - 1] || null);
+    } else this.sendTabs();
+  }
+
+  // Text selected in a page: any frame, or the focused input.
+  async readSelection(page) {
+    let text = "";
+    for (const f of page.frames()) {
+      text = await f.evaluate(() => {
+        const el = document.activeElement;
+        if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") && el.type !== "password" && typeof el.selectionStart === "number" && el.selectionEnd > el.selectionStart) {
+          return el.value.slice(el.selectionStart, el.selectionEnd);
+        }
+        return String(window.getSelection?.() || "");
+      }).catch(() => "");
+      if (text && text.trim()) break;
+    }
+    return String(text || "").slice(0, 100_000);
+  }
+
+  // Keep the dashboard told what is selected, so Ctrl/Cmd+C there can fill
+  // the user's clipboard at once (browsers refuse a clipboard write that
+  // arrives later, after a round trip). Sent shortly after input settles.
+  queueSelection() {
+    if (this.watchOnly || this.closed) return;
+    clearTimeout(this.selTimer);
+    this.selTimer = setTimeout(async () => {
+      const page = this.vpage;
+      if (this.closed || !page) return;
+      const text = await this.readSelection(page).catch(() => "");
+      if (text !== this.selLast) { this.selLast = text; this.send({ type: "selection", text }); }
+    }, 150);
+  }
+
+  // Tell the dashboard which tabs exist (titles are read from the pages).
+  sendTabs() {
+    const run = async () => {
+      if (this.closed || this.watchOnly) return;
+      const tabs = [{ id: "main", title: "FreightPOP", url: "", main: true }];
+      try { tabs[0].url = this.page.url(); } catch {}
+      for (const t of [...this.popups]) {
+        let url = "", title = "";
+        try { url = t.page.url(); title = await t.page.title(); } catch {}
+        if (!title) { try { title = url && url !== "about:blank" ? new URL(url).hostname : "New window"; } catch { title = "New window"; } }
+        tabs.push({ id: t.id, title: title.slice(0, 60), url, main: false });
+      }
+      this.send({ type: "tabs", active: this.active ? this.active.id : "main", tabs });
+    };
+    this.tabsSend = (this.tabsSend || Promise.resolve()).then(run, run);
+    return this.tabsSend;
   }
 
   async start() {
@@ -122,20 +268,28 @@ export class ViewerSession {
         this.page = await openWindowPage(this.lease.browser, null);
       }
     }
-    this.cdp = await this.page.createCDPSession();
-    this.ext = new ExtensionContexts(this.cdp);
-    await this.ext.init();
+    const attach = async () => {
+      this.cdp = await this.page.createCDPSession();
+      this.ext = new ExtensionContexts(this.cdp);
+      await this.ext.init();
+    };
+    try { await attach(); } catch (e) {
+      // The window's page has crashed ("Target crashed") or gone. A kept
+      // (parked) window in that state used to be handed back on every
+      // reconnect, so the view never recovered. Replace it with a new one.
+      if (this.watchOnly || !this.lease) throw e;
+      console.warn(`[ws] ${this.who.email}: window unusable (${e.message}) → opening a new one`);
+      this.page.close().catch(() => {});
+      this.resumed = false;
+      this.crashed = true; // until the new window attaches, never park this
+      this.page = await openWindowPage(this.lease.browser, null);
+      await attach();
+      this.crashed = false;
+    }
+    // Renderer crash while in use: don't keep this window for the next connection.
+    if (!this.watchOnly) this.page.on("error", (e) => { this.crashed = true; console.warn(`[ws] ${this.who.email}: page crashed (${e?.message || e})`); });
 
-    this.cdp.on("Page.screencastFrame", ({ data, sessionId }) => {
-      // Ack first so Chrome keeps producing frames; drop frames if the socket
-      // is backed up (slow client) instead of queueing unboundedly.
-      this.cdp.send("Page.screencastFrameAck", { sessionId }).catch(() => {});
-      if (this.ws.readyState === 1 && this.ws.bufferedAmount < 2_000_000) {
-        const buf = Buffer.from(data, "base64");
-        countEgress(buf.length);
-        this.ws.send(buf, { binary: true });
-      }
-    });
+    this.attachCast(this.cdp);
     // Page-level listeners only on pages we own — a watcher must not change
     // the scrape window's behaviour (or leak listeners onto it).
     // Kept as fields so close() can remove them before the page is parked.
@@ -143,14 +297,13 @@ export class ViewerSession {
       this.onNav = (f) => {
         if (f === this.page.mainFrame()) {
           this.send({ type: "url", url: f.url() });
+          this.sendTabs();
           this.checkSignedIn(f.url()).catch(() => {});
         }
       };
-      // Popups (FreightPOP opens some docs in new windows) — pull them into
-      // this tab rather than spawning windows nobody can see.
-      this.onPopup = async (p) => {
-        try { const u = p.url(); await p.close(); if (u && u !== "about:blank") await this.page.goto(u); } catch {}
-      };
+      // Popups (FreightPOP opens some docs in new windows) — show them in
+      // the view until closed (see openPopup).
+      this.onPopup = (p) => { if (p) this.openPopup(p).catch(() => {}); };
       this.page.on("framenavigated", this.onNav);
       this.page.on("popup", this.onPopup);
       // Expired FreightPOP login: drop the stale "user" record (otherwise
@@ -205,6 +358,7 @@ export class ViewerSession {
       }, 30_000);
     }
     this.send({ type: "ready", watchOnly: this.watchOnly });
+    this.sendTabs();
     if (this.watchOnly || this.resumed) { this.send({ type: "url", url: this.page.url() }); return; }
     // Open on the user's dashboard so the shipment grid is there for
     // Filter / Open tracking (the bare site root lands elsewhere).
@@ -223,8 +377,9 @@ export class ViewerSession {
   // active" to the user. Restart = stop, then start, one at a time.
   async startCast() {
     const run = async () => {
-      await this.cdp.send("Page.stopScreencast").catch(() => {});
-      await this.cdp.send("Page.startScreencast", {
+      const cdp = this.vcdp;
+      await cdp.send("Page.stopScreencast").catch(() => {});
+      await cdp.send("Page.startScreencast", {
         format: "jpeg",
         quality: setting("browser.stream_quality"),
         everyNthFrame: setting("browser.stream_every_nth_frame"),
@@ -245,7 +400,7 @@ export class ViewerSession {
 
   async applyViewport() {
     const { width, height, dpr } = this.viewport;
-    await this.cdp.send("Emulation.setDeviceMetricsOverride", {
+    await this.vcdp.send("Emulation.setDeviceMetricsOverride", {
       width, height, deviceScaleFactor: dpr, mobile: false,
     });
   }
@@ -256,7 +411,7 @@ export class ViewerSession {
     if (this.closed) return;
     // Pause/resume apply to watchers too (closing the live view panel).
     if (this.cdp && msg.type === "pause") {
-      if (!this.paused) { this.paused = true; await this.cdp.send("Page.stopScreencast").catch(() => {}); }
+      if (!this.paused) { this.paused = true; await this.vcdp.send("Page.stopScreencast").catch(() => {}); }
       return;
     }
     if (this.cdp && msg.type === "resume") {
@@ -286,6 +441,7 @@ export class ViewerSession {
         return;
       }
       case "mouse":
+        if (msg.event === "mouseReleased") this.queueSelection();
         return this.input("Input.dispatchMouseEvent", {
           type: msg.event,
           x: Number(msg.x) || 0,
@@ -298,6 +454,7 @@ export class ViewerSession {
           modifiers: Number(msg.modifiers) || 0,
         });
       case "key": {
+        if (msg.event === "keyUp") this.queueSelection();
         const printable = typeof msg.text === "string" && msg.text.length > 0;
         return this.input("Input.dispatchKeyEvent", {
           type: msg.event === "keyUp" ? "keyUp" : (printable ? "keyDown" : "rawKeyDown"),
@@ -308,36 +465,87 @@ export class ViewerSession {
           text: msg.event === "keyUp" ? undefined : (printable ? msg.text : undefined),
           unmodifiedText: msg.event === "keyUp" ? undefined : (printable ? msg.text : undefined),
           modifiers: Number(msg.modifiers) || 0,
+          // Editing shortcuts (select all, undo, cut…) named by the dashboard:
+          // a key event sent this way doesn't run them by itself.
+          commands: msg.event !== "keyUp" && Array.isArray(msg.commands) ? msg.commands.filter((c) => KEY_COMMANDS.has(c)) : undefined,
         });
       }
-      case "copy": {
+      case "copy":
+      case "copyAt": {
         // Ctrl/Cmd+C in the dashboard: hand back the text selected in
-        // FreightPOP (any frame, incl. popups, or the focused input) so the
-        // dashboard can put it on the user's own clipboard.
-        if (this.watchOnly || !this.page) return;
-        let text = "";
-        for (const f of this.page.frames()) {
-          text = await f.evaluate(() => {
-            const el = document.activeElement;
-            if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") && typeof el.selectionStart === "number" && el.selectionEnd > el.selectionStart) {
-              return el.value.slice(el.selectionStart, el.selectionEnd);
+        // FreightPOP (any frame, or the focused input) so the dashboard can
+        // put it on the user's own clipboard. Right-click (copyAt) does the
+        // same, and with nothing selected copies the word under the pointer
+        // (a tracking number, a PRO, a reference) and highlights it.
+        const page = this.vpage;
+        if (this.watchOnly || !page) return;
+        let text = await this.readSelection(page);
+        if (!(text && text.trim()) && msg.type === "copyAt") {
+          text = await page.evaluate((x, y) => {
+            let doc = document, el = doc.elementFromPoint(x, y);
+            // Same-origin iframe (some FreightPOP pop-ups): look inside it.
+            while (el && el.tagName === "IFRAME") {
+              try {
+                const r = el.getBoundingClientRect();
+                x -= r.left; y -= r.top; doc = el.contentDocument;
+                el = doc.elementFromPoint(x, y);
+              } catch { return ""; }
             }
-            return String(window.getSelection?.() || "");
-          }).catch(() => "");
-          if (text && text.trim()) break;
+            if (!el) return "";
+            if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return el.type === "password" ? "" : String(el.value || "");
+            const range = doc.caretRangeFromPoint ? doc.caretRangeFromPoint(x, y) : null;
+            const node = range && range.startContainer;
+            if (node && node.nodeType === 3 && el.contains(node)) {
+              const t = node.data;
+              let a = Math.min(range.startOffset, t.length), b = a;
+              while (a > 0 && !/\s/.test(t[a - 1])) a--;
+              while (b < t.length && !/\s/.test(t[b])) b++;
+              // Trim punctuation around the word ("210991346," → "210991346").
+              while (a < b && /[,;:()\[\]"']/.test(t[a])) a++;
+              while (b > a && /[,;:()\[\]"'.]/.test(t[b - 1])) b--;
+              if (b > a) {
+                try {
+                  const w = doc.createRange(); w.setStart(node, a); w.setEnd(node, b);
+                  // Only when the pointer is really on the word, not in blank space beside it.
+                  const hit = [...w.getClientRects()].some((r) => x >= r.left - 4 && x <= r.right + 4 && y >= r.top - 4 && y <= r.bottom + 4);
+                  if (!hit) return "";
+                  const sel = doc.defaultView.getSelection(); sel.removeAllRanges(); sel.addRange(w);
+                } catch {}
+                return t.slice(a, b);
+              }
+            }
+            return "";
+          }, Number(msg.x) || 0, Number(msg.y) || 0).catch(() => "");
         }
-        this.send({ type: "copyResult", id: msg.id, text: String(text || "").slice(0, 100_000) });
+        this.queueSelection();
+        this.send({ type: "copyResult", id: msg.id, text: String(text || "").slice(0, 100_000), at: msg.type === "copyAt" });
+        return;
+      }
+      case "tab": {
+        if (msg.action === "select") return this.showTab(this.popups.find((t) => t.id === msg.id) || null);
+        if (msg.action === "close") {
+          const t = this.popups.find((x) => x.id === msg.id);
+          if (t) await t.page.close().catch(() => {});
+          return;
+        }
+        if (msg.action === "new" && this.lease && this.popups.length < 8) {
+          // A second FreightPOP tab in the same browser (same login).
+          const url = (await this.signedIn()) ? dashboardUrlFor(this.who.email) : SIGN_IN_URL;
+          const p = await openWindowPage(this.lease.browser, null);
+          await this.openPopup(p);
+          p.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+        }
         return;
       }
       case "insertText":
         if (typeof msg.text === "string" && msg.text.length <= 10_000) {
-          return this.cdp.send("Input.insertText", { text: msg.text });
+          return this.vcdp.send("Input.insertText", { text: msg.text });
         }
         return;
       case "nav":
-        if (msg.action === "back") return this.page.goBack().catch(() => {});
-        if (msg.action === "forward") return this.page.goForward().catch(() => {});
-        if (msg.action === "reload") return this.page.reload().catch(() => {});
+        if (msg.action === "back") return this.vpage.goBack().catch(() => {});
+        if (msg.action === "forward") return this.vpage.goForward().catch(() => {});
+        if (msg.action === "reload") return this.vpage.reload().catch(() => {});
         if (msg.action === "goto" && typeof msg.url === "string" && FP_HOST.test(msg.url)) {
           return this.page.goto(msg.url, { waitUntil: "domcontentloaded" }).catch(() => {});
         }
@@ -398,14 +606,14 @@ export class ViewerSession {
   // reload the page once (per 30s) and tell the user.
   async input(method, params) {
     try {
-      const r = await this.cdp.send(method, params);
+      const r = await this.vcdp.send(method, params);
       this.inputErrors = 0;
       return r;
     } catch (e) {
       if (!/Internal error/i.test(e.message)) throw e;
       this.inputErrors = (this.inputErrors || 0) + 1;
       const now = Date.now();
-      if (this.inputErrors >= 5 && !this.watchOnly && this.page && now - (this.lastAutoReload || 0) > 30_000) {
+      if (this.inputErrors >= 5 && !this.watchOnly && this.page && !this.active && now - (this.lastAutoReload || 0) > 30_000) {
         this.lastAutoReload = now;
         this.inputErrors = 0;
         console.warn(`[ws] ${this.who.email}: page not taking input (${this.page.url()}) → reloading`);
@@ -489,7 +697,14 @@ export class ViewerSession {
     this.closed = true;
     clearInterval(this.readyTimer);
     clearInterval(this.idleTimer);
+    clearTimeout(this.selTimer);
     this.offSettings?.();
+    // Extra tabs don't outlive the view: a parked tab comes back without them.
+    this.active = null;
+    for (const pop of this.popups.splice(0)) {
+      try { await pop.cdp.detach(); } catch {}
+      pop.page.close().catch(() => {});
+    }
     try { await this.cdp?.send("Page.stopScreencast"); } catch {}
     try { await this.cdp?.detach(); } catch {}
     if (this.lease) recordSession(this.who.email, Date.now() - (this.startedAt || Date.now()));
@@ -497,7 +712,10 @@ export class ViewerSession {
       if (this.onNav) this.page.off("framenavigated", this.onNav);
       this.offAuth?.();
       if (this.onPopup) this.page.off("popup", this.onPopup);
-      if (!this.page.isClosed() && this.lease.browser.connected) {
+      if (this.crashed) {
+        this.page.close().catch(() => {});
+        this.lease.release();
+      } else if (!this.page.isClosed() && this.lease.browser.connected) {
         // Keep the window (and the browser lease) for this user's next connection.
         park(this.who.email, this.page, this.lease);
       } else {
@@ -509,6 +727,9 @@ export class ViewerSession {
     this.lease = null;
   }
 }
+
+// Editing commands the dashboard may attach to a key event.
+const KEY_COMMANDS = new Set(["selectAll", "undo", "redo"]);
 
 const SIGN_IN_URL = "https://app.freightpop.com/";
 const FP_COOKIE_URLS = ["https://app.freightpop.com/", "https://app.freightpop.com/Broker/Broker.html", "https://app.freightpop.com/app/"];

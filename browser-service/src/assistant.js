@@ -168,9 +168,11 @@ async function toolSummary() {
 }
 
 // ---------------- retrieval index (RAG) ----------------
-// fpx_assistant_index holds one compact record per shipment that's on the
-// dashboard or has open tasks (facts + open tasks + latest note), full-text +
-// trigram searchable, with a precomputed focus score. Rebuilt in the database
+// fpx_assistant_index holds one record per non-archived shipment (facts, open
+// and closed tasks, all notes, tracking history), full-text + trigram
+// searchable, with a precomputed focus score; on_dashboard marks the ones
+// FreightPOP currently lists. Its text is split into ~1,000-character chunks
+// in fpx_assistant_chunks and every chunk is embedded. Rebuilt in the database
 // by fpx_assistant_reindex() every few minutes and after each scrape. Every
 // lookup is then one indexed query instead of several round trips; the
 // original queries above remain as the fallback.

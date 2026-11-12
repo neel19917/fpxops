@@ -232,7 +232,7 @@ function AuthedApp() {
 
   // Defense against URL-bar admin probes.
   if (ADMIN_TABS.has(tab) && !isAdmin) {
-    return <Navigate to="/tracking" replace />;
+    return <Navigate to="/tasks" replace />;
   }
 
   return (
@@ -248,7 +248,7 @@ function AuthedApp() {
       >
         <Suspense fallback={<RouteFallback />}>
           <Routes>
-            <Route path="/" element={<Navigate to="/tracking" replace />} />
+            <Route path="/" element={<Navigate to="/tasks" replace />} />
             <Route path="/tracking" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
@@ -297,7 +297,7 @@ function AuthedApp() {
                 <Route path="/admin/data-flow" element={<DataFlowPage />} />
               </>
             ) : null}
-            <Route path="*" element={<Navigate to="/tracking" replace />} />
+            <Route path="*" element={<Navigate to="/tasks" replace />} />
           </Routes>
         </Suspense>
       </Layout>

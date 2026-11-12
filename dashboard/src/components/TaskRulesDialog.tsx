@@ -111,3 +111,42 @@ function TaskRulesDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+
+// Inline "Create tasks" mode picker (Scraping page, next to the Refresh modes).
+// Same setting as the Task rules dialog: tasks.generate.modes. Admin only —
+// the settings API is admin-only. Saves on every toggle.
+export function TaskModesInline() {
+  const [modes, setModes] = useState<string[] | null>(null);
+  const [state, setState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.settings.list().then((r) => {
+      const get = (k: string) => r.data.find((x) => x.key === k)?.value;
+      const m = toList(get("tasks.generate.modes"));
+      setModes(m.length ? ALL_MODES.filter((x) => m.includes(x))
+        : get("ui.tracking.show_parcels") === true ? ALL_MODES : ["LTL", "Truckload"]);
+    }).catch((e) => { setErr((e as Error).message); setState("error"); });
+  }, []);
+
+  async function change(next: string[]) {
+    const prev = modes;
+    setModes(next); setState("saving"); setErr(null);
+    try { await api.settings.update("tasks.generate.modes", next); setState("saved"); }
+    catch (e) { setModes(prev); setErr((e as Error).message); setState("error"); }
+  }
+
+  if (!modes) return err ? <span className="col-span-2 text-xs text-rose-700" title={err}>Task modes unavailable</span> : <span className="col-span-2" />;
+  return (
+    <>
+      <ModePicker value={modes} onChange={change} disabled={state === "saving"} />
+      <span className="text-xs min-w-14 text-left"
+        title="Which modes the AI auto-creates tasks for, from the next scrape on. Same as Tasks → Task rules.">
+        {state === "saving" ? <span className="text-slate-500">Saving…</span>
+          : state === "saved" ? <span className="text-emerald-700">Saved</span>
+          : state === "error" ? <span className="text-rose-700" title={err || undefined}>Not saved</span>
+          : null}
+      </span>
+    </>
+  );
+}
