@@ -125,6 +125,7 @@ const FRIENDLY_LABEL: Record<string, string> = {
   "prompt.invoice_row_review": "Invoice Audit — per-row review prompt",
   "model.default": "Default model (short prompts)",
   "model.large": "Large model (long prompts ≥ ~12k chars)",
+  "model.shipment_analysis": "Shipment analysis model (every scraped shipment; overrides the two above for it)",
   "storage.carriers": "Carriers that bill storage on delivery holds (comma-separated, matched against carrier name)",
   "storage.hold_hours": "Free hold at destination terminal before storage applies (hours)",
   "storage.assignee": "Owner of auto-created storage-risk tasks — user email (blank = default task owner)",
@@ -146,7 +147,10 @@ const FRIENDLY_LABEL: Record<string, string> = {
 // Model list mirrors MODEL_PRICING in server/lib/anthropic.js — keep in sync,
 // otherwise selecting an unpriced model logs analyses with the wrong cost.
 const MODEL_OPTIONS = [
-  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5 (fast, cheap — $1.00 / $5.00 per 1M)" },
+  { value: "claude-haiku-5-5",           label: "Haiku 5.5 (fastest, cheapest — $0.10 / $0.50 per 1M)" },
+  { value: "claude-sonnet-5-5",          label: "Sonnet 5.5 (fast, balanced — $2.00 / $10.00 per 1M)" },
+  { value: "claude-opus-5-5",            label: "Opus 5.5 (best quality — $4.00 / $20.00 per 1M)" },
+  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5 (previous gen — $1.00 / $5.00 per 1M)" },
   { value: "claude-sonnet-5",            label: "Sonnet 5 (balanced — $2.00 / $10.00 per 1M)" },
   { value: "claude-sonnet-4-6",          label: "Sonnet 4.6 (previous gen — $3.00 / $15.00 per 1M)" },
   { value: "claude-opus-5",              label: "Opus 5 (heavy — $5.00 / $25.00 per 1M)" },
@@ -155,6 +159,7 @@ const MODEL_OPTIONS = [
 ];
 const ENUM_OPTIONS: Record<string, { value: string; label: string }[]> = {
   "model.default": MODEL_OPTIONS,
+  "model.shipment_analysis": [{ value: "", label: "Default rule (Default model / Large-prompt model)" }, ...MODEL_OPTIONS],
   "model.large": MODEL_OPTIONS,
   "prompt.email_draft.carrier_group.model": MODEL_OPTIONS,
   "prompt.email_draft.customer_group.model": MODEL_OPTIONS,
