@@ -57,8 +57,9 @@ const FALLBACKS = {
   "tasks.generate.skip_customers": [],
   // AI governance trail (prompt/model changes, rewrites, reviews). On by default.
   "ai.governance.logging": true,
-  // Shipment analysis model; null = model.default / model.large by prompt size.
-  "model.shipment_analysis": null,
+  // Shipment analysis model (Haiku 5.5: ~80% cheaper than Haiku 4.5, same
+  // verdicts on a 20-shipment replay). "" = model.default / model.large.
+  "model.shipment_analysis": "claude-haiku-5-5",
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   // Large = long prompts (≥ ~12k chars) and any board-level synthesis.
   // Bumped to Opus 5 on 2026-09-22: the tasks page moved to heavier

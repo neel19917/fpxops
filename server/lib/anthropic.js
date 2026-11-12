@@ -24,19 +24,24 @@ const LARGE_PROMPT_CHARS = 12000;
 // fpx_settings (with env-var fallback) so admins can switch models without a
 // redeploy.
 // Shipment analysis has its own model setting (Admin → Settings → "Shipment
-// analysis model"); empty = the shared default/large rule below. Newer models
+// analysis model"; default Haiku 5.5); empty = the shared default/large rule. Newer models
 // think before answering and the thinking counts against max_tokens, so they
 // get room (2,000) and low effort — tested: Sonnet 5.5 / Haiku 5.5 / Opus 5.5
 // on 20 real shipments, no cut-offs, same verdicts as Haiku 4.5.
 export async function shipmentAnalysisCall(override) {
   const { "model.shipment_analysis": m } = await getSettings("model.shipment_analysis");
   const model = override || m || undefined;
-  const modern = /^claude-(opus-5|sonnet-5|haiku-5|fable-5)/.test(String(model || ""));
-  return {
-    modelOverride: model,
-    maxTokens: modern ? 2000 : 512,
-    extraBody: modern ? { output_config: { effort: "low" }, fallbacks: "default" } : null,
-  };
+  const id = String(model || "");
+  // Haiku 5.5: max output (128K) so an answer can never be cut off — billing
+  // is per token used (~1.2K on a typical shipment at low effort). No
+  // server-side fallback option: Haiku 5.5 doesn't support it.
+  if (/^claude-haiku-5/.test(id)) {
+    return { modelOverride: model, maxTokens: 128000, extraBody: { output_config: { effort: "low" } } };
+  }
+  if (/^claude-(opus-5|sonnet-5|fable-5)/.test(id)) {
+    return { modelOverride: model, maxTokens: 2000, extraBody: { output_config: { effort: "low" }, fallbacks: "default" } };
+  }
+  return { modelOverride: model, maxTokens: 512, extraBody: null };
 }
 
 async function pickModel(systemPrompt, userMessage, override) {
