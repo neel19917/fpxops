@@ -21,7 +21,7 @@ import {
   BOARD_KEY, OFF_DASHBOARD_WINDOW_MS, PREF_KEY, PRIORITY_WEIGHT, SEGMENT_SHORT, isActive, loadPrefs, looksDelivered,
   type GroupBy, type Prefs, type SortBy,
   taskMode,
-  openTasksInTabs, SLOW_TABS,
+  openTasksInTabs, BlockedTabsDialog, SLOW_TABS,
 } from "../components/tasksV2/shared";
 import { modeLabel } from "../components/ModePicker";
 import { RailItem, RailSection } from "../components/tasksV2/Rail";
@@ -352,10 +352,11 @@ export function TasksV2Page() {
     if (ids.length) navigate(`/tasks/v2/${ids[0]}`, { state: { from: `/tasks/v2${location.search}`, walkIds: ids } });
   }
   // Open every selected task in its own browser tab.
+  const [blockedTabs, setBlockedTabs] = useState<{ ids: string[]; total: number } | null>(null);
   function openSelectionInTabs() {
     const ids = selectedInOrder();
     const blocked = openTasksInTabs(ids);
-    if (blocked) setError(`Your browser blocked ${blocked} of ${ids.length} tabs. Allow pop-ups for this site, or use “Open ${ids.length}” to step through them in the drawer.`);
+    setBlockedTabs(blocked.length ? { ids: blocked, total: ids.length } : null);
   }
   function toggleAll() {
     setSelected((p) => {
@@ -767,6 +768,11 @@ export function TasksV2Page() {
           onClose={() => setEmailing(null)}
           onTasksChanged={() => { void load(true); }}
         />
+      ) : null}
+
+      {blockedTabs ? (
+        <BlockedTabsDialog ids={blockedTabs.ids} total={blockedTabs.total} onClose={() => setBlockedTabs(null)}
+          onRetry={() => { const still = openTasksInTabs(blockedTabs.ids, { quiet: true }); setBlockedTabs(still.length ? { ids: still, total: blockedTabs.total } : null); }} />
       ) : null}
 
       {dismissing ? (

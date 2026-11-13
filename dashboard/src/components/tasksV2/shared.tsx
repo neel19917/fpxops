@@ -152,10 +152,35 @@ export const MODE_CLS: Record<string, string> = {
 };
 
 // Opens every task in its own browser tab. Past SLOW_TABS it warns first that
-// loading takes a moment. Returns how many tabs the browser blocked, or null
-// if the user backed out.
+// loading takes a moment. Returns the ids the browser's pop-up blocker
+// refused (empty when all opened, or when the user backed out).
 export const SLOW_TABS = 20;
-export function openTasksInTabs(ids: string[]): number | null {
-  if (ids.length > SLOW_TABS && !window.confirm(`Opening ${ids.length} tabs. That many will take a second to load.`)) return null;
-  return ids.filter((id) => !window.open(`/tasks/v2/${id}`, "_blank")).length;
+export function openTasksInTabs(ids: string[], { quiet = false } = {}): string[] {
+  if (!quiet && ids.length > SLOW_TABS && !window.confirm(`Opening ${ids.length} tabs. That many will take a second to load.`)) return [];
+  return ids.filter((id) => !window.open(`/tasks/v2/${id}`, "_blank"));
+}
+
+// Shown when the pop-up blocker stopped some tabs. A browser lets a site open
+// one tab per click until pop-ups are allowed for it, so this explains the
+// one-time fix and offers a retry for the tabs that didn't open.
+export function BlockedTabsDialog({ ids, total, onRetry, onClose }: { ids: string[]; total: number; onRetry: () => void; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-2xl bg-white shadow-xl ring-1 ring-slate-200 p-5" onClick={(e) => e.stopPropagation()} role="alertdialog" aria-label="Tabs blocked">
+        <h2 className="font-semibold text-slate-900">Your browser blocked {ids.length} of {total} tabs</h2>
+        <p className="mt-2 text-sm text-slate-600">
+          {total - ids.length} opened. Browsers only let a site open several tabs at once after you allow pop-ups for it. This is a one-time setting:
+        </p>
+        <ol className="mt-2 text-sm text-slate-700 list-decimal pl-5 space-y-1">
+          <li>Click the <b>pop-up blocked</b> icon at the right end of the address bar.</li>
+          <li>Choose <b>Always allow pop-ups and redirects</b> from this site, then <b>Done</b>.</li>
+          <li>Press <b>Open the other {ids.length}</b> below.</li>
+        </ol>
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <button onClick={onClose} className="rounded-lg px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50">Close</button>
+          <button onClick={onRetry} className="rounded-lg px-3 py-2 text-sm bg-slate-900 text-white hover:bg-slate-800">Open the other {ids.length}</button>
+        </div>
+      </div>
+    </div>
+  );
 }

@@ -14,7 +14,7 @@ import { useAuth } from "../lib/auth";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
 import { GroupEmailComposer, type EmailAudience } from "../components/tasksV2/GroupEmailComposer";
-import { isActive, openTasksInTabs, shortTitle, SLOW_TABS } from "../components/tasksV2/shared";
+import { BlockedTabsDialog, isActive, openTasksInTabs, shortTitle, SLOW_TABS } from "../components/tasksV2/shared";
 
 const nameFor = (r: TaskBoardRow, by: EmailAudience) =>
   (by === "carrier" ? (r.shipment?.carrier_name || r.shipment?.carrier || "") : (r.shipment?.customer_name || "")).trim();
@@ -118,11 +118,11 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
   function walk(ids: string[]) {
     if (ids.length) navigate(`/tasks/v2/${ids[0]}`, { state: { from: `/email-studio${location.search}`, walkIds: ids } });
   }
+  const [blockedTabs, setBlockedTabs] = useState<{ ids: string[]; total: number } | null>(null);
   function openTabs(ids: string[]) {
     const blocked = openTasksInTabs(ids);
-    if (blocked) setErr(`Your browser blocked ${blocked} of ${ids.length} tabs. Allow pop-ups for this site, or use “Open” to step through them in the drawer.`);
+    setBlockedTabs(blocked.length ? { ids: blocked, total: ids.length } : null);
   }
-
   async function unqueue(ids: string[]) {
     setBusyId(ids[0]); setErr(null);
     try { await api.tasks.bulkUpdate({ ids, email_queued: false }); onChanged(); }
@@ -218,6 +218,11 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
           {homeless.length} queued task{homeless.length === 1 ? " has" : "s have"} no {by} on the shipment, so {homeless.length === 1 ? "it isn't" : "they aren't"} in any group here.
           Try “Group by {by === "carrier" ? "customer" : "carrier"}”.
         </div>
+      ) : null}
+
+      {blockedTabs ? (
+        <BlockedTabsDialog ids={blockedTabs.ids} total={blockedTabs.total} onClose={() => setBlockedTabs(null)}
+          onRetry={() => { const still = openTasksInTabs(blockedTabs.ids, { quiet: true }); setBlockedTabs(still.length ? { ids: still, total: blockedTabs.total } : null); }} />
       ) : null}
 
       {composing ? (
