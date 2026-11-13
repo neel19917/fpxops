@@ -14,7 +14,7 @@ import { useAuth } from "../lib/auth";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
 import { GroupEmailComposer, type EmailAudience } from "../components/tasksV2/GroupEmailComposer";
-import { isActive, shortTitle } from "../components/tasksV2/shared";
+import { isActive, openTasksInTabs, shortTitle, SLOW_TABS } from "../components/tasksV2/shared";
 
 const nameFor = (r: TaskBoardRow, by: EmailAudience) =>
   (by === "carrier" ? (r.shipment?.carrier_name || r.shipment?.carrier || "") : (r.shipment?.customer_name || "")).trim();
@@ -119,9 +119,8 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
     if (ids.length) navigate(`/tasks/v2/${ids[0]}`, { state: { from: `/email-studio${location.search}`, walkIds: ids } });
   }
   function openTabs(ids: string[]) {
-    const first = ids.slice(0, 5);
-    const blocked = first.filter((id) => !window.open(`/tasks/v2/${id}`, "_blank")).length;
-    if (blocked) setErr(`Your browser blocked ${blocked} of ${first.length} tabs. Allow pop-ups for this site, or use “Open” to step through them in the drawer.`);
+    const blocked = openTasksInTabs(ids);
+    if (blocked) setErr(`Your browser blocked ${blocked} of ${ids.length} tabs. Allow pop-ups for this site, or use “Open” to step through them in the drawer.`);
   }
 
   async function unqueue(ids: string[]) {
@@ -174,7 +173,7 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
           <span className="text-slate-400">·</span>
           <button onClick={() => setComposing({ to: null, only: pickedIds })} className="inline-flex items-center gap-1 rounded-md bg-violet-500 hover:bg-violet-400 px-2.5 py-1"><Mail className="h-3.5 w-3.5" /> Draft email</button>
           <button onClick={() => walk(pickedIds)} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title="Open these in the drawer and step through them with the arrows"><PanelRightOpen className="h-3.5 w-3.5" /> Open {pickedIds.length}</button>
-          <button onClick={() => openTabs(pickedIds)} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title="Open each in its own browser tab (the first 5)"><ExternalLink className="h-3.5 w-3.5" /> {pickedIds.length > 5 ? "First 5 in tabs" : "In tabs"}</button>
+          <button onClick={() => openTabs(pickedIds)} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title={pickedIds.length > SLOW_TABS ? `Open all ${pickedIds.length} in their own browser tabs. That many will take a second to load.` : "Open each one in its own browser tab"}><ExternalLink className="h-3.5 w-3.5" /> Open all in tabs</button>
           <button onClick={() => unqueue(pickedIds)} disabled={!!busyId} className="inline-flex items-center gap-1 rounded-md bg-slate-600 hover:bg-slate-500 px-2.5 py-1 disabled:opacity-50" title="Take these out of the email queue (the tasks themselves are untouched)"><Trash2 className="h-3.5 w-3.5" /> Remove from queue</button>
           <button onClick={() => setPicked(new Set())} className="ml-auto text-slate-300 hover:text-white inline-flex items-center gap-1"><X className="h-3.5 w-3.5" /> Clear</button>
         </div>

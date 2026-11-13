@@ -150,3 +150,12 @@ export const MODE_CLS: Record<string, string> = {
   Truckload: "bg-indigo-100 text-indigo-800 ring-indigo-200",
   Parcel: "bg-amber-100 text-amber-800 ring-amber-200",
 };
+
+// Opens every task in its own browser tab. Past SLOW_TABS it warns first that
+// loading takes a moment. Returns how many tabs the browser blocked, or null
+// if the user backed out.
+export const SLOW_TABS = 20;
+export function openTasksInTabs(ids: string[]): number | null {
+  if (ids.length > SLOW_TABS && !window.confirm(`Opening ${ids.length} tabs. That many will take a second to load.`)) return null;
+  return ids.filter((id) => !window.open(`/tasks/v2/${id}`, "_blank")).length;
+}

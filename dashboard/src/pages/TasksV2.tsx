@@ -21,6 +21,7 @@ import {
   BOARD_KEY, OFF_DASHBOARD_WINDOW_MS, PREF_KEY, PRIORITY_WEIGHT, SEGMENT_SHORT, isActive, loadPrefs, looksDelivered,
   type GroupBy, type Prefs, type SortBy,
   taskMode,
+  openTasksInTabs, SLOW_TABS,
 } from "../components/tasksV2/shared";
 import { modeLabel } from "../components/ModePicker";
 import { RailItem, RailSection } from "../components/tasksV2/Rail";
@@ -62,8 +63,6 @@ const VIEW_PARAMS = ["seg", "flag", "group", "sort", "q", "owner", "carrier", "m
 const pick = <T extends string>(v: string | null, allowed: string[], fallback: T): T => (v && allowed.includes(v) ? (v as T) : fallback);
 // Task ids travel as their first 8 characters to keep links short.
 const ID_PREFIX = 8;
-// Most tabs "Open in tabs" will open at once.
-const TAB_LIMIT = 5;
 
 interface Emailing { ids: string[]; audience: EmailAudience; to: string | null; whole: boolean }
 
@@ -352,10 +351,10 @@ export function TasksV2Page() {
     const ids = selectedInOrder();
     if (ids.length) navigate(`/tasks/v2/${ids[0]}`, { state: { from: `/tasks/v2${location.search}`, walkIds: ids } });
   }
-  // Open the first few in their own browser tabs.
+  // Open every selected task in its own browser tab.
   function openSelectionInTabs() {
-    const ids = selectedInOrder().slice(0, TAB_LIMIT);
-    const blocked = ids.filter((id) => !window.open(`/tasks/v2/${id}`, "_blank")).length;
+    const ids = selectedInOrder();
+    const blocked = openTasksInTabs(ids);
     if (blocked) setError(`Your browser blocked ${blocked} of ${ids.length} tabs. Allow pop-ups for this site, or use “Open ${ids.length}” to step through them in the drawer.`);
   }
   function toggleAll() {
@@ -678,7 +677,7 @@ export function TasksV2Page() {
               <span className="font-medium">{selected.size} selected</span>
               <span className="text-slate-400">·</span>
               <button onClick={walkSelection} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title="Open these in the drawer and step through them with the arrows (j / k)"><PanelRightOpen className="h-3.5 w-3.5" /> Open {selected.size}</button>
-              <button onClick={openSelectionInTabs} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title={`Open ${selected.size > TAB_LIMIT ? `the first ${TAB_LIMIT}` : "each one"} in its own browser tab`}><ExternalLink className="h-3.5 w-3.5" /> {selected.size > TAB_LIMIT ? `First ${TAB_LIMIT} in tabs` : "In tabs"}</button>
+              <button onClick={openSelectionInTabs} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title={selected.size > SLOW_TABS ? `Open all ${selected.size} in their own browser tabs. That many will take a second to load.` : "Open each one in its own browser tab"}><ExternalLink className="h-3.5 w-3.5" /> Open all in tabs</button>
               <button disabled={bulkBusy || !selectedActive.length} onClick={() => bulkStatus("in_progress")} className="inline-flex items-center gap-1 rounded-md bg-indigo-500 hover:bg-indigo-400 px-2.5 py-1 disabled:opacity-50"><Play className="h-3.5 w-3.5" /> Start</button>
               <button disabled={bulkBusy || !selectedActive.length} onClick={() => bulkStatus("done")} className="inline-flex items-center gap-1 rounded-md bg-emerald-500 hover:bg-emerald-400 px-2.5 py-1 disabled:opacity-50"><CheckCircle2 className="h-3.5 w-3.5" /> Done</button>
               <button disabled={bulkBusy || !selectedActive.length} onClick={() => openDismiss(selectedActive)} className="inline-flex items-center gap-1 rounded-md bg-slate-600 hover:bg-slate-500 px-2.5 py-1 disabled:opacity-50"><Ban className="h-3.5 w-3.5" /> Dismiss…</button>
