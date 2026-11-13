@@ -774,6 +774,26 @@ async function runErpIn(browser, url, who, months, shipmentType) {
       lost = 0;
       for (const l of r.lines || []) logLine(l.text, l.level || "info");
       if (current && r.counts) Object.assign(current.counts, r.counts);
+      // The page has rows ready: fetch them in slices and post them from here.
+      if (r.upload && !r.done) {
+        let answer;
+        try {
+          const meta = JSON.parse((await ext.evaluate("fpxErpTakeMeta()")).value || "null");
+          if (!meta) throw new Error("the page had no upload waiting");
+          const rows = [];
+          for (let at = 0; at < meta.rowCount; at += 400) {
+            rows.push(...JSON.parse((await ext.evaluate(`fpxErpTake(${at}, 400)`)).value || "[]"));
+          }
+          if (rows.length !== meta.rowCount) throw new Error(`read ${rows.length} of ${meta.rowCount} rows from the page`);
+          const { rowCount, ...body } = meta;
+          const resp = await api("/api/audits/invoice/from-history", { method: "POST", body: JSON.stringify({ ...body, rows }) });
+          answer = { ok: true, ...resp };
+        } catch (e) {
+          answer = { ok: false, error: e.message };
+        }
+        await ext.evaluate(`fpxErpDeliver(${JSON.stringify(answer)})`).catch(() => {});
+        continue;
+      }
       if (r.done) {
         if (current && r.done.result) current.result = r.done.result;
         if (!r.done.ok) {

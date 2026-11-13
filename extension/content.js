@@ -3596,7 +3596,43 @@ const ERP_UPLOAD_MAX_BYTES = 12 * 1024 * 1024; // per POST; the API's limit is 2
 
 function fpxErpPoll() {
   if (!fpxErp) return { started: false };
-  return { started: true, lines: fpxErp.lines.splice(0), counts: fpxErp.counts, done: fpxErp.done };
+  return {
+    started: true, lines: fpxErp.lines.splice(0), counts: fpxErp.counts, done: fpxErp.done,
+    upload: fpxErp.outbox ? { rows: fpxErp.outbox.rows.length } : null,
+  };
+}
+
+// The upload itself is done by the browser service, not from this page: it
+// collects the waiting body in slices with these, posts it to the API with
+// its own key, and hands the answer back. (Sending it through the extension's
+// background script failed with "message port closed".)
+function fpxErpTakeMeta() {
+  if (!fpxErp || !fpxErp.outbox) return "null";
+  const { rows, ...meta } = fpxErp.outbox;
+  return JSON.stringify({ ...meta, rowCount: rows.length });
+}
+function fpxErpTake(start, count) {
+  if (!fpxErp || !fpxErp.outbox) return "[]";
+  return JSON.stringify(fpxErp.outbox.rows.slice(start, start + count));
+}
+function fpxErpDeliver(resp) {
+  if (!fpxErp) return "no job";
+  fpxErp.outbox = null;
+  fpxErp.inbox = resp || { ok: false, error: "empty answer" };
+  return "ok";
+}
+// Park one upload body for the browser service and wait for its answer.
+async function erpHandOff(payload) {
+  fpxErp.inbox = null;
+  fpxErp.outbox = payload;
+  const until = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < until) {
+    if (fpxErp.inbox) { const r = fpxErp.inbox; fpxErp.inbox = null; return r; }
+    if (stopRequested) { fpxErp.outbox = null; return { ok: false, error: "stopped before the upload finished" }; }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  fpxErp.outbox = null;
+  return { ok: false, error: "no answer from the browser service after 5 min" };
 }
 
 function erpLog(text, level = "info") {
@@ -3956,7 +3992,7 @@ async function erpAuditPull(months, runBy, shipmentType) {
       const payload = c === 0 ? { run, rows, ai_level: "summary" } : { audit_id: auditId, rows };
       if (chunks > 1) payload.final = c === chunks - 1;
       // Never retried: a repeat could leave a second audit or double the rows.
-      const resp = await erpUploadChunk(payload, false);
+      const resp = await erpHandOff(payload);
       if (!resp || !resp.ok) {
         const msg = `Upload failed${chunks > 1 ? ` on part ${c + 1} of ${chunks}` : ""}: ${(resp && resp.error) || "no reply"}` +
           (auditId ? ` — audit ${String(auditId).slice(0, 8)} holds ${erpNum(state.counts.uploaded)} of ${erpNum(pending.length)} rows` : "");
