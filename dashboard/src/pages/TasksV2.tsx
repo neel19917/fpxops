@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   AlertTriangle, Ban, CheckCircle2, Clock, Filter, Layers, ListChecks,
-  Loader2, Mail, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
+  Loader2, Mail, MailPlus, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
@@ -173,6 +173,7 @@ export function TasksV2Page() {
     return people[k] || people[k.toLowerCase()] || k;
   };
   const rowById = useMemo(() => new Map(rows.map((r) => [r.task.id, r])), [rows]);
+  const queuedCount = useMemo(() => rows.filter((r) => r.task.email_queued_at && isActive(r.task.status)).length, [rows]);
 
   // Reopen a linked group email: the listed tasks, or else every active task
   // on the board for that carrier / customer.
@@ -636,6 +637,11 @@ export function TasksV2Page() {
               <span>Show recently closed</span>
             </label>
             <span className="text-xs text-slate-500">{visible.length} of {rows.length}</span>
+            {queuedCount ? (
+              <button type="button" onClick={() => navigate("/email-studio")} className="inline-flex items-center gap-1.5 text-xs px-2.5 py-2 rounded-lg bg-violet-50 text-violet-800 ring-1 ring-violet-200 hover:bg-violet-100" title="Open Email Studio to group and draft these">
+                <Mail className="h-3.5 w-3.5" /> {queuedCount} queued for email
+              </button>
+            ) : null}
           </div>
 
           {/* Bulk bar */}
@@ -650,6 +656,7 @@ export function TasksV2Page() {
                 <div className="w-56 text-slate-900"><UserPicker value={assignTo} onChange={setAssignTo} placeholder="Assign to…" size="sm" /></div>
                 <button disabled={bulkBusy || !(assignTo || "").trim()} onClick={bulkAssign} className="inline-flex items-center gap-1 rounded-md bg-sky-500 hover:bg-sky-400 px-2.5 py-1 disabled:opacity-50"><UserPlus className="h-3.5 w-3.5" /> Assign</button>
               </div>
+              <button disabled={bulkBusy || !selectedActive.length} onClick={() => bulk(() => api.tasks.bulkUpdate({ ids: selectedActive, email_queued: true }))} className="inline-flex items-center gap-1 rounded-md bg-slate-600 hover:bg-slate-500 px-2.5 py-1 disabled:opacity-50" title="Mark these for email. They collect in Email Studio, grouped by carrier or customer."><MailPlus className="h-3.5 w-3.5" /> Queue for email</button>
               <button disabled={!selectedActive.length} onClick={() => setEmailing({ ids: selectedActive, audience: prefs.groupBy === "customer" ? "customer" : "carrier", to: null, whole: false })} className="inline-flex items-center gap-1 rounded-md bg-fuchsia-500 hover:bg-fuchsia-400 px-2.5 py-1 disabled:opacity-50" title="Draft one email per carrier (or customer) covering every selected shipment"><Mail className="h-3.5 w-3.5" /> Email {prefs.groupBy === "customer" ? "customer" : "carrier"}…</button>
               <button disabled={bulkBusy} onClick={() => runTriage({ ids: Array.from(selected) })} className="inline-flex items-center gap-1 rounded-md bg-violet-500 hover:bg-violet-400 px-2.5 py-1 disabled:opacity-50" title="Triage only the selected tasks"><Wand2 className="h-3.5 w-3.5" /> Triage selection</button>
               <button onClick={() => setSelected(new Set())} className="ml-auto text-slate-300 hover:text-white inline-flex items-center gap-1"><X className="h-3.5 w-3.5" /> Clear</button>

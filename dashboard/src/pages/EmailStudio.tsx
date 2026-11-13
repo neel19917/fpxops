@@ -116,7 +116,7 @@ export function EmailStudioPage() {
     <div className="space-y-4">
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
-          <h1 className="text-xl font-semibold flex items-center gap-2"><Mail className="h-5 w-5 text-violet-600" /> Email Studio</h1>
+          <h1 className="text-xl font-semibold flex items-center gap-2"><Mail className="h-5 w-5 text-violet-600" /> Email prompts</h1>
           <p className="text-sm text-slate-500 mt-0.5">Edit how FPX's AI writes emails. Rewrite with plain-English instructions, preview on real shipments, then save.</p>
         </div>
         <div className="flex items-center gap-2">

@@ -12,6 +12,15 @@ import { getSettings } from "../lib/settings.js";
 
 export const tasksRouter = Router();
 
+// { email_queued: true|false } on a task update → the two queue columns.
+// Returns {} when the body doesn't mention it.
+function emailQueuePatch(req) {
+  if (typeof req.body?.email_queued !== "boolean") return {};
+  return req.body.email_queued
+    ? { email_queued_at: new Date().toISOString(), email_queued_by: req.user?.email || req.apiKey?.name || null }
+    : { email_queued_at: null, email_queued_by: null };
+}
+
 // Convention-based detector: a task is a "carrier follow-up" when its
 // title contains both "carrier" and "follow" (case-insensitive). No
 // schema change needed — operators just type a recognizable title like
@@ -681,7 +690,13 @@ tasksRouter.post("/v2/group-email", async (req, res) => {
   const tone = GROUP_EMAIL_TONES[req.body?.tone] ? req.body.tone : null;
   const userNotes = typeof req.body?.notes === "string" ? req.body.notes.trim().slice(0, 2000) : "";
   const notes = [tone ? GROUP_EMAIL_TONES[tone] : "", userNotes].filter(Boolean).join("\n") || undefined;
-  const callMeta = { api_key_id: req.apiKey?.id, user_email: req.user?.email, metadata: { source: "tasks_v2", tone } };
+  // What the email covers, kept with the draft so Email Studio's history can
+  // show its scope later.
+  const scope = Array.from(byShip.entries()).map(([sid, ts]) => ({
+    id: sid, tn: shipById.get(sid).tracking_number || null, fpx: shipById.get(sid).shipment_id || null,
+    task_ids: ts.map((t) => t.id),
+  }));
+  const callMeta = { api_key_id: req.apiKey?.id, user_email: req.user?.email, metadata: { source: "tasks_v2", tone, audience, scope } };
   const result = audience === "carrier"
     ? await generateCarrierGroupEmail({ carrier: name, items, notes, callMeta })
     : await generateCustomerGroupEmail({ customer: name, items, notes, callMeta });
@@ -700,6 +715,40 @@ tasksRouter.post("/v2/group-email", async (req, res) => {
     subject: result.subject, body: result.body, model: result.model || null,
     count: items.length, task_ids: active.filter((t) => shipById.has(t.shipment_id)).map((t) => t.id),
     missing,
+  });
+});
+
+// GET /tasks/v2/group-emails?limit=50
+// Every group email drafted (carrier and customer), newest first, with the
+// shipments each one covered. Open to all signed-in users: it is the History
+// tab of Email Studio.
+tasksRouter.get("/v2/group-emails", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const cols = "id, created_at, model, user_email, response_text, metadata, rating";
+  const pull = (subkind) => supabase.from("fpx_ai_analyses").select(cols)
+    .contains("metadata", { subkind }).order("created_at", { ascending: false }).limit(limit);
+  const [c, k] = await Promise.all([pull("email_draft_carrier_group"), pull("email_draft_customer_group")]);
+  if (c.error || k.error) return res.status(500).json({ error: (c.error || k.error).message });
+  const rows = [...(c.data || []), ...(k.data || [])]
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).slice(0, limit);
+  res.json({
+    data: rows.map((a) => {
+      const md = a.metadata && typeof a.metadata === "object" ? a.metadata : {};
+      let subject = null, body = null;
+      try {
+        const m = (a.response_text || "").match(/\{[\s\S]*\}/);
+        if (m) { const j = JSON.parse(m[0]); subject = j?.subject ? String(j.subject) : null; body = j?.body ? String(j.body) : null; }
+      } catch { /* fall back to the raw text */ }
+      return {
+        id: a.id, created_at: a.created_at, model: a.model, by: a.user_email || null,
+        audience: md.subkind === "email_draft_customer_group" ? "customer" : "carrier",
+        recipient: md.carrier || md.customer || null,
+        count: Number(md.count) || null, tone: md.tone || null,
+        subject, body: body || a.response_text || "",
+        scope: Array.isArray(md.scope) ? md.scope : null,
+        rating: a.rating || null,
+      };
+    }),
   });
 });
 
@@ -804,7 +853,7 @@ tasksRouter.post("/bulk-update", async (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((x) => typeof x === "string") : [];
   if (!ids.length) return res.status(400).json({ error: "ids required" });
   const allowed = ["status","priority","assigned_to"];
-  const patch = {};
+  const patch = { ...emailQueuePatch(req) };
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
   if (!Object.keys(patch).length) return res.status(400).json({ error: "no fields to update" });
   if ("assigned_to" in patch) patch.assigned_to = await resolveAssignee(patch.assigned_to);
@@ -842,8 +891,9 @@ tasksRouter.post("/bulk-delete", async (req, res) => {
 // Same UUID constraint as GET /:id — see the rationale above.
 tasksRouter.patch("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", async (req, res) => {
   const allowed = ["status", "priority", "assigned_to", "title", "description", "due_at"];
-  const patch = {};
+  const patch = { ...emailQueuePatch(req) };
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+  if (!Object.keys(patch).length) return res.status(400).json({ error: "no fields to update" });
   if ("assigned_to" in patch) patch.assigned_to = await resolveAssignee(patch.assigned_to);
   if (patch.status === "done" && !patch.completed_at) patch.completed_at = new Date().toISOString();
   if (patch.status && patch.status !== "done") patch.completed_at = null;

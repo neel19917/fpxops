@@ -38,6 +38,7 @@ const InstallPage     = lazy(() => import("./pages/Install").then((m) => ({ defa
 const ConnectClaudePage = lazy(() => import("./pages/ConnectClaude").then((m) => ({ default: m.ConnectClaudePage })));
 const DataFlowPage = lazy(() => import("./pages/DataFlow").then((m) => ({ default: m.DataFlowPage })));
 const AIGovernancePage = lazy(() => import("./pages/AIGovernance").then((m) => ({ default: m.AIGovernancePage })));
+const EmailQueuePage  = lazy(() => import("./pages/EmailQueue").then((m) => ({ default: m.EmailQueuePage })));
 const EmailStudioPage = lazy(() => import("./pages/EmailStudio").then((m) => ({ default: m.EmailStudioPage })));
 const HostedBrowserSettingsPage = lazy(() => import("./pages/HostedBrowserSettings").then((m) => ({ default: m.HostedBrowserSettingsPage })));
 const ScrapeLogsPage  = lazy(() => import("./pages/ScrapeLogs").then((m) => ({ default: m.ScrapeLogsPage })));
@@ -68,6 +69,7 @@ const TAB_PATH: Record<TabId, string> = {
   scrape_logs: "/admin/scrape-logs",
   hosted_browser: "/admin/hosted-browser",
   email_studio: "/admin/email-studio",
+  emails: "/email-studio",
   ai_governance: "/admin/ai-governance",
   data_flow: "/admin/data-flow",
   claude: "/claude",
@@ -92,6 +94,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/claude")) return "claude";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
+  if (pathname.startsWith("/email-studio")) return "emails";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
   if (pathname.startsWith("/scraping")) return "scraping";
@@ -272,6 +275,7 @@ function AuthedApp() {
             <Route path="/ops" element={<OpsPage />} />
             <Route path="/scraping" element={<ScrapingPage />} />
             <Route path="/freightpop" element={<FreightPopLoginPage />} />
+            <Route path="/email-studio" element={<EmailQueuePage />} />
             <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />

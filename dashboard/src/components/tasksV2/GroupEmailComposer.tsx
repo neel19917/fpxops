@@ -132,10 +132,13 @@ export function GroupEmailComposer({ rows, initialAudience, initialTo, onView, o
   async function startTasks(b: Batch) {
     const st = stateOf(b.name);
     const openIds = b.lines.flatMap((l) => l.tasks).filter((t) => st.taskIds.includes(t.task.id) && t.task.status === "open").map((t) => t.task.id);
-    if (!openIds.length) { patch(b.name, { started: true }); return; }
+    // Sent → these tasks leave Email Studio's queue.
+    const queuedIds = b.lines.flatMap((l) => l.tasks).filter((t) => st.taskIds.includes(t.task.id) && t.task.email_queued_at).map((t) => t.task.id);
+    if (!openIds.length && !queuedIds.length) { patch(b.name, { started: true }); return; }
     patch(b.name, { busy: true, err: null });
     try {
-      await api.tasks.bulkUpdate({ ids: openIds, status: "in_progress" });
+      if (openIds.length) await api.tasks.bulkUpdate({ ids: openIds, status: "in_progress" });
+      if (queuedIds.length) await api.tasks.bulkUpdate({ ids: queuedIds, email_queued: false });
       patch(b.name, { busy: false, started: true });
       onTasksChanged();
     } catch (e) { patch(b.name, { busy: false, err: (e as Error).message }); }
@@ -229,6 +232,7 @@ function BatchPane({ batch, audience, st, patch, onDraft, onCopy, onStart, locke
   const count = batch.lines.length - st.excluded.size;
   const mailto = `mailto:?subject=${encodeURIComponent(st.subject)}&body=${encodeURIComponent(st.body)}`;
   const openCount = batch.lines.flatMap((l) => l.tasks).filter((t) => st.taskIds.includes(t.task.id) && t.task.status === "open").length;
+  const queuedCount = batch.lines.flatMap((l) => l.tasks).filter((t) => st.taskIds.includes(t.task.id) && t.task.email_queued_at).length;
   // The list changed since the draft was written.
   const stale = !!st.body && st.draftedFor !== count;
 
@@ -340,11 +344,11 @@ function BatchPane({ batch, audience, st, patch, onDraft, onCopy, onStart, locke
             ) : <span className="text-[11px] text-slate-500">Too long for a mail link — copy and paste it into your mail.</span>}
             <span className="ml-auto">
               {st.started ? (
-                <span className="text-xs text-emerald-700 inline-flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5" /> Tasks marked in progress</span>
-              ) : openCount ? (
-                <button onClick={onStart} disabled={st.busy} title="Once the email is sent, move its open tasks to In progress so the board shows you're waiting on a reply"
+                <span className="text-xs text-emerald-700 inline-flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5" /> Marked as sent</span>
+              ) : openCount || queuedCount ? (
+                <button onClick={onStart} disabled={st.busy} title="Once the email is sent: open tasks move to In progress (waiting on a reply) and queued tasks leave the email queue"
                   className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40">
-                  <Play className="h-4 w-4" /> Sent it — mark {openCount} task{openCount === 1 ? "" : "s"} in progress
+                  <Play className="h-4 w-4" /> {openCount ? `Sent it — mark ${openCount} task${openCount === 1 ? "" : "s"} in progress` : "Sent it — clear from queue"}
                 </button>
               ) : null}
             </span>

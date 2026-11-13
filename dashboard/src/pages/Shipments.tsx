@@ -788,6 +788,19 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     if (drawerNext) setDrawerId(drawerNext.id);
   }
 
+  // Task walk: put the current task in (or take it out of) Email Studio's
+  // queue. Bound to E and to the button on the task banner.
+  const walkTask = taskWalk?.task ? (drawerTasks.find((t) => t.id === taskWalk.taskId) ?? taskWalk.task) : null;
+  async function toggleEmailQueue() {
+    if (!walkTask || taskBusy) return;
+    setTaskBusy(true);
+    try {
+      const { task } = await api.tasks.update(walkTask.id, { email_queued: !walkTask.email_queued_at });
+      setDrawerTasks((p) => (p.some((x) => x.id === task.id) ? p.map((x) => (x.id === task.id ? task : x)) : [...p, task]));
+    } catch (e) { setErr((e as Error).message); }
+    finally { setTaskBusy(false); }
+  }
+
   // Keyboard shortcuts that fire only while the drawer is open. CRM-style:
   // step through the filtered list, jump to a tab, run the common drawer
   // actions (re-analyze, override, share), close. Pause whenever the user
@@ -860,6 +873,12 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         }
         return;
       }
+      // Task walk: E marks (or unmarks) the task for Email Studio.
+      if (e.key === "e" && taskWalk?.task) {
+        e.preventDefault();
+        void toggleEmailQueue();
+        return;
+      }
       if (e.key === "r") {
         e.preventDefault();
         if (!drawerId) return;
@@ -870,7 +889,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawerId, drawerHelpOpen, drawerPrev, drawerNext, drawerData, taskWalk]);
+  }, [drawerId, drawerHelpOpen, drawerPrev, drawerNext, drawerData, taskWalk, walkTask?.email_queued_at, taskBusy]);
 
   const allFilteredSelected = filtered.length > 0 && filtered.every((r) => selectedIds.has(r.id));
   function toggleRow(id: string) {
@@ -1526,6 +1545,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 siblings={drawerTasks.filter((t) => t.id !== taskWalk.taskId && (t.status === "open" || t.status === "in_progress" || t.status === "blocked"))}
                 onOpenTask={(id) => taskWalk.onWalk(id)}
                 busy={taskBusy}
+                onToggleEmailQueue={toggleEmailQueue}
                 onSetStatus={async (status) => {
                   if (!taskWalk?.task) return;
                   setTaskBusy(true);
@@ -1917,6 +1937,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 { keys: ["3"], label: "Email tab" },
                 { keys: ["4"], label: "Analysis tab" },
                 { keys: ["5"], label: "Intel tab (similar shipments, ask)" },
+                { keys: ["e"], label: "Mark task for email (in a task)" },
                 { keys: ["o"], label: "Open override modal" },
                 { keys: ["r"], label: "Re-analyze" },
                 { keys: ["esc"], label: "Close drawer" },
@@ -2428,8 +2449,10 @@ function AnalysisThumbs({ analysis, onRated }: {
   );
 }
 
-function TaskBanner({ task, shipment, latestNote, siblings = [], onOpenTask, busy, onSetStatus, onSaveDescription, onCreateInverseFollowup }: {
+function TaskBanner({ task, shipment, latestNote, siblings = [], onOpenTask, busy, onSetStatus, onToggleEmailQueue, onSaveDescription, onCreateInverseFollowup }: {
   task: ShipmentTask;
+  // Marks / unmarks the task for Email Studio (hotkey E).
+  onToggleEmailQueue?: () => void;
   // The shipment as of the latest scrape/analysis. The task's own title +
   // description are frozen at creation (AI wording from that day), so the
   // banner shows the CURRENT read next to it and offers to refresh the
@@ -2764,6 +2787,19 @@ function TaskBanner({ task, shipment, latestNote, siblings = [], onOpenTask, bus
               title={`Open the FreightPOP tracking modal for ${task.tracking_number} in the embedded panel`}
             >
               Open tracking #
+            </button>
+          ) : null}
+          {onToggleEmailQueue && task.status !== "done" && task.status !== "cancelled" ? (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onToggleEmailQueue}
+              aria-pressed={!!task.email_queued_at}
+              title={task.email_queued_at ? "Queued for Email Studio. Press E to take it out." : "Mark for email: it collects in Email Studio, grouped by carrier or customer (E)"}
+              className={"text-xs font-semibold rounded-md px-2.5 py-1 inline-flex items-center gap-1 disabled:opacity-50 " + (task.email_queued_at ? "bg-violet-600 text-white hover:bg-violet-700" : "bg-white text-violet-700 ring-1 ring-violet-200 hover:bg-violet-50")}
+            >
+              <Mail className="h-3.5 w-3.5" /> {task.email_queued_at ? "Queued for email" : "Mark for email"}
+              <kbd className={"ml-0.5 px-1 rounded text-[10px] font-mono " + (task.email_queued_at ? "bg-violet-500" : "bg-violet-100")}>E</kbd>
             </button>
           ) : null}
           {actions.map((a) => (

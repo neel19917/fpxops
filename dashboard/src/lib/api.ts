@@ -415,12 +415,12 @@ export const api = {
       request<{ data: ShipmentTask[] }>(`/api/shipments/${shipmentId}/tasks`),
     create: (shipmentId: string, body: { title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string; status?: "open" | "in_progress" | "blocked" }) =>
       request<{ task: ShipmentTask }>(`/api/shipments/${shipmentId}/tasks`, { method: "POST", body: JSON.stringify(body) }),
-    update: (id: string, patch: Partial<Pick<ShipmentTask, "status" | "priority" | "assigned_to" | "title" | "description" | "due_at">>) =>
+    update: (id: string, patch: Partial<Pick<ShipmentTask, "status" | "priority" | "assigned_to" | "title" | "description" | "due_at">> & { email_queued?: boolean }) =>
       request<{ task: ShipmentTask }>(`/api/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
     remove: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
     bulkCreate: (body: { shipment_ids: string[]; title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string }) =>
       request<{ created: number; missing: string[] }>("/api/tasks/bulk", { method: "POST", body: JSON.stringify(body) }),
-    bulkUpdate: (body: { ids: string[]; status?: string; priority?: string; assigned_to?: string }) =>
+    bulkUpdate: (body: { ids: string[]; status?: string; priority?: string; assigned_to?: string; email_queued?: boolean }) =>
       request<{ updated: number }>("/api/tasks/bulk-update", { method: "POST", body: JSON.stringify(body) }),
     bulkDelete: (body: { ids: string[] }) =>
       request<{ deleted: number }>("/api/tasks/bulk-delete", { method: "POST", body: JSON.stringify(body) }),
@@ -451,6 +451,8 @@ export const api = {
     v2GroupEmail: (body: { audience: "carrier" | "customer"; name: string; task_ids: string[]; notes?: string; tone?: "friendly" | "direct" | "escalate" }) =>
       request<{ subject: string; body: string; model: string | null; count: number; task_ids: string[]; missing?: string[] }>(
         "/api/tasks/v2/group-email", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
+    // Every group email drafted, newest first, with the shipments it covered.
+    v2GroupEmails: (limit = 50) => request<{ data: GroupEmailRecord[] }>("/api/tasks/v2/group-emails", { params: { limit } }),
     v2Dismiss: (body: { ids: string[]; reason?: string; disposition?: string }) =>
       request<{ dismissed: number; skipped: number }>("/api/tasks/v2/dismiss", { method: "POST", body: JSON.stringify(body) }),
     // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
@@ -656,6 +658,16 @@ export interface GovCall {
 }
 
 export type EmailStudioType = "carrier" | "customer" | "carrier_group" | "customer_group";
+// One drafted group email, as listed in Email Studio's History.
+export interface GroupEmailRecord {
+  id: string; created_at: string; model: string | null; by: string | null;
+  audience: "carrier" | "customer"; recipient: string | null; count: number | null; tone: string | null;
+  subject: string | null; body: string;
+  // Shipments the email covered. Null for emails drafted before scope was recorded.
+  scope: { id: string; tn: string | null; fpx: string | null; task_ids: string[] }[] | null;
+  rating: "up" | "down" | null;
+}
+
 // A group email a rep drafted for real (not a Studio preview).
 export interface EmailStudioDraft {
   id: string; created_at: string; model: string | null; by: string | null;

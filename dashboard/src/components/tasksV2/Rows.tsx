@@ -95,6 +95,7 @@ function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagM
             return <Pill key={f} cls={FLAG_CLS[m?.tone || "slate"]} title={m?.description}>{m?.label || f}</Pill>;
           })}
           {closeCandidate ? <Pill cls="bg-emerald-600 text-white ring-emerald-600" title="AI triage suggests dismissing this task">AI: close</Pill> : null}
+          {row.task.email_queued_at ? <Pill cls="bg-violet-100 text-violet-800 ring-violet-200" title={`Queued for email${row.task.email_queued_by ? ` by ${row.task.email_queued_by}` : ""}. Draft it in Email Studio.`}>To email</Pill> : null}
         </div>
         <button onClick={onOpen} className="text-left font-medium text-slate-900 hover:text-sky-700 leading-snug line-clamp-2" title={t.title}>{shortTitle(t.title)}</button>
         {seg.health ? <div className="text-xs text-slate-500 mt-0.5">{seg.health}</div> : null}
