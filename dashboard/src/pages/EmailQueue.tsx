@@ -5,8 +5,8 @@
 //   History — every group email drafted, with the shipments it covered.
 // The AI prompts behind the emails are edited on the admin "Email prompts" page.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
-import { ChevronDown, ChevronRight, Copy, History, Inbox, Mail, RefreshCw, Search, Settings2, Sparkles, X } from "lucide-react";
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import { ChevronDown, ChevronRight, Copy, ExternalLink, History, Inbox, Mail, PanelRightOpen, RefreshCw, Search, Settings2, Sparkles, Trash2, X } from "lucide-react";
 import { api, type GroupEmailRecord } from "../lib/api";
 import type { TaskBoardRow } from "../lib/types";
 import { fmtRelative } from "../lib/format";
@@ -74,8 +74,12 @@ export function EmailQueuePage() {
 }
 
 function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: EmailAudience; onBy: (b: EmailAudience) => void; onChanged: () => void }) {
-  const [composing, setComposing] = useState<{ to: string | null } | null>(null);
+  const navigate = useNavigate();
+  const location = useLocation();
+  // `only`: draft just these task ids instead of the whole queue.
+  const [composing, setComposing] = useState<{ to: string | null; only?: string[] } | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
   const [err, setErr] = useState<string | null>(null);
 
   const { groups, homeless } = useMemo(() => {
@@ -91,6 +95,34 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
       .sort((a, b) => b.shipments - a.shipments || a.name.localeCompare(b.name));
     return { groups, homeless };
   }, [queued, by]);
+
+  // Drop ticks for tasks that have left the queue.
+  useEffect(() => { setPicked((p) => new Set(Array.from(p).filter((id) => queued.some((r) => r.task.id === id)))); }, [queued]);
+  const order = useMemo(() => groups.flatMap((g) => g.rows.map((r) => r.task.id)), [groups]);
+  const pickedIds = order.filter((id) => picked.has(id));
+  const [lastTicked, setLastTicked] = useState<string | null>(null);
+  function tick(id: string, shift: boolean) {
+    setPicked((p) => {
+      const n = new Set(p);
+      const a = shift && lastTicked ? order.indexOf(lastTicked) : -1;
+      const b = order.indexOf(id);
+      if (a >= 0 && b >= 0 && a !== b) { for (let i = Math.min(a, b); i <= Math.max(a, b); i++) n.add(order[i]); return n; }
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+    setLastTicked(id);
+  }
+  function tickMany(ids: string[]) {
+    setPicked((p) => { const n = new Set(p); const all = ids.every((id) => n.has(id)); ids.forEach((id) => (all ? n.delete(id) : n.add(id))); return n; });
+  }
+  function walk(ids: string[]) {
+    if (ids.length) navigate(`/tasks/v2/${ids[0]}`, { state: { from: `/email-studio${location.search}`, walkIds: ids } });
+  }
+  function openTabs(ids: string[]) {
+    const first = ids.slice(0, 5);
+    const blocked = first.filter((id) => !window.open(`/tasks/v2/${id}`, "_blank")).length;
+    if (blocked) setErr(`Your browser blocked ${blocked} of ${first.length} tabs. Allow pop-ups for this site, or use “Open” to step through them in the drawer.`);
+  }
 
   async function unqueue(ids: string[]) {
     setBusyId(ids[0]); setErr(null);
@@ -125,6 +157,9 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
           ))}
         </div>
         <span className="text-sm text-slate-500">{queued.length} task{queued.length === 1 ? "" : "s"} queued · {groups.length} {by}{groups.length === 1 ? "" : "s"}</span>
+        <label className="inline-flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer select-none">
+          <input type="checkbox" checked={order.length > 0 && order.every((id) => picked.has(id))} onChange={() => tickMany(order)} className="accent-violet-600" /> Select all
+        </label>
         {groups.length > 1 ? (
           <button onClick={() => setComposing({ to: null })} className="ml-auto inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">
             <Sparkles className="h-4 w-4" /> Draft all {groups.length} emails
@@ -133,11 +168,25 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
       </div>
       {err ? <div className="text-sm text-rose-700">{err}</div> : null}
 
+      {pickedIds.length ? (
+        <div className="sticky top-2 z-10 rounded-xl bg-slate-900 text-white px-4 py-2.5 flex items-center gap-2 flex-wrap text-sm">
+          <span className="font-medium">{pickedIds.length} selected</span>
+          <span className="text-slate-400">·</span>
+          <button onClick={() => setComposing({ to: null, only: pickedIds })} className="inline-flex items-center gap-1 rounded-md bg-violet-500 hover:bg-violet-400 px-2.5 py-1"><Mail className="h-3.5 w-3.5" /> Draft email</button>
+          <button onClick={() => walk(pickedIds)} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title="Open these in the drawer and step through them with the arrows"><PanelRightOpen className="h-3.5 w-3.5" /> Open {pickedIds.length}</button>
+          <button onClick={() => openTabs(pickedIds)} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title="Open each in its own browser tab (the first 5)"><ExternalLink className="h-3.5 w-3.5" /> {pickedIds.length > 5 ? "First 5 in tabs" : "In tabs"}</button>
+          <button onClick={() => unqueue(pickedIds)} disabled={!!busyId} className="inline-flex items-center gap-1 rounded-md bg-slate-600 hover:bg-slate-500 px-2.5 py-1 disabled:opacity-50" title="Take these out of the email queue (the tasks themselves are untouched)"><Trash2 className="h-3.5 w-3.5" /> Remove from queue</button>
+          <button onClick={() => setPicked(new Set())} className="ml-auto text-slate-300 hover:text-white inline-flex items-center gap-1"><X className="h-3.5 w-3.5" /> Clear</button>
+        </div>
+      ) : null}
+
       <div className="grid gap-3 lg:grid-cols-2">
         {groups.map((g) => (
           <div key={g.name} className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4">
             <div className="flex items-start justify-between gap-2">
-              <div className="min-w-0">
+              <input type="checkbox" checked={g.rows.every((r) => picked.has(r.task.id))} onChange={() => tickMany(g.rows.map((r) => r.task.id))}
+                aria-label={`Select all for ${g.name}`} title="Select every task in this group" className="accent-violet-600 mt-1.5 shrink-0" />
+              <div className="min-w-0 flex-1">
                 <div className="font-semibold text-slate-900 truncate">{g.name}</div>
                 <div className="text-xs text-slate-500">{g.shipments} shipment{g.shipments === 1 ? "" : "s"} · oldest ask <span className={g.oldest >= 7 ? "text-rose-600 font-medium" : ""}>{g.oldest}d</span></div>
               </div>
@@ -147,7 +196,9 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
             </div>
             <ul className="mt-3 divide-y divide-slate-100 rounded-xl ring-1 ring-slate-100 max-h-64 overflow-y-auto">
               {g.rows.map((r) => (
-                <li key={r.task.id} className="flex items-start gap-2 px-3 py-2 text-xs">
+                <li key={r.task.id} className={"flex items-start gap-2 px-3 py-2 text-xs " + (picked.has(r.task.id) ? "bg-violet-50/60" : "")}>
+                  <input type="checkbox" checked={picked.has(r.task.id)} onChange={() => {}} onClick={(e) => tick(r.task.id, e.shiftKey)}
+                    aria-label="Select task" title="Shift-click to select a range" className="accent-violet-600 mt-0.5 shrink-0" />
                   <span className="min-w-0 flex-1">
                     <Link to={`/tasks/v2/${r.task.id}`} className="font-mono font-semibold text-sky-700 hover:underline">{r.shipment?.tracking_number || r.shipment?.shipment_id || "(no PRO)"}</Link>
                     <span className="text-slate-500"> · {r.shipment?.shipment_status || "No status"} · {by === "carrier" ? r.shipment?.customer_name : (r.shipment?.carrier_name || r.shipment?.carrier)}</span>
@@ -172,7 +223,7 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
 
       {composing ? (
         <GroupEmailComposer
-          rows={queued}
+          rows={composing.only ? queued.filter((r) => composing.only!.includes(r.task.id)) : queued}
           initialAudience={by}
           initialTo={composing.to}
           onClose={() => setComposing(null)}

@@ -12,7 +12,7 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
   showHeader: boolean; collapsed: boolean; onToggle: () => void; onSelectGroup: () => void;
   // Set when the board is grouped by carrier / customer: shows "Email carrier".
   emailLabel?: "carrier" | "customer"; onEmailGroup?: () => void;
-  selected: Set<string>; toggle: (id: string) => void;
+  selected: Set<string>; toggle: (id: string, shift?: boolean) => void;
   triageRank: Map<string, number>; closeCandidateIds: Set<string>; staleDays: number;
   flagsMeta: { id: TaskFlag; label: string; tone: string; description: string }[];
   segmentHelp: Record<string, string>;
@@ -52,7 +52,7 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
           key={r.task.id}
           row={r}
           checked={selected.has(r.task.id)}
-          onCheck={() => toggle(r.task.id)}
+          onCheck={(shift) => toggle(r.task.id, shift)}
           rank={triageRank.get(r.task.id)}
           closeCandidate={closeCandidateIds.has(r.task.id)}
           staleDays={staleDays}
@@ -69,7 +69,7 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
 }
 
 function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagMeta, segmentHelp, people, onOpen, onStatus, onDismiss }: {
-  row: TaskBoardRow; checked: boolean; onCheck: () => void; rank?: number; closeCandidate: boolean; staleDays: number;
+  row: TaskBoardRow; checked: boolean; onCheck: (shift: boolean) => void; rank?: number; closeCandidate: boolean; staleDays: number;
   flagMeta: Map<string, { id: TaskFlag; label: string; tone: string; description: string }>;
   segmentHelp: Record<string, string>;
   people: Record<string, string>;
@@ -84,7 +84,7 @@ function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagM
   return (
     <>
     <tr className={`border-t border-slate-100 align-top ${checked ? "bg-violet-50/40" : moot ? "bg-emerald-50/20" : ""} ${!active ? "opacity-60" : ""}`}>
-      <td className="px-3 py-2.5"><input type="checkbox" checked={checked} onChange={onCheck} aria-label="Select task" className="accent-violet-600 mt-0.5" /></td>
+      <td className="px-3 py-2.5"><input type="checkbox" checked={checked} onChange={() => {}} onClick={(e) => onCheck(e.shiftKey)} aria-label="Select task" title="Shift-click to select every task between this one and the last one you ticked" className="accent-violet-600 mt-0.5" /></td>
       <td className="px-3 py-2.5 min-w-[22rem]">
         <div className="flex items-center gap-1.5 flex-wrap mb-1">
           {rank !== undefined ? <Pill cls="bg-violet-600 text-white ring-violet-600" title="AI triage priority rank">#{rank}</Pill> : null}

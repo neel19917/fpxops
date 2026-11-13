@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   AlertTriangle, Ban, CheckCircle2, Clock, Filter, Layers, ListChecks,
-  Loader2, Mail, MailPlus, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
+  ExternalLink, Loader2, Mail, MailPlus, PanelRightOpen, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
@@ -62,6 +62,8 @@ const VIEW_PARAMS = ["seg", "flag", "group", "sort", "q", "owner", "carrier", "m
 const pick = <T extends string>(v: string | null, allowed: string[], fallback: T): T => (v && allowed.includes(v) ? (v as T) : fallback);
 // Task ids travel as their first 8 characters to keep links short.
 const ID_PREFIX = 8;
+// Most tabs "Open in tabs" will open at once.
+const TAB_LIMIT = 5;
 
 interface Emailing { ids: string[]; audience: EmailAudience; to: string | null; whole: boolean }
 
@@ -329,7 +331,33 @@ export function TasksV2Page() {
 
   const visibleIds = useMemo(() => visible.map((r) => r.task.id), [visible]);
   const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
-  function toggle(id: string) { setSelected((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; }); }
+  // Shift-click ticks everything between this row and the last one ticked.
+  const lastTicked = useRef<string | null>(null);
+  function toggle(id: string, shift = false) {
+    const from = lastTicked.current;
+    lastTicked.current = id;
+    setSelected((p) => {
+      const n = new Set(p);
+      const a = shift && from ? visibleIds.indexOf(from) : -1;
+      const b = visibleIds.indexOf(id);
+      if (a >= 0 && b >= 0 && a !== b) { for (let i = Math.min(a, b); i <= Math.max(a, b); i++) n.add(visibleIds[i]); return n; }
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+  }
+  // Selected tasks in board order.
+  const selectedInOrder = () => visibleIds.filter((id) => selected.has(id));
+  // Open the selection in the drawer: prev / next steps through just these.
+  function walkSelection() {
+    const ids = selectedInOrder();
+    if (ids.length) navigate(`/tasks/v2/${ids[0]}`, { state: { from: `/tasks/v2${location.search}`, walkIds: ids } });
+  }
+  // Open the first few in their own browser tabs.
+  function openSelectionInTabs() {
+    const ids = selectedInOrder().slice(0, TAB_LIMIT);
+    const blocked = ids.filter((id) => !window.open(`/tasks/v2/${id}`, "_blank")).length;
+    if (blocked) setError(`Your browser blocked ${blocked} of ${ids.length} tabs. Allow pop-ups for this site, or use “Open ${ids.length}” to step through them in the drawer.`);
+  }
   function toggleAll() {
     setSelected((p) => {
       const n = new Set(p);
@@ -649,6 +677,8 @@ export function TasksV2Page() {
             <div className="mb-3 rounded-xl bg-slate-900 text-white px-4 py-2.5 flex items-center gap-3 flex-wrap text-sm">
               <span className="font-medium">{selected.size} selected</span>
               <span className="text-slate-400">·</span>
+              <button onClick={walkSelection} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title="Open these in the drawer and step through them with the arrows (j / k)"><PanelRightOpen className="h-3.5 w-3.5" /> Open {selected.size}</button>
+              <button onClick={openSelectionInTabs} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1" title={`Open ${selected.size > TAB_LIMIT ? `the first ${TAB_LIMIT}` : "each one"} in its own browser tab`}><ExternalLink className="h-3.5 w-3.5" /> {selected.size > TAB_LIMIT ? `First ${TAB_LIMIT} in tabs` : "In tabs"}</button>
               <button disabled={bulkBusy || !selectedActive.length} onClick={() => bulkStatus("in_progress")} className="inline-flex items-center gap-1 rounded-md bg-indigo-500 hover:bg-indigo-400 px-2.5 py-1 disabled:opacity-50"><Play className="h-3.5 w-3.5" /> Start</button>
               <button disabled={bulkBusy || !selectedActive.length} onClick={() => bulkStatus("done")} className="inline-flex items-center gap-1 rounded-md bg-emerald-500 hover:bg-emerald-400 px-2.5 py-1 disabled:opacity-50"><CheckCircle2 className="h-3.5 w-3.5" /> Done</button>
               <button disabled={bulkBusy || !selectedActive.length} onClick={() => openDismiss(selectedActive)} className="inline-flex items-center gap-1 rounded-md bg-slate-600 hover:bg-slate-500 px-2.5 py-1 disabled:opacity-50"><Ban className="h-3.5 w-3.5" /> Dismiss…</button>
