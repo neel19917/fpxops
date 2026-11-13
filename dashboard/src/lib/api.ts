@@ -453,6 +453,10 @@ export const api = {
         "/api/tasks/v2/group-email", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
     // Every group email drafted, newest first, with the shipments it covered.
     v2GroupEmails: (limit = 50) => request<{ data: GroupEmailRecord[] }>("/api/tasks/v2/group-emails", { params: { limit } }),
+    // The email-draft prompts in use, readable by every user (not only
+    // admins). `prompts` is keyed by setting key (prompt.email_draft.…);
+    // `tones` is the sentence a group email gets for each tone a rep picks.
+    v2EmailPrompts: () => request<{ prompts: Record<string, string>; tones: Record<string, string> }>("/api/tasks/v2/email-prompts"),
     v2Dismiss: (body: { ids: string[]; reason?: string; disposition?: string }) =>
       request<{ dismissed: number; skipped: number }>("/api/tasks/v2/dismiss", { method: "POST", body: JSON.stringify(body) }),
     // Several active tasks on one shipment for the same audience: the newest

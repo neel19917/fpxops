@@ -631,6 +631,23 @@ tasksRouter.post("/v2/dismiss", async (req, res) => {
   res.json({ dismissed, skipped: ids.length - dismissed });
 });
 
+// GET /tasks/v2/email-prompts — every prompt behind the email drafts, read
+// only, for anyone signed in. Email Studio shows these so reps can see what
+// the AI is told; editing stays on the admin-only /email-studio routes.
+const EMAIL_PROMPT_KEYS = [
+  "prompt.email_draft.system_base", "prompt.email_draft.audience_carrier", "prompt.email_draft.audience_customer", "prompt.email_draft.model",
+  "prompt.email_draft.carrier_group.system_base", "prompt.email_draft.carrier_group.audience", "prompt.email_draft.carrier_group.model",
+  "prompt.email_draft.customer_group.system_base", "prompt.email_draft.customer_group.audience", "prompt.email_draft.customer_group.model",
+];
+tasksRouter.get("/v2/email-prompts", async (_req, res) => {
+  try {
+    const values = await getSettings(...EMAIL_PROMPT_KEYS);
+    res.json({ prompts: Object.fromEntries(EMAIL_PROMPT_KEYS.map((k) => [k, typeof values[k] === "string" ? values[k] : String(values[k] ?? "")])), tones: GROUP_EMAIL_TONES });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /tasks/v2/dedupe  { dry_run?: boolean, min_confidence?: number, task_ids?: string[], shipment_ids?: string[] }
 // Newest task wins per shipment + audience (a carrier task and a customer
 // task on one shipment are not duplicates). Older active duplicates are

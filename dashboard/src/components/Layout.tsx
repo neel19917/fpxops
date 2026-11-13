@@ -6,7 +6,7 @@ import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "email_studio" | "emails" | "ai_governance" | "data_flow" | "claude";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude";
 
 interface TabDef {
   id: TabId;
@@ -43,7 +43,6 @@ const ALL_TABS: TabDef[] = [
   { id: "keys",      label: "API Keys",       Icon: KeyRound,     group: "admin" },
   { id: "audit",     label: "Audit Log",      Icon: ScrollText,   group: "admin" },
   { id: "settings",  label: "Settings",       Icon: SettingsIcon, group: "admin" },
-  { id: "email_studio", label: "Email prompts", Icon: Mail,      group: "admin" },
   { id: "ai_governance", label: "AI Governance", Icon: ShieldAlert, group: "admin" },
   { id: "data_flow", label: "Data Flow", Icon: Activity, group: "admin" },
   { id: "services",  label: "Services",       Icon: Database,     group: "admin" },

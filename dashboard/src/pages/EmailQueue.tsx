@@ -1,12 +1,13 @@
-// Email Studio (rep-facing). Two tabs:
+// Email Studio. Three tabs:
 //   Queue   — tasks marked "to email" (hotkey E in the task drawer, or
 //             "Queue for email" on the Tasks board), grouped by carrier or
 //             customer, ready to draft as one email per recipient.
 //   History — every group email drafted, with the shipments it covered.
-// The AI prompts behind the emails are edited on the admin "Email prompts" page.
-import { useCallback, useEffect, useMemo, useState } from "react";
+//   Prompts — the AI prompts behind the emails. Everyone can read them;
+//             admins can edit. The panel owns its own `?email=` param.
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { ChevronDown, ChevronRight, Copy, ExternalLink, History, Inbox, Layers, Mail, PanelRightOpen, RefreshCw, Search, Settings2, Sparkles, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, ExternalLink, FileText, History, Inbox, Layers, Mail, PanelRightOpen, RefreshCw, Search, Sparkles, Trash2, X } from "lucide-react";
 import { api, type GroupEmailRecord } from "../lib/api";
 import type { TaskBoardRow } from "../lib/types";
 import { fmtRelative } from "../lib/format";
@@ -16,6 +17,11 @@ import { LoadingState } from "../components/LoadingState";
 import { GroupEmailComposer, type EmailAudience } from "../components/tasksV2/GroupEmailComposer";
 import { BlockedTabsDialog, isActive, openTasksInTabs, shortTitle, SLOW_TABS } from "../components/tasksV2/shared";
 import { DedupeDialog } from "../components/tasksV2/DedupeDialog";
+
+const EmailPromptsPanel = lazy(() => import("./EmailStudio").then((m) => ({ default: m.EmailPromptsPanel })));
+
+const TABS = [["queue", "Queue", Inbox], ["history", "History", History], ["prompts", "Prompts", FileText]] as const;
+type TabKey = (typeof TABS)[number][0];
 
 const nameFor = (r: TaskBoardRow, by: EmailAudience) =>
   (by === "carrier" ? (r.shipment?.carrier_name || r.shipment?.carrier || "") : (r.shipment?.customer_name || "")).trim();
@@ -59,9 +65,16 @@ function collapseNewest(rows: TaskBoardRow[]): { rows: TaskBoardRow[]; older: Ma
 export function EmailQueuePage() {
   const { profile: me } = useAuth();
   const [params, setParams] = useSearchParams();
-  const tab = params.get("tab") === "history" ? "history" : "queue";
+  const tab: TabKey = TABS.find(([id]) => id === params.get("tab"))?.[0] ?? "queue";
   const by: EmailAudience = params.get("by") === "customer" ? "customer" : "carrier";
   const setParam = (k: string, v: string | null) => setParams((p) => { const n = new URLSearchParams(p); if (v) n.set(k, v); else n.delete(k); return n; }, { replace: true });
+  // `email` belongs to the Prompts tab, so it goes when you leave it. Everything else stays.
+  const setTab = (t: TabKey) => setParams((p) => {
+    const n = new URLSearchParams(p);
+    if (t === "queue") n.delete("tab"); else n.set("tab", t);
+    if (t !== "prompts") n.delete("email");
+    return n;
+  }, { replace: true });
 
   const [rows, setRows] = useState<TaskBoardRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -82,21 +95,16 @@ export function EmailQueuePage() {
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-xl font-semibold flex items-center gap-2"><Mail className="h-5 w-5 text-violet-600" /> Email Studio</h1>
-          <p className="text-sm text-slate-500 mt-0.5">Group the tasks you marked for email into one message per carrier or customer.</p>
+          <p className="text-sm text-slate-500 mt-0.5">Draft one email per carrier or customer from the tasks you queued, look back at past drafts, and see the prompts the AI writes from.</p>
         </div>
-        <div className="flex items-center gap-2">
-          {me?.role === "admin" ? (
-            <Link to="/admin/email-studio" className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white hover:bg-slate-50 text-slate-700">
-              <Settings2 className="h-4 w-4" /> Edit AI prompts
-            </Link>
-          ) : null}
-          <button onClick={load} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white hover:bg-slate-50"><RefreshCw className="h-4 w-4" /> Refresh</button>
-        </div>
+        {tab === "queue" ? (
+          <button onClick={load} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white hover:bg-slate-50 text-slate-700"><RefreshCw className="h-4 w-4" /> Refresh</button>
+        ) : null}
       </div>
 
       <div className="flex gap-1 border-b border-slate-200" role="tablist">
-        {([["queue", "Queue", Inbox], ["history", "History", History]] as const).map(([id, label, Icon]) => (
-          <button key={id} role="tab" aria-selected={tab === id} onClick={() => setParam("tab", id === "queue" ? null : id)}
+        {TABS.map(([id, label, Icon]) => (
+          <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}
             className={"px-3 py-2 text-sm -mb-px border-b-2 inline-flex items-center gap-1.5 " + (tab === id ? "border-violet-600 text-violet-700 font-medium" : "border-transparent text-slate-600 hover:text-slate-900")}>
             <Icon className="h-4 w-4" /> {label}
             {id === "queue" && queued.length ? <span className="text-[10px] font-semibold rounded-full px-1.5 py-0.5 bg-violet-100 text-violet-800">{queued.length}</span> : null}
@@ -108,7 +116,8 @@ export function EmailQueuePage() {
         err ? <ErrorBlock>{err} <button onClick={load} className="underline ml-1">Retry</button></ErrorBlock>
           : !rows ? <LoadingState />
           : <Queue queued={queued} older={older} hidden={hidden} by={by} onBy={(b) => setParam("by", b === "carrier" ? null : b)} onChanged={load} />
-      ) : <HistoryList />}
+      ) : tab === "history" ? <HistoryList />
+        : <Suspense fallback={<LoadingState />}><EmailPromptsPanel canEdit={me?.role === "admin"} /></Suspense>}
     </div>
   );
 }
@@ -127,7 +136,6 @@ function Queue({ queued, older, hidden, by, onBy, onChanged }: {
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [err, setErr] = useState<string | null>(null);
   const [deduping, setDeduping] = useState(false);
-  const dedupeDialog = deduping ? <DedupeDialog onClose={() => setDeduping(false)} onApplied={() => onChanged()} /> : null;
 
   const { groups, homeless } = useMemo(() => {
     const m = new Map<string, TaskBoardRow[]>();
@@ -188,36 +196,35 @@ function Queue({ queued, older, hidden, by, onBy, onChanged }: {
           While working a task, press <kbd className="px-1.5 py-0.5 rounded bg-slate-100 ring-1 ring-slate-200 font-mono text-[11px]">E</kbd> to mark it for email.
           On the Tasks board you can also tick several tasks and choose “Queue for email”. They collect here, grouped by carrier or customer.
         </p>
-        <div className="mt-4 flex items-center justify-center gap-2 flex-wrap">
-          <Link to="/tasks/v2" className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800">Go to Tasks</Link>
-          <button onClick={() => setDeduping(true)} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100" title="Find shipments with several tasks for the same carrier or customer and keep the newest"><Layers className="h-4 w-4" /> Clean up duplicates</button>
-        </div>
-        {dedupeDialog}
+        <Link to="/tasks/v2" className="mt-4 inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800">Go to Tasks</Link>
       </div>
     );
   }
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-3 flex-wrap">
-        <div className="inline-flex rounded-lg ring-1 ring-slate-200 bg-white p-0.5 text-sm">
-          {(["carrier", "customer"] as const).map((a) => (
-            <button key={a} onClick={() => onBy(a)} aria-pressed={by === a}
-              className={"px-3 py-1 rounded-md " + (by === a ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100")}>
-              Group by {a}
-            </button>
-          ))}
+      <div className="flex items-center gap-x-4 gap-y-2 flex-wrap text-sm">
+        <div className="inline-flex items-center gap-2">
+          <span className="text-slate-500">Group by</span>
+          <div className="inline-flex rounded-lg ring-1 ring-slate-200 bg-white p-0.5">
+            {(["carrier", "customer"] as const).map((a) => (
+              <button key={a} onClick={() => onBy(a)} aria-pressed={by === a}
+                className={"px-3 py-1 rounded-md capitalize " + (by === a ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100")}>
+                {a}
+              </button>
+            ))}
+          </div>
         </div>
-        <span className="text-sm text-slate-500">{queued.length} task{queued.length === 1 ? "" : "s"} queued · {groups.length} {by}{groups.length === 1 ? "" : "s"}</span>
-        <label className="inline-flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer select-none">
+        <span className="text-slate-500">{queued.length} task{queued.length === 1 ? "" : "s"} · {groups.length} {by}{groups.length === 1 ? "" : "s"}</span>
+        <label className="inline-flex items-center gap-1.5 text-slate-600 cursor-pointer select-none">
           <input type="checkbox" checked={order.length > 0 && order.every((id) => picked.has(id))} onChange={() => tickMany(order)} className="accent-violet-600" /> Select all
         </label>
         <div className="ml-auto flex items-center gap-2">
-          <button onClick={() => setDeduping(true)} className="inline-flex items-center gap-1.5 text-sm px-2.5 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100" title="Find shipments with several tasks for the same carrier or customer and keep the newest">
+          <button onClick={() => setDeduping(true)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100" title="Find shipments with several tasks for the same carrier or customer and keep the newest">
             <Layers className="h-4 w-4" /> Clean up duplicates
           </button>
           {groups.length > 1 ? (
-            <button onClick={() => setComposing({ to: null })} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">
+            <button onClick={() => setComposing({ to: null })} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">
               <Sparkles className="h-4 w-4" /> Draft all {groups.length} emails
             </button>
           ) : null}
@@ -226,7 +233,7 @@ function Queue({ queued, older, hidden, by, onBy, onChanged }: {
       {err ? <div className="text-sm text-rose-700">{err}</div> : null}
 
       {hidden ? (
-        <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 px-4 py-2 text-sm text-slate-600 flex items-center gap-3 flex-wrap">
+        <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 px-4 py-2.5 text-sm text-slate-600 flex items-center gap-3 flex-wrap">
           <span>{hidden} older duplicate task{hidden === 1 ? " is" : "s are"} hidden. The newest task for each shipment is shown.</span>
           <button onClick={() => setDeduping(true)} className="ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50"><Layers className="h-3.5 w-3.5" /> Clean up duplicates</button>
         </div>
@@ -282,9 +289,9 @@ function Queue({ queued, older, hidden, by, onBy, onChanged }: {
       </div>
 
       {homeless.length ? (
-        <div className="rounded-xl bg-amber-50 ring-1 ring-amber-200 px-4 py-3 text-sm text-amber-900">
+        <div className="rounded-xl bg-amber-50 ring-1 ring-amber-200 px-4 py-2.5 text-sm text-amber-900">
           {homeless.length} queued task{homeless.length === 1 ? " has" : "s have"} no {by} on the shipment, so {homeless.length === 1 ? "it isn't" : "they aren't"} in any group here.
-          Try “Group by {by === "carrier" ? "customer" : "carrier"}”.
+          Try grouping by {by === "carrier" ? "customer" : "carrier"}.
         </div>
       ) : null}
 
@@ -293,7 +300,7 @@ function Queue({ queued, older, hidden, by, onBy, onChanged }: {
           onRetry={() => { const still = openTasksInTabs(blockedTabs.ids, { quiet: true }); setBlockedTabs(still.length ? { ids: still, total: blockedTabs.total } : null); }} />
       ) : null}
 
-      {dedupeDialog}
+      {deduping ? <DedupeDialog onClose={() => setDeduping(false)} onApplied={() => onChanged()} /> : null}
 
       {composing ? (
         <GroupEmailComposer
@@ -334,7 +341,11 @@ function HistoryList() {
         <Search className="h-4 w-4 text-slate-400" />
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by carrier, customer, PRO or wording…" className="flex-1 text-sm outline-none bg-transparent" />
       </div>
-      {!shown.length ? <div className="text-sm text-slate-500">{rows.length ? "No emails match that search." : "No group emails have been drafted yet."}</div> : (
+      {!shown.length ? (
+        <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-10 text-center text-sm text-slate-500">
+          {rows.length ? "No emails match that search." : "No group emails have been drafted yet. Drafts you make from the Queue show up here."}
+        </div>
+      ) : (
         <ul className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm divide-y divide-slate-100 overflow-hidden">
           {shown.map((d) => {
             const open = openId === d.id;
