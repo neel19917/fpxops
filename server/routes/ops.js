@@ -11,11 +11,49 @@ export const opsRouter = Router();
 // All routes are under the dual-auth /api router, so the extension authenticates
 // with its x-api-key just like it does for POST /api/shipments.
 
-// POST /ops/rescrape  { scope?: "all" | "selected", tracking_numbers?: string[], modes?: ("LTL"|"Truckload"|"Parcel")[] }
+// POST /ops/rescrape  { scope?: "all" | "selected" | "erp_audit", tracking_numbers?: string[], modes?: ("LTL"|"Truckload"|"Parcel")[], months?: 1-12 }
 // Operator clicks "Rescrape". Coalesces an existing pending full rescrape so we
 // don't stack duplicates the extension would run twice.
+// scope "erp_audit" is not a shipment scrape: it asks the hosted browser to
+// pull the Transactions History Report for the last `months` months (default
+// 3) and post it to /audits/invoice/from-history. The window travels in
+// note as "months=N" (the complete route later replaces note with the result).
+const SCOPES = ["all", "selected", "erp_audit"];
+// Only the hosted browser knows how to run an ERP audit pull. Any other
+// claimer would treat the row as a full rescrape, so it is never handed one.
+const HOSTED_WORKER = "fpx-browser";
+
 opsRouter.post("/rescrape", async (req, res) => {
-  const scope = req.body?.scope === "selected" ? "selected" : "all";
+  const scope = SCOPES.includes(req.body?.scope) ? req.body.scope : "all";
+  if (scope === "erp_audit") {
+    const rawMonths = req.body?.months;
+    const months = rawMonths === undefined || rawMonths === null || rawMonths === "" ? 3 : Number(rawMonths);
+    if (!Number.isInteger(months) || months < 1 || months > 12) {
+      return res.status(400).json({ error: "months must be a whole number from 1 to 12" });
+    }
+    const { data: existing } = await supabase
+      .from("fpx_scrape_requests")
+      .select("*").eq("status", "pending").eq("scope", "erp_audit")
+      .order("requested_at", { ascending: false }).limit(1);
+    if (existing?.[0]) return res.json({ request: existing[0], coalesced: true });
+    const { data, error } = await supabase
+      .from("fpx_scrape_requests")
+      .insert({
+        scope,
+        note: `months=${months}`,
+        requested_by: req.user?.email || req.apiKey?.name || null,
+      })
+      .select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    logAudit(req, {
+      action: "rescrape_request",
+      entity_type: "scrape_request",
+      entity_id: data.id,
+      summary: `Requested ERP audit pull (last ${months} month${months === 1 ? "" : "s"})`,
+      metadata: { scope, months },
+    });
+    return res.json({ request: data });
+  }
   const tns = Array.isArray(req.body?.tracking_numbers)
     ? req.body.tracking_numbers.map(String).filter(Boolean)
     : null;
@@ -64,15 +102,38 @@ opsRouter.get("/rescrape", async (req, res) => {
   res.json({ requests: data || [] });
 });
 
+// An ERP pull that the hosted worker can't run (older build) is closed out
+// after 2 minutes, so it can't sit "queued" forever and block the Scraping
+// page from starting a scrape.
+async function expireStaleErpRequests() {
+  const cutoff = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  await supabase.from("fpx_scrape_requests")
+    .update({ status: "error", completed_at: new Date().toISOString(), note: "Not picked up — the hosted browser needs an update before it can run ERP pulls." })
+    .eq("status", "pending").eq("scope", "erp_audit").lt("requested_at", cutoff);
+}
+
 // GET /ops/rescrape/pending?claim=1&by=<name> — extension poll. With claim=1 it
 // atomically flips the oldest pending request to 'claimed' (guarded on
 // status='pending' so two pollers can't grab the same one).
+//
+// Rows come back whole, so the caller sees scope ("all" | "selected" |
+// "erp_audit") and, for erp_audit, note "months=N". erp_audit rows are only
+// handed to a claimer named "fpx-browser" (the hosted worker): anyone else
+// claiming skips past them to the next shipment rescrape.
 opsRouter.get("/rescrape/pending", async (req, res) => {
   const claim = req.query.claim === "1" || req.query.claim === "true";
   const by = req.query.by ? String(req.query.by) : (req.apiKey?.name || null);
-  const { data: rows, error } = await supabase
+  let query = supabase
     .from("fpx_scrape_requests")
-    .select("*").eq("status", "pending")
+    .select("*").eq("status", "pending");
+  // …and only when it says it knows how (caps=erp_audit). A hosted worker
+  // build from before this job existed would run the row as a full rescrape.
+  const caps = String(req.query.caps || "").split(",");
+  // A worker polling without the cap can't run ERP pulls: close out any that
+  // have waited, so they don't sit "queued" forever.
+  if (claim && by === HOSTED_WORKER && !caps.includes("erp_audit")) await expireStaleErpRequests();
+  if (claim && (by !== HOSTED_WORKER || !caps.includes("erp_audit"))) query = query.neq("scope", "erp_audit");
+  const { data: rows, error } = await query
     .order("requested_at", { ascending: true }).limit(1);
   if (error) return res.status(500).json({ error: error.message });
   const pending = rows?.[0] || null;

@@ -6,7 +6,7 @@ import { poolStats, closeAll, userStatus, selfTest, resetUserProfile } from "./b
 import { summary as usageSummary, flush as flushUsage } from "./usage.js";
 import { ViewerSession, egressStats, dropAllParked } from "./session.js";
 import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
-import { startScrapeWorker, workerBusy, workerState, requestStop, fullLog } from "./worker.js";
+import { startScrapeWorker, workerBusy, workerState, requestStop, requestPause, requestResume, fullLog } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
 import { chat, assistantEnabled, startAssistantIndexer, assistantIndexStatus, saveChatTurn, listChats, getChat, deleteChat } from "./assistant.js";
 
@@ -74,7 +74,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404).end();
 });
 
-const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/log|runs|schedules|assistant|admin)(\/|$)/;
+const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/pause|scrape\/resume|scrape\/log|runs|schedules|assistant|admin)(\/|$)/;
 
 async function readJson(req, maxBytes = 64 * 1024) {
   let body = "";
@@ -160,6 +160,13 @@ async function handleApi(req, res, url, who) {
     const cur = workerState().current;
     if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can stop this scrape" });
     return json(res, 200, { stopping: requestStop(who.email) });
+  }
+  // Pause / resume the running job (scrape or ERP audit pull). Same rule as stop.
+  if ((p === "/scrape/pause" || p === "/scrape/resume") && m === "POST") {
+    const cur = workerState().current;
+    if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can pause this run" });
+    const paused = p === "/scrape/pause" ? requestPause(who.email) : requestResume(who.email);
+    return json(res, 200, { ok: true, paused });
   }
   if (p === "/scrape/log" && m === "GET") {
     const runId = url.searchParams.get("run");

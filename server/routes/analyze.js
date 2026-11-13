@@ -394,12 +394,69 @@ export async function analyzeGpAuditRun(auditId, { reqContext, level = "summary"
   return updatedRun || run;
 }
 
+// ERP pulls (shipment_type "erp_pending") are FreightPOP History Report rows
+// not yet exported to ERP, ranked by charge. They can run to thousands of
+// rows, so the model gets totals, breakdowns and the biggest items — never
+// the whole list.
+function buildErpPendingPayload(run, rows) {
+  const n = (v) => (v !== null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null);
+  const sum = (arr, f) => +arr.reduce((t, r) => t + (n(f(r)) || 0), 0).toFixed(2);
+  const slim = (r) => ({
+    rank: r.raw?.rank, shipmentId: r.shipment_id, customer: r.customer_name, carrier: r.carrier,
+    shipped: r.raw?.shipped_date, charge: r.raw?.charge, cost: r.shipment_cost, grossProfit: r.raw?.gross_profit,
+    invoiceAmount: r.bill_amount, difference: r.difference, status: r.status, flags: r.raw?.flags || [],
+  });
+  const byRank = [...rows].sort((a, b) => (a.raw?.rank ?? 1e9) - (b.raw?.rank ?? 1e9));
+  const group = (key) => {
+    const m = new Map();
+    for (const r of rows) {
+      const k = key(r) || "Unknown";
+      const g = m.get(k) || { name: k, shipments: 0, charges: 0 };
+      g.shipments++; g.charges += n(r.raw?.charge) || 0;
+      m.set(k, g);
+    }
+    return [...m.values()].sort((a, b) => b.charges - a.charges).slice(0, 15).map((g) => ({ ...g, charges: +g.charges.toFixed(2) }));
+  };
+  const flagCounts = {};
+  for (const r of rows) for (const f of r.raw?.flags || []) flagCounts[f] = (flagCounts[f] || 0) + 1;
+  const discrepancies = rows.filter((r) => r.status === "discrepancy")
+    .sort((a, b) => Math.abs(n(b.difference) || 0) - Math.abs(n(a.difference) || 0));
+  return {
+    what: "Shipments from the FreightPOP History Report that have NOT been exported to ERP, ranked by the charge to the customer. 'no_invoice' means no carrier invoice has been approved or received yet; it is pending, not an error.",
+    dateFrom: run.date_from, dateTo: run.date_to,
+    totalNotExported: rows.length,
+    totalCharges: sum(rows, (r) => r.raw?.charge),
+    totalCost: sum(rows, (r) => r.shipment_cost),
+    matched: rows.filter((r) => r.status === "match").length,
+    discrepancies: discrepancies.length,
+    noInvoiceYet: rows.filter((r) => r.status === "no_invoice").length,
+    totalVariance: sum(discrepancies, (r) => r.difference),
+    flagCounts,
+    byCustomer: group((r) => r.customer_name),
+    byCarrier: group((r) => r.carrier),
+    largestByCharge: byRank.slice(0, 40).map(slim),
+    largestDiscrepancies: discrepancies.slice(0, 40).map(slim),
+  };
+}
+
+async function loadInvoiceAuditRows(auditId, max = 10000) {
+  const out = [];
+  for (let from = 0; from < max; from += 1000) {
+    const { data, error } = await supabase.from("fpx_invoice_audit_rows").select("*").eq("audit_id", auditId)
+      .order("id", { ascending: true }).range(from, from + 999);
+    if (error || !data?.length) break;
+    out.push(...data);
+    if (data.length < 1000) break;
+  }
+  return out;
+}
+
 export async function analyzeInvoiceAuditRun(auditId, { reqContext, level = "summary" } = {}) {
   if (!auditId) return null;
   const { data: run } = await supabase.from("fpx_invoice_audits").select("*").eq("id", auditId).maybeSingle();
   if (!run) return null;
-  const { data: rows } = await supabase.from("fpx_invoice_audit_rows").select("*").eq("audit_id", auditId).limit(2000);
-  const allRows = rows || [];
+  const erpPending = run.shipment_type === "erp_pending";
+  const allRows = await loadInvoiceAuditRows(auditId, erpPending ? 10000 : 2000);
 
   const settings = await getSettings(
     "prompt.invoice_system", "prompt.invoice_exec_summary", "prompt.invoice_row_review"
@@ -408,8 +465,12 @@ export async function analyzeInvoiceAuditRun(auditId, { reqContext, level = "sum
   const execTpl = settings["prompt.invoice_exec_summary"] || INV_DEFAULT_EXEC_SUMMARY;
   const rowTpl = settings["prompt.invoice_row_review"] || INV_DEFAULT_ROW_REVIEW;
 
-  const payload = buildInvoiceExecPayload(run, allRows);
-  const userMsg = execTpl.replace("{{data}}", JSON.stringify(payload));
+  const payload = erpPending ? buildErpPendingPayload(run, allRows) : buildInvoiceExecPayload(run, allRows);
+  // The saved summary prompt is written for carrier-bill audits; an ERP pull
+  // gets its own ask in front of the data.
+  const userMsg = erpPending
+    ? "This is not a carrier-bill audit. It is a list of shipments NOT yet exported to ERP, ranked by charge. Write a short summary for the billing team in plain words: how much is waiting to be exported (count and dollars), which customers and carriers hold most of it, the largest items, any invoice-vs-cost discrepancies and flags worth acting on first, and what to do next. Use only the data given; cite shipment ids. Markdown, under 400 words.\n\nDATA:\n" + JSON.stringify(payload)
+    : execTpl.replace("{{data}}", JSON.stringify(payload));
 
   const result = await callClaude({
     systemPrompt: system,
@@ -430,7 +491,8 @@ export async function analyzeInvoiceAuditRun(auditId, { reqContext, level = "sum
     .from("fpx_invoice_audits").update(patch).eq("id", auditId).select().single();
 
   if (level === "full" && allRows.length) {
-    const discrepancies = allRows
+    const discrepancies = [...allRows]
+      .sort((x, y) => (erpPending ? Math.abs(Number(y.difference) || 0) - Math.abs(Number(x.difference) || 0) : 0))
       .filter((r) => r.status === "discrepancy" || (typeof r.difference === "number" && Math.abs(Number(r.difference)) > 0.01))
       .slice(0, 50);
     for (const r of discrepancies) {
@@ -440,8 +502,9 @@ export async function analyzeInvoiceAuditRun(auditId, { reqContext, level = "sum
         invoiceNumber: r.raw?.invoiceNumber,
         billAmount: r.bill_amount,
         shipmentCost: r.shipment_cost,
-        shipmentSale: r.raw?.shipmentSale,
-        grossProfit: r.raw?.grossProfit,
+        shipmentSale: r.raw?.shipmentSale ?? r.raw?.charge,
+        grossProfit: r.raw?.grossProfit ?? r.raw?.gross_profit,
+        flags: r.raw?.flags,
         difference: r.difference,
         pctDifference: r.raw?.pctDifference,
         direction: r.raw?.direction,

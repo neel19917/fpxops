@@ -179,6 +179,33 @@ export interface InvoiceAudit {
   unmatched_count: number | null;
   exec_summary: string | null;
   created_at: string;
+  // "erp_pending" = an ERP audit pull (FreightPOP History Report, shipments
+  // not exported to ERP). Anything else is a carrier-bill upload.
+  shipment_type?: string | null;
+  carrier_bill_file?: string | null;
+}
+
+export type InvoiceAuditRowStatus = "match" | "discrepancy" | "no_invoice" | "error";
+
+// Per-row extras. Only ERP audit pulls fill these in; the History Report
+// values can arrive as numbers or as the report's own text, so stay loose.
+export interface InvoiceAuditRowRaw {
+  charge?: number | string | null;
+  gross_profit?: number | string | null;
+  shipped_date?: string | null;
+  invoice_number?: string | null;
+  tracking?: string | null;
+  service?: string | null;
+  account_manager?: string | null;
+  shipment_status?: string | null;
+  transaction_type?: string | null;
+  not_approved_amount?: number | string | null;
+  variance?: number | string | null;
+  customer_invoice_sent?: boolean | string | null;
+  user?: string | null;
+  rank?: number | null;
+  flags?: string[] | null;
+  [key: string]: unknown;
 }
 
 export interface InvoiceAuditRow {
@@ -186,11 +213,14 @@ export interface InvoiceAuditRow {
   audit_id: string;
   shipment_id: string | null;
   carrier: string | null;
+  customer_name?: string | null;
   bill_amount: number | null;
   shipment_cost: number | null;
   difference: number | null;
-  status: string | null;
+  // InvoiceAuditRowStatus for current runs; older rows may hold other text.
+  status: InvoiceAuditRowStatus | (string & {}) | null;
   ai_notes: string | null;
+  raw?: InvoiceAuditRowRaw | null;
 }
 
 export interface ApiKey {

@@ -57,10 +57,28 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Random delay between min and max ms — prevents robotic timing patterns
-function humanDelay(minMs, maxMs) {
+// ---------------------------------------------------------------------
+// Pause (hosted browser only). The browser service sets self.__fpxPaused in
+// this content-script world when someone presses Pause on the Scraping page,
+// and clears it on Resume. Nothing sets it in a rep's own Chrome, so there
+// the gate is a no-op. A stop always gets through a pause.
+// ---------------------------------------------------------------------
+function fpxIsPaused() {
+  try { return self.__fpxPaused === true; } catch { return false; }
+}
+
+async function fpxPauseGate() {
+  while (fpxIsPaused() && !stopRequested) await sleep(500);
+}
+
+// Random delay between min and max ms — prevents robotic timing patterns.
+// Holds while paused (before and after the wait), so every flow built on it
+// stops at its next step.
+async function humanDelay(minMs, maxMs) {
+  if (fpxIsPaused()) await fpxPauseGate();
   const jitter = minMs + Math.random() * (maxMs - minMs);
-  return sleep(Math.round(jitter));
+  await sleep(Math.round(jitter));
+  if (fpxIsPaused()) await fpxPauseGate();
 }
 
 // Yield to the browser so it can paint/reflow — prevents "page unresponsive"
@@ -1039,6 +1057,7 @@ async function processPage() {
 
   let failures = 0;
   for (let i = 0; i < total; i++) {
+    await fpxPauseGate(); // paused: wait here, between shipments
     if (stopRequested) {
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
@@ -1289,6 +1308,7 @@ async function run(filterCol, filterVal) {
   // "running" forever.
   try {
   while (true) {
+    await fpxPauseGate(); // paused: wait here, between pages
     if (stopRequested) {
       await flushAndDropLogRows("stopped");
       sendComplete(`Stopped by user. ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
@@ -1585,7 +1605,11 @@ function mergeKendoRow(modalData, kendoRow) {
   }
 }
 
-function getKendoGridAllRows() {
+// `timeoutMs` — how long to wait for the page-world reader (3s suits the
+// shipment grid; a multi-thousand-row history report needs longer).
+// `meta` — optional object filled with { total, fieldMap, skipped, error }
+// so a caller can tell "0 rows" from "could not read" and spot a paged grid.
+function getKendoGridAllRows(timeoutMs = 3000, meta = null) {
   return new Promise((resolve) => {
     let settled = false;
 
@@ -1600,6 +1624,12 @@ function getKendoGridAllRows() {
       try {
         const result = event.data.payload;
         if (!result || typeof result !== "object") { resolve(null); return; }
+        if (meta) {
+          meta.total = typeof result.total === "number" ? result.total : null;
+          meta.fieldMap = result.fieldMap || null;
+          meta.skipped = result.skipped || 0;
+          meta.error = result.error || null;
+        }
 
         if (result.error) {
           dlog("[FPX-GP] Kendo inject error:", result.error);
@@ -1630,6 +1660,7 @@ function getKendoGridAllRows() {
     script.onerror = () => {
       dlog("[FPX-GP] Failed to load inject-kendo.js");
       script.remove();
+      if (meta) meta.error = "inject-kendo.js failed to load";
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
@@ -1642,10 +1673,11 @@ function getKendoGridAllRows() {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        dlog("[FPX-GP] Kendo inject timed out after 3s");
+        dlog("[FPX-GP] Kendo inject timed out after", timeoutMs, "ms");
+        if (meta) meta.error = `no answer from the grid after ${Math.round(timeoutMs / 1000)}s`;
         resolve(null);
       }
-    }, 3000);
+    }, timeoutMs);
   });
 }
 
@@ -2791,18 +2823,29 @@ function invoiceMatchFromGrid(ship, gridMap) {
   return result;
 }
 
-async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFilter) {
+// Drives Transactions → Generate History Report → CONTINUE and waits for the
+// results grid. Shared by the invoice audit (4 arguments, unchanged) and the
+// ERP audit pull, which passes `opts`:
+//   status(text) / fail(text)  where progress and the failure reason go
+//   openDialog                 click "Generate History Report" if the dialog isn't already open
+//   beforeContinue()           runs once the dates and customer are set; return a string to abort with it
+//   gridWaitSec                how long to wait for the results grid (default 15)
+//   onGridWait(sec)            called about once a second while waiting
+//   stoppable                  give up waiting when a stop is requested
+async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFilter, opts = {}) {
+  const status = opts.status || sendInvStatus;
+  const fail = opts.fail || sendInvComplete;
   const currentUrl = window.location.href;
   const onTransactions = currentUrl.includes("Transactions");
   if (!onTransactions) {
-    sendInvStatus("Navigating to Transactions page...");
+    status("Navigating to Transactions page...");
     window.location.hash = "#!/Transactions";
     await humanDelay(2500, 4000);
   } else {
-    sendInvStatus("Already on Transactions page.");
+    status("Already on Transactions page.");
   }
 
-  sendInvStatus("Waiting for Generate History Report dialog...");
+  status("Waiting for Generate History Report dialog...");
   let dialogFound = false;
   for (let wait = 0; wait < 20000; wait += 500) {
     const allText = document.body.innerText.toUpperCase();
@@ -2819,7 +2862,7 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
 
   if (!dialogFound) {
-    sendInvStatus("Looking for Generate Report button...");
+    status("Looking for Generate Report button...");
     const allBtns = document.querySelectorAll("button, a.btn, input[type='button']");
     for (const b of allBtns) {
       if (/generate\s*report/i.test(b.textContent || b.value || "")) {
@@ -2833,23 +2876,36 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   await humanDelay(800, 1500);
 
   const dateLabel = fromDate === toDate ? fromDate : `${fromDate} — ${toDate}`;
-  sendInvStatus("Filling date fields: " + dateLabel + "...");
+  status("Filling date fields: " + dateLabel + "...");
 
-  const dateFields = findDateInputs();
+  let dateFields = findDateInputs();
+  if (opts.openDialog && !dateFields.from && !dateFields.to) {
+    // The dialog did not open by itself: press the page's own button for it.
+    const openers = document.querySelectorAll("button, a, input[type='button'], [role='button']");
+    for (const b of openers) {
+      if (!isVisibleForClick(b)) continue;
+      const txt = (b.textContent || b.value || "").replace(/\s+/g, " ").trim();
+      if (/^generate\s+(history\s+)?report$/i.test(txt)) { simulateClick(b); break; }
+    }
+    for (let wait = 0; wait < 10 && !dateFields.from && !dateFields.to; wait++) {
+      await humanDelay(800, 1200);
+      dateFields = findDateInputs();
+    }
+  }
   if (!dateFields.from && !dateFields.to) {
-    sendInvComplete("Failed — no date inputs found.");
+    fail("Failed — no date inputs found.");
     return false;
   }
 
   if (dateFields.from) {
     setDateInput(dateFields.from, fromDate);
-    sendInvStatus("Set FROM DATE to " + fromDate);
+    status("Set FROM DATE to " + fromDate);
   }
   await humanDelay(400, 800);
 
   if (dateFields.to) {
     setDateInput(dateFields.to, toDate);
-    sendInvStatus("Set TO DATE to " + toDate);
+    status("Set TO DATE to " + toDate);
   }
   await humanDelay(400, 800);
 
@@ -2882,7 +2938,7 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   const custTarget = customerFilter || "";
   const useAllCustomers = !custTarget || /^all(\s*customers)?$/i.test(custTarget);
 
-  sendInvStatus(useAllCustomers ? "Setting All Customers..." : `Setting customer to "${custTarget}"...`);
+  status(useAllCustomers ? "Setting All Customers..." : `Setting customer to "${custTarget}"...`);
   const selects = document.querySelectorAll("select");
   for (const sel of selects) {
     const row = sel.closest("tr, div, .form-group");
@@ -2941,7 +2997,12 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
   await humanDelay(400, 800);
 
-  sendInvStatus("Clicking CONTINUE...");
+  if (opts.beforeContinue) {
+    const abort = await opts.beforeContinue(dateFields);
+    if (abort) { fail(abort); return false; }
+  }
+
+  status("Clicking CONTINUE...");
   let continueClicked = false;
   const buttons = document.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn, .btn");
   for (const btn of buttons) {
@@ -2954,15 +3015,18 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
 
   if (!continueClicked) {
-    sendInvComplete("ERROR: Could not find CONTINUE button.");
+    fail("ERROR: Could not find CONTINUE button.");
     return false;
   }
 
-  sendInvStatus("Waiting for results grid to load...");
+  status("Waiting for results grid to load...");
   await humanDelay(2500, 4000);
 
   let gridReady = false;
-  for (let wait = 0; wait < 15000; wait += 1000) {
+  const gridWaitMs = (opts.gridWaitSec || 15) * 1000;
+  for (let wait = 0; wait < gridWaitMs; wait += 1000) {
+    if (opts.stoppable && stopRequested) return false;
+    if (opts.onGridWait) opts.onGridWait(wait / 1000);
     const gridRows = document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr");
     const visibleRows = [...gridRows].filter(
       (r) => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row")
@@ -2972,19 +3036,19 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
 
   if (!gridReady) {
-    sendInvComplete("No grid data loaded. Report may not have generated.");
+    fail("No grid data loaded. Report may not have generated.");
     return false;
   }
 
   const typeToClick = shipmentType || "non-parcel";
   if (typeToClick !== "all") {
-    sendInvStatus("Selecting " + (typeToClick === "parcel" ? "Parcel" : "Non-Parcel") + " tab...");
+    status("Selecting " + (typeToClick === "parcel" ? "Parcel" : "Non-Parcel") + " tab...");
     clickShipmentTypeTab(typeToClick);
     await humanDelay(1500, 2500);
     await waitForGridReady(5000);
   }
 
-  sendInvStatus("Report generated. Ready to process shipments.");
+  status("Report generated. Ready to process shipments.");
   return true;
 }
 
@@ -3510,6 +3574,424 @@ async function invoiceFinalize(results, skippedRows, dateLabel, aiLevel) {
   sendInvComplete(
     `Invoice Audit done — ${results.length} shipment(s), ${discrepancies.length} discrepancy(ies), ${matches.length} match(es), ${errors.length} error(s).`
   );
+}
+
+// =====================================================================
+// ERP AUDIT PULL (hosted browser job)
+//
+// Transactions → Generate History Report for the last N months, all
+// customers, all carriers → read both result tabs (Non-Parcel + Parcel) →
+// keep the rows whose "Exported to ERP" is false → upload them for an
+// invoice audit (POST /api/audits/invoice/from-history via the background).
+//
+// Started by the browser service with erpAuditPull(months, runBy); it polls
+// fpxErpPoll() for log lines and the outcome. Every wait has a limit and
+// every failure ends the run with a sentence that names the step.
+// Pause: every step passes erpCheckpoint() / humanDelay(), which hold while
+// self.__fpxPaused is set. Stop: `stopRequested`, as for a scrape.
+// =====================================================================
+let fpxErp = null; // { lines: [{ level, text }], counts, done: null | { ok, note, result, stopped } }
+
+const ERP_UPLOAD_MAX_BYTES = 12 * 1024 * 1024; // per POST; the API's limit is 20 MB
+
+function fpxErpPoll() {
+  if (!fpxErp) return { started: false };
+  return { started: true, lines: fpxErp.lines.splice(0), counts: fpxErp.counts, done: fpxErp.done };
+}
+
+function erpLog(text, level = "info") {
+  dlog("[FPX-ERP]", level, text);
+  if (fpxErp) fpxErp.lines.push({ level, text: String(text) });
+}
+
+function erpNum(n) { return Number(n || 0).toLocaleString("en-US"); }
+
+// MM/DD/YYYY — the format the report dialog's date fields take (see setDateInput).
+function erpDate(d) {
+  return `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
+}
+
+// Same day N months back; a day that doesn't exist there (May 31 → Feb 31)
+// becomes that month's last day.
+function erpMonthsAgo(d, months) {
+  const out = new Date(d.getFullYear(), d.getMonth() - months, 1);
+  const lastDay = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
+  out.setDate(Math.min(d.getDate(), lastDay));
+  return out;
+}
+
+// Holds while paused; throws (caught in erpAuditPull) once a stop is asked for.
+async function erpCheckpoint() {
+  await fpxPauseGate();
+  if (stopRequested) throw Object.assign(new Error("Stopped by user"), { fpxStop: true });
+}
+
+function erpLoginExpired() {
+  return /[#/]login\b/i.test(window.location.pathname + window.location.hash);
+}
+
+// "Exported to ERP" false / 0 / No / blank → not exported. Anything else
+// (true, 1, Yes, a date…) counts as exported.
+function erpIsNotExported(v) {
+  if (v === null || v === undefined || v === false || v === 0) return true;
+  const t = String(v).trim().toLowerCase();
+  return t === "" || t === "0" || t === "false" || t === "no";
+}
+
+// The report's "Exported to ERP" column, as the rows are keyed. Rows omit
+// blank cells, so the grid's own column list is checked too.
+// → { key } or { error }
+function erpFindExportedKey(rows, fieldMap) {
+  const norm = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const seen = new Map(); // key → rows that carry it
+  for (const r of rows) for (const k of Object.keys(r)) seen.set(k, (seen.get(k) || 0) + 1);
+  for (const [field, title] of Object.entries(fieldMap || {})) {
+    const k = title || field;
+    if (!seen.has(k)) seen.set(k, 0);
+  }
+  const keys = [...seen.keys()];
+  const exact = ["exportedtoerp", "isexportedtoerp", "exportedtoerpflag", "erpexported", "isexportedtoerpflag"];
+  for (const want of exact) {
+    const hit = keys.find((k) => norm(k) === want);
+    if (hit) return { key: hit };
+  }
+  const loose = keys.filter((k) => { const n = norm(k); return n.includes("export") && n.includes("erp"); });
+  if (loose.length === 1) return { key: loose[0] };
+  if (loose.length > 1) return { error: `Could not tell which column is "Exported to ERP" — the report has ${loose.map((k) => `"${k}"`).join(", ")}` };
+  return { error: `The report has no "Exported to ERP" column (columns: ${keys.slice(0, 60).join(", ") || "none"})` };
+}
+
+// A <select> of the report dialog by what it filters ("customer" / "carrier"):
+// by its own name / id / ng-model first, then by a label right next to it.
+function erpFindDialogSelect(word, exclude = null) {
+  const w = word.toLowerCase();
+  const selects = [...document.querySelectorAll("select")].filter((s) => s !== exclude);
+  for (const sel of selects) {
+    const own = `${sel.name || ""} ${sel.id || ""} ${sel.getAttribute("ng-model") || ""} ${sel.getAttribute("data-ng-model") || ""}`.toLowerCase();
+    if (own.includes(w)) return sel;
+  }
+  for (const sel of selects) {
+    const box = sel.closest("tr, .form-group, .control-group, label");
+    const text = box ? box.textContent.replace(/\s+/g, " ").trim().toLowerCase() : "";
+    // A short label only: a whole-dialog container mentions every filter.
+    const labelOnly = [...(box ? box.childNodes : [])]
+      .filter((n) => !(n.nodeType === 1 && n.contains(sel)))
+      .map((n) => n.textContent || "").join(" ").toLowerCase();
+    if (text && labelOnly.length < 120 && labelOnly.includes(w)) return sel;
+  }
+  return null;
+}
+
+const ERP_ALL_OPTION = /^[\s\-–—]*(all|any|select all)(\s+(customers?|carriers?))?[\s\-–—]*$/i;
+
+// → { label, select, error?, note? }
+function erpCheckCustomer() {
+  const sel = erpFindDialogSelect("customer");
+  if (!sel) return { label: "all customers", select: null, note: "No customer dropdown found in the dialog — FreightPOP's own default applies" };
+  const opt = sel.options[sel.selectedIndex];
+  const text = opt ? opt.text.replace(/\s+/g, " ").trim() : "";
+  if (!opt || ERP_ALL_OPTION.test(text) || /all\s*customers/i.test(text)) return { label: "all customers", select: sel };
+  return { label: text, select: sel, error: `Could not set the customer to All Customers (the dialog shows "${text}")` };
+}
+
+// Makes sure no carrier is filtered out. → { label, note?, level? }
+function erpSetAllCarriers(customerSelect) {
+  const sel = erpFindDialogSelect("carrier", customerSelect);
+  if (!sel) return { label: "all carriers", note: "No carrier filter in the dialog — FreightPOP's default (all carriers) applies" };
+  if (sel.multiple) {
+    const picked = [...sel.selectedOptions];
+    if (!picked.length) return { label: "all carriers" };
+    for (const o of picked) o.selected = false;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return { label: "all carriers", level: "warn", note: `Carrier filter had ${picked.length} carrier(s) picked — cleared them so every carrier is included` };
+  }
+  const cur = sel.options[sel.selectedIndex];
+  const curText = cur ? cur.text.replace(/\s+/g, " ").trim() : "";
+  if (!cur || ERP_ALL_OPTION.test(curText) || (cur.value === "" && sel.selectedIndex === 0)) return { label: "all carriers" };
+  for (const opt of sel.options) {
+    if (ERP_ALL_OPTION.test(opt.text)) {
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      return { label: "all carriers", note: `Carrier filter was "${curText}" — set to "${opt.text.trim()}"` };
+    }
+  }
+  return { label: `carrier ${curText}`, error: `The carrier filter shows "${curText}" and has no "All" choice` };
+}
+
+function erpGridSig() {
+  const grid = document.querySelector(".k-grid");
+  if (!grid) return "";
+  const pager = (grid.querySelector(".k-pager-info") || {}).textContent || "";
+  const first = (grid.querySelector(".k-grid-content tbody tr, tbody tr") || {}).textContent || "";
+  return pager.trim() + "|" + first.replace(/\s+/g, " ").slice(0, 200);
+}
+
+// After a tab click: wait until the grid has finished loading. True once the
+// loading mask has come and gone or the rows changed, or after ~8 quiet
+// seconds with nothing changing (the tab was already the one on screen).
+// False if it is still loading after `maxSec`. Counts steps, not wall time,
+// so a pause doesn't use the limit up.
+async function erpWaitGridSettled(prevSig, maxSec = 60) {
+  let calm = 0;
+  let sawLoading = false;
+  for (let i = 0; i < maxSec * 2; i++) {
+    await erpCheckpoint();
+    if (document.querySelector(".k-loading-mask, .k-loading-image")) { sawLoading = true; calm = 0; }
+    else calm++;
+    if (calm >= 3 && (sawLoading || erpGridSig() !== prevSig)) return true;
+    if (calm >= 16) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// Every row of the grid on screen, through the grid's own data (not the
+// visible page). Throws with the reason when it can't be read in full.
+async function erpReadGrid(label) {
+  const read = async () => {
+    let rows = null;
+    let meta = {};
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await erpCheckpoint();
+      meta = {};
+      rows = await getKendoGridAllRows(30000, meta);
+      // An empty answer is checked once more before it is believed.
+      if (rows && (rows.length > 0 || attempt >= 2)) break;
+      await humanDelay(2500, 3500);
+    }
+    return { rows, meta };
+  };
+  let { rows, meta } = await read();
+  if (!rows) throw new Error(`Could not read the ${label} rows from the report grid (${meta.error || "grid data not reachable"})`);
+  const short = () => meta.total != null && meta.total > rows.length + (meta.skipped || 0);
+  if (short()) {
+    // The grid holds one page at a time: ask it for everything, then re-read.
+    erpLog(`${label} · grid holds ${erpNum(rows.length)} of ${erpNum(meta.total)} rows — asking it for all of them`, "warn");
+    const before = erpGridSig();
+    try { await setGridPageSize(meta.total, () => {}); } catch { /* reported below if it didn't help */ }
+    await erpWaitGridSettled(before, 60);
+    ({ rows, meta } = await read());
+    if (!rows || short()) {
+      throw new Error(`${label}: the report has ${erpNum(meta.total)} rows but only ${erpNum(rows ? rows.length : 0)} could be read (the grid loads one page at a time)`);
+    }
+  }
+  if (meta.skipped) erpLog(`${label} · ${erpNum(meta.skipped)} unreadable row(s) skipped`, "warn");
+  return rows;
+}
+
+function erpUploadChunk(payload, retry) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } };
+    const timer = setTimeout(() => finish({ ok: false, error: "no answer from the API after 4 min" }), 240000);
+    try {
+      chrome.runtime.sendMessage({ type: "uploadErpAudit", payload, retry }, (resp) => {
+        if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
+        else finish(resp || { ok: false, error: "empty reply from the extension" });
+      });
+    } catch (e) {
+      finish({ ok: false, error: e?.message || String(e) });
+    }
+  });
+}
+
+async function erpAuditPull(months, runBy) {
+  if (fpxErp && !fpxErp.done) return; // already running in this page
+  stopRequested = false;
+  const state = { lines: [], counts: { reportRows: 0, notExported: 0, uploaded: 0 }, done: null };
+  fpxErp = state;
+  let lastResult = null;
+
+  try {
+    const n = Math.min(12, Math.max(1, Math.round(Number(months)) || 3));
+    const today = new Date();
+    const fromStr = erpDate(erpMonthsAgo(today, n));
+    const toStr = erpDate(today);
+
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
+
+    erpLog("Opening Transactions");
+    let failNote = null;
+    const generated = await invoiceGenerateReport(fromStr, toStr, "all", "", {
+      status: (t) => dlog("[FPX-ERP]", t),
+      fail: (t) => { failNote = t; },
+      openDialog: true,
+      stoppable: true,
+      gridWaitSec: 180,
+      beforeContinue: async (dateFields) => {
+        await erpCheckpoint();
+        const f = dateFields.from ? dateFields.from.value : "";
+        const t = dateFields.to ? dateFields.to.value : "";
+        if (!f || !t) return `Could not fill the report dates (From "${f}", To "${t}")`;
+        const cust = erpCheckCustomer();
+        if (cust.error) return cust.error;
+        const carr = erpSetAllCarriers(cust.select);
+        if (carr.error) return carr.error;
+        erpLog(`Generate History Report · ${fromStr} to ${toStr} · ${cust.label} · ${carr.label}`);
+        if (cust.note) erpLog(cust.note, "warn");
+        if (carr.note) erpLog(carr.note, carr.level || "info");
+        await humanDelay(300, 600);
+        return null;
+      },
+      onGridWait: (sec) => {
+        if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 3 min)");
+        else if (sec % 15 === 0) erpLog(`Still loading the report · ${sec}s`);
+      },
+    });
+
+    if (!generated) {
+      await erpCheckpoint(); // a stop ends here as "stopped", not as a failure
+      if (erpLoginExpired()) throw new Error("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
+      const where = window.location.hash || window.location.pathname;
+      if (/no date inputs/i.test(failNote || "")) throw new Error(`Generate History Report dialog not found on the Transactions page (no date fields appeared; page is ${where})`);
+      if (/CONTINUE/.test(failNote || "")) throw new Error("Generate History Report dialog: CONTINUE button not found");
+      if (/No grid data/i.test(failNote || "")) throw new Error("Report grid never loaded — no rows appeared within 3 min of pressing Continue (FreightPOP is still loading, or there are no transactions in this range)");
+      throw new Error(failNote || "Generate History Report failed");
+    }
+
+    // All shipment types = both result tabs.
+    const parts = [];
+    for (const [type, label] of [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"]]) {
+      await erpCheckpoint();
+      const before = erpGridSig();
+      if (!clickShipmentTypeTab(type)) { parts.push({ label, rows: null }); continue; }
+      erpLog(`Reading the ${label} tab`);
+      await humanDelay(800, 1400);
+      if (!(await erpWaitGridSettled(before, 60))) throw new Error(`The ${label} tab was still loading after 60s`);
+      parts.push({ label, rows: await erpReadGrid(label) });
+    }
+    if (parts.every((p) => p.rows === null)) {
+      erpLog("Parcel / Non-Parcel tabs not found — reading the report as shown", "warn");
+      parts.length = 0;
+      parts.push({ label: "All", rows: await erpReadGrid("report") });
+    } else {
+      for (const p of parts) if (p.rows === null) erpLog(`${p.label} tab not found — its rows are not included`, "warn");
+    }
+    const got = parts.filter((p) => p.rows !== null);
+    if (got.length === 2 && got[0].rows.length > 0 && got[0].rows.length === got[1].rows.length) {
+      const a = got[0].rows, b = got[1].rows;
+      if (JSON.stringify(a[0]) === JSON.stringify(b[0]) && JSON.stringify(a[a.length - 1]) === JSON.stringify(b[b.length - 1])) {
+        erpLog(`${got[1].label} tab gave the same rows as ${got[0].label} — counted once; check the ${got[1].label} tab by hand`, "warn");
+        got.pop();
+      }
+    }
+
+    const allRows = [];
+    for (const p of got) for (const r of p.rows) allRows.push(normalizeRowKeys(r));
+    state.counts.reportRows = allRows.length;
+    erpLog(`Report loaded · ${erpNum(allRows.length)} rows (${got.map((p) => `${p.label} ${erpNum(p.rows.length)}`).join(", ")})`);
+    if (!allRows.length) {
+      state.done = { ok: true, note: `No transactions in the report for ${fromStr} to ${toStr} — nothing to audit`, result: null };
+      return;
+    }
+
+    // The column list of whichever tab is on screen (rows drop blank cells).
+    const colMeta = {};
+    await getKendoGridAllRows(30000, colMeta).catch(() => null);
+    const found = erpFindExportedKey(allRows, colMeta.fieldMap);
+    if (found.error) throw new Error(found.error);
+    const seenValues = new Map();
+    const pending = [];
+    for (const r of allRows) {
+      const v = r[found.key];
+      const shown = v === null || v === undefined || String(v).trim() === "" ? "blank" : String(v).trim();
+      seenValues.set(shown, (seenValues.get(shown) || 0) + 1);
+      if (!erpIsNotExported(v)) continue;
+      if (found.key !== "Exported to ERP" && v !== undefined) { r["Exported to ERP"] = v; delete r[found.key]; }
+      pending.push(r);
+    }
+    state.counts.notExported = pending.length;
+    const valueList = [...seenValues].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([v, c]) => `${v} ${erpNum(c)}`).join(", ");
+    erpLog(`Not exported to ERP · ${erpNum(pending.length)} rows · column "${found.key}" (${valueList})`, seenValues.size === 1 && allRows.length > 20 ? "warn" : "info");
+    if (!pending.length) {
+      state.done = { ok: true, note: `All ${erpNum(allRows.length)} rows are already exported to ERP — nothing to audit`, result: null };
+      return;
+    }
+
+    const run = {
+      date_from: isoDateFromMmDdYyyy(fromStr),
+      date_to: isoDateFromMmDdYyyy(toStr),
+      run_by: runBy || null,
+      total_report_rows: allRows.length,
+    };
+    // Biggest invoices first (the server keeps this order).
+    const rate = (r) => {
+      const v = r["Shipment Marked-Up Rate"];
+      if (v === null || v === undefined || v === "") return null;
+      const x = parseFloat(String(v).replace(/[^0-9.\-]/g, ""));
+      return Number.isFinite(x) ? x : null;
+    };
+    pending.sort((x, y) => {
+      const a = rate(x), b = rate(y);
+      if (a === null && b === null) return 0;
+      if (a === null) return 1;
+      if (b === null) return -1;
+      return b - a;
+    });
+
+    // One POST when it fits (the API takes 20 MB); otherwise parts of at most
+    // ~12 MB, the last one marked final so the AI summary runs once.
+    const posts = [[]];
+    let size = 0;
+    for (const r of pending) {
+      const bytes = JSON.stringify(r).length * 1.1 + 1;
+      if (size + bytes > ERP_UPLOAD_MAX_BYTES && posts[posts.length - 1].length) { posts.push([]); size = 0; }
+      posts[posts.length - 1].push(r);
+      size += bytes;
+    }
+    const chunks = posts.length;
+    erpLog(`Uploading · ${erpNum(pending.length)} rows` + (chunks > 1 ? ` in ${chunks} parts` : ""));
+    let auditId = null;
+    for (let c = 0; c < chunks; c++) {
+      await erpCheckpoint();
+      const rows = posts[c];
+      const payload = c === 0 ? { run, rows, ai_level: "summary" } : { audit_id: auditId, rows };
+      if (chunks > 1) payload.final = c === chunks - 1;
+      // Never retried: a repeat could leave a second audit or double the rows.
+      const resp = await erpUploadChunk(payload, false);
+      if (!resp || !resp.ok) {
+        const msg = `Upload failed${chunks > 1 ? ` on part ${c + 1} of ${chunks}` : ""}: ${(resp && resp.error) || "no reply"}` +
+          (auditId ? ` — audit ${String(auditId).slice(0, 8)} holds ${erpNum(state.counts.uploaded)} of ${erpNum(pending.length)} rows` : "");
+        erpLog(msg, "error");
+        throw new Error(msg);
+      }
+      if (!resp.audit_id) throw new Error("The API took the upload but returned no audit id");
+      auditId = resp.audit_id;
+      // total = every row the report had; pending = the not-exported rows stored.
+      lastResult = { audit_id: resp.audit_id, total: state.counts.reportRows || resp.total || null, pending: resp.pending ?? null };
+      // The API says how many rows it could read each money column from. A
+      // zero means FreightPOP's column title differs from what we expect.
+      if (resp.fields && c === chunks - 1) {
+        const f = resp.fields;
+        erpLog(`Columns read · charge ${erpNum(f.charge)} · cost ${erpNum(f.cost)} · invoice amount ${erpNum(f.invoice)} · of ${erpNum(f.rows)} rows`);
+        if (f.rows && (!f.charge || !f.cost || !f.shipment_id)) {
+          erpLog(`Some columns could not be read (charge ${f.charge}, cost ${f.cost}, shipment id ${f.shipment_id}). The audit is saved but its numbers are incomplete — the report's column titles need checking.`, "warn");
+        }
+      }
+      state.counts.uploaded += rows.length;
+      if (chunks > 1) erpLog(`Uploaded ${erpNum(state.counts.uploaded)} of ${erpNum(pending.length)} rows`);
+    }
+    const id8 = String(auditId).slice(0, 8);
+    erpLog(`Uploaded · audit ${id8} · ${erpNum(state.counts.uploaded)} rows` + (lastResult.pending != null ? ` · ${erpNum(lastResult.pending)} waiting for review` : ""), "done");
+    state.done = {
+      ok: true,
+      note: `${erpNum(pending.length)} of ${erpNum(allRows.length)} report rows not exported to ERP · audit ${id8}`,
+      result: lastResult,
+    };
+  } catch (e) {
+    if (e && e.fpxStop) {
+      state.done = {
+        ok: true, stopped: true, result: lastResult,
+        note: lastResult
+          ? `${erpNum(state.counts.uploaded)} of ${erpNum(state.counts.notExported)} rows uploaded before the stop · audit ${String(lastResult.audit_id).slice(0, 8)}`
+          : "Nothing was uploaded.",
+      };
+    } else {
+      console.warn("[FPX-ERP] failed:", e?.message || e);
+      state.done = { ok: false, note: String(e?.message || e), result: lastResult };
+    }
+  }
 }
 
 // =====================================================================
