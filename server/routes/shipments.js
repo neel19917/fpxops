@@ -11,6 +11,7 @@ import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG 
 import { detectStorageRisk, isStorageRiskTitle, STORAGE_TAG } from "../lib/storageRisk.js";
 import { peopleIndex, resolveWithIndex, resolveAssignee } from "../lib/people.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
+import { supersedeOlderFor } from "../lib/taskDedupe.js";
 
 // Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
 // default; Sonnet/Opus are escalation options for ambiguous shipments.
@@ -422,6 +423,17 @@ async function autoCreateActionTasks(
   if (error) {
     console.warn("[FPX] auto-task insert failed:", error.message);
     return 0;
+  }
+  // Newest task takes precedence: retire older ACTIVE duplicates (same
+  // shipment + audience) of what was just inserted. They become cancelled
+  // rows, which the `existing` lookup above still counts — so they keep
+  // working as tombstones and as prior redelivery attempts. Never fails
+  // task creation.
+  try {
+    const shipIds = Array.from(new Set((data || []).map((t) => t.shipment_id).filter(Boolean)));
+    if (shipIds.length) await supersedeOlderFor(supabase, shipIds, { who: "system (auto-flag)" });
+  } catch (e) {
+    console.warn("[FPX] auto-task supersede failed:", e.message);
   }
   // Audit each auto-created task.
   for (const t of data || []) {
@@ -1306,6 +1318,13 @@ shipmentsRouter.post("/:id/tasks", async (req, res) => {
   };
   const { data, error } = await supabase.from("fpx_shipment_tasks").insert(row).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  // Newest task takes precedence: retire older active duplicates (same
+  // shipment + audience). Never fails the create.
+  try {
+    await supersedeOlderFor(supabase, [ship.id], { who: creatorName || "operator" });
+  } catch (e) {
+    console.warn("[FPX] supersede after task create failed:", e.message);
+  }
   res.json({ task: data });
 });
 

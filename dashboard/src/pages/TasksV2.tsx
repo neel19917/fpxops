@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
-  AlertTriangle, Ban, CheckCircle2, Clock, Filter, Layers, ListChecks,
+  AlertTriangle, Ban, CheckCircle2, Clock, CopyMinus, Filter, Layers, ListChecks,
   ExternalLink, Loader2, Mail, MailPlus, PanelRightOpen, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
 } from "lucide-react";
 import { api } from "../lib/api";
@@ -29,6 +29,7 @@ import { GroupRows } from "../components/tasksV2/Rows";
 import { TriagePanel } from "../components/tasksV2/TriagePanel";
 import { DailySummaryPanel } from "../components/tasksV2/DailySummaryPanel";
 import { DismissModal } from "../components/tasksV2/DismissModal";
+import { DedupeDialog } from "../components/tasksV2/DedupeDialog";
 import { GroupEmailComposer, type EmailAudience } from "../components/tasksV2/GroupEmailComposer";
 import { PromptsDialog, loadAiNotes, saveAiNotes, type AiNotes } from "../components/tasksV2/PromptsDialog";
 
@@ -56,6 +57,8 @@ import { PromptsDialog, loadAiNotes, saveAiNotes, type AiNotes } from "../compon
 // sender saw: segment, health flags, grouping, sort, search, the owner /
 // carrier / mode filters, and an open group email.
 //   /tasks/v2?group=carrier&carrier=SAIA&email=carrier&to=SAIA
+// dedupe=1 opens "Clean up duplicates" for the whole board. It is not part
+// of the view, so on its own it leaves the saved filters alone.
 const SEGS = ["all", "attention", "redelivery", "return_claim", "storage_risk", "carrier", "customer", "other"];
 const GROUPS = ["none", "segment", "carrier", "customer", "assignee", "shipment", "mode"];
 const SORTS = ["smart", "age", "priority", "scrape"];
@@ -101,6 +104,8 @@ export function TasksV2Page() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const [assignTo, setAssignTo] = useState<string | null>(null);
   const [dismissing, setDismissing] = useState<{ ids: string[]; disposition: string; reason: string } | null>(null);
+  // "Clean up duplicates" dialog: the selected tasks, or the whole board.
+  const [deduping, setDeduping] = useState<{ ids?: string[] } | null>(() => (link.get("dedupe") === "1" ? {} : null));
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   // Group email composer: the tasks it was opened on, and who it addresses.
   const [emailing, setEmailing] = useState<Emailing | null>(null);
@@ -207,10 +212,11 @@ export function TasksV2Page() {
     set("email", emailing?.audience);
     set("to", emailing?.to);
     set("tasks", emailing && !emailing.whole ? emailing.ids.slice(0, 60).map((id) => id.slice(0, ID_PREFIX)).join(",") : "");
+    set("dedupe", deduping && !deduping.ids ? "1" : "");
     const next = p.toString();
     if (next !== new URLSearchParams(location.search).toString()) navigate({ search: next ? `?${next}` : "" }, { replace: true, state: location.state });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prefs.seg, prefs.flags, prefs.groupBy, prefs.sortBy, search, assigneeFilter, carrierFilter, modeFilter, emailing]);
+  }, [prefs.seg, prefs.flags, prefs.groupBy, prefs.sortBy, search, assigneeFilter, carrierFilter, modeFilter, emailing, deduping]);
 
   // Triage rank per task id — feeds the "smart" sort and the rank chip.
   const triageRank = useMemo(() => {
@@ -345,12 +351,12 @@ export function TasksV2Page() {
     });
   }
   // ⌘/Ctrl+A selects every task in view; Esc clears the selection. Ignored
-  // while typing, and while a dialog (email, dismiss, prompts) is open.
+  // while typing, and while a dialog (email, dismiss, prompts, duplicates) is open.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const el = e.target as HTMLElement | null;
       if (el && (/^(input|textarea|select)$/i.test(el.tagName) || el.isContentEditable)) return;
-      if (emailing || dismissing || promptsOpen) return;
+      if (emailing || dismissing || promptsOpen || deduping) return;
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "a") {
         if (!visibleIds.length) return;
         e.preventDefault();
@@ -361,7 +367,7 @@ export function TasksV2Page() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [visibleIds, selected.size, emailing, dismissing, promptsOpen]);
+  }, [visibleIds, selected.size, emailing, dismissing, promptsOpen, deduping]);
 
   // Selected tasks in board order.
   const selectedInOrder = () => visibleIds.filter((id) => selected.has(id));
@@ -504,6 +510,10 @@ export function TasksV2Page() {
             title={aiNotes.triage || aiNotes.daily ? "Your extra instructions are on for the next AI run" : "See or change what the AI is told for triage and the daily summary"}>
             <MessageSquareText className="h-4 w-4" /> AI prompts
             {aiNotes.triage || aiNotes.daily ? <span className="h-2 w-2 rounded-full bg-violet-500" aria-label="Extra instructions on" /> : null}
+          </button>
+          <button onClick={() => setDeduping({})} className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50"
+            title="Find shipments with more than one active task for the carrier or the customer. Shows a preview first; nothing changes until you confirm.">
+            <CopyMinus className="h-4 w-4" /> Clean up duplicates
           </button>
           <button onClick={() => load()} className="rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 text-sm px-3 py-2 inline-flex items-center gap-1.5 hover:bg-slate-50" title="Reload board">
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh
@@ -708,6 +718,7 @@ export function TasksV2Page() {
               <button disabled={bulkBusy || !selectedActive.length} onClick={() => bulk(() => api.tasks.bulkUpdate({ ids: selectedActive, email_queued: true }))} className="inline-flex items-center gap-1 rounded-md bg-slate-600 hover:bg-slate-500 px-2.5 py-1 disabled:opacity-50" title="Mark these for email. They collect in Email Studio, grouped by carrier or customer."><MailPlus className="h-3.5 w-3.5" /> Queue for email</button>
               <button disabled={!selectedActive.length} onClick={() => setEmailing({ ids: selectedActive, audience: prefs.groupBy === "customer" ? "customer" : "carrier", to: null, whole: false })} className="inline-flex items-center gap-1 rounded-md bg-fuchsia-500 hover:bg-fuchsia-400 px-2.5 py-1 disabled:opacity-50" title="Draft one email per carrier (or customer) covering every selected shipment"><Mail className="h-3.5 w-3.5" /> Email {prefs.groupBy === "customer" ? "customer" : "carrier"}…</button>
               <button disabled={bulkBusy} onClick={() => runTriage({ ids: Array.from(selected) })} className="inline-flex items-center gap-1 rounded-md bg-violet-500 hover:bg-violet-400 px-2.5 py-1 disabled:opacity-50" title="Triage only the selected tasks"><Wand2 className="h-3.5 w-3.5" /> Triage selection</button>
+              <button disabled={!selectedActive.length} onClick={() => setDeduping({ ids: selectedActive })} className="inline-flex items-center gap-1 rounded-md bg-white/10 hover:bg-white/20 px-2.5 py-1 disabled:opacity-50" title="See whether the selected tasks include older duplicates on the same shipment. Shows a preview first."><CopyMinus className="h-3.5 w-3.5" /> Check duplicates</button>
               <button onClick={() => setSelected(new Set())} className="ml-auto text-slate-300 hover:text-white inline-flex items-center gap-1"><X className="h-3.5 w-3.5" /> Clear</button>
             </div>
           ) : null}
@@ -786,6 +797,18 @@ export function TasksV2Page() {
           onView={(audience, to) => setEmailing((e) => (e && (e.audience !== audience || e.to !== to) ? { ...e, audience, to, whole: e.whole && e.audience === audience && e.to === to } : e))}
           onClose={() => setEmailing(null)}
           onTasksChanged={() => { void load(true); }}
+        />
+      ) : null}
+
+      {deduping ? (
+        <DedupeDialog
+          taskIds={deduping.ids}
+          onClose={() => setDeduping(null)}
+          onApplied={({ ids }) => {
+            const gone = new Set(ids);
+            setSelected((p) => new Set(Array.from(p).filter((id) => !gone.has(id))));
+            void load(true);
+          }}
         />
       ) : null}
 

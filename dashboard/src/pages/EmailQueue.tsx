@@ -6,7 +6,7 @@
 // The AI prompts behind the emails are edited on the admin "Email prompts" page.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { ChevronDown, ChevronRight, Copy, ExternalLink, History, Inbox, Mail, PanelRightOpen, RefreshCw, Search, Settings2, Sparkles, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, ExternalLink, History, Inbox, Layers, Mail, PanelRightOpen, RefreshCw, Search, Settings2, Sparkles, Trash2, X } from "lucide-react";
 import { api, type GroupEmailRecord } from "../lib/api";
 import type { TaskBoardRow } from "../lib/types";
 import { fmtRelative } from "../lib/format";
@@ -15,10 +15,46 @@ import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
 import { GroupEmailComposer, type EmailAudience } from "../components/tasksV2/GroupEmailComposer";
 import { BlockedTabsDialog, isActive, openTasksInTabs, shortTitle, SLOW_TABS } from "../components/tasksV2/shared";
+import { DedupeDialog } from "../components/tasksV2/DedupeDialog";
 
 const nameFor = (r: TaskBoardRow, by: EmailAudience) =>
   (by === "carrier" ? (r.shipment?.carrier_name || r.shipment?.carrier || "") : (r.shipment?.customer_name || "")).trim();
 const ageDays = (iso: string) => Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 86_400_000));
+
+// Who a task is written for, read from its title prefix. Anything else is
+// "none" and is never collapsed.
+const titleAudience = (title: string): EmailAudience | null => {
+  const m = /^\s*(carrier|customer) followup:/i.exec(title || "");
+  return m ? (m[1].toLowerCase() as EmailAudience) : null;
+};
+const isNewer = (a: TaskBoardRow, b: TaskBoardRow) => {
+  const d = (Date.parse(a.task.created_at) || 0) - (Date.parse(b.task.created_at) || 0);
+  return d ? d > 0 : a.task.id > b.task.id;
+};
+// When one shipment has several queued tasks for the same audience, the newest
+// one wins. `rows` keeps the incoming order with the older ones taken out;
+// `older` maps each surviving task id to the tasks it stands in for (newest first).
+function collapseNewest(rows: TaskBoardRow[]): { rows: TaskBoardRow[]; older: Map<string, TaskBoardRow[]>; hidden: number } {
+  const sets = new Map<string, TaskBoardRow[]>();
+  for (const r of rows) {
+    const ship = r.task.shipment_id || r.shipment?.id;
+    const aud = titleAudience(r.task.title);
+    if (!ship || !aud) continue;
+    // Storage-risk tasks are their own lane, same as the server rule.
+    const k = `${ship}|${aud}|${/^\s*(carrier|customer) followup:\s*storage risk/i.test(r.task.title) ? "storage" : "std"}`;
+    if (!sets.has(k)) sets.set(k, []);
+    sets.get(k)!.push(r);
+  }
+  const older = new Map<string, TaskBoardRow[]>();
+  const drop = new Set<string>();
+  for (const set of sets.values()) {
+    if (set.length < 2) continue;
+    const [newest, ...rest] = [...set].sort((a, b) => (isNewer(a, b) ? -1 : 1));
+    older.set(newest.task.id, rest);
+    rest.forEach((r) => drop.add(r.task.id));
+  }
+  return { rows: drop.size ? rows.filter((r) => !drop.has(r.task.id)) : rows, older, hidden: drop.size };
+}
 
 export function EmailQueuePage() {
   const { profile: me } = useAuth();
@@ -35,7 +71,11 @@ export function EmailQueuePage() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const queued = useMemo(() => (rows || []).filter((r) => r.task.email_queued_at && isActive(r.task.status)), [rows]);
+  // Newest task per shipment + audience; the older ones ride along in `older`.
+  const { rows: queued, older, hidden } = useMemo(
+    () => collapseNewest((rows || []).filter((r) => r.task.email_queued_at && isActive(r.task.status))),
+    [rows],
+  );
 
   return (
     <div className="space-y-4">
@@ -67,13 +107,18 @@ export function EmailQueuePage() {
       {tab === "queue" ? (
         err ? <ErrorBlock>{err} <button onClick={load} className="underline ml-1">Retry</button></ErrorBlock>
           : !rows ? <LoadingState />
-          : <Queue queued={queued} by={by} onBy={(b) => setParam("by", b === "carrier" ? null : b)} onChanged={load} />
+          : <Queue queued={queued} older={older} hidden={hidden} by={by} onBy={(b) => setParam("by", b === "carrier" ? null : b)} onChanged={load} />
       ) : <HistoryList />}
     </div>
   );
 }
 
-function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: EmailAudience; onBy: (b: EmailAudience) => void; onChanged: () => void }) {
+function Queue({ queued, older, hidden, by, onBy, onChanged }: {
+  queued: TaskBoardRow[];                 // newest task per shipment + audience
+  older: Map<string, TaskBoardRow[]>;     // shown task id → the older tasks hidden behind it
+  hidden: number;
+  by: EmailAudience; onBy: (b: EmailAudience) => void; onChanged: () => void;
+}) {
   const navigate = useNavigate();
   const location = useLocation();
   // `only`: draft just these task ids instead of the whole queue.
@@ -81,6 +126,8 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
   const [busyId, setBusyId] = useState<string | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [err, setErr] = useState<string | null>(null);
+  const [deduping, setDeduping] = useState(false);
+  const dedupeDialog = deduping ? <DedupeDialog onClose={() => setDeduping(false)} onApplied={() => onChanged()} /> : null;
 
   const { groups, homeless } = useMemo(() => {
     const m = new Map<string, TaskBoardRow[]>();
@@ -123,9 +170,11 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
     const blocked = openTasksInTabs(ids);
     setBlockedTabs(blocked.length ? { ids: blocked, total: ids.length } : null);
   }
+  // Also un-queues the older tasks hidden behind each row, so they don't pop back up.
   async function unqueue(ids: string[]) {
     setBusyId(ids[0]); setErr(null);
-    try { await api.tasks.bulkUpdate({ ids, email_queued: false }); onChanged(); }
+    const all = ids.flatMap((id) => [id, ...(older.get(id) || []).map((r) => r.task.id)]);
+    try { await api.tasks.bulkUpdate({ ids: all, email_queued: false }); onChanged(); }
     catch (e) { setErr((e as Error).message); }
     finally { setBusyId(null); }
   }
@@ -139,7 +188,11 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
           While working a task, press <kbd className="px-1.5 py-0.5 rounded bg-slate-100 ring-1 ring-slate-200 font-mono text-[11px]">E</kbd> to mark it for email.
           On the Tasks board you can also tick several tasks and choose “Queue for email”. They collect here, grouped by carrier or customer.
         </p>
-        <Link to="/tasks/v2" className="mt-4 inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800">Go to Tasks</Link>
+        <div className="mt-4 flex items-center justify-center gap-2 flex-wrap">
+          <Link to="/tasks/v2" className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800">Go to Tasks</Link>
+          <button onClick={() => setDeduping(true)} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100" title="Find shipments with several tasks for the same carrier or customer and keep the newest"><Layers className="h-4 w-4" /> Clean up duplicates</button>
+        </div>
+        {dedupeDialog}
       </div>
     );
   }
@@ -159,13 +212,25 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
         <label className="inline-flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer select-none">
           <input type="checkbox" checked={order.length > 0 && order.every((id) => picked.has(id))} onChange={() => tickMany(order)} className="accent-violet-600" /> Select all
         </label>
-        {groups.length > 1 ? (
-          <button onClick={() => setComposing({ to: null })} className="ml-auto inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">
-            <Sparkles className="h-4 w-4" /> Draft all {groups.length} emails
+        <div className="ml-auto flex items-center gap-2">
+          <button onClick={() => setDeduping(true)} className="inline-flex items-center gap-1.5 text-sm px-2.5 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100" title="Find shipments with several tasks for the same carrier or customer and keep the newest">
+            <Layers className="h-4 w-4" /> Clean up duplicates
           </button>
-        ) : null}
+          {groups.length > 1 ? (
+            <button onClick={() => setComposing({ to: null })} className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">
+              <Sparkles className="h-4 w-4" /> Draft all {groups.length} emails
+            </button>
+          ) : null}
+        </div>
       </div>
       {err ? <div className="text-sm text-rose-700">{err}</div> : null}
+
+      {hidden ? (
+        <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 px-4 py-2 text-sm text-slate-600 flex items-center gap-3 flex-wrap">
+          <span>{hidden} older duplicate task{hidden === 1 ? " is" : "s are"} hidden. The newest task for each shipment is shown.</span>
+          <button onClick={() => setDeduping(true)} className="ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50"><Layers className="h-3.5 w-3.5" /> Clean up duplicates</button>
+        </div>
+      ) : null}
 
       {pickedIds.length ? (
         <div className="sticky top-2 z-10 rounded-xl bg-slate-900 text-white px-4 py-2.5 flex items-center gap-2 flex-wrap text-sm">
@@ -203,8 +268,11 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
                     <span className="text-slate-500"> · {r.shipment?.shipment_status || "No status"} · {by === "carrier" ? r.shipment?.customer_name : (r.shipment?.carrier_name || r.shipment?.carrier)}</span>
                     <span className="block text-slate-500 truncate">{shortTitle(r.task.title)}</span>
                   </span>
+                  {older.get(r.task.id)?.length ? (
+                    <span className="shrink-0 text-slate-400 cursor-help" title={"Older tasks hidden behind this one:\n" + older.get(r.task.id)!.map((o) => `• ${o.task.title}`).join("\n")}>+{older.get(r.task.id)!.length} older</span>
+                  ) : null}
                   <span className="shrink-0 text-slate-400 tabular-nums">{ageDays(r.task.created_at)}d</span>
-                  <button onClick={() => unqueue([r.task.id])} disabled={busyId === r.task.id} title="Take this task out of the email queue (the task itself is untouched)"
+                  <button onClick={() => unqueue([r.task.id])} disabled={busyId === r.task.id} title={older.get(r.task.id)?.length ? "Take this task and its older duplicates out of the email queue (the tasks themselves are untouched)" : "Take this task out of the email queue (the task itself is untouched)"}
                     className="shrink-0 text-slate-400 hover:text-rose-600 disabled:opacity-40" aria-label="Remove from queue"><X className="h-3.5 w-3.5" /></button>
                 </li>
               ))}
@@ -224,6 +292,8 @@ function Queue({ queued, by, onBy, onChanged }: { queued: TaskBoardRow[]; by: Em
         <BlockedTabsDialog ids={blockedTabs.ids} total={blockedTabs.total} onClose={() => setBlockedTabs(null)}
           onRetry={() => { const still = openTasksInTabs(blockedTabs.ids, { quiet: true }); setBlockedTabs(still.length ? { ids: still, total: blockedTabs.total } : null); }} />
       ) : null}
+
+      {dedupeDialog}
 
       {composing ? (
         <GroupEmailComposer

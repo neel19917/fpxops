@@ -9,6 +9,7 @@ import { loadBoard } from "../lib/taskBoard.js";
 import { collectDailyDigest, runDailySummary } from "../lib/dailySummary.js";
 import { resolveAssignee } from "../lib/people.js";
 import { getSettings } from "../lib/settings.js";
+import { taskAudience, planDedupe, applyDedupe, supersedeOlderFor, loadActiveForDedupe } from "../lib/taskDedupe.js";
 
 export const tasksRouter = Router();
 
@@ -630,6 +631,50 @@ tasksRouter.post("/v2/dismiss", async (req, res) => {
   res.json({ dismissed, skipped: ids.length - dismissed });
 });
 
+// POST /tasks/v2/dedupe  { dry_run?: boolean, task_ids?: string[], shipment_ids?: string[] }
+// Newest task wins per shipment + audience (a carrier task and a customer
+// task on one shipment are not duplicates). Older active duplicates are
+// cancelled with a "superseded" note — tombstones, never deleted — and an
+// email-queue flag on an older one moves to the newest.
+// DRY RUN BY DEFAULT: nothing is written unless the body carries
+// dry_run: false exactly. No scope = the whole active board.
+tasksRouter.post("/v2/dedupe", async (req, res) => {
+  try {
+    const dryRun = req.body?.dry_run !== false;
+    const strs = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string" && x) : null);
+    const taskIds = strs(req.body?.task_ids);
+    const shipmentIds = strs(req.body?.shipment_ids);
+    // A scope that was sent but is empty must not silently widen to the
+    // whole board.
+    if ((taskIds && !taskIds.length) || (shipmentIds && !shipmentIds.length)) {
+      return res.status(400).json({ error: "task_ids / shipment_ids must not be empty when supplied" });
+    }
+    const who = req.user?.email || req.apiKey?.name || "operator";
+
+    const tasks = await loadActiveForDedupe(supabase, {
+      shipmentIds: shipmentIds || undefined,
+      taskIds: taskIds || undefined,
+    });
+    const plan = planDedupe(tasks);
+    if (dryRun) return res.json({ dry_run: true, ...plan });
+
+    const result = await applyDedupe(supabase, plan, { who });
+    const shipmentCount = Array.isArray(plan.shipments) ? plan.shipments.length : Number(plan.shipments) || 0;
+    logAudit(req, {
+      action: "bulk_update", entity_type: "task",
+      summary: `De-duped tasks: superseded ${result.superseded} older task(s) on ${shipmentCount} shipment(s)`,
+      metadata: {
+        count: result.superseded, ids: result.ids, carried_queue: result.carried_queue, failed: result.failed, skipped: result.skipped,
+        shipments: shipmentCount, disposition: "superseded",
+        scope: { task_ids: taskIds, shipment_ids: shipmentIds },
+      },
+    });
+    res.json({ dry_run: false, ...plan, result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // How hard the email pushes. Sent as an operator note, so the saved group
 // prompts still decide the wording; this only sets the temperature.
 const GROUP_EMAIL_TONES = {
@@ -644,8 +689,10 @@ const GROUP_EMAIL_MAX_SHIPMENTS = 60;
 // One email to a carrier (or customer) covering every shipment behind the
 // supplied tasks. Unlike /carrier-email-draft this takes ANY active task —
 // the v2 board groups by the shipment's carrier / customer, not by a
-// "Carrier followup:" title — and folds several tasks on one shipment into
-// a single line so a PRO is never listed twice.
+// "Carrier followup:" title. Each shipment gets ONE line, written from its
+// newest task for the requested audience (newest task of any kind when it
+// has none for that audience): the newest task takes precedence, so a PRO
+// is never listed twice and a stale ask never rides along.
 tasksRouter.post("/v2/group-email", async (req, res) => {
   const audience = req.body?.audience === "customer" ? "customer" : req.body?.audience === "carrier" ? "carrier" : "";
   const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 200) : "";
@@ -671,20 +718,26 @@ tasksRouter.post("/v2/group-email", async (req, res) => {
   if (shipErr) return res.status(500).json({ error: shipErr.message });
   const shipById = new Map((ships || []).map((s) => [s.id, s]));
 
-  // One line per shipment; its tasks' asks are merged.
+  // One line per shipment, from its newest task for this audience.
   const byShip = new Map();
   for (const t of active) {
     if (!shipById.has(t.shipment_id)) continue;
     if (!byShip.has(t.shipment_id)) byShip.set(t.shipment_id, []);
     byShip.get(t.shipment_id).push(t);
   }
-  const items = Array.from(byShip.entries()).map(([sid, ts]) => ({
-    shipment: shipById.get(sid),
-    task: {
-      title: ts.map((t) => t.title).filter(Boolean).join(" | "),
-      description: ts.map((t) => t.description).filter(Boolean).join("\n").slice(0, 1500) || null,
-    },
-  }));
+  const createdMs = (t) => Date.parse(t.created_at) || 0;
+  const newestOf = (list) => list.reduce((a, b) => (createdMs(b) > createdMs(a) ? b : a));
+  const items = Array.from(byShip.entries()).map(([sid, ts]) => {
+    const forAudience = ts.filter((t) => taskAudience(t.title) === audience);
+    const lead = newestOf(forAudience.length ? forAudience : ts);
+    return {
+      shipment: shipById.get(sid),
+      task: {
+        title: lead.title || "",
+        description: (lead.description || "").slice(0, 1500) || null,
+      },
+    };
+  });
   if (!items.length) return res.status(404).json({ error: "Shipments not found" });
 
   const tone = GROUP_EMAIL_TONES[req.body?.tone] ? req.body.tone : null;
@@ -839,6 +892,15 @@ tasksRouter.post("/bulk", async (req, res) => {
 
   const { data, error } = await supabase.from("fpx_shipment_tasks").insert(rows).select("id, shipment_id, assigned_to, title");
   if (error) return res.status(500).json({ error: error.message });
+  // Newest task takes precedence: retire older active duplicates (same
+  // shipment + audience) now that these exist. Never fails the create.
+  try {
+    await supersedeOlderFor(supabase, Array.from(new Set(data.map((t) => t.shipment_id))), {
+      who: req.user?.email || req.apiKey?.name || "operator",
+    });
+  } catch (e) {
+    console.warn("[FPX] supersede after bulk-create failed:", e.message);
+  }
   logAudit(req, {
     action: "bulk_create", entity_type: "task",
     summary: `Bulk-created ${data.length} task(s): "${title}"`,

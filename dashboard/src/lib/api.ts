@@ -455,6 +455,11 @@ export const api = {
     v2GroupEmails: (limit = 50) => request<{ data: GroupEmailRecord[] }>("/api/tasks/v2/group-emails", { params: { limit } }),
     v2Dismiss: (body: { ids: string[]; reason?: string; disposition?: string }) =>
       request<{ dismissed: number; skipped: number }>("/api/tasks/v2/dismiss", { method: "POST", body: JSON.stringify(body) }),
+    // Several active tasks on one shipment for the same audience: the newest
+    // stays, older ones are cancelled as superseded. Previews unless
+    // dry_run is false. No task_ids / shipment_ids = the whole board.
+    v2Dedupe: (body: { dry_run?: boolean; task_ids?: string[]; shipment_ids?: string[] } = {}) =>
+      request<DedupePlan>("/api/tasks/v2/dedupe", { method: "POST", body: JSON.stringify(body) }),
     // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
     // each task joined to its shipment so the Kanban panel can render
     // carrier/customer/ETA without further round trips.
@@ -655,6 +660,27 @@ export interface GovCall {
   id: string; created_at: string; kind: string; model: string | null; tracking_number: string | null; user_email: string | null;
   cost_usd: number | string | null; input_tokens: number | null; output_tokens: number | null; duration_ms: number | null;
   error: string | null; rating: string | null; rated_by: string | null; metadata: Record<string, unknown> | null;
+}
+
+// "Clean up duplicates": one task as the duplicate check sees it.
+export interface DedupeTask {
+  id: string; title: string; status: string; priority: string; assigned_to: string | null;
+  created_at: string; email_queued_at: string | null; email_queued_by: string | null;
+}
+// One shipment + audience with more than one active task.
+export interface DedupeGroup {
+  shipment_id: string; tracking_number: string | null; audience: "carrier" | "customer";
+  keep: DedupeTask; supersede: DedupeTask[];
+  // The kept task takes over an older one's place in the email queue.
+  carry_queue: boolean;
+  // One of the older tasks is in progress.
+  working: boolean;
+}
+export interface DedupePlan {
+  dry_run: boolean; supersede_count: number; shipments: number;
+  groups: DedupeGroup[];
+  // Present only when the changes were applied (dry_run false).
+  result?: { superseded: number; carried_queue: number; failed: number; ids: string[] };
 }
 
 export type EmailStudioType = "carrier" | "customer" | "carrier_group" | "customer_group";
