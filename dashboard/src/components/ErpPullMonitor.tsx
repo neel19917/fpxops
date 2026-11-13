@@ -5,6 +5,7 @@ import { hostedBrowser, type HostedStats } from "../lib/hostedBrowser";
 import {
   ERP_MONTH_CHOICES, EndpointMissingError, erpWorker, isErpRequest, pauseErpPull, requestErpPull, resumeErpPull,
   type ErpMonths,
+  ERP_TYPE_CHOICES, type ErpShipmentType,
 } from "../lib/erpPull";
 import { fmtNum, fmtRelative } from "../lib/format";
 import { HostedFreightPop } from "./HostedFreightPop";
@@ -33,6 +34,7 @@ export function ErpPullMonitor({ onFinished, onSettled }: { onFinished?: (auditI
   const [requests, setRequests] = useState<ScrapeRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [months, setMonths] = useState<ErpMonths>(3);
+  const [shipType, setShipType] = useState<ErpShipmentType>("non-parcel");
   // The request this panel started (the hosted browser may not label jobs yet).
   const [reqId, setReqId] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -118,7 +120,7 @@ export function ErpPullMonitor({ onFinished, onSettled }: { onFinished?: (auditI
   async function start() {
     setStarting(true); setError(null);
     try {
-      const res = await requestErpPull(months);
+      const res = await requestErpPull(months, shipType);
       if (!isErpRequest(res.request)) {
         // An API that doesn't know this job yet answers with a regular scrape request.
         setError("The server queued a regular scrape instead of the ERP pull. The ERP pull needs the next server update.");
@@ -158,7 +160,7 @@ export function ErpPullMonitor({ onFinished, onSettled }: { onFinished?: (auditI
         <div className="min-w-0">
           <h2 className="text-sm font-semibold text-slate-900">Pull from FreightPOP</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Runs FreightPOP's History Report for every carrier and customer and brings in the rows not exported to ERP.
+            Runs FreightPOP's History Report for every customer and brings in the rows not exported to ERP.
           </p>
         </div>
         {!active ? (
@@ -178,6 +180,19 @@ export function ErpPullMonitor({ onFinished, onSettled }: { onFinished?: (auditI
                   </button>
                 ))}
               </div>
+            </div>
+            <div className="inline-flex rounded-lg ring-1 ring-slate-200 overflow-hidden" role="group" aria-label="Shipment type">
+              {ERP_TYPE_CHOICES.map(([id, label]) => (
+                <button
+                  key={id}
+                  onClick={() => setShipType(id)}
+                  disabled={starting}
+                  aria-pressed={shipType === id}
+                  className={"px-2.5 py-1.5 text-xs font-medium " + (shipType === id ? "bg-violet-600 text-white" : "bg-white text-slate-700 hover:bg-slate-50")}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
             <button
               onClick={start}

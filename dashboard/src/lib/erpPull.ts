@@ -37,10 +37,13 @@ export function isErpRequest(r: ScrapeRequest): boolean {
 }
 
 /** Queue the pull. Same endpoint as Refresh All, with scope "erp_audit". */
-export function requestErpPull(months: number): Promise<{ request: ScrapeRequest; coalesced?: boolean }> {
+export const ERP_TYPE_CHOICES = [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"], ["both", "Both"]] as const;
+export type ErpShipmentType = (typeof ERP_TYPE_CHOICES)[number][0];
+
+export function requestErpPull(months: number, shipment_type: ErpShipmentType = "non-parcel"): Promise<{ request: ScrapeRequest; coalesced?: boolean }> {
   // api.ops.requestRescrape types scope as "all" | "selected" and the low-level
   // request helper in api.ts isn't exported, hence the cast.
-  return api.ops.requestRescrape({ scope: ERP_SCOPE, months } as never);
+  return api.ops.requestRescrape({ scope: ERP_SCOPE, months, shipment_type } as never);
 }
 
 /** The hosted browser doesn't have this endpoint yet (older version). */

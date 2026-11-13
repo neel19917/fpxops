@@ -3715,7 +3715,11 @@ function erpSetAllCarriers(customerSelect) {
       return { label: "all carriers", note: `Carrier filter was "${curText}" — set to "${opt.text.trim()}"` };
     }
   }
-  return { label: `carrier ${curText}`, error: `The carrier filter shows "${curText}" and has no "All" choice` };
+  // No "All" choice. A placeholder such as "Select Carrier" means no carrier
+  // is picked, which FreightPOP treats as every carrier. Either way the
+  // filter is left exactly as FreightPOP shows it; the pull never fails here.
+  if (/^(select|choose|pick|--|—|none)\b/i.test(curText) || /^select\s/i.test(curText)) return { label: "all carriers" };
+  return { label: `carrier filter left as "${curText}"`, level: "warn", note: `The carrier filter shows "${curText}" and was left as is — if that is one carrier, only its shipments are in the report` };
 }
 
 function erpGridSig() {
@@ -3795,7 +3799,10 @@ function erpUploadChunk(payload, retry) {
   });
 }
 
-async function erpAuditPull(months, runBy) {
+// shipmentType: "non-parcel" (default) | "parcel" | "both"
+async function erpAuditPull(months, runBy, shipmentType) {
+  const erpType = shipmentType === "parcel" || shipmentType === "both" ? shipmentType : "non-parcel";
+  const erpTabs = [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"]].filter(([t]) => erpType === "both" || t === erpType);
   if (fpxErp && !fpxErp.done) return; // already running in this page
   stopRequested = false;
   const state = { lines: [], counts: { reportRows: 0, notExported: 0, uploaded: 0 }, done: null };
@@ -3813,7 +3820,7 @@ async function erpAuditPull(months, runBy) {
 
     erpLog("Opening Transactions");
     let failNote = null;
-    const generated = await invoiceGenerateReport(fromStr, toStr, "all", "", {
+    const generated = await invoiceGenerateReport(fromStr, toStr, erpTabs[0][0], "", {
       status: (t) => dlog("[FPX-ERP]", t),
       fail: (t) => { failNote = t; },
       openDialog: true,
@@ -3828,7 +3835,7 @@ async function erpAuditPull(months, runBy) {
         if (cust.error) return cust.error;
         const carr = erpSetAllCarriers(cust.select);
         if (carr.error) return carr.error;
-        erpLog(`Generate History Report · ${fromStr} to ${toStr} · ${cust.label} · ${carr.label}`);
+        erpLog(`Generate History Report · ${fromStr} to ${toStr} · ${cust.label} · ${carr.label} · ${erpTabs.map((t) => t[1]).join(" + ")}`);
         if (cust.note) erpLog(cust.note, "warn");
         if (carr.note) erpLog(carr.note, carr.level || "info");
         await humanDelay(300, 600);
@@ -3850,9 +3857,9 @@ async function erpAuditPull(months, runBy) {
       throw new Error(failNote || "Generate History Report failed");
     }
 
-    // All shipment types = both result tabs.
+    // One result tab per shipment type asked for.
     const parts = [];
-    for (const [type, label] of [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"]]) {
+    for (const [type, label] of erpTabs) {
       await erpCheckpoint();
       const before = erpGridSig();
       if (!clickShipmentTypeTab(type)) { parts.push({ label, rows: null }); continue; }

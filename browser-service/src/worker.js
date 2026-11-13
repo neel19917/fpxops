@@ -394,11 +394,18 @@ async function claimAndRun() {
     modes: Array.isArray(request.modes) && request.modes.length ? request.modes : null,
     // Read now: completing the request overwrites its note.
     months: request.scope === "erp_audit" ? monthsFromNote(request.note) : null,
+    shipmentType: request.scope === "erp_audit" ? typeFromNote(request.note) : null,
   };
   // A scheduled job may have started while the claim was in flight: this one
   // is already claimed, so it waits its turn instead of running beside it.
   if (busy) { localQueue.push(job); return; }
   return runJob(job);
+}
+
+// "type=parcel|both|non-parcel" in an ERP audit request's note (non-parcel when absent).
+export function typeFromNote(note) {
+  const m = /type\s*=\s*(non-parcel|parcel|both)/i.exec(String(note || ""));
+  return m ? m[1].toLowerCase() : "non-parcel";
 }
 
 // "months=3" in an ERP audit request's note → 1-12 (3 when absent or unreadable).
@@ -419,7 +426,7 @@ async function runJob(job) {
   // One lock, two kinds of job: a Refresh All scrape, or an ERP audit pull.
   const kind = job.scope === "erp_audit" ? "erp_audit" : "scrape";
   current = {
-    kind, paused: false, result: null, months: kind === "erp_audit" ? job.months || 3 : null,
+    kind, paused: false, result: null, months: kind === "erp_audit" ? job.months || 3 : null, shipmentType: kind === "erp_audit" ? job.shipmentType || "non-parcel" : null,
     requestId: job.id, user: email, scope: job.scope || "all", source: job.source, modes: job.modes || null,
     scheduleId: job.scheduleId || null, scheduleName: job.scheduleName || null,
     startedAt: new Date(startedAt).toISOString(), status: "Starting…", statusAt: new Date().toISOString(), log: [],
@@ -432,7 +439,7 @@ async function runJob(job) {
   };
   if (kind === "erp_audit") {
     Object.assign(current.counts, { reportRows: 0, notExported: 0, uploaded: 0 });
-    logLine(`Claimed ERP audit pull · last ${current.months} month(s) — running as ${email || "unknown user"}`);
+    logLine(`Claimed ERP audit pull · last ${current.months} month(s) · ${current.shipmentType} — running as ${email || "unknown user"}`);
   } else {
     if (job.modes) logLine(`Limited to ${job.modes.join(" + ")} shipments`);
     logLine(job.source === "schedule"
@@ -447,7 +454,7 @@ async function runJob(job) {
     if (!hasProfile(email)) throw new Error(`${email} hasn't logged in to FreightPOP in the hosted view yet`);
     let result;
     if (kind === "erp_audit") {
-      result = await runErpAudit(email, current.months);
+      result = await runErpAudit(email, current.months, current.shipmentType);
     } else {
       if (current) current.tasksBefore = await taskSnapshot();
       result = await runRefreshAll(email, job.modes || null);
@@ -705,10 +712,10 @@ async function runIn(browser, url, who, modes = null) {
 // The page work is erpAuditPull() in the extension's content.js; this opens
 // the window (so the read-only live view shows it, like a scrape), relays its
 // log lines, and passes stop / pause on.
-async function runErpAudit(email, months) {
+async function runErpAudit(email, months, shipmentType) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runErpIn(lease.browser, dashboardUrlFor(email), email, months);
+    return await runErpIn(lease.browser, dashboardUrlFor(email), email, months, shipmentType);
   } finally {
     lease.release();
   }
@@ -716,7 +723,7 @@ async function runErpAudit(email, months) {
 
 const ERP_LIMIT_MS = 45 * 60_000; // whole pull, not counting paused time
 
-async function runErpIn(browser, url, who, months) {
+async function runErpIn(browser, url, who, months, shipmentType) {
   clearAuthExpired(who);
   const page = await openWindowPage(browser, url);
   currentPage = page;
@@ -748,7 +755,7 @@ async function runErpIn(browser, url, who, months) {
     if (!has) throw new Error("The extension in the hosted browser has no ERP audit pull (needs version 4.7 or later) — redeploy the browser service");
 
     if (pauseFlag) pushPause(); // paused while it was starting up
-    await ext.evaluate(`erpAuditPull(${Number(months) || 3}, ${JSON.stringify(String(who))}); 'started'`, { awaitPromise: false });
+    await ext.evaluate(`erpAuditPull(${Number(months) || 3}, ${JSON.stringify(String(who))}, ${JSON.stringify(String(shipmentType || "non-parcel"))}); 'started'`, { awaitPromise: false });
 
     const startedAt = Date.now();
     let lost = 0;

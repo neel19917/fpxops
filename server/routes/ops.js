@@ -40,7 +40,7 @@ opsRouter.post("/rescrape", async (req, res) => {
       .from("fpx_scrape_requests")
       .insert({
         scope,
-        note: `months=${months}`,
+        note: `months=${months};type=${["parcel", "both"].includes(req.body?.shipment_type) ? req.body.shipment_type : "non-parcel"}`,
         requested_by: req.user?.email || req.apiKey?.name || null,
       })
       .select().single();
