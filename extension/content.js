@@ -3599,7 +3599,68 @@ function fpxErpPoll() {
   return {
     started: true, lines: fpxErp.lines.splice(0), counts: fpxErp.counts, done: fpxErp.done,
     upload: fpxErp.outbox ? { rows: fpxErp.outbox.rows.length } : null,
+    download: fpxErp.wantDownload || null,
   };
+}
+
+// ── FreightPOP's own Excel export ──
+// The browser service captures the file: it sees `download` in the poll,
+// points Chromium's downloads at a folder, calls fpxErpClickExport(), reads
+// the .xlsx and answers with fpxErpDownloadDone().
+function erpExportCandidates() {
+  const out = [];
+  const seen = new Set();
+  for (const el of document.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button], .k-button, .k-grid-excel, [ng-click], [data-ng-click], i, span, img")) {
+    const target = el.closest("a, button, [role=button], .k-button, [ng-click], [data-ng-click]") || el;
+    if (seen.has(target) || !isVisibleForClick(target)) continue;
+    const text = (target.textContent || target.value || "").replace(/\s+/g, " ").trim();
+    if (text.length > 60) continue;
+    const hay = [text, target.title, target.getAttribute("aria-label"), target.getAttribute("data-original-title"),
+      target.getAttribute("uib-tooltip"), target.getAttribute("tooltip"), target.className && String(target.className),
+      target.getAttribute("ng-click"), target.getAttribute("data-ng-click"), target.id, el.className && String(el.className), el.getAttribute("src"), el.getAttribute("alt"), el.title,
+    ].filter(Boolean).join(" | ").toLowerCase();
+    // Never click anything that could act on shipments: "Export to ERP"
+    // style buttons push data out of FreightPOP. Only a button that says
+    // Excel, or a bare Export / Download, is a file export.
+    if (/\berp\b|quickbooks|netsuite|accounting|invoice|send|e-?mail|\bedi\b|delete|void|cancel|approve|import|upload|template|pdf|print/.test(hay)) continue;
+    let score = 0;
+    if (/k-grid-excel/.test(hay)) score += 10;
+    if (/excel|xlsx?\b|\.xls/.test(hay)) score += 8;
+    if (/^(export|download)( (data|report|results|all|to file))?$/i.test(text)) score += 5;
+    if (score <= 0) continue;
+    seen.add(target);
+    out.push({ el: target, score, desc: (text || target.title || target.getAttribute("aria-label") || String(target.className || target.tagName)).slice(0, 60) });
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+function fpxErpClickExport() {
+  const c = erpExportCandidates();
+  if (!c.length) {
+    const near = [...document.querySelectorAll("a, button, .k-button")].filter(isVisibleForClick)
+      .map((e) => (e.textContent || e.title || "").replace(/\s+/g, " ").trim()).filter((t) => t && t.length < 40);
+    return JSON.stringify({ error: "No Excel / Export button found on the report", buttons: [...new Set(near)].slice(0, 40) });
+  }
+  simulateClick(c[0].el);
+  return JSON.stringify({ clicked: c[0].desc, others: c.slice(1, 5).map((x) => x.desc) });
+}
+function fpxErpDownloadDone(resp) {
+  if (!fpxErp) return "no job";
+  fpxErp.wantDownload = null;
+  fpxErp.downloadResult = resp || { ok: false, error: "empty answer" };
+  return "ok";
+}
+// Ask the browser service to capture the export for the tab on screen.
+async function erpHandOffDownload(label) {
+  fpxErp.downloadResult = null;
+  fpxErp.wantDownload = { label };
+  const until = Date.now() + 4 * 60 * 1000;
+  while (Date.now() < until) {
+    if (fpxErp.downloadResult) { const r = fpxErp.downloadResult; fpxErp.downloadResult = null; return r; }
+    if (stopRequested) { fpxErp.wantDownload = null; return { ok: false, error: "stopped" }; }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  fpxErp.wantDownload = null;
+  return { ok: false, error: "no answer from the browser service after 4 min" };
 }
 
 // The upload itself is done by the browser service, not from this page: it
@@ -3903,6 +3964,10 @@ async function erpAuditPull(months, runBy, shipmentType) {
       await humanDelay(800, 1400);
       if (!(await erpWaitGridSettled(before, 60))) throw new Error(`The ${label} tab was still loading after 60s`);
       parts.push({ label, rows: await erpReadGrid(label) });
+      await erpCheckpoint();
+      erpLog(`Downloading FreightPOP's Excel export · ${label}`);
+      const dl = await erpHandOffDownload(label);
+      if (!dl.ok) erpLog(`Excel export not captured (${dl.error}) — using the rows read from the report on screen`, "warn");
     }
     if (parts.every((p) => p.rows === null)) {
       erpLog("Parcel / Non-Parcel tabs not found — reading the report as shown", "warn");

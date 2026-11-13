@@ -1,5 +1,8 @@
 import { acquireUserBrowser, hasProfile, getServiceWorker, openWindowPage, ExtensionContexts, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
 import { config } from "./config.js";
+import fs from "node:fs";
+import path from "node:path";
+import { readXlsx } from "./xlsxRead.js";
 import { recordScrape } from "./usage.js";
 import { recordRun } from "./runs.js";
 import { reindexAssistant } from "./assistant.js";
@@ -759,6 +762,10 @@ async function runErpIn(browser, url, who, months, shipmentType) {
 
     const startedAt = Date.now();
     let lost = 0;
+    // Rows from FreightPOP's Excel export, all tabs together.
+    const excelRows = [];
+    let excelHeaders = [];
+    let excelFailed = false;
     // Paused time doesn't count towards the limit.
     while (Date.now() < startedAt + ERP_LIMIT_MS + pausedTotal()) {
       await sleep(1500);
@@ -774,6 +781,25 @@ async function runErpIn(browser, url, who, months, shipmentType) {
       lost = 0;
       for (const l of r.lines || []) logLine(l.text, l.level || "info");
       if (current && r.counts) Object.assign(current.counts, r.counts);
+      // The page wants FreightPOP's Excel export captured for the tab on screen.
+      if (r.download && !r.done) {
+        let answer;
+        try {
+          const got = await captureExport(browser, cdp, ext, current?.requestId || "job");
+          const before = excelRows.length;
+          const dup = before && got.rows.length === before && JSON.stringify(got.rows[0]) === JSON.stringify(excelRows[0]);
+          if (dup) logLine(`Excel export · ${r.download.label} · same rows as the previous tab, counted once`, "warn");
+          else excelRows.push(...got.rows);
+          if (!excelHeaders.length) excelHeaders = got.headers;
+          logLine(`Excel export · ${r.download.label} · ${got.file} · ${got.rows.length.toLocaleString("en-US")} rows · ${got.headers.length} columns · button "${got.clicked}"`);
+          answer = { ok: true, rows: got.rows.length, file: got.file };
+        } catch (e) {
+          excelFailed = true;
+          answer = { ok: false, error: e.message };
+        }
+        await ext.evaluate(`fpxErpDownloadDone(${JSON.stringify(answer)})`).catch(() => {});
+        continue;
+      }
       // The page has rows ready: fetch them in slices and post them from here.
       if (r.upload && !r.done) {
         let answer;
@@ -786,7 +812,18 @@ async function runErpIn(browser, url, who, months, shipmentType) {
           }
           if (rows.length !== meta.rowCount) throw new Error(`read ${rows.length} of ${meta.rowCount} rows from the page`);
           const { rowCount, ...body } = meta;
-          const resp = await api("/api/audits/invoice/from-history", { method: "POST", body: JSON.stringify({ ...body, rows }) });
+          // Prefer the Excel export when every tab's file was captured.
+          let send = rows;
+          const fromExcel = !excelFailed && excelRows.length ? notExportedSorted(excelRows) : null;
+          if (fromExcel && !fromExcel.error && !body.audit_id) {
+            send = fromExcel.rows;
+            if (body.run) body.run.total_report_rows = excelRows.length;
+            logLine(`Source: FreightPOP Excel export · ${excelRows.length.toLocaleString("en-US")} rows · ${send.length.toLocaleString("en-US")} not exported to ERP` +
+              (send.length !== rows.length ? ` (the report on screen gave ${rows.length.toLocaleString("en-US")})` : ""), send.length !== rows.length ? "warn" : "info");
+          } else {
+            logLine(`Source: rows read from the report on screen${fromExcel?.error ? ` (${fromExcel.error})` : ""}`, fromExcel?.error ? "warn" : "info");
+          }
+          const resp = await api("/api/audits/invoice/from-history", { method: "POST", body: JSON.stringify({ ...body, rows: send }) });
           answer = { ok: true, ...resp };
         } catch (e) {
           answer = { ok: false, error: e.message };
@@ -823,6 +860,74 @@ async function runErpIn(browser, url, who, months, shipmentType) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Click the report's Excel export and read the file Chromium saves.
+// → { rows, headers, file, clicked }
+async function captureExport(browser, cdp, ext, jobId) {
+  const dir = path.join(path.dirname(config.profileRoot), "erp-downloads", String(jobId).replace(/[^a-zA-Z0-9_-]/g, ""));
+  fs.mkdirSync(dir, { recursive: true });
+  for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f), { force: true });
+  // Page-level and browser-level: Chromium versions differ in which they honour.
+  await cdp.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir }).catch(() => {});
+  await cdp.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: dir }).catch(() => {});
+  try {
+    const root = await browser.target().createCDPSession();
+    await root.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: dir }).catch(() => {});
+    await root.detach().catch(() => {});
+  } catch { /* page-level setting may be enough */ }
+
+  const click = JSON.parse((await ext.evaluate("fpxErpClickExport()")).value || "{}");
+  if (click.error) throw new Error(`${click.error}${click.buttons?.length ? ` — buttons on the page: ${click.buttons.join(", ")}` : ""}`);
+
+  const until = Date.now() + 120_000;
+  let last = null;
+  while (Date.now() < until) {
+    await sleep(1000);
+    const done = fs.readdirSync(dir).filter((f) => !/\.(crdownload|tmp|part)$/i.test(f));
+    if (!done.length) continue;
+    const file = path.join(dir, done[0]);
+    const size = fs.statSync(file).size;
+    if (size > 0 && last === size) {
+      try {
+        if (!/\.xlsx$/i.test(done[0])) throw new Error(`the export is "${done[0]}", not an .xlsx file`);
+        const { headers, rows } = readXlsx(fs.readFileSync(file));
+        if (!rows.length) throw new Error(`"${done[0]}" has no rows`);
+        return { rows, headers, file: done[0], clicked: click.clicked };
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    last = size;
+  }
+  const partial = fs.readdirSync(dir);
+  fs.rmSync(dir, { recursive: true, force: true });
+  throw new Error(`clicked "${click.clicked}" but no file arrived within 2 min${partial.length ? ` (still downloading: ${partial.join(", ")})` : ""}${click.others?.length ? ` — other candidates: ${click.others.join(", ")}` : ""}`);
+}
+
+// Rows of the export that are not exported to ERP, highest charge first.
+// → { rows } or { error }
+function notExportedSorted(all) {
+  const norm = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const keys = Object.keys(all[0] || {});
+  const key = keys.find((k) => norm(k) === "exportedtoerp") || keys.find((k) => norm(k).includes("export") && norm(k).includes("erp"));
+  if (!key) return { error: 'the Excel file has no "Exported to ERP" column' };
+  const notExported = (v) => v === null || v === undefined || ["", "0", "0.0", "false", "no", "n"].includes(String(v).trim().toLowerCase());
+  const rate = (r) => {
+    const v = r["Shipment Marked-Up Rate"];
+    if (v === null || v === undefined || v === "") return null;
+    const x = parseFloat(String(v).replace(/[^0-9.\-]/g, ""));
+    return Number.isFinite(x) ? x : null;
+  };
+  const rows = all.filter((r) => notExported(r[key])).map((r) => (key === "Exported to ERP" ? r : { ...r, "Exported to ERP": r[key] }));
+  rows.sort((x, y) => {
+    const a = rate(x), b = rate(y);
+    if (a === null && b === null) return 0;
+    if (a === null) return 1;
+    if (b === null) return -1;
+    return b - a;
+  });
+  return { rows };
+}
 
 // The Tasks board in numbers, from the API (null if it can't be read — a
 // missing snapshot must never fail a scrape).
