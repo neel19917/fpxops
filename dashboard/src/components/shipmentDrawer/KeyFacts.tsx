@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { ArrowRight } from "lucide-react";
 import type { Shipment } from "../../lib/types";
 import { fmtDateTime } from "../../lib/format";
+import { firstPlace } from "./placeFormat";
 import { ActionDispositionControl, type ActionDispositionControlProps } from "./ActionDispositionControl";
 
 // Tone the status pill on common-case strings; default to slate. Best-effort:
@@ -14,16 +15,6 @@ export function statusTone(status: string | null | undefined): string {
   if (/pick|tender|book/.test(s)) return "bg-violet-100 text-violet-800 ring-violet-200";
   if (/cancel|fail/.test(s)) return "bg-rose-100 text-rose-800 ring-rose-200";
   return "bg-slate-100 text-slate-700 ring-slate-200";
-}
-
-// "City, ST" out of a full address when we can find it; otherwise the
-// (truncated) address itself. Keeps the lane readable in one line.
-function shortPlace(addr: string | null | undefined): string {
-  const a = String(addr || "").trim();
-  if (!a) return "—";
-  const m = a.match(/([A-Za-z .'-]+?)\s*,\s*([A-Z]{2})\b(?:\s*,?\s*\d{5}(?:-\d{4})?)?\s*(?:,\s*[A-Za-z ]+)?$/);
-  if (m) return `${m[1].trim().replace(/\s+/g, " ")}, ${m[2]}`;
-  return a;
 }
 
 function Fact({ label, children, title, tone }: { label: string; children: ReactNode; title?: string; tone?: "late" | "good" }) {
@@ -46,8 +37,11 @@ export function KeyFacts({ shipment, ...action }: { shipment: Shipment } & Omit<
   const pickedUp = shipment.actual_departure || null;
   // ship_from / ship_to are the address fields; origin / destination can
   // hold unrelated grid text on some rows, so they're only the fallback.
-  const from = shipment.ship_from || shipment.origin;
-  const to = shipment.ship_to || shipment.destination;
+  // The raw strings are scraped and messy (run-together "Name:…Address:…"
+  // labels, or a bare label with no value), so they go through parsePlace:
+  // "City, ST" for the fact, the cleaned full address for the tooltip.
+  const from = firstPlace(shipment.ship_from, shipment.origin);
+  const to = firstPlace(shipment.ship_to, shipment.destination);
   return (
     <div className="pb-3">
       <div className="flex items-center gap-2 flex-wrap">
@@ -66,11 +60,11 @@ export function KeyFacts({ shipment, ...action }: { shipment: Shipment } & Omit<
         <Fact label="Delivered" tone={delivered ? "good" : undefined} title={shipment.signed_by ? `Signed by ${shipment.signed_by}` : undefined}>
           {delivered ? fmtDateTime(shipment.delivery_date) : "Not yet"}
         </Fact>
-        <Fact label="Lane" title={`${from || "—"}  →  ${to || "—"}`}>
+        <Fact label="Lane" title={`${from?.full || "—"}  →  ${to?.full || "—"}`}>
           <span className="inline-flex items-center gap-1 max-w-full">
-            <span className="truncate">{shortPlace(from)}</span>
+            <span className="truncate">{from?.short || "—"}</span>
             <ArrowRight className="h-3 w-3 shrink-0 text-slate-400" />
-            <span className="truncate">{shortPlace(to)}</span>
+            <span className="truncate">{to?.short || "—"}</span>
           </span>
         </Fact>
       </div>

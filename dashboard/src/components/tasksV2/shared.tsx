@@ -172,10 +172,15 @@ export function BlockedTabsDialog({ ids, total, onRetry, onClose }: { ids: strin
           {total - ids.length} opened. Browsers only let a site open several tabs at once after you allow pop-ups for it. This is a one-time setting:
         </p>
         <ol className="mt-2 text-sm text-slate-700 list-decimal pl-5 space-y-1">
-          <li>Click the <b>pop-up blocked</b> icon at the right end of the address bar.</li>
-          <li>Choose <b>Always allow pop-ups and redirects</b> from this site, then <b>Done</b>.</li>
-          <li>Press <b>Open the other {ids.length}</b> below.</li>
+          <li>Click the icon at the <b>left</b> of the address bar (next to the web address), then <b>Site settings</b>.</li>
+          <li>Find <b>Pop-ups and redirects</b> and change it to <b>Allow</b>.</li>
+          <li>Come back to this tab and press <b>Open the other {ids.length}</b>.</li>
         </ol>
+        <p className="mt-2 text-xs text-slate-500">
+          No Site settings there? Open a new tab, go to <span className="font-mono">chrome://settings/content/popups</span>, and under
+          “Allowed to send pop-ups” add <span className="font-mono">{window.location.origin}</span>.
+          Or skip tabs: “Open {total}” steps through the same tasks in the drawer with no permission needed.
+        </p>
         <div className="mt-4 flex items-center justify-end gap-2">
           <button onClick={onClose} className="rounded-lg px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50">Close</button>
           <button onClick={onRetry} className="rounded-lg px-3 py-2 text-sm bg-slate-900 text-white hover:bg-slate-800">Open the other {ids.length}</button>
