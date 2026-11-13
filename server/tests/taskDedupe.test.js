@@ -253,10 +253,10 @@ test("applyDedupe cancels old tasks with a note, clears their queue, carries it 
 
   const row = (id) => sb.db.find((r) => r.id === id);
   const today = new Date().toISOString().slice(0, 10);
-  const note = `[${today} superseded by newer task 99999999 — ops@fpx.com — confidence 99%]`;
+  const noteAt = (pct) => `[${today} superseded by newer task 99999999 — ops@fpx.com — confidence ${pct}%]`;
   assert.equal(row(old1.id).status, "cancelled");
-  assert.equal(row(old1.id).description, `Original ask\n\n${note}`);
-  assert.equal(row(old2.id).description, note);
+  assert.equal(row(old1.id).description, `Original ask\n\n${noteAt(99)}`);
+  assert.equal(row(old2.id).description, noteAt(59)); // in progress → lower score
   for (const id of [old1.id, old2.id]) {
     assert.equal(row(id).status, "cancelled");
     assert.equal(row(id).completed_at, null);
