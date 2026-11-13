@@ -344,6 +344,25 @@ export function TasksV2Page() {
       return n;
     });
   }
+  // ⌘/Ctrl+A selects every task in view; Esc clears the selection. Ignored
+  // while typing, and while a dialog (email, dismiss, prompts) is open.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const el = e.target as HTMLElement | null;
+      if (el && (/^(input|textarea|select)$/i.test(el.tagName) || el.isContentEditable)) return;
+      if (emailing || dismissing || promptsOpen) return;
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "a") {
+        if (!visibleIds.length) return;
+        e.preventDefault();
+        setSelected(new Set(visibleIds));
+      } else if (e.key === "Escape" && selected.size) {
+        setSelected(new Set());
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [visibleIds, selected.size, emailing, dismissing, promptsOpen]);
+
   // Selected tasks in board order.
   const selectedInOrder = () => visibleIds.filter((id) => selected.has(id));
   // Open the selection in the drawer: prev / next steps through just these.
@@ -698,7 +717,7 @@ export function TasksV2Page() {
             <table className="w-full text-sm">
               <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th className="px-3 py-2 w-8"><input type="checkbox" checked={allChecked} onChange={toggleAll} aria-label="Select all visible" className="accent-violet-600" /></th>
+                  <th className="px-3 py-2 w-8"><input type="checkbox" checked={allChecked} onChange={toggleAll} aria-label="Select all visible" title="Select all in view (⌘/Ctrl+A). Shift-click a row for a range, ⌘/Ctrl-click to add one. Esc clears." className="accent-violet-600 h-4 w-4 cursor-pointer" /></th>
                   <th className="text-left px-3 py-2">Task</th>
                   <th className="text-left px-3 py-2">Shipment</th>
                   <th className="text-left px-3 py-2 w-20" title="Shipment mode from FreightPOP (LTL, FTL, Parcel)">Mode</th>

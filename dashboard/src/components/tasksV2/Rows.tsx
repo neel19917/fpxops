@@ -68,6 +68,12 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
   );
 }
 
+// Links, buttons and fields keep their own click behaviour (⌘-click a link
+// still opens it in a new tab).
+function isControl(target: EventTarget | null): boolean {
+  return !!(target as HTMLElement | null)?.closest?.("a, button, input, textarea, select, summary, [role='button']");
+}
+
 function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagMeta, segmentHelp, people, onOpen, onStatus, onDismiss }: {
   row: TaskBoardRow; checked: boolean; onCheck: (shift: boolean) => void; rank?: number; closeCandidate: boolean; staleDays: number;
   flagMeta: Map<string, { id: TaskFlag; label: string; tone: string; description: string }>;
@@ -83,8 +89,24 @@ function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagM
   const [expanded, setExpanded] = useState(false);
   return (
     <>
-    <tr className={`border-t border-slate-100 align-top ${checked ? "bg-violet-50/40" : moot ? "bg-emerald-50/20" : ""} ${!active ? "opacity-60" : ""}`}>
-      <td className="px-3 py-2.5"><input type="checkbox" checked={checked} onChange={() => {}} onClick={(e) => onCheck(e.shiftKey)} aria-label="Select task" title="Shift-click to select every task between this one and the last one you ticked" className="accent-violet-600 mt-0.5" /></td>
+    <tr
+      className={`border-t border-slate-100 align-top ${checked ? "bg-violet-100/60 shadow-[inset_3px_0_0_0_#7c3aed]" : moot ? "bg-emerald-50/20" : ""} ${!active ? "opacity-60" : ""}`}
+      // ⌘/Ctrl-click anywhere on a row ticks it; Shift-click ticks the range
+      // from the last ticked row. Stopping the mousedown keeps the browser
+      // from highlighting the text in between, which made a range look broken.
+      onMouseDown={(e) => { if ((e.shiftKey || e.metaKey || e.ctrlKey) && !isControl(e.target)) e.preventDefault(); }}
+      onClick={(e) => {
+        if (!(e.shiftKey || e.metaKey || e.ctrlKey) || isControl(e.target)) return;
+        e.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        onCheck(e.shiftKey);
+      }}
+    >
+      {/* The whole cell is the click target, not just the 13px box. */}
+      <td className="px-3 py-2.5 cursor-pointer select-none" onMouseDown={(e) => e.preventDefault()} onClick={(e) => { e.stopPropagation(); onCheck(e.shiftKey); }}
+        title="Click to select. Shift-click selects a range; ⌘/Ctrl-click anywhere on a row also selects it.">
+        <input type="checkbox" checked={checked} onChange={() => {}} aria-label="Select task" className="accent-violet-600 mt-0.5 h-4 w-4 cursor-pointer pointer-events-none" />
+      </td>
       <td className="px-3 py-2.5 min-w-[22rem]">
         <div className="flex items-center gap-1.5 flex-wrap mb-1">
           {rank !== undefined ? <Pill cls="bg-violet-600 text-white ring-violet-600" title="AI triage priority rank">#{rank}</Pill> : null}
