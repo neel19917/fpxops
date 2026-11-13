@@ -415,12 +415,12 @@ export const api = {
       request<{ data: ShipmentTask[] }>(`/api/shipments/${shipmentId}/tasks`),
     create: (shipmentId: string, body: { title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string; status?: "open" | "in_progress" | "blocked" }) =>
       request<{ task: ShipmentTask }>(`/api/shipments/${shipmentId}/tasks`, { method: "POST", body: JSON.stringify(body) }),
-    update: (id: string, patch: Partial<Pick<ShipmentTask, "status" | "priority" | "assigned_to" | "title" | "description" | "due_at">>) =>
+    update: (id: string, patch: Partial<Pick<ShipmentTask, "status" | "priority" | "assigned_to" | "title" | "description" | "due_at">> & { email_queued?: boolean }) =>
       request<{ task: ShipmentTask }>(`/api/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
     remove: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
     bulkCreate: (body: { shipment_ids: string[]; title: string; description?: string; priority?: string; assigned_to?: string; due_at?: string }) =>
       request<{ created: number; missing: string[] }>("/api/tasks/bulk", { method: "POST", body: JSON.stringify(body) }),
-    bulkUpdate: (body: { ids: string[]; status?: string; priority?: string; assigned_to?: string }) =>
+    bulkUpdate: (body: { ids: string[]; status?: string; priority?: string; assigned_to?: string; email_queued?: boolean }) =>
       request<{ updated: number }>("/api/tasks/bulk-update", { method: "POST", body: JSON.stringify(body) }),
     bulkDelete: (body: { ids: string[] }) =>
       request<{ deleted: number }>("/api/tasks/bulk-delete", { method: "POST", body: JSON.stringify(body) }),
@@ -446,8 +446,24 @@ export const api = {
     v2DailySummaryLatest: () => request<DailySummaryResult>("/api/tasks/v2/daily-summary/latest"),
     // Cancel-with-reason. The board's replacement for delete: the row stays
     // as a dedup tombstone so the auto-task builder doesn't respawn it.
+    // One email to a carrier / customer covering the shipments behind the
+    // given tasks (any active task, not only "…followup:" titled ones).
+    v2GroupEmail: (body: { audience: "carrier" | "customer"; name: string; task_ids: string[]; notes?: string; tone?: "friendly" | "direct" | "escalate" }) =>
+      request<{ subject: string; body: string; model: string | null; count: number; task_ids: string[]; missing?: string[] }>(
+        "/api/tasks/v2/group-email", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
+    // Every group email drafted, newest first, with the shipments it covered.
+    v2GroupEmails: (limit = 50) => request<{ data: GroupEmailRecord[] }>("/api/tasks/v2/group-emails", { params: { limit } }),
+    // The email-draft prompts in use, readable by every user (not only
+    // admins). `prompts` is keyed by setting key (prompt.email_draft.…);
+    // `tones` is the sentence a group email gets for each tone a rep picks.
+    v2EmailPrompts: () => request<{ prompts: Record<string, string>; tones: Record<string, string> }>("/api/tasks/v2/email-prompts"),
     v2Dismiss: (body: { ids: string[]; reason?: string; disposition?: string }) =>
       request<{ dismissed: number; skipped: number }>("/api/tasks/v2/dismiss", { method: "POST", body: JSON.stringify(body) }),
+    // Several active tasks on one shipment for the same audience: the newest
+    // stays, older ones are cancelled as superseded. Previews unless
+    // dry_run is false. No task_ids / shipment_ids = the whole board.
+    v2Dedupe: (body: { dry_run?: boolean; min_confidence?: number; task_ids?: string[]; shipment_ids?: string[] } = {}) =>
+      request<DedupePlan>("/api/tasks/v2/dedupe", { method: "POST", body: JSON.stringify(body) }),
     // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
     // each task joined to its shipment so the Kanban panel can render
     // carrier/customer/ETA without further round trips.
@@ -537,6 +553,8 @@ export const api = {
   },
   emailStudio: {
     samples: () => request<{ data: EmailStudioSample[] }>("/api/email-studio/samples"),
+    drafts: (type: "carrier_group" | "customer_group", limit = 30) =>
+      request<{ data: EmailStudioDraft[] }>("/api/email-studio/drafts", { params: { type, limit } }),
     rewrite: (body: { key: string; text: string; instructions: string }) =>
       request<{ text: string; model: string | null; warnings: string[] }>("/api/email-studio/rewrite", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
     preview: (body: { type: EmailStudioType; tracking_numbers: string[]; notes?: string; group?: string; overrides?: Record<string, string> }) =>
@@ -648,7 +666,53 @@ export interface GovCall {
   error: string | null; rating: string | null; rated_by: string | null; metadata: Record<string, unknown> | null;
 }
 
+// "Clean up duplicates": one task as the duplicate check sees it.
+export interface DedupeTask {
+  id: string; title: string; status: string; priority: string; assigned_to: string | null;
+  created_at: string; email_queued_at: string | null; email_queued_by: string | null;
+}
+// An older task with how sure the check is that the newest one replaces it (0-100) and why.
+export type DedupeScored = DedupeTask & { confidence: number; reasons: string[] };
+// One shipment + audience with more than one active task.
+export interface DedupeGroup {
+  shipment_id: string; tracking_number: string | null; audience: "carrier" | "customer";
+  keep: DedupeTask; supersede: DedupeScored[];
+  // Older tasks scoring under the confidence floor: left alone.
+  held: DedupeScored[];
+  // Lowest score among this group's older tasks.
+  confidence: number;
+  // The kept task takes over an older one's place in the email queue.
+  carry_queue: boolean;
+  // One of the older tasks is in progress.
+  working: boolean;
+}
+export interface DedupePlan {
+  dry_run: boolean; supersede_count: number; shipments: number;
+  min_confidence: number; held_count: number;
+  groups: DedupeGroup[];
+  // Present only when the changes were applied (dry_run false).
+  result?: { superseded: number; carried_queue: number; failed: number; ids: string[] };
+}
+
 export type EmailStudioType = "carrier" | "customer" | "carrier_group" | "customer_group";
+// One drafted group email, as listed in Email Studio's History.
+export interface GroupEmailRecord {
+  id: string; created_at: string; model: string | null; by: string | null;
+  audience: "carrier" | "customer"; recipient: string | null; count: number | null; tone: string | null;
+  subject: string | null; body: string;
+  // Shipments the email covered. Null for emails drafted before scope was recorded.
+  scope: { id: string; tn: string | null; fpx: string | null; task_ids: string[] }[] | null;
+  rating: "up" | "down" | null;
+}
+
+// A group email a rep drafted for real (not a Studio preview).
+export interface EmailStudioDraft {
+  id: string; created_at: string; model: string | null; by: string | null;
+  recipient: string | null; count: number | null; tone: string | null; source: string | null;
+  subject: string | null; body: string; cost_usd: number | null;
+  rating: "up" | "down" | null; rating_reason: string | null;
+}
+
 export interface EmailStudioSample {
   tracking_number: string;
   shipment_id: string | null;

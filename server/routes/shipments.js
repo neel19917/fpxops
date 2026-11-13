@@ -11,6 +11,7 @@ import { detectRedelivery, isNewFailureEvent, isRedeliveryTitle, REDELIVERY_TAG 
 import { detectStorageRisk, isStorageRiskTitle, STORAGE_TAG } from "../lib/storageRisk.js";
 import { peopleIndex, resolveWithIndex, resolveAssignee } from "../lib/people.js";
 import { MATERIAL_FIELDS, computeMaterialDiff, recordScrapeBatch } from "../lib/scrapeHistory.js";
+import { supersedeOlderFor } from "../lib/taskDedupe.js";
 
 // Models an operator may pick in the "Re-analyze" modal. Haiku is the cheap
 // default; Sonnet/Opus are escalation options for ambiguous shipments.
@@ -61,7 +62,7 @@ function preserveExistingAi(rows) {
 // extension's POST is fast. Concurrency is capped to avoid hammering Claude
 // for big bulk uploads. Skips rows already analyzed (action_required set) and
 // rows the user manually overrode (action_source === 'manual'). Returns the
-// updated rows so autoCreateActionTasks / autoDraftEmails can fan out from
+// updated rows so autoCreateActionTasks can fan out from
 // fresh analyses.
 const AUTO_ANALYZE_CONCURRENCY = 4;
 
@@ -176,9 +177,11 @@ async function runPostUpsertFlow(req, {
     const settled = Array.from(byId.values());
     const mappedByTracking = new Map(mapped.map((m) => [m.tracking_number, m]));
     const tasks = await autoCreateActionTasks(req, settled, { diffByTracking, priorByTracking, mappedByTracking });
-    const drafts = await autoDraftEmails(settled);
-    if (tasks || drafts || freshlyAnalyzed.length) {
-      console.log(`[FPX] post-upload: ${freshlyAnalyzed.length} (re)analyzed, ${tasks} task(s), ${drafts} draft(s)`);
+    // Emails are no longer drafted automatically after a scrape (that wrote
+    // ~2,600 unread drafts a month). They are drafted on command: the
+    // drawer's Email tab for one shipment, Email Studio for a group.
+    if (tasks || freshlyAnalyzed.length) {
+      console.log(`[FPX] post-upload: ${freshlyAnalyzed.length} (re)analyzed, ${tasks} task(s)`);
     }
   })().catch((e) => console.warn("[FPX] post-upload background failed:", e.message));
   // Don't await — let scrape recording + background drain on their own.
@@ -421,6 +424,17 @@ async function autoCreateActionTasks(
     console.warn("[FPX] auto-task insert failed:", error.message);
     return 0;
   }
+  // Newest task takes precedence: retire older ACTIVE duplicates (same
+  // shipment + audience) of what was just inserted. They become cancelled
+  // rows, which the `existing` lookup above still counts — so they keep
+  // working as tombstones and as prior redelivery attempts. Never fails
+  // task creation.
+  try {
+    const shipIds = Array.from(new Set((data || []).map((t) => t.shipment_id).filter(Boolean)));
+    if (shipIds.length) await supersedeOlderFor(supabase, shipIds, { who: "system (auto-flag)" });
+  } catch (e) {
+    console.warn("[FPX] auto-task supersede failed:", e.message);
+  }
   // Audit each auto-created task.
   for (const t of data || []) {
     logAudit(req, {
@@ -433,58 +447,6 @@ async function autoCreateActionTasks(
     });
   }
   return (data || []).length;
-}
-
-// Fire-and-forget: for each action-required shipment with a known target,
-// generate one email draft addressed to that target. Drafts are persisted as
-// fpx_ai_analyses rows with metadata.subkind=email_draft_<audience>, which is
-// what the dashboard's Drafts sub-tab already reads. Skips shipments that
-// already have a recent draft for the same audience.
-async function autoDraftEmails(upsertedRows) {
-  const { "action.auto_draft_enabled": enabled } = await getSettings("action.auto_draft_enabled");
-  if (!enabled) return 0;
-
-  const candidates = (upsertedRows || []).filter((s) => {
-    if (String(s.action_required || "").toUpperCase() !== "YES") return false;
-    const tgt = String(s.action_target || "").toLowerCase();
-    return tgt === "customer" || tgt === "carrier";
-  });
-  if (!candidates.length) return 0;
-
-  // Skip shipments that already have a draft for this audience in the last 24h
-  // — auto-drafts shouldn't pile up on every re-scrape.
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const ids = candidates.map((s) => s.id);
-  const { data: recent } = await supabase
-    .from("fpx_ai_analyses")
-    .select("shipment_uuid, metadata")
-    .in("shipment_uuid", ids)
-    .gte("created_at", since);
-  const drafted = new Set();
-  for (const r of recent || []) {
-    const sub = r?.metadata?.subkind;
-    if (typeof sub === "string" && sub.startsWith("email_draft_")) {
-      drafted.add(`${r.shipment_uuid}::${sub.slice("email_draft_".length)}`);
-    }
-  }
-
-  let count = 0;
-  // Need the full shipment row for context; fetch in one query.
-  const todo = candidates.filter((s) => !drafted.has(`${s.id}::${String(s.action_target).toLowerCase()}`));
-  if (!todo.length) return 0;
-  const { data: ships } = await supabase
-    .from("fpx_shipments").select("*").in("id", todo.map((s) => s.id));
-  for (const ship of ships || []) {
-    const audience = String(ship.action_target || "").toLowerCase();
-    if (audience !== "customer" && audience !== "carrier") continue;
-    try {
-      const draft = await generateEmailDraft({ ship, audience, callMeta: { metadata: { auto: true } } });
-      if (!draft.error) count++;
-    } catch (e) {
-      console.warn("[FPX] auto email draft failed:", ship.tracking_number, e.message);
-    }
-  }
-  return count;
 }
 
 // GET /shipments?limit=200&before=<scraped_at iso>&customer=Acme&action=YES&status=Issue&q=track123&source=ai|manual
@@ -1356,6 +1318,13 @@ shipmentsRouter.post("/:id/tasks", async (req, res) => {
   };
   const { data, error } = await supabase.from("fpx_shipment_tasks").insert(row).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  // Newest task takes precedence: retire older active duplicates (same
+  // shipment + audience). Never fails the create.
+  try {
+    await supersedeOlderFor(supabase, [ship.id], { who: creatorName || "operator" });
+  } catch (e) {
+    console.warn("[FPX] supersede after task create failed:", e.message);
+  }
   res.json({ task: data });
 });
 

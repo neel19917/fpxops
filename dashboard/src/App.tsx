@@ -38,7 +38,7 @@ const InstallPage     = lazy(() => import("./pages/Install").then((m) => ({ defa
 const ConnectClaudePage = lazy(() => import("./pages/ConnectClaude").then((m) => ({ default: m.ConnectClaudePage })));
 const DataFlowPage = lazy(() => import("./pages/DataFlow").then((m) => ({ default: m.DataFlowPage })));
 const AIGovernancePage = lazy(() => import("./pages/AIGovernance").then((m) => ({ default: m.AIGovernancePage })));
-const EmailStudioPage = lazy(() => import("./pages/EmailStudio").then((m) => ({ default: m.EmailStudioPage })));
+const EmailQueuePage  = lazy(() => import("./pages/EmailQueue").then((m) => ({ default: m.EmailQueuePage })));
 const HostedBrowserSettingsPage = lazy(() => import("./pages/HostedBrowserSettings").then((m) => ({ default: m.HostedBrowserSettingsPage })));
 const ScrapeLogsPage  = lazy(() => import("./pages/ScrapeLogs").then((m) => ({ default: m.ScrapeLogsPage })));
 const FreightPopLoginPage = lazy(() => import("./pages/FreightPopLogin").then((m) => ({ default: m.FreightPopLoginPage })));
@@ -67,13 +67,13 @@ const TAB_PATH: Record<TabId, string> = {
   ai_export: "/admin/ai-export",
   scrape_logs: "/admin/scrape-logs",
   hosted_browser: "/admin/hosted-browser",
-  email_studio: "/admin/email-studio",
+  emails: "/email-studio",
   ai_governance: "/admin/ai-governance",
   data_flow: "/admin/data-flow",
   claude: "/claude",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "email_studio", "ai_governance", "data_flow"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "ai_governance", "data_flow"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -86,12 +86,13 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/ai-export")) return "ai_export";
   if (pathname.startsWith("/admin/scrape-logs")) return "scrape_logs";
   if (pathname.startsWith("/admin/hosted-browser")) return "hosted_browser";
-  if (pathname.startsWith("/admin/email-studio")) return "email_studio";
+  if (pathname.startsWith("/admin/email-studio")) return "emails"; // old prompts URL, redirects below
   if (pathname.startsWith("/admin/ai-governance")) return "ai_governance";
   if (pathname.startsWith("/admin/data-flow")) return "data_flow";
   if (pathname.startsWith("/claude")) return "claude";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
+  if (pathname.startsWith("/email-studio")) return "emails";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
   if (pathname.startsWith("/scraping")) return "scraping";
@@ -272,6 +273,8 @@ function AuthedApp() {
             <Route path="/ops" element={<OpsPage />} />
             <Route path="/scraping" element={<ScrapingPage />} />
             <Route path="/freightpop" element={<FreightPopLoginPage />} />
+            <Route path="/email-studio" element={<EmailQueuePage />} />
+            <Route path="/admin/email-studio" element={<EmailPromptsRedirect />} />
             <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
@@ -292,7 +295,6 @@ function AuthedApp() {
                 <Route path="/admin/ai-export" element={<AiExportPage />} />
                 <Route path="/admin/scrape-logs" element={<ScrapeLogsPage />} />
                 <Route path="/admin/hosted-browser" element={<HostedBrowserSettingsPage />} />
-                <Route path="/admin/email-studio" element={<EmailStudioPage />} />
                 <Route path="/admin/ai-governance" element={<AIGovernancePage />} />
                 <Route path="/admin/data-flow" element={<DataFlowPage />} />
               </>
@@ -303,6 +305,13 @@ function AuthedApp() {
       </Layout>
     </NavCtx.Provider>
   );
+}
+
+// /admin/email-studio was the admin-only prompts page. The prompts now live on
+// the Prompts tab of Email Studio; keep old links (and their ?email=) working.
+function EmailPromptsRedirect() {
+  const email = new URLSearchParams(useLocation().search).get("email");
+  return <Navigate to={`/email-studio?tab=prompts${email ? `&email=${encodeURIComponent(email)}` : ""}`} replace />;
 }
 
 // /notes — same Shipments table, mounted with the "With notes" filter

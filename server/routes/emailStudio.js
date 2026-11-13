@@ -68,6 +68,40 @@ emailStudioRouter.get("/samples", async (_req, res) => {
   res.json({ data });
 });
 
+// GET /api/email-studio/drafts?type=carrier_group|customer_group[&limit=30]
+// The group emails reps actually drafted (Tasks board or the follow-up
+// panels), newest first, so an admin tuning the prompts can read real output.
+// Studio previews are not included — they are logged under their own subkind.
+emailStudioRouter.get("/drafts", async (req, res) => {
+  const type = String(req.query.type || "");
+  if (!["carrier_group", "customer_group"].includes(type)) return res.status(400).json({ error: "type must be carrier_group or customer_group" });
+  const limit = Math.min(Number(req.query.limit) || 30, 100);
+  const { data, error } = await supabase
+    .from("fpx_ai_analyses")
+    .select("id, created_at, model, user_email, response_text, cost_usd, metadata, rating, rating_reason")
+    .contains("metadata", { subkind: `email_draft_${type}` })
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    data: (data || []).map((a) => {
+      let subject = null, body = null;
+      try {
+        const m = (a.response_text || "").match(/\{[\s\S]*\}/);
+        if (m) { const j = JSON.parse(m[0]); subject = j?.subject ? String(j.subject) : null; body = j?.body ? String(j.body) : null; }
+      } catch { /* show the raw text instead */ }
+      const md = a.metadata && typeof a.metadata === "object" ? a.metadata : {};
+      return {
+        id: a.id, created_at: a.created_at, model: a.model, by: a.user_email || null,
+        recipient: md.carrier || md.customer || null, count: Number(md.count) || null,
+        tone: md.tone || null, source: md.source || null,
+        subject, body: body || a.response_text || "", cost_usd: a.cost_usd,
+        rating: a.rating || null, rating_reason: a.rating_reason || null,
+      };
+    }),
+  });
+});
+
 // POST /api/email-studio/rewrite  { key, text, instructions }
 // Claude revises one prompt from plain-English instructions. Nothing is
 // saved — the admin reviews the result, previews it, then saves.
@@ -123,7 +157,7 @@ emailStudioRouter.post("/preview", async (req, res) => {
   const type = String(req.body?.type || "");
   if (!["carrier", "customer", "carrier_group", "customer_group"].includes(type)) return res.status(400).json({ error: "type required" });
   const trackings = (Array.isArray(req.body?.tracking_numbers) ? req.body.tracking_numbers : [])
-    .map((t) => String(t || "").trim()).filter(Boolean).slice(0, 12);
+    .map((t) => String(t || "").trim()).filter(Boolean).slice(0, 60);
   if (!trackings.length) return res.status(400).json({ error: "Pick at least one shipment" });
   const overrides = cleanOverrides(req.body?.overrides);
   const notes = typeof req.body?.notes === "string" ? req.body.notes.slice(0, 2000) : undefined;

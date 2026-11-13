@@ -1,16 +1,18 @@
 // Board table rows: optional group header + one row per task.
 import { useMemo, useState } from "react";
-import { Ban, CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Play, RotateCcw } from "lucide-react";
+import { Ban, CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Mail, Play, RotateCcw } from "lucide-react";
 import type { TaskBoardRow, TaskFlag, TaskStatus } from "../../lib/types";
 import { fmtDate, fmtRelative } from "../../lib/format";
 import { RowAnnotations } from "./RowAnnotations";
 import { FLAG_CLS, IconBtn, Pill, PRIORITY_CLS, SEGMENT_CLS, SEGMENT_SHORT, STATUS_CLS, STATUS_LABEL, TrackingLink, isActive, shipmentStatusTone, shortTitle, taskMode, MODE_CLS } from "./shared";
 import { modeLabel } from "../ModePicker";
 
-export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, selected, toggle, triageRank, closeCandidateIds, staleDays, flagsMeta, segmentHelp, people, onOpen, onStatus, onDismiss }: {
+export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, emailLabel, onEmailGroup, selected, toggle, triageRank, closeCandidateIds, staleDays, flagsMeta, segmentHelp, people, onOpen, onStatus, onDismiss }: {
   group: { key: string; label: string; rows: TaskBoardRow[] };
   showHeader: boolean; collapsed: boolean; onToggle: () => void; onSelectGroup: () => void;
-  selected: Set<string>; toggle: (id: string) => void;
+  // Set when the board is grouped by carrier / customer: shows "Email carrier".
+  emailLabel?: "carrier" | "customer"; onEmailGroup?: () => void;
+  selected: Set<string>; toggle: (id: string, shift?: boolean) => void;
   triageRank: Map<string, number>; closeCandidateIds: Set<string>; staleDays: number;
   flagsMeta: { id: TaskFlag; label: string; tone: string; description: string }[];
   segmentHelp: Record<string, string>;
@@ -29,7 +31,18 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
                 {group.label}
               </button>
               <span className="text-xs text-slate-500">{group.rows.length}</span>
-              <button onClick={onSelectGroup} className="ml-auto text-xs text-sky-700 hover:underline">Select group</button>
+              <span className="ml-auto flex items-center gap-3">
+                {emailLabel && onEmailGroup && !group.label.startsWith("(unknown") ? (() => {
+                  const ticked = group.rows.filter((r) => selected.has(r.task.id) && isActive(r.task.status)).length;
+                  return (
+                    <button onClick={onEmailGroup} className="inline-flex items-center gap-1 text-xs font-medium text-violet-700 hover:underline"
+                      title={ticked ? `One email to this ${emailLabel} covering the ${ticked} ticked task${ticked === 1 ? "" : "s"}` : `One email to this ${emailLabel} covering every shipment in the group`}>
+                      <Mail className="h-3.5 w-3.5" /> Email {emailLabel}{ticked ? ` (${ticked})` : ""}
+                    </button>
+                  );
+                })() : null}
+                <button onClick={onSelectGroup} className="text-xs text-sky-700 hover:underline">Select group</button>
+              </span>
             </div>
           </td>
         </tr>
@@ -39,7 +52,7 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
           key={r.task.id}
           row={r}
           checked={selected.has(r.task.id)}
-          onCheck={() => toggle(r.task.id)}
+          onCheck={(shift) => toggle(r.task.id, shift)}
           rank={triageRank.get(r.task.id)}
           closeCandidate={closeCandidateIds.has(r.task.id)}
           staleDays={staleDays}
@@ -55,8 +68,14 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
   );
 }
 
+// Links, buttons and fields keep their own click behaviour (⌘-click a link
+// still opens it in a new tab).
+function isControl(target: EventTarget | null): boolean {
+  return !!(target as HTMLElement | null)?.closest?.("a, button, input, textarea, select, summary, [role='button']");
+}
+
 function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagMeta, segmentHelp, people, onOpen, onStatus, onDismiss }: {
-  row: TaskBoardRow; checked: boolean; onCheck: () => void; rank?: number; closeCandidate: boolean; staleDays: number;
+  row: TaskBoardRow; checked: boolean; onCheck: (shift: boolean) => void; rank?: number; closeCandidate: boolean; staleDays: number;
   flagMeta: Map<string, { id: TaskFlag; label: string; tone: string; description: string }>;
   segmentHelp: Record<string, string>;
   people: Record<string, string>;
@@ -70,8 +89,24 @@ function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagM
   const [expanded, setExpanded] = useState(false);
   return (
     <>
-    <tr className={`border-t border-slate-100 align-top ${checked ? "bg-violet-50/40" : moot ? "bg-emerald-50/20" : ""} ${!active ? "opacity-60" : ""}`}>
-      <td className="px-3 py-2.5"><input type="checkbox" checked={checked} onChange={onCheck} aria-label="Select task" className="accent-violet-600 mt-0.5" /></td>
+    <tr
+      className={`border-t border-slate-100 align-top ${checked ? "bg-violet-100/60 shadow-[inset_3px_0_0_0_#7c3aed]" : moot ? "bg-emerald-50/20" : ""} ${!active ? "opacity-60" : ""}`}
+      // ⌘/Ctrl-click anywhere on a row ticks it; Shift-click ticks the range
+      // from the last ticked row. Stopping the mousedown keeps the browser
+      // from highlighting the text in between, which made a range look broken.
+      onMouseDown={(e) => { if ((e.shiftKey || e.metaKey || e.ctrlKey) && !isControl(e.target)) e.preventDefault(); }}
+      onClick={(e) => {
+        if (!(e.shiftKey || e.metaKey || e.ctrlKey) || isControl(e.target)) return;
+        e.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        onCheck(e.shiftKey);
+      }}
+    >
+      {/* The whole cell is the click target, not just the 13px box. */}
+      <td className="px-3 py-2.5 cursor-pointer select-none" onMouseDown={(e) => e.preventDefault()} onClick={(e) => { e.stopPropagation(); onCheck(e.shiftKey); }}
+        title="Click to select. Shift-click selects a range; ⌘/Ctrl-click anywhere on a row also selects it.">
+        <input type="checkbox" checked={checked} onChange={() => {}} aria-label="Select task" className="accent-violet-600 mt-0.5 h-4 w-4 cursor-pointer pointer-events-none" />
+      </td>
       <td className="px-3 py-2.5 min-w-[22rem]">
         <div className="flex items-center gap-1.5 flex-wrap mb-1">
           {rank !== undefined ? <Pill cls="bg-violet-600 text-white ring-violet-600" title="AI triage priority rank">#{rank}</Pill> : null}
@@ -82,6 +117,7 @@ function TaskRow({ row, checked, onCheck, rank, closeCandidate, staleDays, flagM
             return <Pill key={f} cls={FLAG_CLS[m?.tone || "slate"]} title={m?.description}>{m?.label || f}</Pill>;
           })}
           {closeCandidate ? <Pill cls="bg-emerald-600 text-white ring-emerald-600" title="AI triage suggests dismissing this task">AI: close</Pill> : null}
+          {row.task.email_queued_at ? <Pill cls="bg-violet-100 text-violet-800 ring-violet-200" title={`Queued for email${row.task.email_queued_by ? ` by ${row.task.email_queued_by}` : ""}. Draft it in Email Studio.`}>To email</Pill> : null}
         </div>
         <button onClick={onOpen} className="text-left font-medium text-slate-900 hover:text-sky-700 leading-snug line-clamp-2" title={t.title}>{shortTitle(t.title)}</button>
         {seg.health ? <div className="text-xs text-slate-500 mt-0.5">{seg.health}</div> : null}

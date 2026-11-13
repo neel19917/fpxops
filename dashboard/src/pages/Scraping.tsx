@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Clock, ExternalLink, LogIn, Maximize2, Minimize2, MonitorPlay, Play, Square, XCircle } from "lucide-react";
 import { api, type ScrapeRequest } from "../lib/api";
-import { hostedBrowser, type HostedStats, type ScrapeLogLine, type ScrapeCounts, type FpTotals, type TaskSnapshot } from "../lib/hostedBrowser";
+import { hostedBrowser, type HostedStats, type ScrapeCounts, type FpTotals, type TaskSnapshot } from "../lib/hostedBrowser";
 import { FpTotalsTrend, FpBeforeAfter } from "../components/FpTotalsTrend";
 import { ModePicker, ALL_MODES, modesText } from "../components/ModePicker";
 import { TaskModesInline } from "../components/TaskRulesDialog";
@@ -10,6 +10,7 @@ import { useAuth } from "../lib/auth";
 import { showFrame, hideFrame, useFrameState } from "../lib/freightpopFrame";
 import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
 import { HostedFreightPop } from "../components/HostedFreightPop";
+import { ScrapeLog } from "../components/ScrapeLog";
 import { SchedulesPane } from "../components/SchedulesPane";
 import { Link } from "react-router-dom";
 
@@ -55,6 +56,7 @@ export function ScrapingPage() {
   const [now, setNow] = useState(() => Date.now());
   const [watch, setWatch] = useState(true);
   const [full, setFull] = useState(false);
+  const [logOpen, setLogOpen] = useState(false); // last run's log disclosure
   // Esc leaves full screen; leaving full screen when the run ends.
   useEffect(() => {
     if (!full) return;
@@ -304,9 +306,8 @@ export function ScrapingPage() {
                     <HostedFreightPop key={running.requestId} target="scrape" />
                   </div>
                 ) : null}
-                <LogPanel lines={running.log || []} live tall={full} />
+                <ScrapeLog lines={running.log || []} total={running.logTotal} live tall={full} />
               </div>
-              <LogFooter shown={running.log?.length || 0} total={running.logTotal} />
             </div>
           </div>
         ) : pending.length || worker?.queued?.length ? (
@@ -325,10 +326,10 @@ export function ScrapingPage() {
             {lastRun.note ? <div className="mt-1 break-words">{lastRun.note}</div> : null}
             {lastRun.counts ? <div className="mt-2"><CountsStrip counts={lastRun.counts} /></div> : null}
             {lastRun.log?.length ? (
-              <details className="mt-2">
-                <summary className="text-xs cursor-pointer underline opacity-80 hover:opacity-100">Show log ({lastRun.logTotal ?? lastRun.log.length} lines)</summary>
-                <div className="mt-2"><LogPanel lines={lastRun.log} /></div>
-                <LogFooter shown={lastRun.log.length} total={lastRun.logTotal} />
+              <details className="mt-2" open={logOpen} onToggle={(e) => setLogOpen(e.currentTarget.open)}>
+                <summary className="text-xs cursor-pointer underline opacity-80 hover:opacity-100">{logOpen ? "Hide" : "Show"} log ({fmtNum(lastRun.logTotal ?? lastRun.log.length)} lines)</summary>
+                {/* Rendered only while open, so it can start at the newest line. */}
+                {logOpen ? <div className="mt-2"><ScrapeLog lines={lastRun.log} total={lastRun.logTotal} /></div> : null}
               </details>
             ) : null}
           </div>
@@ -429,39 +430,6 @@ export function ScrapingPage() {
   );
 }
 
-// Scrolling log. While live, sticks to the bottom unless the user has
-// scrolled up to read something.
-function LogPanel({ lines, live = false, tall = false }: { lines: ScrapeLogLine[]; live?: boolean; tall?: boolean }) {
-  const ref = useRef<HTMLDivElement | null>(null);
-  const stick = useRef(true);
-  useEffect(() => {
-    const el = ref.current;
-    if (el && live && stick.current) el.scrollTop = el.scrollHeight;
-  }, [lines.length, live]);
-  const color: Record<ScrapeLogLine["level"], string> = {
-    info: "text-slate-400", data: "text-sky-200", warn: "text-amber-300", error: "text-rose-300", done: "text-emerald-300",
-  };
-  return (
-    <div
-      ref={ref}
-      onScroll={(e) => {
-        const el = e.currentTarget;
-        stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-      }}
-      className={"rounded-lg bg-slate-900 ring-1 ring-slate-800 p-3 overflow-y-auto font-mono text-[11px] leading-relaxed " + (tall ? "h-full min-h-[300px]" : live ? "h-[420px]" : "max-h-64")}
-    >
-      {lines.length === 0 ? (
-        <div className="text-slate-500">{live ? "Waiting for the first log line…" : "No log."}</div>
-      ) : lines.map((l, i) => (
-        <div key={i} className="flex gap-2">
-          <span className="text-slate-500 shrink-0 tabular-nums">{new Date(l.t).toLocaleTimeString()}</span>
-          <span className={(color[l.level] || color.info) + " break-words"}>{l.text}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 // "Processed 120 of 659" + bar + time left. The total comes from the Kendo
 // grid's pager at the bottom of FreightPOP's dashboard.
 function ProgressBar({ processed, total, startedAt, now }: { processed: number; total: number | null; startedAt: string; now: number }) {
@@ -518,21 +486,6 @@ function CountsStrip({ counts }: { counts: ScrapeCounts }) {
       {items.map(([label, n, cls]) => (
         <span key={label} className="text-slate-500">{label} <span className={"font-semibold tabular-nums " + cls}>{fmtNum(n)}</span></span>
       ))}
-    </div>
-  );
-}
-
-function LogFooter({ shown, total }: { shown: number; total?: number }) {
-  const [err, setErr] = useState<string | null>(null);
-  return (
-    <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500 mt-1">
-      <span>{total && total > shown ? `Showing the latest ${fmtNum(shown)} of ${fmtNum(total)} lines` : `${fmtNum(shown)} lines`}{err ? <span className="text-rose-600"> · {err}</span> : null}</span>
-      <button
-        onClick={() => { setErr(null); hostedBrowser.downloadLog().catch((e) => setErr((e as Error).message)); }}
-        className="underline hover:text-slate-800"
-      >
-        Download full log
-      </button>
     </div>
   );
 }

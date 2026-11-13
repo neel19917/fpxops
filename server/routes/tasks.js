@@ -9,8 +9,18 @@ import { loadBoard } from "../lib/taskBoard.js";
 import { collectDailyDigest, runDailySummary } from "../lib/dailySummary.js";
 import { resolveAssignee } from "../lib/people.js";
 import { getSettings } from "../lib/settings.js";
+import { taskAudience, CONFIDENCE_REVIEW, planDedupe, applyDedupe, supersedeOlderFor, loadActiveForDedupe } from "../lib/taskDedupe.js";
 
 export const tasksRouter = Router();
+
+// { email_queued: true|false } on a task update → the two queue columns.
+// Returns {} when the body doesn't mention it.
+function emailQueuePatch(req) {
+  if (typeof req.body?.email_queued !== "boolean") return {};
+  return req.body.email_queued
+    ? { email_queued_at: new Date().toISOString(), email_queued_by: req.user?.email || req.apiKey?.name || null }
+    : { email_queued_at: null, email_queued_by: null };
+}
 
 // Convention-based detector: a task is a "carrier follow-up" when its
 // title contains both "carrier" and "follow" (case-insensitive). No
@@ -621,6 +631,203 @@ tasksRouter.post("/v2/dismiss", async (req, res) => {
   res.json({ dismissed, skipped: ids.length - dismissed });
 });
 
+// GET /tasks/v2/email-prompts — every prompt behind the email drafts, read
+// only, for anyone signed in. Email Studio shows these so reps can see what
+// the AI is told; editing stays on the admin-only /email-studio routes.
+const EMAIL_PROMPT_KEYS = [
+  "prompt.email_draft.system_base", "prompt.email_draft.audience_carrier", "prompt.email_draft.audience_customer", "prompt.email_draft.model",
+  "prompt.email_draft.carrier_group.system_base", "prompt.email_draft.carrier_group.audience", "prompt.email_draft.carrier_group.model",
+  "prompt.email_draft.customer_group.system_base", "prompt.email_draft.customer_group.audience", "prompt.email_draft.customer_group.model",
+];
+tasksRouter.get("/v2/email-prompts", async (_req, res) => {
+  try {
+    const values = await getSettings(...EMAIL_PROMPT_KEYS);
+    res.json({ prompts: Object.fromEntries(EMAIL_PROMPT_KEYS.map((k) => [k, typeof values[k] === "string" ? values[k] : String(values[k] ?? "")])), tones: GROUP_EMAIL_TONES });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /tasks/v2/dedupe  { dry_run?: boolean, min_confidence?: number, task_ids?: string[], shipment_ids?: string[] }
+// Newest task wins per shipment + audience (a carrier task and a customer
+// task on one shipment are not duplicates). Older active duplicates are
+// cancelled with a "superseded" note — tombstones, never deleted — and an
+// email-queue flag on an older one moves to the newest.
+// DRY RUN BY DEFAULT: nothing is written unless the body carries
+// dry_run: false exactly. No scope = the whole active board.
+tasksRouter.post("/v2/dedupe", async (req, res) => {
+  try {
+    const dryRun = req.body?.dry_run !== false;
+    const strs = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string" && x) : null);
+    const taskIds = strs(req.body?.task_ids);
+    const shipmentIds = strs(req.body?.shipment_ids);
+    // A scope that was sent but is empty must not silently widen to the
+    // whole board.
+    if ((taskIds && !taskIds.length) || (shipmentIds && !shipmentIds.length)) {
+      return res.status(400).json({ error: "task_ids / shipment_ids must not be empty when supplied" });
+    }
+    const who = req.user?.email || req.apiKey?.name || "operator";
+
+    const tasks = await loadActiveForDedupe(supabase, {
+      shipmentIds: shipmentIds || undefined,
+      taskIds: taskIds || undefined,
+    });
+    // min_confidence 0-100: older tasks scoring below it are held back, not
+    // replaced. Default 50; send 0 to include everything.
+    const mc = Number(req.body?.min_confidence);
+    const minConfidence = Number.isFinite(mc) ? Math.max(0, Math.min(100, mc)) : CONFIDENCE_REVIEW;
+    const full = planDedupe(tasks, { minConfidence });
+    const plan = { ...full, shipments: full.shipments.length };
+    if (dryRun) return res.json({ dry_run: true, ...plan });
+
+    const result = await applyDedupe(supabase, plan, { who });
+    const shipmentCount = Array.isArray(plan.shipments) ? plan.shipments.length : Number(plan.shipments) || 0;
+    logAudit(req, {
+      action: "bulk_update", entity_type: "task",
+      summary: `De-duped tasks: superseded ${result.superseded} older task(s) on ${shipmentCount} shipment(s)`,
+      metadata: {
+        count: result.superseded, ids: result.ids, carried_queue: result.carried_queue, failed: result.failed, skipped: result.skipped,
+        shipments: shipmentCount, disposition: "superseded", min_confidence: minConfidence, held: plan.held_count,
+        confidence: Object.fromEntries(plan.groups.flatMap((g) => g.supersede.map((t) => [t.id, t.confidence]))),
+        scope: { task_ids: taskIds, shipment_ids: shipmentIds },
+      },
+    });
+    res.json({ dry_run: false, ...plan, result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// How hard the email pushes. Sent as an operator note, so the saved group
+// prompts still decide the wording; this only sets the temperature.
+const GROUP_EMAIL_TONES = {
+  friendly: "Tone for this email: a friendly check-in. Warm, brief, no pressure.",
+  direct: "Tone for this email: direct and businesslike. Ask for a specific update on each shipment.",
+  escalate: "Tone for this email: an escalation. These have gone unanswered or are overdue. Be firm but professional, ask for a same-day reply, and ask who owns each shipment.",
+};
+const GROUP_EMAIL_MAX_SHIPMENTS = 60;
+
+// POST /tasks/v2/group-email
+//   { audience: "carrier" | "customer", name, task_ids: string[], notes?, tone? }
+// One email to a carrier (or customer) covering every shipment behind the
+// supplied tasks. Unlike /carrier-email-draft this takes ANY active task —
+// the v2 board groups by the shipment's carrier / customer, not by a
+// "Carrier followup:" title. Each shipment gets ONE line, written from its
+// newest task for the requested audience (newest task of any kind when it
+// has none for that audience): the newest task takes precedence, so a PRO
+// is never listed twice and a stale ask never rides along.
+tasksRouter.post("/v2/group-email", async (req, res) => {
+  const audience = req.body?.audience === "customer" ? "customer" : req.body?.audience === "carrier" ? "carrier" : "";
+  const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 200) : "";
+  const taskIds = Array.isArray(req.body?.task_ids) ? req.body.task_ids.filter((x) => typeof x === "string" && x) : [];
+  if (!audience) return res.status(400).json({ error: "audience must be carrier or customer" });
+  if (!name) return res.status(400).json({ error: "name required" });
+  if (!taskIds.length) return res.status(400).json({ error: "task_ids required" });
+
+  const tasks = [];
+  for (let i = 0; i < taskIds.length; i += 200) {
+    const { data, error } = await supabase.from("fpx_shipment_tasks").select("*").in("id", taskIds.slice(i, i + 200));
+    if (error) return res.status(500).json({ error: error.message });
+    tasks.push(...(data || []));
+  }
+  const active = tasks.filter((t) => ["open", "in_progress", "blocked"].includes(t.status) && t.shipment_id);
+  if (!active.length) return res.status(400).json({ error: "None of those tasks are still active" });
+
+  const shipIds = Array.from(new Set(active.map((t) => t.shipment_id)));
+  if (shipIds.length > GROUP_EMAIL_MAX_SHIPMENTS) {
+    return res.status(400).json({ error: `That's ${shipIds.length} shipments — one email covers up to ${GROUP_EMAIL_MAX_SHIPMENTS}. Remove some and draft a second email.` });
+  }
+  const { data: ships, error: shipErr } = await supabase.from("fpx_shipments").select("*").in("id", shipIds);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  const shipById = new Map((ships || []).map((s) => [s.id, s]));
+
+  // One line per shipment, from its newest task for this audience.
+  const byShip = new Map();
+  for (const t of active) {
+    if (!shipById.has(t.shipment_id)) continue;
+    if (!byShip.has(t.shipment_id)) byShip.set(t.shipment_id, []);
+    byShip.get(t.shipment_id).push(t);
+  }
+  const createdMs = (t) => Date.parse(t.created_at) || 0;
+  const newestOf = (list) => list.reduce((a, b) => (createdMs(b) > createdMs(a) ? b : a));
+  const items = Array.from(byShip.entries()).map(([sid, ts]) => {
+    const forAudience = ts.filter((t) => taskAudience(t.title) === audience);
+    const lead = newestOf(forAudience.length ? forAudience : ts);
+    return {
+      shipment: shipById.get(sid),
+      task: {
+        title: lead.title || "",
+        description: (lead.description || "").slice(0, 1500) || null,
+      },
+    };
+  });
+  if (!items.length) return res.status(404).json({ error: "Shipments not found" });
+
+  const tone = GROUP_EMAIL_TONES[req.body?.tone] ? req.body.tone : null;
+  const userNotes = typeof req.body?.notes === "string" ? req.body.notes.trim().slice(0, 2000) : "";
+  const notes = [tone ? GROUP_EMAIL_TONES[tone] : "", userNotes].filter(Boolean).join("\n") || undefined;
+  // What the email covers, kept with the draft so Email Studio's history can
+  // show its scope later.
+  const scope = Array.from(byShip.entries()).map(([sid, ts]) => ({
+    id: sid, tn: shipById.get(sid).tracking_number || null, fpx: shipById.get(sid).shipment_id || null,
+    task_ids: ts.map((t) => t.id),
+  }));
+  const callMeta = { api_key_id: req.apiKey?.id, user_email: req.user?.email, metadata: { source: "tasks_v2", tone, audience, scope } };
+  const result = audience === "carrier"
+    ? await generateCarrierGroupEmail({ carrier: name, items, notes, callMeta })
+    : await generateCustomerGroupEmail({ customer: name, items, notes, callMeta });
+  if (result.error) return res.status(500).json({ error: result.error });
+  logAudit(req, {
+    action: "create", entity_type: "email_draft",
+    summary: `Drafted ${audience} group email to "${name}" covering ${items.length} shipment(s) from the Tasks board`,
+    metadata: { audience, name, tone, task_ids: active.map((t) => t.id), count: items.length, model: result.model || null },
+  });
+  // The model occasionally drops a shipment or repeats a neighbour's PRO.
+  // Report every tracking number that isn't in the body so the rep checks
+  // before sending.
+  const text = `${result.subject || ""}\n${result.body || ""}`;
+  const missing = items.map((it) => it.shipment.tracking_number).filter((tn) => tn && !text.includes(String(tn)));
+  res.json({
+    subject: result.subject, body: result.body, model: result.model || null,
+    count: items.length, task_ids: active.filter((t) => shipById.has(t.shipment_id)).map((t) => t.id),
+    missing,
+  });
+});
+
+// GET /tasks/v2/group-emails?limit=50
+// Every group email drafted (carrier and customer), newest first, with the
+// shipments each one covered. Open to all signed-in users: it is the History
+// tab of Email Studio.
+tasksRouter.get("/v2/group-emails", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const cols = "id, created_at, model, user_email, response_text, metadata, rating";
+  const pull = (subkind) => supabase.from("fpx_ai_analyses").select(cols)
+    .contains("metadata", { subkind }).order("created_at", { ascending: false }).limit(limit);
+  const [c, k] = await Promise.all([pull("email_draft_carrier_group"), pull("email_draft_customer_group")]);
+  if (c.error || k.error) return res.status(500).json({ error: (c.error || k.error).message });
+  const rows = [...(c.data || []), ...(k.data || [])]
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).slice(0, limit);
+  res.json({
+    data: rows.map((a) => {
+      const md = a.metadata && typeof a.metadata === "object" ? a.metadata : {};
+      let subject = null, body = null;
+      try {
+        const m = (a.response_text || "").match(/\{[\s\S]*\}/);
+        if (m) { const j = JSON.parse(m[0]); subject = j?.subject ? String(j.subject) : null; body = j?.body ? String(j.body) : null; }
+      } catch { /* fall back to the raw text */ }
+      return {
+        id: a.id, created_at: a.created_at, model: a.model, by: a.user_email || null,
+        audience: md.subkind === "email_draft_customer_group" ? "customer" : "carrier",
+        recipient: md.carrier || md.customer || null,
+        count: Number(md.count) || null, tone: md.tone || null,
+        subject, body: body || a.response_text || "",
+        scope: Array.isArray(md.scope) ? md.scope : null,
+        rating: a.rating || null,
+      };
+    }),
+  });
+});
+
 // GET /tasks/:id  — task lookup by id, with optional walk-through context.
 // When ?walk=active is set, returns prev_task_id / next_task_id keyed against
 // the active (open + in_progress) task set so the drawer can step through.
@@ -708,6 +915,15 @@ tasksRouter.post("/bulk", async (req, res) => {
 
   const { data, error } = await supabase.from("fpx_shipment_tasks").insert(rows).select("id, shipment_id, assigned_to, title");
   if (error) return res.status(500).json({ error: error.message });
+  // Newest task takes precedence: retire older active duplicates (same
+  // shipment + audience) now that these exist. Never fails the create.
+  try {
+    await supersedeOlderFor(supabase, Array.from(new Set(data.map((t) => t.shipment_id))), {
+      who: req.user?.email || req.apiKey?.name || "operator",
+    });
+  } catch (e) {
+    console.warn("[FPX] supersede after bulk-create failed:", e.message);
+  }
   logAudit(req, {
     action: "bulk_create", entity_type: "task",
     summary: `Bulk-created ${data.length} task(s): "${title}"`,
@@ -722,7 +938,7 @@ tasksRouter.post("/bulk-update", async (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((x) => typeof x === "string") : [];
   if (!ids.length) return res.status(400).json({ error: "ids required" });
   const allowed = ["status","priority","assigned_to"];
-  const patch = {};
+  const patch = { ...emailQueuePatch(req) };
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
   if (!Object.keys(patch).length) return res.status(400).json({ error: "no fields to update" });
   if ("assigned_to" in patch) patch.assigned_to = await resolveAssignee(patch.assigned_to);
@@ -760,8 +976,9 @@ tasksRouter.post("/bulk-delete", async (req, res) => {
 // Same UUID constraint as GET /:id — see the rationale above.
 tasksRouter.patch("/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", async (req, res) => {
   const allowed = ["status", "priority", "assigned_to", "title", "description", "due_at"];
-  const patch = {};
+  const patch = { ...emailQueuePatch(req) };
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+  if (!Object.keys(patch).length) return res.status(400).json({ error: "no fields to update" });
   if ("assigned_to" in patch) patch.assigned_to = await resolveAssignee(patch.assigned_to);
   if (patch.status === "done" && !patch.completed_at) patch.completed_at = new Date().toISOString();
   if (patch.status && patch.status !== "done") patch.completed_at = null;

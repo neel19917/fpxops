@@ -2,14 +2,22 @@
 // page (fpx_user_profiles.scrape_email: off | all | failed).
 //
 // Env (Railway → fpx-browser):
-//   RESEND_API_KEY   required — without it, sending is skipped (logged once)
-//   NOTIFY_FROM      default "FPX <fpx@updates.freightpopsales.com>" (a verified Resend domain)
+//   SALESOS_EMAIL_KEY  preferred — a Sales OS email-relay key (fpk_…, scope email:send). When set,
+//                      mail goes through Sales OS (POST /api/email-relay/send) and this service
+//                      holds no Resend credential. The relay only delivers to staff addresses.
+//   SALESOS_EMAIL_URL  default "https://api.freightpopsales.com/api/email-relay/send"
+//   RESEND_API_KEY     fallback — used only when SALESOS_EMAIL_KEY is not set. With neither,
+//                      sending is skipped (logged once)
+//   NOTIFY_FROM        default "FPX <fpx@updates.freightpopsales.com>" (a verified Resend domain).
+//                      Via the relay only its name and mailbox are used; the domain is Sales OS's.
 //   DASHBOARD_URL    default "https://fpxpress.netlify.app"
 
 const SB_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const RESEND_KEY = process.env.RESEND_API_KEY || "";
 const FROM = process.env.NOTIFY_FROM || "FPX <fpx@updates.freightpopsales.com>";
+const RELAY_KEY = process.env.SALESOS_EMAIL_KEY || "";
+const RELAY_URL = process.env.SALESOS_EMAIL_URL || "https://api.freightpopsales.com/api/email-relay/send";
 const DASH = (process.env.DASHBOARD_URL || "https://fpxpress.netlify.app").replace(/\/$/, "");
 
 let warned = false;
@@ -114,17 +122,57 @@ export function buildRunEmail(run) {
   return { subject, html, text };
 }
 
+// "FPX <fpx@updates.example.com>" → { fromName: "FPX", fromLocal: "fpx" }. The relay
+// picks the domain itself, so only the name and the mailbox travel.
+export function relaySender(from) {
+  const m = String(from || "").match(/^\s*"?([^"<]*?)"?\s*<\s*([^@\s<>]+)@[^>]+>\s*$/);
+  if (m) return { fromName: m[1].trim() || "FPX", fromLocal: m[2].toLowerCase() };
+  const bare = String(from || "").match(/^\s*([^@\s<>]+)@\S+\s*$/);
+  return { fromName: "FPX", fromLocal: bare ? bare[1].toLowerCase() : "fpx" };
+}
+
+// One request per person (no shared To: list), in sequence so a long subscriber
+// list stays under the relay's per-minute limit for as long as possible. Returns
+// { sent, failed: [{ email, status, error }] }. Never throws.
+export async function sendViaRelay(subs, { subject, html, text }, fetchImpl = fetch) {
+  const sender = relaySender(FROM);
+  const out = { sent: 0, failed: [] };
+  for (const u of subs) {
+    try {
+      const res = await fetchImpl(RELAY_URL, {
+        method: "POST",
+        headers: { "x-api-key": RELAY_KEY, "content-type": "application/json" },
+        body: JSON.stringify({ to: [u.email], subject, html, text, ...sender }),
+      });
+      if (res.ok) { out.sent++; continue; }
+      const body = await res.text();
+      out.failed.push({ email: u.email, status: res.status, error: body.slice(0, 200) });
+      // A bad key or a spent limit fails the same way for everyone: stop, don't hammer.
+      if ([401, 403, 429, 503].includes(res.status)) break;
+    } catch (e) {
+      out.failed.push({ email: u.email, status: 0, error: e.message });
+    }
+  }
+  return out;
+}
+
 // Called after every finished run. Never throws.
 export async function notifyRunDone(run) {
   try {
     if (!SB_URL || !SB_KEY) return;
     const subs = await subscribers(!!run.ok);
     if (!subs.length) return;
-    if (!RESEND_KEY) {
-      if (!warned) { warned = true; console.warn(`[notify] ${subs.length} subscriber(s) but RESEND_API_KEY isn't set — not emailing`); }
+    if (!RELAY_KEY && !RESEND_KEY) {
+      if (!warned) { warned = true; console.warn(`[notify] ${subs.length} subscriber(s) but neither SALESOS_EMAIL_KEY nor RESEND_API_KEY is set — not emailing`); }
       return;
     }
     const { subject, html, text } = buildRunEmail(run);
+    if (RELAY_KEY) {
+      const r = await sendViaRelay(subs.slice(0, 100), { subject, html, text });
+      console.log(`[notify] Sales OS relay: emailed ${r.sent} of ${subs.length} subscriber(s) about run ${run.id} (${run.ok ? "done" : "failed"})`);
+      for (const f of r.failed) console.warn(`[notify] relay ${f.status} for ${f.email}: ${f.error}`);
+      return;
+    }
     // One email per person (no shared To: list), up to 100 per batch call.
     const batch = subs.slice(0, 100).map((u) => ({ from: FROM, to: [u.email], subject, html, text }));
     const res = await fetch("https://api.resend.com/emails/batch", {

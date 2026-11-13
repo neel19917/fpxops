@@ -266,6 +266,9 @@ export interface ShipmentTask {
   created_by: string | null;
   due_at: string | null;
   completed_at: string | null;
+  // Set while the task waits in Email Studio's queue (hotkey E in the drawer).
+  email_queued_at?: string | null;
+  email_queued_by?: string | null;
   created_at: string;
   updated_at: string;
 }

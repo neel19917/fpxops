@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Mail, Sparkles, Save, RotateCcw, Undo2, Eye, AlertTriangle, CheckCircle2 } from "lucide-react";
-import { api, type EmailStudioSample, type EmailStudioType, type SettingRow } from "../lib/api";
+import { useSearchParams } from "react-router-dom";
+import { Mail, Sparkles, Save, RotateCcw, Undo2, Eye, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Copy, History, ThumbsDown, ThumbsUp } from "lucide-react";
+import { api, type EmailStudioDraft, type EmailStudioSample, type EmailStudioType, type SettingRow } from "../lib/api";
 import { fmtRelative } from "../lib/format";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
@@ -33,7 +34,7 @@ const EMAILS: EmailDef[] = [
   },
   {
     id: "carrier_group", label: "Group email → carrier", group: true,
-    blurb: "One email to a carrier covering several shipments (Tasks → carrier follow-ups).",
+    blurb: "One email to a carrier covering several shipments. Reps draft these from Tasks: group by carrier, then Email group.",
     modelKey: "prompt.email_draft.carrier_group.model",
     parts: [
       { key: "prompt.email_draft.carrier_group.system_base", label: "Main instructions", hint: "{{audienceCopy}} is where the audience part goes." },
@@ -42,7 +43,7 @@ const EMAILS: EmailDef[] = [
   },
   {
     id: "customer_group", label: "Group email → customer", group: true,
-    blurb: "One email to a customer covering several shipments (Tasks → customer follow-ups).",
+    blurb: "One email to a customer covering several shipments. Reps draft these from Tasks: group by customer, then Email group.",
     modelKey: "prompt.email_draft.customer_group.model",
     parts: [
       { key: "prompt.email_draft.customer_group.system_base", label: "Main instructions", hint: "{{audienceCopy}} is where the audience part goes." },
@@ -59,13 +60,163 @@ const MODELS = [
 
 const asText = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : JSON.stringify(v, null, 2));
 
+const TONES = [
+  { id: "friendly", label: "Friendly" },
+  { id: "direct", label: "Direct" },
+  { id: "escalate", label: "Escalate" },
+];
+
+// The standalone admin page: a title over the panel. The rep-facing Email
+// Studio page hosts the same panel as its "Prompts" tab.
 export function EmailStudioPage() {
+  return (
+    <div className="space-y-4">
+      <h1 className="text-xl font-semibold flex items-center gap-2"><Mail className="h-5 w-5 text-violet-600" /> Email prompts</h1>
+      <EmailPromptsPanel canEdit />
+    </div>
+  );
+}
+
+// The prompts body without a page title. Everyone can read the prompts;
+// only admins (canEdit) get the editor, which uses admin-only routes.
+export function EmailPromptsPanel({ canEdit }: { canEdit: boolean }) {
+  return canEdit ? <PromptsEditor /> : <PromptsReadOnly />;
+}
+
+// The open email lives in the URL (?email=carrier_group) so it can be linked.
+// Other params (the host page's own tab, say) are left alone.
+function useEmailParam(): [EmailStudioType, (id: EmailStudioType) => void] {
+  const [params, setParams] = useSearchParams();
+  const emailId: EmailStudioType = EMAILS.some((e) => e.id === params.get("email")) ? (params.get("email") as EmailStudioType) : "carrier";
+  const setEmailId = (id: EmailStudioType) => setParams((p) => { const n = new URLSearchParams(p); if (id === "carrier") n.delete("email"); else n.set("email", id); return n; }, { replace: true });
+  return [emailId, setEmailId];
+}
+
+function EmailSwitcher({ emailId, onPick, dirtyKeys }: { emailId: EmailStudioType; onPick: (id: EmailStudioType) => void; dirtyKeys?: string[] }) {
+  return (
+    <div className="flex gap-1 flex-wrap border-b border-slate-200">
+      {EMAILS.map((e) => {
+        const dirty = dirtyKeys ? [...e.parts.map((p) => p.key), e.modelKey].some((k) => dirtyKeys.includes(k)) : false;
+        return (
+          <button key={e.id} onClick={() => onPick(e.id)}
+            className={"px-3 py-2 text-sm -mb-px border-b-2 " + (e.id === emailId ? "border-violet-600 text-violet-700 font-medium" : "border-transparent text-slate-600 hover:text-slate-900")}>
+            {e.label}{dirty ? <span className="ml-1 text-amber-600">•</span> : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// The three tone lines. Always read-only: they are not settings.
+function ToneSection({ tones }: { tones: Record<string, string> }) {
+  const shown = TONES.filter((t) => asText(tones[t.id]).trim());
+  if (!shown.length) return null;
+  return (
+    <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4 space-y-2">
+      <div>
+        <div className="font-medium text-slate-900">Tone</div>
+        <div className="text-xs text-slate-500">One of these lines is added to a group email when a rep picks a tone. They can't be edited here.</div>
+      </div>
+      <dl className="space-y-2">
+        {shown.map((t) => (
+          <div key={t.id} className="sm:flex sm:gap-3">
+            <dt className="text-sm font-medium text-slate-700 sm:w-20 shrink-0">{t.label}</dt>
+            <dd className="text-sm text-slate-700 whitespace-pre-wrap break-words min-w-0">{asText(tones[t.id])}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ }
+  }
+  return (
+    <button onClick={copy} disabled={!text}
+      className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-40 shrink-0">
+      <Copy className="h-3.5 w-3.5" /> {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
+// What every non-admin sees: the prompts as plain text, nothing to change.
+function PromptsReadOnly() {
+  const [data, setData] = useState<{ prompts: Record<string, string>; tones: Record<string, string> } | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [emailId, setEmailId] = useEmailParam();
+
+  const load = useCallback(async () => {
+    setLoadErr(null);
+    try {
+      const r = await api.tasks.v2EmailPrompts();
+      setData({ prompts: r.prompts || {}, tones: r.tones || {} });
+    } catch (e) { setLoadErr((e as Error).message); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  if (loadErr) return <ErrorBlock>Couldn't load the email prompts: {loadErr} <button onClick={load} className="underline ml-1">Retry</button></ErrorBlock>;
+  if (!data) return <LoadingState />;
+
+  const email = EMAILS.find((e) => e.id === emailId)!;
+  const model = asText(data.prompts[email.modelKey]);
+  const modelLabel = MODELS.find((m) => m.value === model)?.label;
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-slate-500">These are the instructions the AI follows when it drafts an email. An admin can change them.</p>
+      <EmailSwitcher emailId={emailId} onPick={setEmailId} />
+      <p className="text-sm text-slate-600">{email.blurb}</p>
+
+      <div className="space-y-4 max-w-4xl">
+        {email.parts.map((p) => {
+          const text = asText(data.prompts[p.key]);
+          return (
+            <div key={p.key} className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4 space-y-2">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="font-medium text-slate-900">{p.label}</div>
+                  <div className="text-xs text-slate-500">{p.hint}</div>
+                </div>
+                <CopyButton text={text} />
+              </div>
+              {text
+                ? <pre className="text-sm font-mono leading-relaxed whitespace-pre-wrap break-words text-slate-800 bg-slate-50 ring-1 ring-slate-200 rounded-lg p-3">{text}</pre>
+                : <div className="text-sm text-slate-500">Nothing set for this part.</div>}
+            </div>
+          );
+        })}
+        <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4 flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <div className="font-medium text-slate-900">AI model</div>
+            {email.id === "carrier" || email.id === "customer" ? <div className="text-xs text-slate-500">Shared by both single-shipment emails.</div> : null}
+          </div>
+          <div className="text-sm text-slate-800">{modelLabel || model || "Not set"}</div>
+        </div>
+        <ToneSection tones={data.tones} />
+      </div>
+    </div>
+  );
+}
+
+function PromptsEditor() {
   const [rows, setRows] = useState<Map<string, SettingRow> | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({}); // unsaved edits by key
-  const [emailId, setEmailId] = useState<EmailStudioType>("carrier");
+  const [emailId, setEmailId] = useEmailParam();
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  // Tone lines come from the read-only route. If it fails (not deployed
+  // yet, say) the section is simply left out.
+  const [tones, setTones] = useState<Record<string, string> | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.tasks.v2EmailPrompts().then((r) => { if (live) setTones(r.tones || null); }).catch(() => { /* no tone section */ });
+    return () => { live = false; };
+  }, []);
 
   const load = useCallback(async () => {
     setLoadErr(null);
@@ -111,10 +262,7 @@ export function EmailStudioPage() {
   return (
     <div className="space-y-4">
       <div className="flex items-end justify-between gap-3 flex-wrap">
-        <div>
-          <h1 className="text-xl font-semibold flex items-center gap-2"><Mail className="h-5 w-5 text-violet-600" /> Email Studio</h1>
-          <p className="text-sm text-slate-500 mt-0.5">Edit how FPX's AI writes emails. Rewrite with plain-English instructions, preview on real shipments, then save.</p>
-        </div>
+        <p className="text-sm text-slate-500">Edit how FPX's AI writes emails. Rewrite with plain-English instructions, preview on real shipments, then save.</p>
         <div className="flex items-center gap-2">
           {dirtyKeys.length ? <span className="text-sm text-amber-700">{dirtyKeys.length} unsaved change(s)</span> : <span className="text-sm text-slate-400">No unsaved changes</span>}
           <button onClick={() => setDrafts({})} disabled={!dirtyKeys.length || saving}
@@ -132,17 +280,7 @@ export function EmailStudioPage() {
         <div className={"rounded-xl p-3 text-sm ring-1 " + (msg.tone === "ok" ? "bg-emerald-50 ring-emerald-200 text-emerald-800" : "bg-rose-50 ring-rose-200 text-rose-800")}>{msg.text}</div>
       ) : null}
 
-      <div className="flex gap-1 flex-wrap border-b border-slate-200">
-        {EMAILS.map((e) => {
-          const dirty = [...e.parts.map((p) => p.key), e.modelKey].some((k) => dirtyKeys.includes(k));
-          return (
-            <button key={e.id} onClick={() => setEmailId(e.id)}
-              className={"px-3 py-2 text-sm -mb-px border-b-2 " + (e.id === emailId ? "border-violet-600 text-violet-700 font-medium" : "border-transparent text-slate-600 hover:text-slate-900")}>
-              {e.label}{dirty ? <span className="ml-1 text-amber-600">•</span> : null}
-            </button>
-          );
-        })}
-      </div>
+      <EmailSwitcher emailId={emailId} onPick={setEmailId} dirtyKeys={dirtyKeys} />
       <p className="text-sm text-slate-600">{email.blurb}</p>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
@@ -153,9 +291,11 @@ export function EmailStudioPage() {
           ))}
           <ModelPicker value={current(email.modelKey)} savedValue={saved(email.modelKey)}
             shared={email.id === "carrier" || email.id === "customer"} onChange={(v) => edit(email.modelKey, v)} />
+          {tones ? <ToneSection tones={tones} /> : null}
         </div>
         <PreviewPanel email={email} overrides={Object.fromEntries(dirtyKeys.map((k) => [k, drafts[k]]))} />
       </div>
+      {email.id === "carrier_group" || email.id === "customer_group" ? <DraftHistory key={email.id} type={email.id} /> : null}
     </div>
   );
 }
@@ -230,6 +370,73 @@ function PromptEditor({ part, row, value, savedValue, onChange, onDiscard }: {
   );
 }
 
+// What reps actually got: every group email drafted from Tasks, newest first.
+// Read these before changing the prompts above.
+function DraftHistory({ type }: { type: "carrier_group" | "customer_group" }) {
+  const [rows, setRows] = useState<EmailStudioDraft[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const load = useCallback(() => {
+    setErr(null);
+    api.emailStudio.drafts(type).then((r) => setRows(r.data)).catch((e) => setErr((e as Error).message));
+  }, [type]);
+  useEffect(() => { load(); }, [load]);
+
+  async function copy(d: EmailStudioDraft) {
+    try { await navigator.clipboard.writeText(`Subject: ${d.subject || ""}\n\n${d.body}`); setCopiedId(d.id); setTimeout(() => setCopiedId(null), 1500); } catch { /* clipboard blocked */ }
+  }
+
+  return (
+    <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4 space-y-3">
+      <div className="flex items-start justify-between gap-2 flex-wrap">
+        <div>
+          <div className="font-medium text-slate-900 flex items-center gap-1.5"><History className="h-4 w-4 text-violet-600" /> Emails reps drafted</div>
+          <div className="text-xs text-slate-500">Every group email to a {type === "carrier_group" ? "carrier" : "customer"}, as the AI wrote it (before any edits by the rep). Previews from this page aren't listed.</div>
+        </div>
+        <button onClick={load} className="text-xs px-2 py-1 rounded ring-1 ring-slate-200 hover:bg-slate-50">Refresh</button>
+      </div>
+      {err ? <div className="text-sm text-rose-700">{err}</div> : null}
+      {!rows && !err ? <div className="text-xs text-slate-400">Loading…</div> : null}
+      {rows && !rows.length ? <div className="text-sm text-slate-500">None yet. They appear here once someone drafts a group email from Tasks.</div> : null}
+      {rows?.length ? (
+        <ul className="divide-y divide-slate-100 rounded-xl ring-1 ring-slate-100">
+          {rows.map((d) => {
+            const open = openId === d.id;
+            return (
+              <li key={d.id}>
+                <button onClick={() => setOpenId(open ? null : d.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 flex items-start gap-2">
+                  {open ? <ChevronDown className="h-4 w-4 text-slate-400 mt-0.5 shrink-0" /> : <ChevronRight className="h-4 w-4 text-slate-400 mt-0.5 shrink-0" />}
+                  <span className="min-w-0 flex-1">
+                    <span className="text-sm font-medium text-slate-900">{d.recipient || "(no recipient)"}</span>
+                    {d.count ? <span className="text-xs text-slate-500"> · {d.count} shipment{d.count === 1 ? "" : "s"}</span> : null}
+                    {d.tone ? <span className="ml-1.5 text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600">{d.tone}</span> : null}
+                    {d.rating === "up" ? <ThumbsUp className="inline h-3.5 w-3.5 ml-1.5 text-emerald-600" /> : d.rating === "down" ? <ThumbsDown className="inline h-3.5 w-3.5 ml-1.5 text-rose-600" /> : null}
+                    <span className="block text-xs text-slate-600 truncate">{d.subject || "(no subject)"}</span>
+                  </span>
+                  <span className="text-[11px] text-slate-400 shrink-0 text-right">
+                    {fmtRelative(d.created_at)}<br />{d.by || "—"}
+                  </span>
+                </button>
+                {open ? (
+                  <div className="px-3 pb-3 pl-9 space-y-2">
+                    <pre className="text-sm whitespace-pre-wrap font-sans text-slate-800 bg-slate-50 ring-1 ring-slate-200 rounded-lg p-3 max-h-96 overflow-auto">{d.body}</pre>
+                    <div className="flex items-center gap-3 text-xs text-slate-500 flex-wrap">
+                      <button onClick={() => copy(d)} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-900 text-white hover:bg-slate-800"><Copy className="h-3 w-3" /> {copiedId === d.id ? "Copied" : "Copy"}</button>
+                      {d.model ? <span>{d.model}</span> : null}
+                      {d.rating_reason ? <span className="italic">“{d.rating_reason}”</span> : null}
+                    </div>
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function ModelPicker({ value, savedValue, shared, onChange }: {
   value: string; savedValue: string; shared: boolean; onChange: (v: string) => void;
 }) {
@@ -275,7 +482,7 @@ function PreviewPanel({ email, overrides }: { email: EmailDef; overrides: Record
   const inGroup = relevant.filter((s) => !group || (byCarrier ? s.carrier : s.customer) === group);
 
   function toggle(tn: string) {
-    setPicked((p) => email.group ? (p.includes(tn) ? p.filter((x) => x !== tn) : [...p, tn].slice(0, 12)) : [tn]);
+    setPicked((p) => email.group ? (p.includes(tn) ? p.filter((x) => x !== tn) : [...p, tn].slice(0, 60)) : [tn]);
   }
 
   async function run() {
@@ -305,7 +512,7 @@ function PreviewPanel({ email, overrides }: { email: EmailDef; overrides: Record
               <option value="">{byCarrier ? "All carriers" : "All customers"}</option>
               {groups.map(([g, n]) => <option key={g} value={g}>{g} ({n})</option>)}
             </select>
-            <span className="text-xs text-slate-500">{email.group ? "Pick up to 12 shipments (same " + (byCarrier ? "carrier" : "customer") + " works best)" : "Pick one shipment"}</span>
+            <span className="text-xs text-slate-500">{email.group ? "Pick up to 60 shipments (same " + (byCarrier ? "carrier" : "customer") + " works best)" : "Pick one shipment"}</span>
           </div>
           <div className="max-h-56 overflow-auto rounded-lg ring-1 ring-slate-100 divide-y divide-slate-100">
             {inGroup.slice(0, 80).map((s) => (

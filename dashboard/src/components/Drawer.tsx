@@ -12,9 +12,16 @@ interface Props {
   // already filling the area to the left of the drawer; rendering a backdrop
   // on top of it would dim the iframe.
   suppressBackdrop?: boolean;
+  // Small label above the title (defaults to "Details").
+  eyebrow?: string;
+  // Rendered to the left of the close button (e.g. prev / next walker).
+  headerActions?: ReactNode;
+  // Rendered inside the fixed header, below the title row, so it stays
+  // pinned while the body scrolls (key facts, toolbar, tab bar).
+  headerExtra?: ReactNode;
 }
 
-export function Drawer({ open, onClose, title, subtitle, children, suppressBackdrop }: Props) {
+export function Drawer({ open, onClose, title, subtitle, children, suppressBackdrop, eyebrow = "Details", headerActions, headerExtra }: Props) {
   // Esc closes the drawer — matches every other modal/dialog in the
   // dashboard. Listener is only attached while open so background drawers
   // don't intercept esc when something else has focus.
@@ -39,20 +46,26 @@ export function Drawer({ open, onClose, title, subtitle, children, suppressBackd
         // wrapped or the title got long enough to push to a second line.
         className={`fixed top-0 right-0 z-30 h-full w-full sm:w-[720px] bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col transform transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}
       >
-        <div className="shrink-0 flex items-start justify-between px-6 pt-5 pb-4 border-b border-slate-200">
-          <div className="min-w-0">
-            <div className="text-xs font-medium text-slate-500 uppercase tracking-wide">Details</div>
-            <h2 className="text-lg font-semibold truncate">{title}</h2>
-            {subtitle ? <div className="text-sm text-slate-500 truncate">{subtitle}</div> : null}
+        <div className="shrink-0 border-b border-slate-200">
+          <div className={"flex items-start justify-between gap-3 px-6 pt-5 " + (headerExtra ? "pb-3" : "pb-4")}>
+            <div className="min-w-0">
+              <div className="text-xs font-medium text-slate-500 uppercase tracking-wide">{eyebrow}</div>
+              <h2 className="text-lg font-semibold truncate">{title}</h2>
+              {subtitle ? <div className="text-sm text-slate-500 truncate">{subtitle}</div> : null}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {headerActions}
+              <button
+                onClick={onClose}
+                className="h-9 w-9 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 shrink-0"
+                aria-label="Close"
+                title="Close (Esc)"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
           </div>
-          <button
-            onClick={onClose}
-            className="h-9 w-9 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 shrink-0"
-            aria-label="Close"
-            title="Close (Esc)"
-          >
-            <X className="h-5 w-5" />
-          </button>
+          {headerExtra ? <div className="px-6">{headerExtra}</div> : null}
         </div>
         <div className="flex-1 overflow-y-auto p-6">{children}</div>
       </aside>

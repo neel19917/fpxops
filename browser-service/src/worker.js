@@ -27,14 +27,210 @@ let currentPage = null; // the window the running scrape is driving
 const LOG_CAP = 5000;  // kept in memory; /stats only ships the tail
 const LOG_TAIL = 400;
 
-// Timestamped log for the dashboard's live log panel. Also mirrors the latest
-// line into current.status (the one-line summary).
-function logLine(text, level = "info") {
+// ── Scrape log convention (the Scraping page and the saved run logs rely on it) ──
+//
+// An entry is { t: ISO time, level, text } — nothing else goes over the wire
+// (/stats tail, GET /scrape/log and the saved run log as "t\tlevel\ttext").
+//
+// level   meaning                                   text starts with
+// ─────   ───────────────────────────────────────   ─────────────────────────────
+// data    one shipment scraped in full              "Scraped <tracking #> · "
+// warn    one shipment saved from the grid only     "Scraped <tracking #> · … · grid data only (<why>)"
+// info    page progress                             "Page <n> of <N> · "
+// warn    a page or setup step needs a look         "Page <n> of <N> · …" or the extension's own sentence
+// done    rows confirmed by the dashboard API       "Saved <n> shipment(s)" / "Archived <n> …"
+// error   an upload or the whole run failed         "Upload failed" / "Archive step failed" / "Failed: "
+// done    last line of a good run                   "Finished: "
+// info    everything else (start-up, filters)       free text
+//
+// So: level "data" is the per-shipment detail (hide it for a short log), and
+// warn + error are everything that needs attention. Fields inside a line are
+// always separated by " · ". `t` on a "Scraped" line is when that shipment
+// was finished, not when its page was uploaded, and entries stay in time order.
+//
+// The extension's per-row steps ("Processing 3 of 40 — …", "Clicked …",
+// "Scraping modal data …", "Done …") are NOT logged: they only drive the
+// one-line live status. At four lines a shipment they filled the 5,000-line
+// cap on a 1,000-shipment run and pushed the start of the log out.
+//
+// `at` backdates an entry (ms); it is slotted in by time and leaves the
+// one-line status alone.
+function logLine(text, level = "info", at = null) {
   if (!current || !text) return;
-  const t = new Date().toISOString();
-  current.log.push({ t, text: String(text).slice(0, 500), level });
+  const now = new Date().toISOString();
+  const t = at ? new Date(at).toISOString() : now;
+  const entry = { t, text: String(text).slice(0, 500), level };
+  let i = current.log.length;
+  if (at) while (i > 0 && current.log[i - 1].t > t) i--;
+  current.log.splice(i, 0, entry);
   if (current.log.length > LOG_CAP) current.log.splice(0, current.log.length - LOG_CAP);
-  if (level !== "data" && (!stopFlag || level !== "info")) { current.status = String(text).slice(0, 500); current.statusAt = t; }
+  if (!at && level !== "data" && (!stopFlag || level !== "info")) { current.status = entry.text; current.statusAt = now; }
+}
+
+// One scraped row → the few fields an operator recognises. Runs INSIDE the
+// extension's service worker (injected with toString), so it must not use
+// anything outside its own body.
+//
+// Keys are matched by exact name, not by pattern. Pattern matching is what
+// printed "18192" on every line: /customer|company/ hit FreightPOP's
+// "CompanyId" (the id of the FPX account itself, identical on every
+// shipment) before the real customer in "Company Name". "CompanyName" is
+// likewise the account ("FreightPOP Inc"), not the customer.
+export function summarizeRow(row) {
+  const byKey = {};
+  for (const k of Object.keys(row || {})) {
+    if (k.charAt(0) === "_") continue;
+    const v = row[k] == null ? "" : String(row[k]).replace(/\s+/g, " ").trim();
+    // A value ending in ":" is the next label on the modal ("Ship Date:"),
+    // scraped because the real value cell was empty.
+    if (v && !/:$/.test(v)) byKey[k.toLowerCase()] = v;
+  }
+  const first = (names) => {
+    for (const n of names) if (byKey[n]) return byKey[n].slice(0, 40);
+    return null;
+  };
+  const date = (names) => {
+    for (const n of names) {
+      const v = byKey[n];
+      if (!v) continue;
+      const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(v);
+      if (iso) return `${+iso[2]}/${+iso[3]}/${iso[1]}`;
+      const us = /^\d{1,2}\/\d{1,2}\/\d{2,4}/.exec(v);
+      if (us) return us[0];
+    }
+    return null;
+  };
+  const partial = !!(row && (row._partial || row._error));
+  return {
+    tn: String((row && row._trackingNumber) || "?"),
+    status: first(["shipment status", "current status", "lastupdatedstatus", "status"]),
+    carrier: first(["carrier name", "carrier"]),
+    customer: first(["customer name", "customer", "company name", "brokerspotquotecustomername"]),
+    eta: date(["updated eta", "estimated delivery date", "eta", "original eta"]),
+    delivered: date(["delivery date", "delivered date"]),
+    partial,
+    why: partial ? String((row && row._error) || "partial").slice(0, 80) : null,
+  };
+}
+
+// "Scraped FRTPOP-1 · Issue · carrier BIG O TRANS INC · customer Clark Pacific · ETA 10/16/2026"
+export function formatRow(r) {
+  return [
+    `Scraped ${r.tn}`,
+    r.status,
+    r.carrier && `carrier ${r.carrier}`,
+    r.customer && `customer ${r.customer}`,
+    r.delivered ? `delivered ${r.delivered}` : r.eta && `ETA ${r.eta}`,
+    r.partial && `grid data only (${r.why || "partial"})`,
+  ].filter(Boolean).join(" · ");
+}
+
+// Extension status sentences that mean something went wrong but the run goes on.
+const WARN_STATUS = /^(Server offline|Server check failed|Couldn't limit the grid|Starting from grid page|Could not read the grid|Page \d+ hit an error|Filter popup did not open|Could not set |Running in the background)|filter icon not found/;
+// Per-row steps: live status only, never logged (see the convention above).
+const ROW_STEP = /^(Processing \d+ of \d+ — |Clicked .+ — waiting for modal|Scraping modal data for )/;
+// A row the extension finished, with or without modal data. The outcome is
+// logged once, by that row's "Scraped" line.
+const ROW_END = /^(Done .+ — closing modal|Timeout on |Error on |Row .+ left the grid)/;
+// Said again by the page summary, or (the "Checking for next page" one) also
+// printed after the last page.
+const REDUNDANT = /^(Page \d+ done\. Checking for next page|Page done — \d+ of \d+ row\(s\) recorded with grid data only|No tracking links found on this page)/;
+
+// How many pages the sweep has, from the grid pager ("41 - 80 of 1074 items")
+// while the extension is on its page `n`. Null when it can't be told.
+export function pagesFrom(pager, n) {
+  if (!pager || !pager.total || pager.from == null || pager.to == null) return null;
+  if (pager.to >= pager.total) return pager.from === 1 ? 1 : n; // on the last page
+  const per = pager.to - pager.from + 1;
+  if (per <= 0 || Math.floor((pager.from - 1) / per) + 1 !== n) return null; // sweep didn't start on page 1
+  return Math.ceil(pager.total / per);
+}
+
+// Turns what the extension reports (status sentences, uploaded rows, API
+// replies) into log entries that follow the convention above. Pure — the
+// caller applies the returned lines and count changes.
+//   ingest(event) → { lines: [{ text, level, at? }], counts: {…deltas}, pageStart: n | null }
+export function createScrapeLog() {
+  let page = null;    // the extension's page counter
+  let pages = null;   // total pages, when the pager could be read
+  let held = null;    // "Page n done — uploading m row(s)" waiting for its rows
+  const label = () => (page ? `Page ${page}${pages ? ` of ${pages}` : ""}` : "Page ?");
+
+  const flushHeld = (lines) => {
+    if (!held) return;
+    // Rows were scraped but none reached the uploader. (An empty page has
+    // already said so on its "0 shipment(s) to scrape" line.)
+    if (held.rows > 0) lines.push({ level: "warn", text: `${held.label} · ${held.rows} scraped · none uploaded (no usable tracking number)` });
+    held = null;
+  };
+
+  function ingest(l) {
+    const lines = [];
+    const counts = {};
+    const add = (k, n = 1) => { counts[k] = (counts[k] || 0) + n; };
+    let pageStart = null;
+
+    if (l.kind === "rows") {
+      const rows = Array.isArray(l.rows) ? l.rows : [];
+      const byStatus = new Map();
+      let partial = 0;
+      for (const r of rows) {
+        lines.push({ level: r.partial ? "warn" : "data", text: formatRow(r), at: r.t || null });
+        add("scraped");
+        if (r.partial) { partial++; add("partial"); }
+        if (r.status) byStatus.set(r.status, (byStatus.get(r.status) || 0) + 1);
+      }
+      const top = [...byStatus].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([s, n]) => `${s} ${n}`).join(", ");
+      lines.push({
+        level: partial ? "warn" : "info",
+        text: `${held ? held.label : label()} · ${rows.length} scraped` + (partial ? ` · ${partial} grid data only` : "") + (top ? ` · ${top}` : "") + " · uploading",
+      });
+      held = null;
+      return { lines, counts, pageStart };
+    }
+
+    if (l.kind !== "status") {
+      // API replies, already worded and levelled where the fetch is wrapped.
+      // (An earlier page's reply can land between a page's "uploading" status
+      // and its rows, so `held` is left alone here.)
+      if (l.kind === "saved") { add("saved", l.n || 0); add("changed", l.changed || 0); }
+      else if (l.kind === "uploadError") add("uploadErrors");
+      else if (l.kind === "archived") add("archived", l.n || 0);
+      if (l.text) lines.push({ level: l.level || "info", text: l.text });
+      return { lines, counts, pageStart };
+    }
+
+    const text = String(l.text || "");
+    if (ROW_STEP.test(text)) return { lines, counts, pageStart };
+    if (ROW_END.test(text)) { add("processed"); return { lines, counts, pageStart }; }
+    flushHeld(lines);
+    let m;
+    if ((m = /^Processing page (\d+)/.exec(text))) {
+      page = Number(m[1]); pageStart = page;
+    } else if ((m = /^Found (\d+) tracking link\(s\) on this page(?: \((\d+) row\(s\) skipped)?/.exec(text))) {
+      const noPickup = /Pickup Response header not found/.test(text);
+      lines.push({
+        level: m[2] || noPickup || m[1] === "0" ? "warn" : "info",
+        text: `${label()} · ${m[1]} shipment(s) to scrape` +
+          (m[2] ? ` · ${m[2]} row(s) skipped (duplicate or no tracking number)` : "") +
+          (noPickup ? " · Pickup Response column not found" : ""),
+      });
+    } else if ((m = /^Page (\d+) done — uploading (\d+) row/.exec(text))) {
+      page = Number(m[1]);
+      held = { label: label(), rows: Number(m[2]) };
+    } else if (!REDUNDANT.test(text) && text) {
+      lines.push({ level: WARN_STATUS.test(text) ? "warn" : "info", text });
+    }
+    return { lines, counts, pageStart };
+  }
+
+  return {
+    ingest,
+    // A pager that can't be read keeps the last known total.
+    setPages(n) { if (n) pages = n; else if (pages && page > pages) pages = null; },
+    // End of the run: nothing may stay held back.
+    finish() { const lines = []; flushHeld(lines); return lines; },
+  };
 }
 
 // The live scrape window, for read-only watching from the dashboard. Only the
@@ -229,6 +425,8 @@ async function runIn(browser, url, who, modes = null) {
     self.__fpxDone = null;
     self.__fpxStatus = null;
     self.__fpxLog = [];
+    self.__fpxRow = null;
+    self.__fpxRowAt = {};
     const push = (e) => {
       (self.__fpxLog ||= []).push({ t: Date.now(), ...e });
       if (self.__fpxLog.length > 2000) self.__fpxLog.splice(0, self.__fpxLog.length - 2000);
@@ -271,35 +469,33 @@ async function runIn(browser, url, who, modes = null) {
     chrome.runtime.onMessage.addListener((msg) => {
       if (msg?.type === "status") {
         self.__fpxStatus = msg.text;
-        self.__fpxPush?.({ text: msg.text });
+        // Note when each row finishes, so its "Scraped" line (built at upload
+        // time, a page later) can carry the time the row was actually done.
+        const text = String(msg.text || "");
+        const row = /^Processing \d+ of \d+ — (.+)$/.exec(text);
+        if (row) self.__fpxRow = row[1];
+        else if (self.__fpxRow && /^(Done |Timeout on |Error on |Row .+ left the grid)/.test(text)) {
+          (self.__fpxRowAt ||= {})[self.__fpxRow] = Date.now();
+          self.__fpxRow = null;
+        }
+        self.__fpxPush?.({ kind: "status", text });
       }
       if (msg?.type === "upsertShipmentsBulk" && Array.isArray(msg.rows)) {
-        // One line per scraped shipment: tracking # + the most useful fields.
-        const pick = (row, re) => {
-          for (const [k, v] of Object.entries(row)) {
-            if (!k.startsWith("_") && re.test(k) && v != null && String(v).trim()) return String(v).trim().slice(0, 60);
-          }
-          return null;
-        };
-        for (const row of msg.rows) {
-          const tn = row?._trackingNumber || "?";
-          const bits = [
-            pick(row, /status/i),
-            pick(row, /carrier/i),
-            pick(row, /customer|company|consignee/i),
-            pick(row, /eta|delivery.?date|estimated/i),
-          ].filter(Boolean);
-          const partial = row?._partial || row?._error;
-          self.__fpxPush?.({
-            kind: "scraped", level: partial ? "warn" : "data", partial: !!partial,
-            text: `Scraped ${tn}` + (bits.length ? ` — ${bits.join(" · ")}` : "") + (partial ? ` (grid data only: ${row._error || "partial"})` : ""),
-          });
-        }
-        self.__fpxPush?.({ text: `Uploading ${msg.rows.length} shipment(s)…` });
+        const at = self.__fpxRowAt || {};
+        const rows = msg.rows.map((raw) => {
+          const r = self.__fpxSummarize(raw);
+          r.t = at[r.tn] || null;
+          delete at[r.tn];
+          return r;
+        });
+        self.__fpxPush?.({ kind: "rows", rows });
       }
       if (msg?.type === "complete") self.__fpxDone = msg.text || "Done.";
     });
   });
+
+  await worker.evaluate(`self.__fpxSummarize = ${summarizeRow.toString()}; true`);
+  const scrapeLog = createScrapeLog();
 
   clearAuthExpired(who);
   const page = await openWindowPage(browser, url);
@@ -352,15 +548,16 @@ async function runIn(browser, url, who, modes = null) {
         done: self.__fpxDone, status: self.__fpxStatus, lines: (self.__fpxLog || []).splice(0),
       }));
       for (const l of lines) {
-        logLine(l.text, l.level || "info");
+        const got = scrapeLog.ingest(l);
+        // A new page: re-read the pager so its lines can say "Page 3 of 27".
+        if (got.pageStart) {
+          const pager = await readPager(page);
+          if (current && pager?.total != null) current.total = pager.total;
+          scrapeLog.setPages(pagesFrom(pager, got.pageStart));
+        }
+        for (const o of got.lines) logLine(o.text, o.level, o.at);
         const c = current?.counts;
-        if (!c) continue;
-        // One per row the extension finished (with or without modal data).
-        if (!l.kind && /^(Done |Timeout on |Row \S+ left the grid)/.test(l.text || "")) c.processed++;
-        if (l.kind === "scraped") { c.scraped++; if (l.partial) c.partial++; }
-        else if (l.kind === "saved") { c.saved += l.n || 0; c.changed += l.changed || 0; }
-        else if (l.kind === "uploadError") c.uploadErrors++;
-        else if (l.kind === "archived") c.archived += l.n || 0;
+        if (c) for (const [k, n] of Object.entries(got.counts)) c[k] = (c[k] || 0) + n;
       }
       if (status && status !== lastStatus) {
         lastStatus = status;
@@ -368,6 +565,7 @@ async function runIn(browser, url, who, modes = null) {
         if (current && !stopFlag) { current.status = status; current.statusAt = new Date().toISOString(); }
       }
       if (done) {
+        for (const o of scrapeLog.finish()) logLine(o.text, o.level);
         // The run's "after" snapshot of FreightPOP's dashboard totals.
         const end = await readDashboardCounts(page);
         if (current && end) { noteCounts(end); current.fpAfter = { ...end, at: new Date().toISOString() }; }
@@ -455,18 +653,28 @@ async function readDashboardCounts(page) {
   } catch { return null; }
 }
 
-// Total shipments in the Kendo grid, from its pager ("1 - 10 of 659 items").
-// Read in the page's main world — the pager is plain DOM. Null if not found.
-async function readGridTotal(page) {
+// The Kendo grid's pager ("41 - 80 of 1074 items") as { from, to, total };
+// from/to are null when only the total is shown. Read in the page's main
+// world — the pager is plain DOM. Null if not found.
+async function readPager(page) {
   try {
     return await page.evaluate(() => {
+      const num = (s) => Number(String(s).replace(/,/g, ""));
       const els = [...document.querySelectorAll(".k-pager-info, .k-pager .k-label, [class*='pager-info']")];
       for (const el of els) {
-        const m = /of\s+([\d,]+)\s+items?/i.exec(el.textContent || "");
-        if (m) return Number(m[1].replace(/,/g, ""));
+        const t = el.textContent || "";
+        const r = /([\d,]+)\s*-\s*([\d,]+)\s+of\s+([\d,]+)\s+items?/i.exec(t);
+        if (r) return { from: num(r[1]), to: num(r[2]), total: num(r[3]) };
+        const m = /of\s+([\d,]+)\s+items?/i.exec(t);
+        if (m) return { from: null, to: null, total: num(m[1]) };
       }
-      if (/no items to display/i.test(document.querySelector(".k-pager-info")?.textContent || "")) return 0;
+      if (/no items to display/i.test(document.querySelector(".k-pager-info")?.textContent || "")) return { from: null, to: null, total: 0 };
       return null;
     });
   } catch { return null; }
+}
+
+// Total shipments in the grid, from the pager. Null if not found.
+async function readGridTotal(page) {
+  return (await readPager(page))?.total ?? null;
 }

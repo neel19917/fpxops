@@ -117,9 +117,8 @@ async function handleApi(req, res, url, who) {
       if (userStatus(email).busy) return json(res, 409, { error: "A scrape is running in this browser — stop it first" });
       for (const s of [...sessions]) {
         if (s.who.email.toLowerCase() !== email) continue;
-        sessions.delete(s);
         try { s.ws.close(4011, "login reset"); } catch {}
-        await s.close();
+        await endSession(s, "login reset");
       }
       dropAllParked(email);
       await resetUserProfile(email);
@@ -322,6 +321,86 @@ async function verifyUserUncached(token) {
   } catch { return { email: "unknown", isAdmin }; }
 }
 
+// End a view exactly once: drop it from `sessions`, log why, close it. A view
+// can be ended from two places (evicted / login reset here, then the socket's
+// own "close" event a moment later); the second caller just gets the first
+// one's promise, so nothing is closed, counted or logged twice.
+const ending = new WeakMap(); // session -> promise of its close()
+function endSession(s, reason) {
+  const already = ending.get(s);
+  if (already) return already;
+  sessions.delete(s);
+  const kind = s.watchOnly ? "watch" : isPaused(s) ? "paused view" : "visible view";
+  console.log(`[ws] session closed for ${s.who.email} (${sessions.size} active): ${reason}, ${kind}`);
+  // Never wait forever on a stuck browser: the caller may hold the user's
+  // connection queue (see withUserLock).
+  const p = Promise.race([
+    Promise.resolve().then(() => s.close()).catch((e) => console.warn(`[ws] close failed for ${s.who.email}: ${e.message}`)),
+    new Promise((r) => { setTimeout(r, 10_000).unref(); }),
+  ]);
+  ending.set(s, p);
+  return p;
+}
+
+// Paused = the dashboard tab is hidden or its FreightPOP pane is closed
+// (client sent { type: "pause" }). Not set yet counts as visible.
+const isPaused = (s) => s.paused === true;
+
+// One connection at a time per person through "make room + register", so a
+// burst of tabs opening together can't each see a free slot and all get in.
+const userQueues = new Map(); // email -> end of that person's queue
+function withUserLock(email, fn) {
+  const run = (userQueues.get(email) || Promise.resolve()).then(fn);
+  const tail = run.catch(() => {});
+  userQueues.set(email, tail);
+  tail.then(() => { if (userQueues.get(email) === tail) userQueues.delete(email); });
+  return run;
+}
+
+function evict(old, why) {
+  try { old.ws.close(4009, "replaced by a newer tab"); } catch {}
+  return endSession(old, `evicted (${why})`);
+}
+
+// Make room for a new connection and register it. Returns the new session, or
+// null when the connection was refused or went away. Runs under withUserLock.
+async function admit(ws, who, target) {
+  const email = who.email.toLowerCase();
+  // `sessions` keeps connection order, so these are oldest first.
+  const myViews = () => [...sessions].filter((s) => s.who.email.toLowerCase() === email && !s.watchOnly);
+  // Gone while waiting in the queue: don't close anything on its behalf.
+  if (ws.readyState !== 1) return null;
+  // Tracking views: many allowed, but each person is capped. Over the cap, a
+  // paused (hidden) view goes first, oldest first; a visible one only when
+  // none is paused, oldest first. Never the new one — that's the tab they're
+  // looking at. Watching a scrape doesn't count and is never closed here.
+  if (target === "tab") {
+    const cap = Math.max(1, Number(config.maxTabsPerUser) || 1);
+    for (let views = myViews(); views.length >= cap; views = myViews()) {
+      await evict(views.find(isPaused) || views[0], `over ${cap} views per user`);
+    }
+  }
+  // Server full: take back this person's own paused views before refusing.
+  // (Their visible views, and other people's, are left alone.)
+  while (sessions.size >= config.maxSessions) {
+    const old = myViews().find(isPaused);
+    if (!old) break;
+    await evict(old, "server at its session limit");
+  }
+  // No awaits from here to sessions.add, so the checks hold across users too.
+  if (ws.readyState !== 1) return null;
+  if (resetting.has(email)) { ws.close(1013, "login reset in progress"); return null; }
+  if (sessions.size >= config.maxSessions) {
+    console.log(`[ws] refused ${who.email}: too many sessions (${sessions.size} active)`);
+    ws.close(4029, "too many sessions");
+    return null;
+  }
+  const session = new ViewerSession(ws, who, { target });
+  sessions.add(session);
+  console.log(`[ws] session opened for ${who.email} (${sessions.size} active): ${target === "tab" ? `view ${myViews().length} of this user's` : "watch"}`);
+  return session;
+}
+
 const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 64 * 1024 });
 
 wss.on("connection", (ws, req) => {
@@ -331,6 +410,7 @@ wss.on("connection", (ws, req) => {
     return;
   }
   let session = null;
+  let authing = false; // an auth message is being handled (ignore repeats)
   // First message must be { type: "auth", token }. Token in the first frame
   // (not the URL) keeps it out of proxy access logs.
   const authTimer = setTimeout(() => ws.close(4001, "auth timeout"), 10_000);
@@ -341,33 +421,24 @@ wss.on("connection", (ws, req) => {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     try {
       if (!session) {
-        if (msg.type !== "auth") return;
+        if (msg.type !== "auth" || authing) return;
+        authing = true;
         clearTimeout(authTimer);
-        const who = await verifyUser(msg.token, msg.devUser);
-        if (!who) { ws.close(4001, "unauthorized"); return; }
-        // Mid login-reset: have the client retry in a moment (normal backoff).
-        if (resetting.has(who.email.toLowerCase())) { ws.close(1013, "login reset in progress"); return; }
-        const target = msg.target === "scrape" ? "scrape" : "tab";
-        // Tracking views: many allowed, but each person is capped. Their
-        // OLDEST view is closed (not the new one — that's the tab they're
-        // looking at). Watching a scrape doesn't count.
-        if (target === "tab") {
-          const mine = [...sessions].filter((s) => s.who.email === who.email && !s.watchOnly);
-          mine.sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
-          while (mine.length >= config.maxTabsPerUser) {
-            const old = mine.shift();
-            try { old.ws.close(4009, "replaced by a newer tab"); } catch {}
-            sessions.delete(old);
-            await old.close();
-          }
+        try {
+          const who = await verifyUser(msg.token, msg.devUser);
+          if (!who) { ws.close(4001, "unauthorized"); return; }
+          // Mid login-reset: have the client retry in a moment (normal backoff).
+          if (resetting.has(who.email.toLowerCase())) { ws.close(1013, "login reset in progress"); return; }
+          const target = msg.target === "scrape" ? "scrape" : "tab";
+          // Per-user cap, server limit and registration: see admit().
+          session = await withUserLock(who.email.toLowerCase(), () => admit(ws, who, target));
+        } finally {
+          if (!session) authing = false;
         }
-        if (sessions.size >= config.maxSessions) { ws.close(4029, "too many sessions"); return; }
-        session = new ViewerSession(ws, who, { target });
-        sessions.add(session);
+        if (!session) return;
         if (msg.viewport) session.viewport = {
           width: msg.viewport.width || 1280, height: msg.viewport.height || 800, dpr: 1,
         };
-        console.log(`[ws] session opened for ${who.email} (${sessions.size} active)`);
         try {
           await session.start();
         } catch (e) {
@@ -383,13 +454,10 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", async () => {
+  ws.on("close", async (code, reason) => {
     clearTimeout(authTimer);
-    if (session) {
-      sessions.delete(session);
-      console.log(`[ws] session closed for ${session.who.email} (${sessions.size} active)`);
-      await session.close();
-    }
+    // Already ended (evicted, login reset) → endSession does nothing more.
+    if (session) await endSession(session, `socket closed ${code}${reason?.length ? ` "${reason}"` : ""}`);
   });
 });
 
