@@ -458,7 +458,7 @@ export const api = {
     // Several active tasks on one shipment for the same audience: the newest
     // stays, older ones are cancelled as superseded. Previews unless
     // dry_run is false. No task_ids / shipment_ids = the whole board.
-    v2Dedupe: (body: { dry_run?: boolean; task_ids?: string[]; shipment_ids?: string[] } = {}) =>
+    v2Dedupe: (body: { dry_run?: boolean; min_confidence?: number; task_ids?: string[]; shipment_ids?: string[] } = {}) =>
       request<DedupePlan>("/api/tasks/v2/dedupe", { method: "POST", body: JSON.stringify(body) }),
     // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
     // each task joined to its shipment so the Kanban panel can render
@@ -667,10 +667,16 @@ export interface DedupeTask {
   id: string; title: string; status: string; priority: string; assigned_to: string | null;
   created_at: string; email_queued_at: string | null; email_queued_by: string | null;
 }
+// An older task with how sure the check is that the newest one replaces it (0-100) and why.
+export type DedupeScored = DedupeTask & { confidence: number; reasons: string[] };
 // One shipment + audience with more than one active task.
 export interface DedupeGroup {
   shipment_id: string; tracking_number: string | null; audience: "carrier" | "customer";
-  keep: DedupeTask; supersede: DedupeTask[];
+  keep: DedupeTask; supersede: DedupeScored[];
+  // Older tasks scoring under the confidence floor: left alone.
+  held: DedupeScored[];
+  // Lowest score among this group's older tasks.
+  confidence: number;
   // The kept task takes over an older one's place in the email queue.
   carry_queue: boolean;
   // One of the older tasks is in progress.
@@ -678,6 +684,7 @@ export interface DedupeGroup {
 }
 export interface DedupePlan {
   dry_run: boolean; supersede_count: number; shipments: number;
+  min_confidence: number; held_count: number;
   groups: DedupeGroup[];
   // Present only when the changes were applied (dry_run false).
   result?: { superseded: number; carried_queue: number; failed: number; ids: string[] };

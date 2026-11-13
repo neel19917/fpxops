@@ -15,6 +15,7 @@
 // pattern as POST /tasks/v2/dismiss).
 
 import { isStorageRiskTitle } from "./storageRisk.js";
+import { isRedeliveryTitle } from "./redelivery.js";
 
 export const DEDUPE_ACTIVE = ["open", "in_progress", "blocked"];
 
@@ -67,8 +68,55 @@ function slim(t) {
   };
 }
 
-// Pure. Never mutates `tasks`.
-export function planDedupe(tasks) {
+// Confidence (0-100) that `older` really is replaced by `keep`, with the
+// reasons in plain words. Deterministic, no model call.
+//   high   ≥ 80  safe to replace without a person looking
+//   medium 50-79 probably a duplicate
+//   low    < 50  someone should look first
+export const CONFIDENCE_AUTO = 80;   // on task creation, only these are replaced
+export const CONFIDENCE_REVIEW = 50; // the clean-up command's default floor
+
+const STOP = new Set(["fpx", "should", "contact", "the", "to", "and", "a", "of", "for", "today", "immediately", "carrier", "customer", "followup", "redelivery", "attempt"]);
+function words(title) {
+  return new Set(String(title || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w)));
+}
+function similarity(a, b) {
+  const A = words(a), B = words(b);
+  if (!A.size || !B.size) return 0;
+  let both = 0;
+  for (const w of A) if (B.has(w)) both++;
+  return both / (A.size + B.size - both);
+}
+const kindOf = (title) => (isRedeliveryTitle(title) ? "redelivery" : "standard");
+
+export function dedupeConfidence(keep, older) {
+  let score = 55;
+  const reasons = [];
+  const sameKind = kindOf(keep.title) === kindOf(older.title);
+  if (sameKind) {
+    score += 30;
+    reasons.push(kindOf(keep.title) === "redelivery" ? "both are redelivery tasks; the newer attempt replaces the older" : "same kind of followup");
+  } else {
+    score += 10;
+    reasons.push("different kind of followup (redelivery vs general)");
+  }
+  const sim = similarity(keep.title, older.title);
+  score += Math.round(sim * 14);
+  if (sim >= 0.5) reasons.push("wording is very similar");
+  if (older.status === "in_progress" || older.status === "blocked") {
+    score -= 40;
+    reasons.push(older.status === "blocked" ? "the older task is blocked" : "the older task is in progress");
+  }
+  if (older.assigned_to && keep.assigned_to && older.assigned_to !== keep.assigned_to) {
+    score -= 15;
+    reasons.push("different owners");
+  }
+  return { confidence: Math.max(5, Math.min(99, score)), reasons };
+}
+
+// Pure. Never mutates `tasks`. Older tasks scoring below `minConfidence`
+// are left alone and listed under `held`.
+export function planDedupe(tasks, { minConfidence = 0 } = {}) {
   const byKey = new Map();
   for (const t of Array.isArray(tasks) ? tasks : []) {
     if (!t || !t.id || !t.shipment_id || t.archived_at) continue;
@@ -86,13 +134,18 @@ export function planDedupe(tasks) {
   for (const { shipment_id, audience, rows } of byKey.values()) {
     if (rows.length < 2) continue;
     const sorted = [...rows].sort(newestFirst);
-    const [keep, ...older] = sorted;
+    const [keep, ...all] = sorted;
+    const scored = all.map((r) => ({ r, ...dedupeConfidence(keep, r) }));
+    const withScore = (x) => ({ ...slim(x.r), confidence: x.confidence, reasons: x.reasons });
+    const older = scored.filter((x) => x.confidence >= minConfidence).map((x) => x.r);
     groups.push({
       shipment_id,
       tracking_number: sorted.map((r) => r.tracking_number).find(Boolean) ?? null,
       audience,
       keep: slim(keep),
-      supersede: older.map(slim),
+      supersede: scored.filter((x) => x.confidence >= minConfidence).map(withScore),
+      held: scored.filter((x) => x.confidence < minConfidence).map(withScore),
+      confidence: Math.min(...scored.map((x) => x.confidence)),
       carry_queue: !keep.email_queued_at && older.some((r) => r.email_queued_at),
       working: older.some((r) => r.status === "in_progress" || r.status === "blocked"),
     });
@@ -110,8 +163,10 @@ export function planDedupe(tasks) {
 
   return {
     groups,
+    min_confidence: minConfidence,
     supersede_count: groups.reduce((n, g) => n + g.supersede.length, 0),
-    shipments: Array.from(new Set(groups.map((g) => g.shipment_id))),
+    held_count: groups.reduce((n, g) => n + g.held.length, 0),
+    shipments: Array.from(new Set(groups.filter((g) => g.supersede.length).map((g) => g.shipment_id))),
   };
 }
 
@@ -195,7 +250,8 @@ export async function applyDedupe(supabase, plan, { who } = {}) {
       const now = fresh.get(s.id);
       if (!now) { if (readFailed) out.failed++; continue; }
       if (!DEDUPE_ACTIVE.includes(now.status)) continue; // closed in the meantime
-      const description = [now.description, note].filter(Boolean).join("\n\n");
+      const scored = Number.isFinite(s.confidence) ? note.replace(/\]$/, ` — confidence ${s.confidence}%]`) : note;
+      const description = [now.description, scored].filter(Boolean).join("\n\n");
       const { data, error } = await supabase.from(TABLE)
         .update({ status: "cancelled", description, completed_at: null, email_queued_at: null, email_queued_by: null })
         .eq("id", s.id)
@@ -244,10 +300,10 @@ export async function loadActiveForDedupe(supabase, { shipmentIds, taskIds } = {
 
 // Load → plan → apply for a set of shipments. For callers that just
 // created a task and want its older siblings out of the way.
-export async function supersedeOlderFor(supabase, shipmentIds, { who, dryRun = false } = {}) {
+export async function supersedeOlderFor(supabase, shipmentIds, { who, dryRun = false, minConfidence = CONFIDENCE_AUTO } = {}) {
   const ids = uniqStrings(shipmentIds);
   const tasks = ids.length ? await loadActiveForDedupe(supabase, { shipmentIds: ids }) : [];
-  const plan = planDedupe(tasks);
+  const plan = planDedupe(tasks, { minConfidence });
   if (dryRun) return { plan, result: null };
   const result = await applyDedupe(supabase, plan, { who });
   return { plan, result };

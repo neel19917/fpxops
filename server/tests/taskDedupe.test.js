@@ -118,7 +118,7 @@ test("a carrier + customer pair on one shipment is not a duplicate", () => {
     task({ title: "Carrier followup: Redelivery — re-attempt" }),
     task({ title: "Customer followup: Redelivery — notify customer" }),
   ]);
-  assert.deepEqual(plan, { groups: [], supersede_count: 0, shipments: [] });
+  assert.deepEqual(plan, { groups: [], min_confidence: 0, supersede_count: 0, held_count: 0, shipments: [] });
 });
 
 test("same audience on different shipments is not a duplicate", () => {
@@ -226,7 +226,7 @@ test("planDedupe does not mutate its input", () => {
   assert.deepEqual(input, snapshot);
   assert.deepEqual(input.map((t) => t.id), order);
   assert.notEqual(plan.groups[0].keep, input[1]);
-  assert.deepEqual(planDedupe(null), { groups: [], supersede_count: 0, shipments: [] });
+  assert.deepEqual(planDedupe(null), { groups: [], min_confidence: 0, supersede_count: 0, held_count: 0, shipments: [] });
 });
 
 test("applyDedupe cancels old tasks with a note, clears their queue, carries it to the keeper", async () => {
@@ -253,7 +253,7 @@ test("applyDedupe cancels old tasks with a note, clears their queue, carries it 
 
   const row = (id) => sb.db.find((r) => r.id === id);
   const today = new Date().toISOString().slice(0, 10);
-  const note = `[${today} superseded by newer task 99999999 — ops@fpx.com]`;
+  const note = `[${today} superseded by newer task 99999999 — ops@fpx.com — confidence 99%]`;
   assert.equal(row(old1.id).status, "cancelled");
   assert.equal(row(old1.id).description, `Original ask\n\n${note}`);
   assert.equal(row(old2.id).description, note);
@@ -315,7 +315,7 @@ test("applyDedupe counts a single-row failure and keeps going", async () => {
   assert.equal(result.failed, 1);
   assert.equal(result.superseded, 1);
   assert.deepEqual(result.ids, [good.id]);
-  assert.match(sb.db.find((r) => r.id === good.id).description, /— system\]$/);
+  assert.match(sb.db.find((r) => r.id === good.id).description, /— system — confidence \d+%\]$/);
 });
 
 test("applyDedupe with an empty plan does nothing", async () => {
@@ -391,4 +391,20 @@ test("storage-risk tasks are their own lane", async () => {
   assert.equal(plan.supersede_count, 1);
   assert.equal(plan.groups[0].keep.id, "b");
   assert.equal(plan.groups[0].supersede[0].id, "c");
+});
+
+test("confidence: same-kind open duplicate is high, in-progress older is low and held back", async () => {
+  const { planDedupe, dedupeConfidence, CONFIDENCE_AUTO } = await import("../lib/taskDedupe.js");
+  const mk = (id, title, created_at, status = "open") => ({ id, shipment_id: "s1", tracking_number: "T1", title, status, created_at });
+  const keep = mk("c", "Carrier followup: Redelivery — get a re-attempt date (attempt 3)", "2026-11-13T00:00:00Z");
+  const same = mk("b", "Carrier followup: Redelivery — get a re-attempt date (attempt 2)", "2026-11-12T00:00:00Z");
+  const working = mk("a", "Carrier followup: confirm pickup scan", "2026-11-11T00:00:00Z", "in_progress");
+  assert.ok(dedupeConfidence(keep, same).confidence >= CONFIDENCE_AUTO);
+  assert.ok(dedupeConfidence(keep, working).confidence < 50);
+  const plan = planDedupe([keep, same, working], { minConfidence: CONFIDENCE_AUTO });
+  assert.deepEqual(plan.groups[0].supersede.map((t) => t.id), ["b"]);
+  assert.deepEqual(plan.groups[0].held.map((t) => t.id), ["a"]);
+  assert.equal(plan.groups[0].working, false);
+  assert.equal(plan.held_count, 1);
+  assert.ok(plan.groups[0].held[0].reasons.length);
 });

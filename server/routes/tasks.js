@@ -9,7 +9,7 @@ import { loadBoard } from "../lib/taskBoard.js";
 import { collectDailyDigest, runDailySummary } from "../lib/dailySummary.js";
 import { resolveAssignee } from "../lib/people.js";
 import { getSettings } from "../lib/settings.js";
-import { taskAudience, planDedupe, applyDedupe, supersedeOlderFor, loadActiveForDedupe } from "../lib/taskDedupe.js";
+import { taskAudience, CONFIDENCE_REVIEW, planDedupe, applyDedupe, supersedeOlderFor, loadActiveForDedupe } from "../lib/taskDedupe.js";
 
 export const tasksRouter = Router();
 
@@ -631,7 +631,7 @@ tasksRouter.post("/v2/dismiss", async (req, res) => {
   res.json({ dismissed, skipped: ids.length - dismissed });
 });
 
-// POST /tasks/v2/dedupe  { dry_run?: boolean, task_ids?: string[], shipment_ids?: string[] }
+// POST /tasks/v2/dedupe  { dry_run?: boolean, min_confidence?: number, task_ids?: string[], shipment_ids?: string[] }
 // Newest task wins per shipment + audience (a carrier task and a customer
 // task on one shipment are not duplicates). Older active duplicates are
 // cancelled with a "superseded" note — tombstones, never deleted — and an
@@ -655,7 +655,12 @@ tasksRouter.post("/v2/dedupe", async (req, res) => {
       shipmentIds: shipmentIds || undefined,
       taskIds: taskIds || undefined,
     });
-    const plan = planDedupe(tasks);
+    // min_confidence 0-100: older tasks scoring below it are held back, not
+    // replaced. Default 50; send 0 to include everything.
+    const mc = Number(req.body?.min_confidence);
+    const minConfidence = Number.isFinite(mc) ? Math.max(0, Math.min(100, mc)) : CONFIDENCE_REVIEW;
+    const full = planDedupe(tasks, { minConfidence });
+    const plan = { ...full, shipments: full.shipments.length };
     if (dryRun) return res.json({ dry_run: true, ...plan });
 
     const result = await applyDedupe(supabase, plan, { who });
@@ -665,7 +670,8 @@ tasksRouter.post("/v2/dedupe", async (req, res) => {
       summary: `De-duped tasks: superseded ${result.superseded} older task(s) on ${shipmentCount} shipment(s)`,
       metadata: {
         count: result.superseded, ids: result.ids, carried_queue: result.carried_queue, failed: result.failed, skipped: result.skipped,
-        shipments: shipmentCount, disposition: "superseded",
+        shipments: shipmentCount, disposition: "superseded", min_confidence: minConfidence, held: plan.held_count,
+        confidence: Object.fromEntries(plan.groups.flatMap((g) => g.supersede.map((t) => [t.id, t.confidence]))),
         scope: { task_ids: taskIds, shipment_ids: shipmentIds },
       },
     });

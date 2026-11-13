@@ -4,7 +4,7 @@
 // user confirms. Nothing is deleted.
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, CopyMinus, Loader2, Mail, X } from "lucide-react";
-import { api, type DedupeGroup, type DedupePlan, type DedupeTask } from "../../lib/api";
+import { api, type DedupeGroup, type DedupePlan, type DedupeScored, type DedupeTask } from "../../lib/api";
 import type { TaskStatus } from "../../lib/types";
 import { fmtDateTime, fmtRelative } from "../../lib/format";
 import { Pill, STATUS_CLS, STATUS_LABEL, shortTitle } from "./shared";
@@ -27,16 +27,20 @@ export function DedupeDialog({ taskIds, onClose, onApplied }: {
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<NonNullable<DedupePlan["result"]> | null>(null);
   const alive = useRef(true);
+  // Off: older tasks the check is less than 50% sure about are left alone.
+  const [includeLow, setIncludeLow] = useState(false);
+  const floor = includeLow ? 0 : 50;
 
   useEffect(() => {
     alive.current = true;
-    api.tasks.v2Dedupe({ dry_run: true, ...scope })
+    setLoading(true);
+    api.tasks.v2Dedupe({ dry_run: true, min_confidence: floor, ...scope })
       .then((p) => { if (alive.current) setPlan(p); })
       .catch((e) => { if (alive.current) setError((e as Error).message || "Could not check for duplicates."); })
       .finally(() => { if (alive.current) setLoading(false); });
     return () => { alive.current = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [floor]);
 
   // Escape closes, except while the change is being saved.
   useEffect(() => {
@@ -52,7 +56,7 @@ export function DedupeDialog({ taskIds, onClose, onApplied }: {
     if (applying || !count) return;
     setApplying(true); setError(null);
     try {
-      const r = await api.tasks.v2Dedupe({ dry_run: false, ...scope });
+      const r = await api.tasks.v2Dedupe({ dry_run: false, min_confidence: floor, ...scope });
       const result = r.result ?? { superseded: r.supersede_count, carried_queue: 0, failed: 0, ids: r.groups.flatMap((g) => g.supersede.map((t) => t.id)) };
       onApplied({ superseded: result.superseded, ids: result.ids });
       if (alive.current) setDone(result);
@@ -97,7 +101,7 @@ export function DedupeDialog({ taskIds, onClose, onApplied }: {
 
               {error ? <div className="mb-3 rounded-lg bg-rose-50 ring-1 ring-rose-200 text-rose-800 text-sm px-3 py-2 break-words">{error}</div> : null}
 
-              {loading ? (
+              {loading && !plan ? (
                 <div className="py-10 text-center text-sm text-slate-500 inline-flex items-center justify-center gap-2 w-full"><Loader2 className="h-4 w-4 animate-spin" /> Checking {scoped ? "the selected tasks" : "the board"} for duplicates…</div>
               ) : plan && !groups.length ? (
                 <div className="py-8 text-center text-sm text-slate-600">
@@ -109,7 +113,13 @@ export function DedupeDialog({ taskIds, onClose, onApplied }: {
                   <p className="text-sm font-medium text-slate-900 mb-2">
                     {plural(count, "older task")} on {plural(plan.shipments, "shipment")} would be replaced by a newer one.
                   </p>
-                  <div className="space-y-2 pb-2">
+                  {plan.held_count || includeLow ? (
+                    <label className="flex items-start gap-2 text-sm text-slate-700 mb-2 cursor-pointer">
+                      <input type="checkbox" className="mt-0.5" checked={includeLow} disabled={loading || applying} onChange={(e) => setIncludeLow(e.target.checked)} />
+                      <span>{includeLow ? "Low-confidence tasks are included." : `${plural(plan.held_count, "older task")} left alone because the check is less than 50% sure.`} Tick to replace those too.</span>
+                    </label>
+                  ) : null}
+                  <div className={`space-y-2 pb-2 ${loading ? "opacity-50" : ""}`}>
                     {groups.map((g) => <GroupBlock key={`${g.shipment_id}:${g.audience}`} group={g} />)}
                   </div>
                 </>
@@ -148,18 +158,27 @@ function GroupBlock({ group: g }: { group: DedupeGroup }) {
       <div className="divide-y divide-slate-100">
         <TaskLine task={g.keep} kept />
         {g.supersede.map((t) => <TaskLine key={t.id} task={t} />)}
+        {(g.held ?? []).map((t) => <TaskLine key={t.id} task={t} held />)}
       </div>
     </div>
   );
 }
 
-function TaskLine({ task: t, kept = false }: { task: DedupeTask; kept?: boolean }) {
+// How sure the check is that the newest task replaces this one.
+function Confidence({ task: t }: { task: DedupeScored }) {
+  const c = t.confidence;
+  const cls = c >= 80 ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : c >= 50 ? "bg-amber-50 text-amber-800 ring-amber-200" : "bg-rose-50 text-rose-800 ring-rose-200";
+  return <span className="shrink-0" title={`${c >= 80 ? "High" : c >= 50 ? "Medium" : "Low"} confidence this is a duplicate: ${(t.reasons || []).join("; ")}`}><Pill cls={cls}>{c}%</Pill></span>;
+}
+
+function TaskLine({ task: t, kept = false, held = false }: { task: DedupeTask | DedupeScored; kept?: boolean; held?: boolean }) {
   const status = t.status as TaskStatus;
   return (
     <div className="flex items-center gap-2 px-3 py-2 text-sm">
-      <span className={`shrink-0 w-28 text-xs font-medium ${kept ? "text-emerald-700" : "text-slate-400"}`}>{kept ? "Keeping (newest)" : "Replaced"}</span>
-      <span className={`flex-1 min-w-0 truncate ${kept ? "text-slate-900" : "text-slate-400 line-through"}`} title={t.title}>{shortTitle(t.title) || t.title}</span>
+      <span className={`shrink-0 w-28 text-xs font-medium ${kept ? "text-emerald-700" : "text-slate-400"}`}>{kept ? "Keeping (newest)" : held ? "Left alone" : "Replaced"}</span>
+      <span className={`flex-1 min-w-0 truncate ${kept ? "text-slate-900" : held ? "text-slate-600" : "text-slate-400 line-through"}`} title={t.title}>{shortTitle(t.title) || t.title}</span>
       <span className={`shrink-0 text-xs ${kept ? "text-slate-500" : "text-slate-400"}`} title={`Created ${fmtDateTime(t.created_at)}`}>{fmtRelative(t.created_at)}</span>
+      {"confidence" in t ? <Confidence task={t} /> : null}
       <span className={`shrink-0 ${kept ? "" : "opacity-60"}`}><Pill cls={STATUS_CLS[status] ?? "bg-slate-100 text-slate-700 ring-slate-200"}>{STATUS_LABEL[status] ?? t.status}</Pill></span>
     </div>
   );
