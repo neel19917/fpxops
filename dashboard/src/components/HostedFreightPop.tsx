@@ -59,7 +59,9 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   onEnded?: (reason: string) => void;
   /** True while the pane is hidden: the service stops encoding frames. */
   paused?: boolean;
-}>(function HostedFreightPop({ onBridgeReady, onUrl, onSignedIn, target = "tab", onEnded, paused = false }, ref) {
+  /** The connection dropped: whatever was loaded in the view can no longer be assumed. */
+  onDisconnected?: () => void;
+}>(function HostedFreightPop({ onBridgeReady, onUrl, onSignedIn, target = "tab", onEnded, paused = false, onDisconnected }, ref) {
   const watchOnly = target === "scrape";
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -86,8 +88,11 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   const pausedRef = useRef(paused);
   const syncPause = useRef<() => void>(() => {});
   const lastPauseSent = useRef<boolean | null>(null); // per connection
-  const cbRef = useRef({ onBridgeReady, onUrl, onSignedIn, onEnded });
-  cbRef.current = { onBridgeReady, onUrl, onSignedIn, onEnded };
+  const cbRef = useRef({ onBridgeReady, onUrl, onSignedIn, onEnded, onDisconnected });
+  cbRef.current = { onBridgeReady, onUrl, onSignedIn, onEnded, onDisconnected };
+  // Set when the service closed this view to make room for a newer tab while
+  // this one was in the background; it reconnects when the tab is shown again.
+  const evictedRef = useRef(false);
 
   function send(obj: unknown) {
     const ws = wsRef.current;
@@ -164,6 +169,11 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         schedule();
         return;
       }
+      // The token wait can outlast this effect (unmount, StrictMode re-run)
+      // or the tab being looked at (flipping past it): don't open a socket
+      // nobody will close, or take a view for a tab that is hidden again.
+      if (disposed) return;
+      if (!watchOnly && document.visibilityState === "hidden") { connectWhenVisible(); return; }
       const wsUrl = HOSTED_BROWSER_URL.replace(/^http/, "ws") + "/ws";
       const ws = new WebSocket(wsUrl);
       ws.binaryType = "blob";
@@ -200,11 +210,16 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         } else if (m.type === "error" && m.error) setError(m.error);
       };
       ws.onclose = (ev) => {
-        if (wsRef.current === ws) wsRef.current = null;
+        const mine = wsRef.current === ws;
+        if (mine) wsRef.current = null;
+        // A socket that is no longer this view's (a newer one replaced it)
+        // must not report the live view as disconnected.
+        if (!mine && disposed) return;
         setTabs([]); setActiveTab("main");
         selKnownRef.current = false; selTextRef.current = "";
         cbRef.current.onBridgeReady?.(false);
-        for (const r of pendingRef.current.values()) r({ ok: false, error: "Hosted browser disconnected" });
+        cbRef.current.onDisconnected?.();
+        for (const r of pendingRef.current.values()) r({ ok: false, reason: "disconnected", error: "Hosted browser disconnected" });
         pendingRef.current.clear();
         if (disposed) return;
         if (ev.code === 4004) {
@@ -227,9 +242,15 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
         }
         if (ev.code === 4009) {
           // Too many of this user's tabs were open; this (older) one was closed.
-          // Don't auto-reconnect, or two tabs would keep evicting each other.
+          // Don't reconnect while hidden, or tabs would keep evicting each
+          // other. A background tab reconnects when the user comes back to it.
           setStatus("ended");
-          setError("FreightPOP is open in a newer tab. Reload this page to use it here.");
+          if (document.visibilityState === "hidden") {
+            evictedRef.current = true;
+            setError("FreightPOP moved to the tab you opened after this one. It reconnects when you come back here.");
+          } else {
+            setError("FreightPOP is open in a newer tab. Press Reconnect to use it here.");
+          }
           return;
         }
         if (ev.code === 4001 || ev.code === 4003) {
@@ -243,13 +264,41 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
       };
     }
 
+    // A person gets only a few hosted views at a time, and each new one closes
+    // their oldest. So a tab that loads in the background (e.g. "Open all in
+    // tabs") waits until it is actually looked at before taking a view;
+    // otherwise eight tabs opening at once knock each other out.
+    let onShown: (() => void) | null = null;
+    function stopWaiting() {
+      if (!onShown) return;
+      document.removeEventListener("visibilitychange", onShown);
+      window.removeEventListener("pageshow", onShown);
+      window.removeEventListener("focus", onShown);
+      onShown = null;
+    }
+    function connectWhenVisible() {
+      if (disposed) return;
+      if (watchOnly || document.visibilityState !== "hidden") { connect(); return; }
+      if (onShown) return;
+      onShown = () => {
+        if (document.visibilityState === "hidden" || !onShown) return;
+        stopWaiting();
+        connect();
+      };
+      // pageshow / focus cover a restore from the back-forward cache, where
+      // visibilitychange isn't guaranteed to fire.
+      document.addEventListener("visibilitychange", onShown);
+      window.addEventListener("pageshow", onShown);
+      window.addEventListener("focus", onShown);
+    }
+
     function schedule() {
       if (disposed) return;
       const delay = Math.min(15_000, 1000 * 2 ** attempt++);
-      retryTimer = setTimeout(connect, delay);
+      retryTimer = setTimeout(connectWhenVisible, delay);
     }
 
-    connect();
+    connectWhenVisible();
 
     // Keep the remote viewport matched to our box.
     const ro = new ResizeObserver(() => {
@@ -261,10 +310,23 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
     return () => {
       disposed = true;
       if (retryTimer) clearTimeout(retryTimer);
+      stopWaiting();
       ro.disconnect();
       wsRef.current?.close();
     };
   }, [target, reconnectKey]);
+
+  // Back on a tab whose view was given to a newer tab → take a view again.
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "hidden" || !evictedRef.current) return;
+      evictedRef.current = false;
+      setStatus("connecting"); setError(null);
+      setReconnectKey((k) => k + 1);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
 
   // Tell the service to stop/start streaming. Re-sent after every reconnect.
   useEffect(() => {

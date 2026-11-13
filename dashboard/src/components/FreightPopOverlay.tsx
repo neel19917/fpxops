@@ -221,7 +221,9 @@ export function FreightPopOverlay() {
       hostedRef.current?.bridge(p).then((ack) => {
         // A newer lookup replaced this one, or the user has already moved
         // on to another shipment — don't flash an old result.
-        if (ack.reason === "superseded") return;
+        // Nor a lookup cut off by the view disconnecting: it is sent again
+        // on reconnect, so "couldn't find this shipment" would be wrong.
+        if (ack.reason === "superseded" || ack.reason === "disconnected") return;
         if (tnForAck && frameRef.current.trackingNumber && frameRef.current.trackingNumber !== tnForAck) return;
         handleFilterAckRef.current({ ...ack, column: "Tracking Number", value: tnForAck });
       });
@@ -686,7 +688,10 @@ export function FreightPopOverlay() {
 
       <div className="flex-1 bg-white min-h-0">
         {hosted ? (
-          <HostedFreightPop ref={hostedRef} onBridgeReady={setBridgeReady} paused={!frame.visible} />
+          <HostedFreightPop ref={hostedRef} onBridgeReady={setBridgeReady} paused={!frame.visible}
+            // A reconnect can land on a hosted window that last showed a
+            // different shipment, so look this one up again once it's ready.
+            onDisconnected={() => { lastAutoFilteredKeyRef.current = null; }} />
         ) : (
           <iframe
             ref={iframeRef}

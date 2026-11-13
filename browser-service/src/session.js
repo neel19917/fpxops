@@ -33,6 +33,14 @@ const parked = new Map(); // email -> [{ page, lease, timer }]
 
 function park(email, page, lease) {
   const list = parked.get(email) || [];
+  // Never park one window twice: two entries for it would hand the same
+  // window to two connections, or let dropParked close it while in use.
+  const dup = list.find((e) => e.page === page);
+  if (dup) {
+    console.warn(`[ws] ${email}: window already parked — not parking it again`);
+    if (dup.lease !== lease) lease.release();
+    return;
+  }
   const entry = { page, lease };
   entry.timer = setTimeout(() => dropParked(email, entry), PARK_MS);
   list.push(entry);
@@ -81,14 +89,22 @@ function takeParked(email) {
 //   { type: "tab", action: "select"|"close"|"new", id }   // tabs: "main" or an id from the tabs list
 //   { type: "nav", action: "back"|"forward"|"reload"|"goto", url }
 //   { type: "bridge", id, payload: { type: "fpxFilter", column, value } | { type: "fpxOpenTracking", trackingNumber } }
+//   { type: "pause" } | { type: "resume" }       // stop / restart the picture (hidden tab, closed panel)
 //
 // Server → client:
 //   binary frames: JPEG screencast frames
-//   { type: "ready" } | { type: "url", url } | { type: "bridgeReady", ready }
+//   { type: "ready", watchOnly, resumed? }       // resumed: true = a kept window, still on whatever page
+//                                                // (and shipment popup) its last viewer left it on
+//   { type: "url", url } | { type: "bridgeReady", ready }
 //   { type: "bridgeAck", id, ack } | { type: "error", error }
 //   { type: "copyResult", id, text }
 //   { type: "selection", text }                  // what is selected now (for instant copy)
 //   { type: "tabs", active, tabs: [{ id, title, url, main }] }   // the FreightPOP tab + windows opened from it
+//   { type: "ended", reason }                    // followed by a close the dashboard does not retry (4004, 4010)
+//
+// Close codes sent from here: 4004 nothing to watch / scrape finished,
+// 4010 idle, 4012 the view's window closed (the dashboard reconnects, as it
+// does for any code it has no special case for).
 export class ViewerSession {
   // target "scrape": attach read-only to the user's running scrape window
   // instead of opening a new one. Input and viewport changes are ignored so a
@@ -102,6 +118,11 @@ export class ViewerSession {
     this.cdp = null;
     this.ext = null;
     this.closed = false;
+    // Read by index.js (read-only there): `paused` = the dashboard said this
+    // view is hidden, so no picture is being sent; `lastInputAt` = time (ms)
+    // of the last click / key / navigation / lookup, or of creation.
+    this.paused = false;
+    this.lastInputAt = Date.now();
     this.viewport = { width: 1280, height: 800, dpr: 1 };
     this.bridgeReadyLast = null;
     // Extra tabs next to the FreightPOP tab: windows FreightPOP opened
@@ -151,15 +172,45 @@ export class ViewerSession {
       this.sendTabs();
       // A page that isn't repainting sends no screencast frame, which would
       // leave the previous tab's picture on screen. Send one still now.
-      if (!this.paused) {
-        const cdp = this.vcdp;
-        const shot = await cdp.send("Page.captureScreenshot", { format: "jpeg", quality: setting("browser.stream_quality") }).catch(() => null);
-        if (shot?.data && cdp === this.vcdp && this.ws.readyState === 1) {
-          const buf = Buffer.from(shot.data, "base64");
-          countEgress(buf.length);
-          this.ws.send(buf, { binary: true });
-        }
-      }
+      // (Skipped while paused — resumeCast() sends it when the view is shown.)
+      await this.sendStill();
+    };
+    this.tabChain = (this.tabChain || Promise.resolve()).then(run, run);
+    return this.tabChain;
+  }
+
+  // One still picture of the tab on show, sent like a screencast frame.
+  // Chrome only produces screencast frames when the page repaints, so a page
+  // that is sitting still would otherwise leave the dashboard's canvas blank
+  // or showing an old picture after a tab switch, a resume or a reconnect.
+  async sendStill() {
+    const cdp = this.vcdp;
+    const open = () => !this.closed && !this.paused && cdp === this.vcdp && this.ws.readyState === 1 && this.ws.bufferedAmount < 2_000_000;
+    if (!cdp || !open()) return;
+    // Bounded: a screenshot of a window Chrome isn't drawing can take very
+    // long, and callers wait for this inside the tab queue.
+    let timer;
+    const shot = await Promise.race([
+      cdp.send("Page.captureScreenshot", { format: "jpeg", quality: setting("browser.stream_quality") }).catch(() => null),
+      new Promise((r) => { timer = setTimeout(r, 5000, null); }),
+    ]);
+    clearTimeout(timer);
+    if (!shot?.data || !open()) return;
+    const buf = Buffer.from(shot.data, "base64");
+    countEgress(buf.length);
+    this.ws.send(buf, { binary: true });
+  }
+
+  // The dashboard shows this view again after a pause: restart the stream
+  // and send a still at once (a tab that loaded in the background pauses
+  // right after "ready", so without the still its canvas stays blank until
+  // FreightPOP happens to repaint). Queued with tab switches so the cast and
+  // the still are for the tab that is on show when it runs.
+  resumeCast() {
+    const run = async () => {
+      if (this.closed || this.paused) return; // paused again meanwhile
+      await this.startCast().catch(() => {});
+      await this.sendStill();
     };
     this.tabChain = (this.tabChain || Promise.resolve()).then(run, run);
     return this.tabChain;
@@ -250,30 +301,58 @@ export class ViewerSession {
     return this.tabsSend;
   }
 
+  // close() can land while this is still waiting for the browser, the window
+  // or the page (the view was replaced by a newer tab, or the dashboard tab
+  // was closed). close() tears down what the session holds at that moment;
+  // every wait in here is followed by a `closed` check that gives back only
+  // what that wait returned and stops — otherwise this kept setting up, and
+  // navigating, a window nobody owns (or one already kept for the next viewer).
   async start() {
+    try { await this.open(); } catch (e) {
+      // Closed meanwhile: the step in flight failed because close() took the
+      // window away. Nothing to report, and close() has done the cleanup.
+      if (!this.closed) throw e;
+    }
+  }
+
+  async open() {
     this.startedAt = Date.now();
     if (this.watchOnly) {
       this.page = scrapePageFor(this.who.email);
       if (!this.page) { this.send({ type: "ended", reason: "No scrape is running in your browser" }); this.ws.close(4004, "no scrape"); return; }
-      this.page.once("close", () => { this.send({ type: "ended", reason: "Scrape finished" }); try { this.ws.close(4004, "scrape ended"); } catch {} });
+      this.onPageClose = () => { this.send({ type: "ended", reason: "Scrape finished" }); try { this.ws.close(4004, "scrape ended"); } catch {} };
+      // on(), not once(): puppeteer's once() wraps the handler, and close()
+      // could then not remove it.
+      this.page.on("close", this.onPageClose);
     } else {
       const resumed = takeParked(this.who.email);
       if (resumed) {
         this.lease = resumed.lease;
         this.page = resumed.page;
         this.resumed = true;
+        this.parkable = true;
       } else {
-        this.lease = await acquireUserBrowser(this.who.email);
-        if (this.closed) { this.lease.release(); return; }
-        this.page = await openWindowPage(this.lease.browser, null);
+        const lease = await acquireUserBrowser(this.who.email);
+        if (this.closed) { lease.release(); return; }
+        this.lease = lease;
+        const page = await openWindowPage(lease.browser, null);
+        // close() released the lease; this blank window is ours to close.
+        if (this.closed) { page.close().catch(() => {}); return; }
+        this.page = page;
       }
     }
+    // false = closed meanwhile (close() detaches this.cdp and deals with the page).
     const attach = async () => {
-      this.cdp = await this.page.createCDPSession();
+      const cdp = await this.page.createCDPSession();
+      if (this.closed) { cdp.detach().catch(() => {}); return false; }
+      this.cdp = cdp;
       this.ext = new ExtensionContexts(this.cdp);
       await this.ext.init();
+      return !this.closed;
     };
-    try { await attach(); } catch (e) {
+    try { if (!(await attach())) return; } catch (e) {
+      // Closed while attaching: that is why it failed — not a crashed window.
+      if (this.closed) return;
       // The window's page has crashed ("Target crashed") or gone. A kept
       // (parked) window in that state used to be handed back on every
       // reconnect, so the view never recovered. Replace it with a new one.
@@ -281,13 +360,31 @@ export class ViewerSession {
       console.warn(`[ws] ${this.who.email}: window unusable (${e.message}) → opening a new one`);
       this.page.close().catch(() => {});
       this.resumed = false;
+      this.parkable = false;
       this.crashed = true; // until the new window attaches, never park this
-      this.page = await openWindowPage(this.lease.browser, null);
-      await attach();
+      const page = await openWindowPage(this.lease.browser, null);
+      if (this.closed) { page.close().catch(() => {}); return; }
+      this.page = page;
+      if (!(await attach())) return;
       this.crashed = false;
     }
-    // Renderer crash while in use: don't keep this window for the next connection.
-    if (!this.watchOnly) this.page.on("error", (e) => { this.crashed = true; console.warn(`[ws] ${this.who.email}: page crashed (${e?.message || e})`); });
+    if (!this.watchOnly) {
+      // Renderer crash while in use: don't keep this window for the next connection.
+      this.onPageError = (e) => { this.crashed = true; console.warn(`[ws] ${this.who.email}: page crashed (${e?.message || e})`); };
+      this.page.on("error", this.onPageError);
+      // The window itself closed under a live view (FreightPOP closed it, or
+      // Chrome did). Frames just stopped and the dashboard sat on a frozen
+      // picture with the socket open. End the view with a code the dashboard
+      // has no special case for, so it reconnects and gets a new window.
+      this.onPageClose = () => {
+        if (this.closed) return;
+        this.pageGone = true; // nothing left to park (isClosed() is still false in this event)
+        console.warn(`[ws] ${this.who.email}: window closed under a live view → ending it`);
+        this.send({ type: "error", error: "The FreightPOP window closed — opening a new one…" });
+        try { this.ws.close(4012, "window closed"); } catch {}
+      };
+      this.page.on("close", this.onPageClose);
+    }
 
     this.attachCast(this.cdp);
     // Page-level listeners only on pages we own — a watcher must not change
@@ -342,7 +439,11 @@ export class ViewerSession {
     }
 
     if (!this.watchOnly) await this.applyViewport();
+    if (this.closed) return;
     await this.startCast();
+    // Checked before the timers and listeners below, which close() would
+    // otherwise never get to clear.
+    if (this.closed) return;
     // Admin changed picture quality / frame skipping → re-apply live.
     this.offSettings = onSettingsChange(() => { if (!this.paused && !this.closed) this.startCast().catch(() => {}); });
     // Close the view after N minutes without clicks/keys (admin setting; 0 = off).
@@ -357,15 +458,30 @@ export class ViewerSession {
         }
       }, 30_000);
     }
-    this.send({ type: "ready", watchOnly: this.watchOnly });
+    // `resumed` (optional; older dashboards ignore it): this is a kept
+    // window, so it may still show the shipment its previous viewer had open
+    // until this viewer's own lookup lands. It is not reloaded or reset here —
+    // a fast reconnect onto the same page is the point of keeping it — so
+    // the dashboard is told and can show its own "loading" state.
+    this.send({ type: "ready", watchOnly: this.watchOnly, ...(this.resumed ? { resumed: true } : {}) });
     this.sendTabs();
-    if (this.watchOnly || this.resumed) { this.send({ type: "url", url: this.page.url() }); return; }
+    if (this.watchOnly || this.resumed) {
+      this.send({ type: "url", url: this.page.url() });
+      // An already-loaded page may not repaint, so no frame would come.
+      this.sendStill().catch(() => {});
+      return;
+    }
     // Open on the user's dashboard so the shipment grid is there for
     // Filter / Open tracking (the bare site root lands elsewhere).
     // Signed out → FreightPOP's sign-in page. (The Broker dashboard draws its
     // menu bar when signed out, then crashes with a blank body.)
     const start = config.startUrl !== "https://app.freightpop.com/" ? config.startUrl
       : (await this.signedIn()) ? dashboardUrlFor(this.who.email) : SIGN_IN_URL;
+    if (this.closed) return;
+    // From here the window is worth keeping for the next connection. Before
+    // this it is a blank window, and a kept window is never navigated again,
+    // so parking it would leave the next viewer on an empty page.
+    this.parkable = true;
     await this.page.goto(start, { waitUntil: "domcontentloaded", timeout: 60_000 })
       .catch((e) => this.send({ type: "error", error: `Navigation failed: ${e.message}` }));
   }
@@ -377,6 +493,8 @@ export class ViewerSession {
   // active" to the user. Restart = stop, then start, one at a time.
   async startCast() {
     const run = async () => {
+      // Paused or closed while this was waiting its turn: stay stopped.
+      if (this.paused || this.closed) return;
       const cdp = this.vcdp;
       await cdp.send("Page.stopScreencast").catch(() => {});
       await cdp.send("Page.startScreencast", {
@@ -386,6 +504,14 @@ export class ViewerSession {
         maxWidth: this.viewport.width, maxHeight: this.viewport.height,
       }).catch((e) => { if (!/already active/i.test(e.message)) throw e; });
     };
+    this.castChain = (this.castChain || Promise.resolve()).then(run, run);
+    return this.castChain;
+  }
+
+  // Stop streaming. In the same queue as startCast, so a pause that arrives
+  // while a (re)start is in flight stops it afterwards instead of losing the race.
+  stopCast() {
+    const run = () => this.vcdp?.send("Page.stopScreencast").catch(() => {});
     this.castChain = (this.castChain || Promise.resolve()).then(run, run);
     return this.castChain;
   }
@@ -411,11 +537,11 @@ export class ViewerSession {
     if (this.closed) return;
     // Pause/resume apply to watchers too (closing the live view panel).
     if (this.cdp && msg.type === "pause") {
-      if (!this.paused) { this.paused = true; await this.vcdp.send("Page.stopScreencast").catch(() => {}); }
+      if (!this.paused) { this.paused = true; await this.stopCast(); }
       return;
     }
     if (this.cdp && msg.type === "resume") {
-      if (this.paused) { this.paused = false; await this.startCast(); }
+      if (this.paused) { this.paused = false; await this.resumeCast(); }
       return;
     }
     if (this.watchOnly) return; // read-only: no input, no resizing, no bridge
@@ -693,7 +819,16 @@ export class ViewerSession {
     return ack;
   }
 
-  async close() {
+  // Called more than once for one session: index.js closes a replaced view
+  // itself AND the socket's "close" event closes it again. Both get the same
+  // teardown — run twice, the second run parked the window a second time
+  // while the first was still waiting on Chrome.
+  close() {
+    if (!this.closing) this.closing = this.teardown();
+    return this.closing;
+  }
+
+  async teardown() {
     this.closed = true;
     clearInterval(this.readyTimer);
     clearInterval(this.idleTimer);
@@ -708,11 +843,16 @@ export class ViewerSession {
     try { await this.cdp?.send("Page.stopScreencast"); } catch {}
     try { await this.cdp?.detach(); } catch {}
     if (this.lease) recordSession(this.who.email, Date.now() - (this.startedAt || Date.now()));
+    // Also for a watcher: don't leave its listener on the scrape window.
+    if (this.page && this.onPageClose) this.page.off("close", this.onPageClose);
     if (this.ownsPage && this.page && this.lease) {
       if (this.onNav) this.page.off("framenavigated", this.onNav);
       this.offAuth?.();
       if (this.onPopup) this.page.off("popup", this.onPopup);
-      if (this.crashed) {
+      if (this.onPageError) this.page.off("error", this.onPageError);
+      // Crashed, already gone, or closed before start() got it onto a
+      // FreightPOP page (see `parkable`): not worth keeping.
+      if (this.crashed || this.pageGone || !this.parkable) {
         this.page.close().catch(() => {});
         this.lease.release();
       } else if (!this.page.isClosed() && this.lease.browser.connected) {
