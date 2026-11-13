@@ -3,7 +3,7 @@
 // recipient covering every shipment behind those tasks. A selection that
 // spans three carriers becomes three emails, listed in the left rail.
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Check, CheckCircle2, Copy, Flame, Handshake, Loader2, Mail, Play, Send, Sparkles, Target, X } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, Copy, ExternalLink, Flame, Link2, Handshake, Loader2, Mail, Play, Send, Sparkles, Target, X } from "lucide-react";
 import { api } from "../../lib/api";
 import type { TaskBoardRow } from "../../lib/types";
 import { isActive, shortTitle } from "./shared";
@@ -40,17 +40,23 @@ const nameFor = (r: TaskBoardRow, audience: EmailAudience) =>
   (audience === "carrier" ? (r.shipment?.carrier_name || r.shipment?.carrier || "") : (r.shipment?.customer_name || "")).trim();
 const ageDays = (iso: string) => Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 86_400_000));
 
-export function GroupEmailComposer({ rows, initialAudience, onClose, onTasksChanged }: {
+export function GroupEmailComposer({ rows, initialAudience, initialTo, onView, onClose, onTasksChanged }: {
   rows: TaskBoardRow[];
   initialAudience: EmailAudience;
+  // Recipient to show first (from a link or a group header).
+  initialTo?: string | null;
+  // Reports who the email is for and which recipient is showing, so the
+  // page can keep both in the URL.
+  onView?: (audience: EmailAudience, to: string | null) => void;
   onClose: () => void;
   // Called after tasks were moved to In progress, so the board can reload.
   onTasksChanged: () => void;
 }) {
   const [audience, setAudience] = useState<EmailAudience>(initialAudience);
   const [states, setStates] = useState<Record<string, BatchState>>({});
-  const [activeName, setActiveName] = useState<string | null>(null);
+  const [activeName, setActiveName] = useState<string | null>(initialTo ?? null);
   const [allBusy, setAllBusy] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
 
   // One batch per recipient, one line per shipment (several tasks on the
   // same shipment share a line so a PRO is never listed twice).
@@ -72,7 +78,12 @@ export function GroupEmailComposer({ rows, initialAudience, onClose, onTasksChan
     return { batches, skipped };
   }, [rows, audience]);
 
-  const active = batches.find((b) => b.name === activeName) || batches[0] || null;
+  const active = batches.find((b) => b.name === activeName) || batches.find((b) => b.name.toLowerCase() === (activeName || "").toLowerCase()) || batches[0] || null;
+  useEffect(() => { onView?.(audience, active?.name ?? null); }, [audience, active?.name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function copyLink() {
+    try { await navigator.clipboard.writeText(window.location.href); setLinkCopied(true); setTimeout(() => setLinkCopied(false), 1800); } catch { /* clipboard blocked: the address bar has the same link */ }
+  }
   const keyOf = (name: string) => `${audience}:${name}`;
   const stateOf = (name: string) => states[keyOf(name)] || blank();
   const patch = (name: string, p: Partial<BatchState>) =>
@@ -149,7 +160,11 @@ export function GroupEmailComposer({ rows, initialAudience, onClose, onTasksChan
           <span className="text-xs text-slate-500">
             {batches.length} {who}{batches.length === 1 ? "" : "s"} · one email each. Nothing is sent from here.
           </span>
-          <button onClick={onClose} className="ml-auto p-1.5 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100" aria-label="Close" title="Close (Esc)"><X className="h-4 w-4" /></button>
+          <button onClick={copyLink} title="Copy a link that reopens this group email (same recipient and shipments). Drafts aren't part of the link."
+            className="ml-auto inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md ring-1 ring-slate-200 text-slate-600 hover:bg-slate-50">
+            {linkCopied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Link2 className="h-3.5 w-3.5" />} {linkCopied ? "Link copied" : "Copy link"}
+          </button>
+          <button onClick={onClose} className="p-1.5 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100" aria-label="Close" title="Close (Esc)"><X className="h-4 w-4" /></button>
         </div>
 
         {!batches.length ? (
@@ -246,6 +261,10 @@ function BatchPane({ batch, audience, st, patch, onDraft, onCopy, onStart, locke
                 </span>
               </span>
               <span className={"shrink-0 tabular-nums " + (oldest >= 7 ? "text-rose-600 font-medium" : "text-slate-400")}>{oldest}d</span>
+              <a href={`/tasks/v2/${l.tasks[0].task.id}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}
+                title="Open this shipment and its task in a new tab" aria-label="Open shipment in a new tab" className="shrink-0 text-slate-400 hover:text-sky-700">
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
             </label>
           );
         })}

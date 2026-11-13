@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   AlertTriangle, Ban, CheckCircle2, Clock, Filter, Layers, ListChecks,
   Loader2, Mail, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
@@ -50,28 +50,64 @@ import { PromptsDialog, loadAiNotes, saveAiNotes, type AiNotes } from "../compon
 // shipment respawns on the next scrape, which is what produced the
 // "duplicates" complaint in the first place.
 
+// ---- deep links ------------------------------------------------------
+// The board's view lives in the URL so a link reopens exactly what the
+// sender saw: segment, health flags, grouping, sort, search, the owner /
+// carrier / mode filters, and an open group email.
+//   /tasks/v2?group=carrier&carrier=SAIA&email=carrier&to=SAIA
+const SEGS = ["all", "attention", "redelivery", "return_claim", "storage_risk", "carrier", "customer", "other"];
+const GROUPS = ["none", "segment", "carrier", "customer", "assignee", "shipment", "mode"];
+const SORTS = ["smart", "age", "priority", "scrape"];
+const VIEW_PARAMS = ["seg", "flag", "group", "sort", "q", "owner", "carrier", "mode", "email", "to", "tasks"];
+const pick = <T extends string>(v: string | null, allowed: string[], fallback: T): T => (v && allowed.includes(v) ? (v as T) : fallback);
+// Task ids travel as their first 8 characters to keep links short.
+const ID_PREFIX = 8;
+
+interface Emailing { ids: string[]; audience: EmailAudience; to: string | null; whole: boolean }
+
 export function TasksV2Page() {
   const { profile: me } = useAuth();
   const isAdmin = me?.role === "admin";
   const navigate = useNavigate();
+  const location = useLocation();
+  // The link this page was opened with. A link that sets any part of the
+  // view sets all of it: what it leaves out is the default, not this
+  // browser's saved preference.
+  const link = useRef(new URLSearchParams(location.search)).current;
+  const linked = VIEW_PARAMS.some((k) => link.has(k));
   const [board, setBoard] = useState<TaskBoard | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
+  const [prefs, setPrefs] = useState<Prefs>(() => {
+    const saved = loadPrefs();
+    if (!linked) return saved;
+    return {
+      ...saved,
+      seg: pick<Prefs["seg"]>(link.get("seg"), SEGS, "all"),
+      flags: (link.get("flag") || "").split(",").filter(Boolean) as Prefs["flags"],
+      groupBy: pick<GroupBy>(link.get("group"), GROUPS, "none"),
+      sortBy: pick<SortBy>(link.get("sort"), SORTS, "smart"),
+    };
+  });
   useEffect(() => { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} }, [prefs]);
   const setPref = <K extends keyof Prefs>(k: K, v: Prefs[K]) => setPrefs((p) => ({ ...p, [k]: v }));
 
-  const [search, setSearch] = useState("");
-  const [assigneeFilter, setAssigneeFilter] = useState<string>("");
-  const [carrierFilter, setCarrierFilter] = useState<string>("");
-  const [modeFilter, setModeFilter] = useState("");
+  const [search, setSearch] = useState(() => link.get("q") || "");
+  const [assigneeFilter, setAssigneeFilter] = useState<string>(() => link.get("owner") || "");
+  const [carrierFilter, setCarrierFilter] = useState<string>(() => link.get("carrier") || "");
+  const [modeFilter, setModeFilter] = useState(() => link.get("mode") || "");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [assignTo, setAssignTo] = useState<string | null>(null);
   const [dismissing, setDismissing] = useState<{ ids: string[]; disposition: string; reason: string } | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   // Group email composer: the tasks it was opened on, and who it addresses.
-  const [emailing, setEmailing] = useState<{ ids: string[]; audience: EmailAudience } | null>(null);
+  const [emailing, setEmailing] = useState<Emailing | null>(null);
+  // A linked group email can only be rebuilt once the board has loaded.
+  const pendingEmail = useRef<{ audience: EmailAudience; to: string | null; tasks: string[] } | null>(
+    link.get("email") === "carrier" || link.get("email") === "customer"
+      ? { audience: link.get("email") as EmailAudience, to: link.get("to"), tasks: (link.get("tasks") || "").split(",").filter(Boolean) }
+      : null);
 
   const [triage, setTriage] = useState<TaskTriageResult | null>(null);
   const [triageBusy, setTriageBusy] = useState(false);
@@ -137,6 +173,42 @@ export function TasksV2Page() {
     return people[k] || people[k.toLowerCase()] || k;
   };
   const rowById = useMemo(() => new Map(rows.map((r) => [r.task.id, r])), [rows]);
+
+  // Reopen a linked group email: the listed tasks, or else every active task
+  // on the board for that carrier / customer.
+  useEffect(() => {
+    const want = pendingEmail.current;
+    if (!want || !rows.length) return;
+    pendingEmail.current = null;
+    const nameOf2 = (r: TaskBoardRow) => (want.audience === "carrier" ? (r.shipment?.carrier_name || r.shipment?.carrier || "") : (r.shipment?.customer_name || "")).trim();
+    const ids = want.tasks.length
+      ? rows.filter((r) => want.tasks.some((t) => r.task.id.startsWith(t))).map((r) => r.task.id)
+      : want.to ? rows.filter((r) => isActive(r.task.status) && nameOf2(r).toLowerCase() === want.to!.toLowerCase()).map((r) => r.task.id) : [];
+    if (ids.length) setEmailing({ ids, audience: want.audience, to: want.to, whole: !want.tasks.length });
+    else setError("That link points to a group email whose tasks are no longer on the board.");
+  }, [rows]);
+
+  // Keep the address bar in step with the view (replace, so Back still
+  // leaves the page instead of undoing one filter at a time).
+  useEffect(() => {
+    if (pendingEmail.current) return; // don't drop the link before it's restored
+    const p = new URLSearchParams(location.search);
+    const set = (k: string, v: string | null | undefined, dflt = "") => { if (v && v !== dflt) p.set(k, v); else p.delete(k); };
+    set("seg", prefs.seg, "all");
+    set("flag", prefs.flags.join(","));
+    set("group", prefs.groupBy, "none");
+    set("sort", prefs.sortBy, "smart");
+    set("q", search.trim());
+    set("owner", assigneeFilter);
+    set("carrier", carrierFilter);
+    set("mode", modeFilter);
+    set("email", emailing?.audience);
+    set("to", emailing?.to);
+    set("tasks", emailing && !emailing.whole ? emailing.ids.slice(0, 60).map((id) => id.slice(0, ID_PREFIX)).join(",") : "");
+    const next = p.toString();
+    if (next !== new URLSearchParams(location.search).toString()) navigate({ search: next ? `?${next}` : "" }, { replace: true, state: location.state });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefs.seg, prefs.flags, prefs.groupBy, prefs.sortBy, search, assigneeFilter, carrierFilter, modeFilter, emailing]);
 
   // Triage rank per task id — feeds the "smart" sort and the rank chip.
   const triageRank = useMemo(() => {
@@ -211,7 +283,7 @@ export function TasksV2Page() {
   // drawer's prev/next chevrons walk THIS list and closing the drawer
   // returns here instead of the classic Tasks page.
   const openTask = (id: string) => navigate(`/tasks/v2/${id}`, {
-    state: { from: "/tasks/v2", walkIds: visible.filter((r) => isActive(r.task.status)).map((r) => r.task.id) },
+    state: { from: `/tasks/v2${location.search}`, walkIds: visible.filter((r) => isActive(r.task.status)).map((r) => r.task.id) },
   });
 
   const groups = useMemo(() => {
@@ -578,7 +650,7 @@ export function TasksV2Page() {
                 <div className="w-56 text-slate-900"><UserPicker value={assignTo} onChange={setAssignTo} placeholder="Assign to…" size="sm" /></div>
                 <button disabled={bulkBusy || !(assignTo || "").trim()} onClick={bulkAssign} className="inline-flex items-center gap-1 rounded-md bg-sky-500 hover:bg-sky-400 px-2.5 py-1 disabled:opacity-50"><UserPlus className="h-3.5 w-3.5" /> Assign</button>
               </div>
-              <button disabled={!selectedActive.length} onClick={() => setEmailing({ ids: selectedActive, audience: prefs.groupBy === "customer" ? "customer" : "carrier" })} className="inline-flex items-center gap-1 rounded-md bg-fuchsia-500 hover:bg-fuchsia-400 px-2.5 py-1 disabled:opacity-50" title="Draft one email per carrier (or customer) covering every selected shipment"><Mail className="h-3.5 w-3.5" /> Email {prefs.groupBy === "customer" ? "customer" : "carrier"}…</button>
+              <button disabled={!selectedActive.length} onClick={() => setEmailing({ ids: selectedActive, audience: prefs.groupBy === "customer" ? "customer" : "carrier", to: null, whole: false })} className="inline-flex items-center gap-1 rounded-md bg-fuchsia-500 hover:bg-fuchsia-400 px-2.5 py-1 disabled:opacity-50" title="Draft one email per carrier (or customer) covering every selected shipment"><Mail className="h-3.5 w-3.5" /> Email {prefs.groupBy === "customer" ? "customer" : "carrier"}…</button>
               <button disabled={bulkBusy} onClick={() => runTriage({ ids: Array.from(selected) })} className="inline-flex items-center gap-1 rounded-md bg-violet-500 hover:bg-violet-400 px-2.5 py-1 disabled:opacity-50" title="Triage only the selected tasks"><Wand2 className="h-3.5 w-3.5" /> Triage selection</button>
               <button onClick={() => setSelected(new Set())} className="ml-auto text-slate-300 hover:text-white inline-flex items-center gap-1"><X className="h-3.5 w-3.5" /> Clear</button>
             </div>
@@ -626,7 +698,7 @@ export function TasksV2Page() {
                       onEmailGroup={() => {
                         const active = g.rows.filter((r) => isActive(r.task.status)).map((r) => r.task.id);
                         const ticked = active.filter((id) => selected.has(id));
-                        setEmailing({ ids: ticked.length ? ticked : active, audience: prefs.groupBy === "customer" ? "customer" : "carrier" });
+                        setEmailing({ ids: ticked.length ? ticked : active, audience: prefs.groupBy === "customer" ? "customer" : "carrier", to: g.label, whole: !ticked.length });
                       }}
                       selected={selected}
                       toggle={toggle}
@@ -654,6 +726,8 @@ export function TasksV2Page() {
         <GroupEmailComposer
           rows={emailing.ids.map((id) => rowById.get(id)).filter((r): r is TaskBoardRow => !!r)}
           initialAudience={emailing.audience}
+          initialTo={emailing.to}
+          onView={(audience, to) => setEmailing((e) => (e && (e.audience !== audience || e.to !== to) ? { ...e, audience, to, whole: e.whole && e.audience === audience && e.to === to } : e))}
           onClose={() => setEmailing(null)}
           onTasksChanged={() => { void load(true); }}
         />

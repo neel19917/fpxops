@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Mail, Sparkles, Save, RotateCcw, Undo2, Eye, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Copy, History, ThumbsDown, ThumbsUp } from "lucide-react";
 import { api, type EmailStudioDraft, type EmailStudioSample, type EmailStudioType, type SettingRow } from "../lib/api";
 import { fmtRelative } from "../lib/format";
@@ -63,7 +64,10 @@ export function EmailStudioPage() {
   const [rows, setRows] = useState<Map<string, SettingRow> | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({}); // unsaved edits by key
-  const [emailId, setEmailId] = useState<EmailStudioType>("carrier");
+  // The open tab lives in the URL (?email=carrier_group) so it can be linked.
+  const [params, setParams] = useSearchParams();
+  const emailId: EmailStudioType = EMAILS.some((e) => e.id === params.get("email")) ? (params.get("email") as EmailStudioType) : "carrier";
+  const setEmailId = (id: EmailStudioType) => setParams((p) => { const n = new URLSearchParams(p); if (id === "carrier") n.delete("email"); else n.set("email", id); return n; }, { replace: true });
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
 
