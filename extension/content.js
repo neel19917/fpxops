@@ -1230,6 +1230,7 @@ async function run(filterCol, filterVal) {
   let totalScraped = 0;        // total rows scraped this run, for the "Done" line
   let confirmedRows = 0;       // rows the server has acked
   let droppedRows = 0;         // rows with no usable tracking number (never uploaded)
+  const uploadsInFlight = new Set(); // page uploads background hasn't answered yet
 
   // Helper: ship the current logRows buffer to background, then
   // truncate logRows so memory stays bounded to ~one page at a time.
@@ -1326,9 +1327,10 @@ async function run(filterCol, filterVal) {
     // on top of an unsent batch. logRows is reset inside the helper
     // so memory stays bounded to ~one page at a time.
     sendStatus(`Page ${pageNum} done — uploading ${pageRowCount} row(s)…`);
-    flushAndDropLogRows(`page ${pageNum}`).catch(() => { /* surfaced via side-panel chip */ });
+    const upload = flushAndDropLogRows(`page ${pageNum}`).catch(() => { /* surfaced via side-panel chip */ });
+    uploadsInFlight.add(upload);
+    upload.then(() => uploadsInFlight.delete(upload));
 
-    sendStatus(`Page ${pageNum} done. Checking for next page...`);
     let advanced = false;
     try { advanced = goToNextPage(); } catch (e) { console.warn("[FPX] goToNextPage failed:", e?.message || e); }
     if (!advanced) break;
@@ -1343,6 +1345,14 @@ async function run(filterCol, filterVal) {
   if (logRows.length > 0) {
     sendStatus(`Finalizing upload of ${logRows.length} remaining row(s)…`);
     await flushAndDropLogRows("final flush");
+  }
+  // Page uploads run in the background, so the last page's is normally still
+  // on its way here. Wait for it (capped) — otherwise the "Done" line reports
+  // that whole page as "queued for retry" when nothing failed, and the
+  // delivered-archive pass below runs before the final rows have landed.
+  if (uploadsInFlight.size > 0) {
+    sendStatus(`Waiting for the last upload${uploadsInFlight.size === 1 ? "" : "s"} to be confirmed…`);
+    await Promise.race([Promise.all([...uploadsInFlight]), sleep(60000)]);
   }
 
   // Background-side bookkeeping: drop the legacy checkpoint blob so
