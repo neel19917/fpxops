@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, Pencil } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ExternalLink, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, Pencil, FileText, Sparkles, Radar } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, PlainSummaryResult, Shipment, ShipmentNote, ShipmentTask, TaskStatus } from "../lib/types";
-import { ActionBadge } from "../components/Badge";
 import { Drawer, Field, Section } from "../components/Drawer";
+import { KeyFacts } from "../components/shipmentDrawer/KeyFacts";
+import { DrawerTabs } from "../components/shipmentDrawer/DrawerTabs";
+import { IntelTab, type SimilarBy } from "../components/shipmentDrawer/IntelTab";
 import { ShareButton } from "../components/ShareButton";
 import { ReanalyzeModal } from "../components/ReanalyzeModal";
 import { ColumnSelector } from "../components/ColumnSelector";
@@ -105,7 +107,7 @@ interface ShipmentsPageProps {
 // history as a collapsible section. Existing /tracking/:id/drafts and
 // /tracking/:id/raw URLs still resolve — asDrawerTab() rewrites them
 // to their new homes so old bookmarks don't dead-end.
-const DRAWER_TABS = ["overview", "tasks", "email", "history"] as const;
+const DRAWER_TABS = ["overview", "tasks", "email", "history", "intel"] as const;
 type DrawerTabId = typeof DRAWER_TABS[number];
 function asDrawerTab(s: string | null | undefined): DrawerTabId {
   // Map removed tabs to their new homes so legacy URLs / nav from
@@ -458,6 +460,9 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
   // route param, and we mirror it locally so existing handlers don't need to
   // round-trip through navigate() to read the current sub-tab.
   const [drawerTab, setDrawerTabState] = useState<DrawerTabId>(asDrawerTab(drawerSection));
+  // Intel tab: which "similar shipments" list is showing. Kept here so it
+  // survives stepping from one shipment to the next.
+  const [similarBy, setSimilarBy] = useState<SimilarBy>("customer");
   useEffect(() => {
     setDrawerTabState(asDrawerTab(drawerSection));
   }, [drawerSection]);
@@ -833,6 +838,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         "2": "tasks",
         "3": "email",
         "4": "history",
+        "5": "intel",
       };
       if (tabMap[e.key]) {
         e.preventDefault();
@@ -1317,40 +1323,65 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
       <Drawer
         open={!!drawerId}
         onClose={() => setDrawerId(null)}
+        eyebrow={drawerData?.shipment.mode ? `${drawerData.shipment.mode} shipment` : "Shipment"}
         // Shipment ID is the unique identifier in the operator's mental
-        // map, so we lead with it. Tracking number + customer follow as
-        // secondary context. Falls back gracefully when shipment_id isn't
-        // populated on legacy rows.
+        // map, so we lead with it. Tracking number, customer and carrier
+        // follow as secondary context. Falls back gracefully when
+        // shipment_id isn't populated on legacy rows.
         title={drawerData?.shipment.shipment_id || drawerData?.shipment.tracking_number || "Shipment"}
         subtitle={drawerData ? [
           drawerData.shipment.shipment_id ? `Tracking ${drawerData.shipment.tracking_number || "—"}` : null,
           drawerData.shipment.customer_name || null,
+          drawerData.shipment.carrier_name || drawerData.shipment.carrier || null,
         ].filter(Boolean).join(" · ") || undefined : undefined}
         // Suppress the dimmed backdrop when the FreightPOP overlay is
         // visible — the overlay (mounted at App scope) takes over the
         // gray space.
         suppressBackdrop={!!(embedCfg?.enabled && splitView && drawerId)}
-      >
-        {drawerData ? (
+        // Prev / next walker sits beside the close button so it stays put
+        // while the rep steps through the list.
+        headerActions={
+          <div className="inline-flex items-center rounded-lg ring-1 ring-slate-200 bg-white">
+            <button
+              type="button"
+              onClick={walkPrev}
+              disabled={!drawerHasPrev}
+              title={drawerHasPrev ? (taskWalk ? "Previous task (k / ←)" : `Previous: ${drawerPrev?.tracking_number || ""} (k / ←)`) : "No previous"}
+              aria-label="Previous"
+              className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-l-lg"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+            <div className="px-2 text-xs text-slate-600 tabular-nums whitespace-nowrap select-none border-x border-slate-200 self-stretch flex items-center">
+              {taskWalk ? (
+                <span className="inline-flex items-center gap-1">
+                  <span className="text-violet-700 font-semibold">Task</span>
+                  <span>{drawerIndex + 1} of {drawerTotal}</span>
+                </span>
+              ) : (
+                drawerIndex >= 0 ? `${drawerIndex + 1} of ${drawerTotal}` : "—"
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={walkNext}
+              disabled={!drawerHasNext}
+              title={drawerHasNext ? (taskWalk ? "Next task (j / →)" : `Next: ${drawerNext?.tracking_number || ""} (j / →)`) : "No next"}
+              aria-label="Next"
+              className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-r-lg"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </div>
+        }
+        // Pinned under the title on every tab: where the shipment stands
+        // (status, action, dates, lane), the FreightPOP / share toolbar,
+        // and the tab bar. The Action control lives here so a rep can
+        // disposition the shipment from any tab.
+        headerExtra={drawerData ? (
           <>
-            {/* High-level summary card. Pinned above every drawer tab so
-                the operator always has the five identifiers / status they
-                need to talk about the shipment, no matter which tab they
-                navigate to. The Action control is rendered inline so an
-                operator can override / Modify without scrolling to the
-                Overview tab. */}
-            <ShipmentSummaryHeader
+            <KeyFacts
               shipment={drawerData.shipment}
-              onOverrideClick={() =>
-                setOverrideModal({
-                  value: drawerData.shipment.action_required === "YES" ? "NO" : "YES",
-                  reason: "",
-                  busy: false,
-                  createCarrierFollowup: false,
-                  createCustomerFollowup: false,
-                  autoDraftEmail: false,
-                })
-              }
               actionEditBusy={actionEditBusy}
               onSetAction={async (v) => {
                 if (!drawerId) return;
@@ -1370,137 +1401,116 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 } catch (e) { setErr((e as Error).message); }
                 finally { setActionEditBusy(false); }
               }}
+              onOverrideClick={() =>
+                setOverrideModal({
+                  value: drawerData.shipment.action_required === "YES" ? "NO" : "YES",
+                  reason: "",
+                  busy: false,
+                  createCarrierFollowup: false,
+                  createCustomerFollowup: false,
+                  autoDraftEmail: false,
+                })
+              }
             />
-            <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
-              <div className="inline-flex items-center rounded-lg ring-1 ring-slate-200 bg-white">
+            <div className="flex items-center gap-2 flex-wrap pb-2">
+              {embedCfg?.enabled && drawerData?.shipment.tracking_number ? (
                 <button
                   type="button"
-                  onClick={walkPrev}
-                  disabled={!drawerHasPrev}
-                  title={drawerHasPrev ? (taskWalk ? "Previous task (k / ←)" : `Previous: ${drawerPrev?.tracking_number || ""} (k / ←)`) : "No previous"}
-                  className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-l-lg"
+                  onClick={() => {
+                    // If split-view is off, turn it on so the iframe is
+                    // actually visible to receive the filter; the
+                    // overlay will fire the postMessage as soon as it's
+                    // mounted and the bridge is ready.
+                    if (!splitView) setSplitView(true);
+                    requestAutoFilter();
+                  }}
+                  className="text-xs px-2.5 py-1.5 rounded-md ring-1 ring-violet-600 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1.5"
+                  title={`Load shipment ${drawerData.shipment.tracking_number} in FreightPOP and filter the grid`}
                 >
-                  <ChevronLeft className="h-4 w-4" />
+                  <ExternalLink className="h-3.5 w-3.5" /> Load in FreightPOP
                 </button>
-                <div className="px-2 text-xs text-slate-600 tabular-nums whitespace-nowrap select-none border-x border-slate-200 self-stretch flex items-center">
-                  {taskWalk ? (
-                    <span className="inline-flex items-center gap-1">
-                      <span className="text-violet-700 font-semibold">Task</span>
-                      <span>{drawerIndex + 1} of {drawerTotal}</span>
-                    </span>
-                  ) : (
-                    drawerIndex >= 0 ? `${drawerIndex + 1} of ${drawerTotal}` : "—"
-                  )}
-                </div>
+              ) : null}
+              {/* Sibling option to "Load in FreightPOP": triggers FP's
+                  native tracking modal *inside* the embedded iframe.
+                  The overlay forwards a postMessage to the FPXpress
+                  extension which filters by tracking number then
+                  simulates a click on the row's tracking link — same
+                  UI path a rep takes manually, just one click. */}
+              {embedCfg?.enabled && drawerData?.shipment.tracking_number ? (
                 <button
                   type="button"
-                  onClick={walkNext}
-                  disabled={!drawerHasNext}
-                  title={drawerHasNext ? (taskWalk ? "Next task (j / →)" : `Next: ${drawerNext?.tracking_number || ""} (j / →)`) : "No next"}
-                  className="px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed rounded-r-lg"
+                  onClick={() => {
+                    // Make sure the iframe is actually on-screen first;
+                    // overlay only forwards the message when the
+                    // bridge has greeted us, which only happens once
+                    // the iframe is mounted + visible.
+                    if (!splitView) setSplitView(true);
+                    requestOpenTracking();
+                  }}
+                  className="text-xs px-2.5 py-1.5 rounded-md ring-1 ring-slate-300 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1.5"
+                  title={`Open the FreightPOP tracking modal for ${drawerData.shipment.tracking_number} in the embedded panel`}
                 >
-                  <ChevronRight className="h-4 w-4" />
+                  <ExternalLink className="h-3.5 w-3.5" /> Open tracking #
                 </button>
-              </div>
-              <div className="flex items-center gap-2">
-                {embedCfg?.enabled && drawerData?.shipment.tracking_number ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      // If split-view is off, turn it on so the iframe is
-                      // actually visible to receive the filter; the
-                      // overlay will fire the postMessage as soon as it's
-                      // mounted and the bridge is ready.
-                      if (!splitView) setSplitView(true);
-                      requestAutoFilter();
-                    }}
-                    className="text-xs px-2.5 py-1.5 rounded-md ring-1 ring-violet-600 bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-1.5"
-                    title={`Load shipment ${drawerData.shipment.tracking_number} in FreightPOP and filter the grid`}
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" /> Load in FreightPOP
-                  </button>
-                ) : null}
-                {/* Sibling option to "Load in FreightPOP": triggers FP's
-                    native tracking modal *inside* the embedded iframe.
-                    The overlay forwards a postMessage to the FPXpress
-                    extension which filters by tracking number then
-                    simulates a click on the row's tracking link — same
-                    UI path a rep takes manually, just one click. */}
-                {embedCfg?.enabled && drawerData?.shipment.tracking_number ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      // Make sure the iframe is actually on-screen first;
-                      // overlay only forwards the message when the
-                      // bridge has greeted us, which only happens once
-                      // the iframe is mounted + visible.
-                      if (!splitView) setSplitView(true);
-                      requestOpenTracking();
-                    }}
-                    className="text-xs px-2.5 py-1.5 rounded-md ring-1 ring-slate-300 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-1.5"
-                    title={`Open the FreightPOP tracking modal for ${drawerData.shipment.tracking_number} in the embedded panel`}
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" /> Open tracking #
-                  </button>
-                ) : null}
-                {embedCfg?.enabled ? (
-                  <button
-                    type="button"
-                    onClick={() => setSplitView((v) => !v)}
-                    className={"text-xs px-2.5 py-1.5 rounded-md ring-1 inline-flex items-center gap-1.5 " + (splitView
-                      ? "bg-white text-violet-700 ring-violet-200 hover:bg-violet-50"
-                      : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50")}
-                    title={splitView ? "Hide FreightPOP side panel" : "Show FreightPOP side panel"}
-                    aria-pressed={splitView}
-                  >
-                    {splitView ? "Panel: on" : "Panel: off"}
-                  </button>
-                ) : null}
+              ) : null}
+              {embedCfg?.enabled ? (
                 <button
                   type="button"
-                  onClick={() => setDrawerHelpOpen(true)}
-                  className="text-xs px-2.5 py-1.5 rounded-md bg-white ring-1 ring-slate-200 text-slate-600 hover:bg-slate-50 inline-flex items-center gap-1.5"
-                  title="Keyboard shortcuts (?)"
+                  onClick={() => setSplitView((v) => !v)}
+                  className={"text-xs px-2.5 py-1.5 rounded-md ring-1 inline-flex items-center gap-1.5 " + (splitView
+                    ? "bg-white text-violet-700 ring-violet-200 hover:bg-violet-50"
+                    : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50")}
+                  title={splitView ? "Hide FreightPOP side panel" : "Show FreightPOP side panel"}
+                  aria-pressed={splitView}
                 >
-                  <Keyboard className="h-3.5 w-3.5" /> Shortcuts
+                  {splitView ? "Panel: on" : "Panel: off"}
                 </button>
-                <ShareButton
-                  resourceType="shipment"
-                  resourceId={drawerData.shipment.id}
-                  defaultLabel={`Shipment ${drawerData.shipment.tracking_number || ""}`.trim()}
-                />
-              </div>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => setDrawerTab("intel")}
+                className="text-xs px-2.5 py-1.5 rounded-md bg-white ring-1 ring-slate-200 text-slate-600 hover:bg-slate-50 inline-flex items-center gap-1.5"
+                title="Other shipments for the same customer or carrier (5)"
+              >
+                <Radar className="h-3.5 w-3.5" /> Find similar
+              </button>
+              <button
+                type="button"
+                onClick={() => setDrawerHelpOpen(true)}
+                className="text-xs px-2.5 py-1.5 rounded-md bg-white ring-1 ring-slate-200 text-slate-600 hover:bg-slate-50 inline-flex items-center gap-1.5"
+                title="Keyboard shortcuts (?)"
+              >
+                <Keyboard className="h-3.5 w-3.5" /> Shortcuts
+              </button>
+              <ShareButton
+                resourceType="shipment"
+                resourceId={drawerData.shipment.id}
+                defaultLabel={`Shipment ${drawerData.shipment.tracking_number || ""}`.trim()}
+              />
             </div>
-            <div className="flex gap-1 border-b border-slate-200 mb-5 -mx-1 px-1 overflow-x-auto">
-              {([
-                { id: "overview", label: "Overview", count: null },
-                { id: "tasks", label: "Tasks", count: drawerTasks.length },
+            <DrawerTabs<DrawerTabId>
+              active={drawerTab}
+              onChange={setDrawerTab}
+              tabs={[
+                { id: "overview", label: "Overview", icon: FileText, hotkey: "1" },
+                { id: "tasks", label: "Tasks", icon: ListChecks, hotkey: "2", count: drawerTasks.length },
                 {
                   id: "email",
                   label: "Email",
-                  // Show saved-draft count on the Email tab pill since
-                  // drafts now live underneath the composer.
+                  icon: Mail,
+                  hotkey: "3",
+                  // Saved-draft count: drafts live underneath the composer.
                   count: drawerData.analyses.filter((a) => a.kind === "other" && typeof (a.metadata as Record<string, unknown>)?.subkind === "string" && String((a.metadata as Record<string, unknown>).subkind).startsWith("email_draft_")).length,
                 },
-                { id: "history", label: "Analysis", count: drawerData.analyses.filter((a) => a.kind === "per_shipment" || a.kind === "summary").length },
-              ] as { id: typeof DRAWER_TABS[number]; label: string; count: number | null }[]).map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => setDrawerTab(t.id)}
-                  className={
-                    "px-3 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px transition " +
-                    (drawerTab === t.id
-                      ? "border-sky-500 text-sky-700"
-                      : "border-transparent text-slate-500 hover:text-slate-900 hover:border-slate-300")
-                  }
-                >
-                  {t.label}
-                  {t.count != null && t.count > 0 ? (
-                    <span className="ml-1.5 inline-flex items-center justify-center text-[10px] font-semibold bg-slate-200 text-slate-700 rounded-full px-1.5 py-0.5 min-w-[18px]">{t.count}</span>
-                  ) : null}
-                </button>
-              ))}
-            </div>
+                { id: "history", label: "Analysis", icon: Sparkles, hotkey: "4", count: drawerData.analyses.filter((a) => a.kind === "per_shipment" || a.kind === "summary").length },
+                { id: "intel", label: "Intel", icon: Radar, hotkey: "5" },
+              ]}
+            />
+          </>
+        ) : undefined}
+      >
+        {drawerData ? (
+          <>
 
             {taskWalk?.task ? (
               <TaskBanner
@@ -1606,36 +1616,6 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   <div className="grid grid-cols-2 gap-4">
                     <Field label="Carrier">{drawerData.shipment.carrier_name || drawerData.shipment.carrier}</Field>
                     <Field label="Mode">{drawerData.shipment.mode}</Field>
-                    <Field label="Status">{drawerData.shipment.shipment_status}</Field>
-                    <div className="flex flex-col gap-0.5">
-                      <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Action</div>
-                      <ActionDispositionControl
-                        shipment={drawerData.shipment}
-                        actionEditBusy={actionEditBusy}
-                        onSetAction={async (v) => {
-                          if (!drawerId) return;
-                          setActionEditBusy(true);
-                          try {
-                            await api.shipments.overrideAction(drawerId, { action_required: v });
-                            await refreshDrawer();
-                          } catch (e) { setErr((e as Error).message); }
-                          finally { setActionEditBusy(false); }
-                        }}
-                        onRevertToAi={async () => {
-                          if (!drawerId) return;
-                          setActionEditBusy(true);
-                          try {
-                            await api.shipments.overrideAction(drawerId, { action_required: null });
-                            await refreshDrawer();
-                          } catch (e) { setErr((e as Error).message); }
-                          finally { setActionEditBusy(false); }
-                        }}
-                        onOverrideClick={() => setOverrideModal({ value: drawerData.shipment.action_required === "YES" ? "NO" : "YES", reason: "", busy: false, createCarrierFollowup: false, createCustomerFollowup: false, autoDraftEmail: false })}
-                      />
-                    </div>
-                    <Field label="Pickup">{fmtDateTime(drawerData.shipment.pickup_date)}</Field>
-                    <Field label="ETA">{fmtDateTime(drawerData.shipment.updated_eta)}</Field>
-                    <Field label="Delivery">{fmtDateTime(drawerData.shipment.delivery_date)}</Field>
                     <Field label="Signed By">{drawerData.shipment.signed_by}</Field>
                     <Field label="Origin">{drawerData.shipment.ship_from || drawerData.shipment.origin}</Field>
                     <Field label="Destination">{drawerData.shipment.ship_to || drawerData.shipment.destination}</Field>
@@ -1789,6 +1769,15 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
               );
             })()}
 
+            {drawerTab === "intel" && (
+              <IntelTab
+                shipment={drawerData.shipment}
+                by={similarBy}
+                onBy={setSimilarBy}
+                onOpen={(id) => { setDrawerId(id); }}
+              />
+            )}
+
             {drawerTab === "history" && (() => {
               const items = drawerData.analyses
                 .filter((a) => a.kind === "per_shipment" || a.kind === "summary")
@@ -1926,9 +1915,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 { keys: ["1"], label: "Overview tab" },
                 { keys: ["2"], label: "Tasks tab" },
                 { keys: ["3"], label: "Email tab" },
-                { keys: ["4"], label: "Drafts tab" },
-                { keys: ["5"], label: "Analysis tab" },
-                { keys: ["6"], label: "Raw tab" },
+                { keys: ["4"], label: "Analysis tab" },
+                { keys: ["5"], label: "Intel tab (similar shipments, ask)" },
                 { keys: ["o"], label: "Open override modal" },
                 { keys: ["r"], label: "Re-analyze" },
                 { keys: ["esc"], label: "Close drawer" },
@@ -2243,24 +2231,6 @@ const TASK_STATUS_LABEL: Record<string, string> = {
 };
 
 // =====================================================================
-// High-level shipment summary header. Renders the five identifiers
-// operators reference constantly — Shipment ID, Tracking Number,
-// Customer, Carrier, Status — as a labeled key/value grid pinned at
-// the top of the drawer body. We surface it on EVERY drawer tab (not
-// just Overview) because the rep often jumps to Email / Drafts /
-// Analysis and still needs these top-of-mind without scrolling back.
-// Also embeds the Action control (override / Modify) so the rep can
-// flip the action state without scrolling to the Overview tab.
-// =====================================================================
-interface ShipmentSummaryHeaderProps {
-  shipment: Shipment;
-  onOverrideClick: () => void;
-  actionEditBusy: boolean;
-  onSetAction: (v: "YES" | "NO" | "RESOLVED") => void | Promise<void>;
-  onRevertToAi: () => void | Promise<void>;
-}
-
-// =====================================================================
 // RecentChangeLog — surfaces the field-level diff from the most recent
 // scrape (the same `recent_changes` block the per-shipment AI prompt
 // now sees). Renders nothing when there's no diff (first scrape, or
@@ -2454,193 +2424,6 @@ function AnalysisThumbs({ analysis, onRated }: {
           ) : null}
         </div>
       ) : null}
-    </div>
-  );
-}
-
-// =====================================================================
-// ActionDispositionControl — clickable ActionBadge + popover. Replaces
-// the previous two-step "tick Modify, then click chip" flow with a
-// single click on the badge that opens a tiny menu of disposition
-// options (Action needed / On track / Resolved). Click-outside closes
-// it. The full Override modal (with reason + followup creation) is
-// still reachable via the "More options…" link inside the popover.
-// =====================================================================
-interface ActionDispositionControlProps {
-  shipment: Shipment;
-  actionEditBusy: boolean;
-  onSetAction: (v: "YES" | "NO" | "RESOLVED") => void | Promise<void>;
-  onRevertToAi: () => void | Promise<void>;
-  onOverrideClick: () => void;
-}
-
-function ActionDispositionControl({ shipment, actionEditBusy, onSetAction, onRevertToAi, onOverrideClick }: ActionDispositionControlProps) {
-  const [open, setOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement | null>(null);
-
-  // Close on outside click + Escape. Both anchored to the wrapping div
-  // so clicks on the badge or inside the popover don't trip close.
-  useEffect(() => {
-    if (!open) return;
-    function onDocPointer(e: MouseEvent) {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpen(false);
-    }
-    document.addEventListener("mousedown", onDocPointer);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDocPointer);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  const isManual = shipment.action_source === "manual";
-
-  return (
-    <div ref={wrapRef} className="relative mt-0.5">
-      <div className="flex items-center gap-2 flex-wrap">
-        <ActionBadge
-          action={shipment.action_required}
-          onClick={() => setOpen((v) => !v)}
-          title="Click to disposition this shipment"
-        />
-        {isManual ? (
-          <span
-            className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-amber-100 text-amber-800 ring-1 ring-amber-200"
-            title={`Overridden by ${shipment.action_overridden_by || "?"}${shipment.action_override_reason ? ` — ${shipment.action_override_reason}` : ""}`}
-          >Manual</span>
-        ) : (
-          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-slate-100 text-slate-600" title="Set by AI">From AI</span>
-        )}
-      </div>
-
-      {open ? (
-        <div
-          role="menu"
-          className="absolute z-30 mt-1.5 left-0 min-w-[220px] rounded-lg ring-1 ring-slate-200 bg-white shadow-lg p-1.5"
-        >
-          <div className="px-2 pt-1 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-500">
-            Set disposition
-          </div>
-          {(["YES", "NO", "RESOLVED"] as const).map((v) => {
-            const active = shipment.action_required === v;
-            const tone =
-              v === "YES" ? "text-rose-700 hover:bg-rose-50"
-              : v === "NO" ? "text-emerald-700 hover:bg-emerald-50"
-              : "text-violet-700 hover:bg-violet-50";
-            const label = v === "YES" ? "Action needed" : v === "NO" ? "On track" : "Manually resolved";
-            return (
-              <button
-                key={v}
-                role="menuitem"
-                disabled={actionEditBusy || active}
-                onClick={async () => {
-                  await onSetAction(v);
-                  setOpen(false);
-                }}
-                className={`w-full text-left text-sm rounded-md px-2 py-1.5 inline-flex items-center justify-between gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed ${tone}`}
-                title={active ? "Already set" : `Set action to ${label}`}
-              >
-                <span className="font-medium">{label}</span>
-                {active ? <Check className="h-3.5 w-3.5 text-slate-400" /> : null}
-              </button>
-            );
-          })}
-          <div className="my-1 border-t border-slate-100" />
-          <button
-            role="menuitem"
-            disabled={actionEditBusy || !isManual}
-            onClick={async () => {
-              await onRevertToAi();
-              setOpen(false);
-            }}
-            className="w-full text-left text-xs rounded-md px-2 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
-            title={isManual ? "Clear override and let the AI value stand" : "Already on the AI value"}
-          >
-            Revert to AI
-          </button>
-          <button
-            role="menuitem"
-            onClick={() => { setOpen(false); onOverrideClick(); }}
-            className="w-full text-left text-xs rounded-md px-2 py-1.5 text-sky-700 hover:bg-sky-50"
-            title="Open the full override dialog (add a reason, create followups, draft an email)"
-          >
-            More options…
-          </button>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function ShipmentSummaryHeader({
-  shipment,
-  onOverrideClick,
-  actionEditBusy,
-  onSetAction,
-  onRevertToAi,
-}: ShipmentSummaryHeaderProps) {
-  const status = shipment.shipment_status || "—";
-  const carrier = shipment.carrier_name || shipment.carrier || "—";
-  // Tone the status pill based on common-case strings; default to slate.
-  // Best-effort match — FreightPOP's status vocabulary is open-ended and
-  // we don't want to invent a regex per phrase.
-  const s = status.toLowerCase();
-  const statusTone =
-    /deliver/.test(s) ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
-    : /transit|in.?route/.test(s) ? "bg-sky-100 text-sky-800 ring-sky-200"
-    : /pick|tender/.test(s) ? "bg-violet-100 text-violet-800 ring-violet-200"
-    : /delay|late|hold|except/.test(s) ? "bg-amber-100 text-amber-800 ring-amber-200"
-    : /cancel|fail/.test(s) ? "bg-rose-100 text-rose-800 ring-rose-200"
-    : "bg-slate-100 text-slate-700 ring-slate-200";
-  return (
-    <div className="mb-4 rounded-xl ring-1 ring-slate-200 bg-gradient-to-br from-white to-slate-50 px-4 py-3">
-      <div className="grid grid-cols-2 gap-x-5 gap-y-2.5">
-        <div className="col-span-2 sm:col-span-1">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Shipment ID</div>
-          <div className="text-base font-bold text-slate-900 truncate" title={shipment.shipment_id || ""}>
-            {shipment.shipment_id || "—"}
-          </div>
-        </div>
-        <div className="col-span-2 sm:col-span-1">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Tracking #</div>
-          <div className="text-sm font-mono font-semibold text-slate-900 truncate" title={shipment.tracking_number || ""}>
-            {shipment.tracking_number || "—"}
-          </div>
-        </div>
-        <div className="col-span-2 sm:col-span-1">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Customer</div>
-          <div className="text-sm font-medium text-slate-900 truncate" title={shipment.customer_name || ""}>
-            {shipment.customer_name || "—"}
-          </div>
-        </div>
-        <div className="col-span-2 sm:col-span-1">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Carrier</div>
-          <div className="text-sm font-medium text-slate-900 truncate" title={carrier}>
-            {carrier}
-          </div>
-        </div>
-        <div className="col-span-2 sm:col-span-1">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Status</div>
-          <div className="mt-0.5">
-            <span className={`inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full ring-1 ${statusTone}`}>
-              {status}
-            </span>
-          </div>
-        </div>
-        <div className="col-span-2 sm:col-span-1">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Action</div>
-          <ActionDispositionControl
-            shipment={shipment}
-            actionEditBusy={actionEditBusy}
-            onSetAction={onSetAction}
-            onRevertToAi={onRevertToAi}
-            onOverrideClick={onOverrideClick}
-          />
-        </div>
-      </div>
     </div>
   );
 }
