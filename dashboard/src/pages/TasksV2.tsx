@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle, Ban, CheckCircle2, Clock, Filter, Layers, ListChecks,
-  Loader2, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
+  Loader2, Mail, Play, RefreshCw, Search, UserPlus, X, Wand2, ShieldCheck, Undo2, RotateCcw, FileText, MessageSquareText, HelpCircle,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
@@ -28,6 +28,7 @@ import { GroupRows } from "../components/tasksV2/Rows";
 import { TriagePanel } from "../components/tasksV2/TriagePanel";
 import { DailySummaryPanel } from "../components/tasksV2/DailySummaryPanel";
 import { DismissModal } from "../components/tasksV2/DismissModal";
+import { GroupEmailComposer, type EmailAudience } from "../components/tasksV2/GroupEmailComposer";
 import { PromptsDialog, loadAiNotes, saveAiNotes, type AiNotes } from "../components/tasksV2/PromptsDialog";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,8 @@ export function TasksV2Page() {
   const [assignTo, setAssignTo] = useState<string | null>(null);
   const [dismissing, setDismissing] = useState<{ ids: string[]; disposition: string; reason: string } | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  // Group email composer: the tasks it was opened on, and who it addresses.
+  const [emailing, setEmailing] = useState<{ ids: string[]; audience: EmailAudience } | null>(null);
 
   const [triage, setTriage] = useState<TaskTriageResult | null>(null);
   const [triageBusy, setTriageBusy] = useState(false);
@@ -575,6 +578,7 @@ export function TasksV2Page() {
                 <div className="w-56 text-slate-900"><UserPicker value={assignTo} onChange={setAssignTo} placeholder="Assign to…" size="sm" /></div>
                 <button disabled={bulkBusy || !(assignTo || "").trim()} onClick={bulkAssign} className="inline-flex items-center gap-1 rounded-md bg-sky-500 hover:bg-sky-400 px-2.5 py-1 disabled:opacity-50"><UserPlus className="h-3.5 w-3.5" /> Assign</button>
               </div>
+              <button disabled={!selectedActive.length} onClick={() => setEmailing({ ids: selectedActive, audience: prefs.groupBy === "customer" ? "customer" : "carrier" })} className="inline-flex items-center gap-1 rounded-md bg-fuchsia-500 hover:bg-fuchsia-400 px-2.5 py-1 disabled:opacity-50" title="Draft one email per carrier (or customer) covering every selected shipment"><Mail className="h-3.5 w-3.5" /> Email {prefs.groupBy === "customer" ? "customer" : "carrier"}…</button>
               <button disabled={bulkBusy} onClick={() => runTriage({ ids: Array.from(selected) })} className="inline-flex items-center gap-1 rounded-md bg-violet-500 hover:bg-violet-400 px-2.5 py-1 disabled:opacity-50" title="Triage only the selected tasks"><Wand2 className="h-3.5 w-3.5" /> Triage selection</button>
               <button onClick={() => setSelected(new Set())} className="ml-auto text-slate-300 hover:text-white inline-flex items-center gap-1"><X className="h-3.5 w-3.5" /> Clear</button>
             </div>
@@ -616,6 +620,14 @@ export function TasksV2Page() {
                       collapsed={collapsed}
                       onToggle={() => setCollapsedGroups((p) => { const n = new Set(p); n.has(g.key) ? n.delete(g.key) : n.add(g.key); return n; })}
                       onSelectGroup={() => setSelected((p) => { const n = new Set(p); g.rows.forEach((r) => n.add(r.task.id)); return n; })}
+                      // Carrier / customer groups get a one-click "Email group".
+                      // If some of the group is ticked, the email covers just those.
+                      emailLabel={prefs.groupBy === "carrier" || prefs.groupBy === "customer" ? prefs.groupBy : undefined}
+                      onEmailGroup={() => {
+                        const active = g.rows.filter((r) => isActive(r.task.status)).map((r) => r.task.id);
+                        const ticked = active.filter((id) => selected.has(id));
+                        setEmailing({ ids: ticked.length ? ticked : active, audience: prefs.groupBy === "customer" ? "customer" : "carrier" });
+                      }}
                       selected={selected}
                       toggle={toggle}
                       triageRank={triageRank}
@@ -637,6 +649,15 @@ export function TasksV2Page() {
       </div>
 
       {promptsOpen ? <PromptsDialog notes={aiNotes} onNotes={setAiNotes} isAdmin={isAdmin} onClose={() => setPromptsOpen(false)} /> : null}
+
+      {emailing ? (
+        <GroupEmailComposer
+          rows={emailing.ids.map((id) => rowById.get(id)).filter((r): r is TaskBoardRow => !!r)}
+          initialAudience={emailing.audience}
+          onClose={() => setEmailing(null)}
+          onTasksChanged={() => { void load(true); }}
+        />
+      ) : null}
 
       {dismissing ? (
         <DismissModal

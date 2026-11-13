@@ -1,15 +1,17 @@
 // Board table rows: optional group header + one row per task.
 import { useMemo, useState } from "react";
-import { Ban, CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Play, RotateCcw } from "lucide-react";
+import { Ban, CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Mail, Play, RotateCcw } from "lucide-react";
 import type { TaskBoardRow, TaskFlag, TaskStatus } from "../../lib/types";
 import { fmtDate, fmtRelative } from "../../lib/format";
 import { RowAnnotations } from "./RowAnnotations";
 import { FLAG_CLS, IconBtn, Pill, PRIORITY_CLS, SEGMENT_CLS, SEGMENT_SHORT, STATUS_CLS, STATUS_LABEL, TrackingLink, isActive, shipmentStatusTone, shortTitle, taskMode, MODE_CLS } from "./shared";
 import { modeLabel } from "../ModePicker";
 
-export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, selected, toggle, triageRank, closeCandidateIds, staleDays, flagsMeta, segmentHelp, people, onOpen, onStatus, onDismiss }: {
+export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGroup, emailLabel, onEmailGroup, selected, toggle, triageRank, closeCandidateIds, staleDays, flagsMeta, segmentHelp, people, onOpen, onStatus, onDismiss }: {
   group: { key: string; label: string; rows: TaskBoardRow[] };
   showHeader: boolean; collapsed: boolean; onToggle: () => void; onSelectGroup: () => void;
+  // Set when the board is grouped by carrier / customer: shows "Email carrier".
+  emailLabel?: "carrier" | "customer"; onEmailGroup?: () => void;
   selected: Set<string>; toggle: (id: string) => void;
   triageRank: Map<string, number>; closeCandidateIds: Set<string>; staleDays: number;
   flagsMeta: { id: TaskFlag; label: string; tone: string; description: string }[];
@@ -29,7 +31,18 @@ export function GroupRows({ group, showHeader, collapsed, onToggle, onSelectGrou
                 {group.label}
               </button>
               <span className="text-xs text-slate-500">{group.rows.length}</span>
-              <button onClick={onSelectGroup} className="ml-auto text-xs text-sky-700 hover:underline">Select group</button>
+              <span className="ml-auto flex items-center gap-3">
+                {emailLabel && onEmailGroup && !group.label.startsWith("(unknown") ? (() => {
+                  const ticked = group.rows.filter((r) => selected.has(r.task.id) && isActive(r.task.status)).length;
+                  return (
+                    <button onClick={onEmailGroup} className="inline-flex items-center gap-1 text-xs font-medium text-violet-700 hover:underline"
+                      title={ticked ? `One email to this ${emailLabel} covering the ${ticked} ticked task${ticked === 1 ? "" : "s"}` : `One email to this ${emailLabel} covering every shipment in the group`}>
+                      <Mail className="h-3.5 w-3.5" /> Email {emailLabel}{ticked ? ` (${ticked})` : ""}
+                    </button>
+                  );
+                })() : null}
+                <button onClick={onSelectGroup} className="text-xs text-sky-700 hover:underline">Select group</button>
+              </span>
             </div>
           </td>
         </tr>

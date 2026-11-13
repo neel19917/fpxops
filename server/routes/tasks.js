@@ -621,6 +621,88 @@ tasksRouter.post("/v2/dismiss", async (req, res) => {
   res.json({ dismissed, skipped: ids.length - dismissed });
 });
 
+// How hard the email pushes. Sent as an operator note, so the saved group
+// prompts still decide the wording; this only sets the temperature.
+const GROUP_EMAIL_TONES = {
+  friendly: "Tone for this email: a friendly check-in. Warm, brief, no pressure.",
+  direct: "Tone for this email: direct and businesslike. Ask for a specific update on each shipment.",
+  escalate: "Tone for this email: an escalation. These have gone unanswered or are overdue. Be firm but professional, ask for a same-day reply, and ask who owns each shipment.",
+};
+const GROUP_EMAIL_MAX_SHIPMENTS = 60;
+
+// POST /tasks/v2/group-email
+//   { audience: "carrier" | "customer", name, task_ids: string[], notes?, tone? }
+// One email to a carrier (or customer) covering every shipment behind the
+// supplied tasks. Unlike /carrier-email-draft this takes ANY active task —
+// the v2 board groups by the shipment's carrier / customer, not by a
+// "Carrier followup:" title — and folds several tasks on one shipment into
+// a single line so a PRO is never listed twice.
+tasksRouter.post("/v2/group-email", async (req, res) => {
+  const audience = req.body?.audience === "customer" ? "customer" : req.body?.audience === "carrier" ? "carrier" : "";
+  const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 200) : "";
+  const taskIds = Array.isArray(req.body?.task_ids) ? req.body.task_ids.filter((x) => typeof x === "string" && x) : [];
+  if (!audience) return res.status(400).json({ error: "audience must be carrier or customer" });
+  if (!name) return res.status(400).json({ error: "name required" });
+  if (!taskIds.length) return res.status(400).json({ error: "task_ids required" });
+
+  const tasks = [];
+  for (let i = 0; i < taskIds.length; i += 200) {
+    const { data, error } = await supabase.from("fpx_shipment_tasks").select("*").in("id", taskIds.slice(i, i + 200));
+    if (error) return res.status(500).json({ error: error.message });
+    tasks.push(...(data || []));
+  }
+  const active = tasks.filter((t) => ["open", "in_progress", "blocked"].includes(t.status) && t.shipment_id);
+  if (!active.length) return res.status(400).json({ error: "None of those tasks are still active" });
+
+  const shipIds = Array.from(new Set(active.map((t) => t.shipment_id)));
+  if (shipIds.length > GROUP_EMAIL_MAX_SHIPMENTS) {
+    return res.status(400).json({ error: `That's ${shipIds.length} shipments — one email covers up to ${GROUP_EMAIL_MAX_SHIPMENTS}. Remove some and draft a second email.` });
+  }
+  const { data: ships, error: shipErr } = await supabase.from("fpx_shipments").select("*").in("id", shipIds);
+  if (shipErr) return res.status(500).json({ error: shipErr.message });
+  const shipById = new Map((ships || []).map((s) => [s.id, s]));
+
+  // One line per shipment; its tasks' asks are merged.
+  const byShip = new Map();
+  for (const t of active) {
+    if (!shipById.has(t.shipment_id)) continue;
+    if (!byShip.has(t.shipment_id)) byShip.set(t.shipment_id, []);
+    byShip.get(t.shipment_id).push(t);
+  }
+  const items = Array.from(byShip.entries()).map(([sid, ts]) => ({
+    shipment: shipById.get(sid),
+    task: {
+      title: ts.map((t) => t.title).filter(Boolean).join(" | "),
+      description: ts.map((t) => t.description).filter(Boolean).join("\n").slice(0, 1500) || null,
+    },
+  }));
+  if (!items.length) return res.status(404).json({ error: "Shipments not found" });
+
+  const tone = GROUP_EMAIL_TONES[req.body?.tone] ? req.body.tone : null;
+  const userNotes = typeof req.body?.notes === "string" ? req.body.notes.trim().slice(0, 2000) : "";
+  const notes = [tone ? GROUP_EMAIL_TONES[tone] : "", userNotes].filter(Boolean).join("\n") || undefined;
+  const callMeta = { api_key_id: req.apiKey?.id, user_email: req.user?.email, metadata: { source: "tasks_v2", tone } };
+  const result = audience === "carrier"
+    ? await generateCarrierGroupEmail({ carrier: name, items, notes, callMeta })
+    : await generateCustomerGroupEmail({ customer: name, items, notes, callMeta });
+  if (result.error) return res.status(500).json({ error: result.error });
+  logAudit(req, {
+    action: "create", entity_type: "email_draft",
+    summary: `Drafted ${audience} group email to "${name}" covering ${items.length} shipment(s) from the Tasks board`,
+    metadata: { audience, name, tone, task_ids: active.map((t) => t.id), count: items.length, model: result.model || null },
+  });
+  // The model occasionally drops a shipment or repeats a neighbour's PRO.
+  // Report every tracking number that isn't in the body so the rep checks
+  // before sending.
+  const text = `${result.subject || ""}\n${result.body || ""}`;
+  const missing = items.map((it) => it.shipment.tracking_number).filter((tn) => tn && !text.includes(String(tn)));
+  res.json({
+    subject: result.subject, body: result.body, model: result.model || null,
+    count: items.length, task_ids: active.filter((t) => shipById.has(t.shipment_id)).map((t) => t.id),
+    missing,
+  });
+});
+
 // GET /tasks/:id  — task lookup by id, with optional walk-through context.
 // When ?walk=active is set, returns prev_task_id / next_task_id keyed against
 // the active (open + in_progress) task set so the drawer can step through.

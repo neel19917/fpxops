@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Mail, Sparkles, Save, RotateCcw, Undo2, Eye, AlertTriangle, CheckCircle2 } from "lucide-react";
-import { api, type EmailStudioSample, type EmailStudioType, type SettingRow } from "../lib/api";
+import { Mail, Sparkles, Save, RotateCcw, Undo2, Eye, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Copy, History, ThumbsDown, ThumbsUp } from "lucide-react";
+import { api, type EmailStudioDraft, type EmailStudioSample, type EmailStudioType, type SettingRow } from "../lib/api";
 import { fmtRelative } from "../lib/format";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
@@ -33,7 +33,7 @@ const EMAILS: EmailDef[] = [
   },
   {
     id: "carrier_group", label: "Group email → carrier", group: true,
-    blurb: "One email to a carrier covering several shipments (Tasks → carrier follow-ups).",
+    blurb: "One email to a carrier covering several shipments. Reps draft these from Tasks: group by carrier, then Email group.",
     modelKey: "prompt.email_draft.carrier_group.model",
     parts: [
       { key: "prompt.email_draft.carrier_group.system_base", label: "Main instructions", hint: "{{audienceCopy}} is where the audience part goes." },
@@ -42,7 +42,7 @@ const EMAILS: EmailDef[] = [
   },
   {
     id: "customer_group", label: "Group email → customer", group: true,
-    blurb: "One email to a customer covering several shipments (Tasks → customer follow-ups).",
+    blurb: "One email to a customer covering several shipments. Reps draft these from Tasks: group by customer, then Email group.",
     modelKey: "prompt.email_draft.customer_group.model",
     parts: [
       { key: "prompt.email_draft.customer_group.system_base", label: "Main instructions", hint: "{{audienceCopy}} is where the audience part goes." },
@@ -156,6 +156,7 @@ export function EmailStudioPage() {
         </div>
         <PreviewPanel email={email} overrides={Object.fromEntries(dirtyKeys.map((k) => [k, drafts[k]]))} />
       </div>
+      {email.id === "carrier_group" || email.id === "customer_group" ? <DraftHistory key={email.id} type={email.id} /> : null}
     </div>
   );
 }
@@ -230,6 +231,73 @@ function PromptEditor({ part, row, value, savedValue, onChange, onDiscard }: {
   );
 }
 
+// What reps actually got: every group email drafted from Tasks, newest first.
+// Read these before changing the prompts above.
+function DraftHistory({ type }: { type: "carrier_group" | "customer_group" }) {
+  const [rows, setRows] = useState<EmailStudioDraft[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const load = useCallback(() => {
+    setErr(null);
+    api.emailStudio.drafts(type).then((r) => setRows(r.data)).catch((e) => setErr((e as Error).message));
+  }, [type]);
+  useEffect(() => { load(); }, [load]);
+
+  async function copy(d: EmailStudioDraft) {
+    try { await navigator.clipboard.writeText(`Subject: ${d.subject || ""}\n\n${d.body}`); setCopiedId(d.id); setTimeout(() => setCopiedId(null), 1500); } catch { /* clipboard blocked */ }
+  }
+
+  return (
+    <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4 space-y-3">
+      <div className="flex items-start justify-between gap-2 flex-wrap">
+        <div>
+          <div className="font-medium text-slate-900 flex items-center gap-1.5"><History className="h-4 w-4 text-violet-600" /> Emails reps drafted</div>
+          <div className="text-xs text-slate-500">Every group email to a {type === "carrier_group" ? "carrier" : "customer"}, as the AI wrote it (before any edits by the rep). Previews from this page aren't listed.</div>
+        </div>
+        <button onClick={load} className="text-xs px-2 py-1 rounded ring-1 ring-slate-200 hover:bg-slate-50">Refresh</button>
+      </div>
+      {err ? <div className="text-sm text-rose-700">{err}</div> : null}
+      {!rows && !err ? <div className="text-xs text-slate-400">Loading…</div> : null}
+      {rows && !rows.length ? <div className="text-sm text-slate-500">None yet. They appear here once someone drafts a group email from Tasks.</div> : null}
+      {rows?.length ? (
+        <ul className="divide-y divide-slate-100 rounded-xl ring-1 ring-slate-100">
+          {rows.map((d) => {
+            const open = openId === d.id;
+            return (
+              <li key={d.id}>
+                <button onClick={() => setOpenId(open ? null : d.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 flex items-start gap-2">
+                  {open ? <ChevronDown className="h-4 w-4 text-slate-400 mt-0.5 shrink-0" /> : <ChevronRight className="h-4 w-4 text-slate-400 mt-0.5 shrink-0" />}
+                  <span className="min-w-0 flex-1">
+                    <span className="text-sm font-medium text-slate-900">{d.recipient || "(no recipient)"}</span>
+                    {d.count ? <span className="text-xs text-slate-500"> · {d.count} shipment{d.count === 1 ? "" : "s"}</span> : null}
+                    {d.tone ? <span className="ml-1.5 text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600">{d.tone}</span> : null}
+                    {d.rating === "up" ? <ThumbsUp className="inline h-3.5 w-3.5 ml-1.5 text-emerald-600" /> : d.rating === "down" ? <ThumbsDown className="inline h-3.5 w-3.5 ml-1.5 text-rose-600" /> : null}
+                    <span className="block text-xs text-slate-600 truncate">{d.subject || "(no subject)"}</span>
+                  </span>
+                  <span className="text-[11px] text-slate-400 shrink-0 text-right">
+                    {fmtRelative(d.created_at)}<br />{d.by || "—"}
+                  </span>
+                </button>
+                {open ? (
+                  <div className="px-3 pb-3 pl-9 space-y-2">
+                    <pre className="text-sm whitespace-pre-wrap font-sans text-slate-800 bg-slate-50 ring-1 ring-slate-200 rounded-lg p-3 max-h-96 overflow-auto">{d.body}</pre>
+                    <div className="flex items-center gap-3 text-xs text-slate-500 flex-wrap">
+                      <button onClick={() => copy(d)} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-900 text-white hover:bg-slate-800"><Copy className="h-3 w-3" /> {copiedId === d.id ? "Copied" : "Copy"}</button>
+                      {d.model ? <span>{d.model}</span> : null}
+                      {d.rating_reason ? <span className="italic">“{d.rating_reason}”</span> : null}
+                    </div>
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function ModelPicker({ value, savedValue, shared, onChange }: {
   value: string; savedValue: string; shared: boolean; onChange: (v: string) => void;
 }) {
@@ -275,7 +343,7 @@ function PreviewPanel({ email, overrides }: { email: EmailDef; overrides: Record
   const inGroup = relevant.filter((s) => !group || (byCarrier ? s.carrier : s.customer) === group);
 
   function toggle(tn: string) {
-    setPicked((p) => email.group ? (p.includes(tn) ? p.filter((x) => x !== tn) : [...p, tn].slice(0, 12)) : [tn]);
+    setPicked((p) => email.group ? (p.includes(tn) ? p.filter((x) => x !== tn) : [...p, tn].slice(0, 60)) : [tn]);
   }
 
   async function run() {
@@ -305,7 +373,7 @@ function PreviewPanel({ email, overrides }: { email: EmailDef; overrides: Record
               <option value="">{byCarrier ? "All carriers" : "All customers"}</option>
               {groups.map(([g, n]) => <option key={g} value={g}>{g} ({n})</option>)}
             </select>
-            <span className="text-xs text-slate-500">{email.group ? "Pick up to 12 shipments (same " + (byCarrier ? "carrier" : "customer") + " works best)" : "Pick one shipment"}</span>
+            <span className="text-xs text-slate-500">{email.group ? "Pick up to 60 shipments (same " + (byCarrier ? "carrier" : "customer") + " works best)" : "Pick one shipment"}</span>
           </div>
           <div className="max-h-56 overflow-auto rounded-lg ring-1 ring-slate-100 divide-y divide-slate-100">
             {inGroup.slice(0, 80).map((s) => (

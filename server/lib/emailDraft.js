@@ -150,7 +150,7 @@ export async function generateCarrierGroupEmail({ carrier, items, notes, callMet
   const result = await callClaude({
     systemPrompt,
     userMessage,
-    maxTokens: emailModelExtras(modelOverride) ? 8000 : 2000,
+    maxTokens: emailModelExtras(modelOverride) ? 8000 : Math.max(2000, 600 + slim.length * 90),
     modelOverride,
     extraBody: emailModelExtras(modelOverride),
     metadata: {
@@ -198,7 +198,7 @@ export async function generateCustomerGroupEmail({ customer, items, notes, callM
   const result = await callClaude({
     systemPrompt,
     userMessage,
-    maxTokens: emailModelExtras(modelOverride) ? 8000 : 2000,
+    maxTokens: emailModelExtras(modelOverride) ? 8000 : Math.max(2000, 600 + slim.length * 90),
     modelOverride,
     extraBody: emailModelExtras(modelOverride),
     metadata: {

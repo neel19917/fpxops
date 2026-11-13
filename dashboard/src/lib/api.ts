@@ -446,6 +446,11 @@ export const api = {
     v2DailySummaryLatest: () => request<DailySummaryResult>("/api/tasks/v2/daily-summary/latest"),
     // Cancel-with-reason. The board's replacement for delete: the row stays
     // as a dedup tombstone so the auto-task builder doesn't respawn it.
+    // One email to a carrier / customer covering the shipments behind the
+    // given tasks (any active task, not only "…followup:" titled ones).
+    v2GroupEmail: (body: { audience: "carrier" | "customer"; name: string; task_ids: string[]; notes?: string; tone?: "friendly" | "direct" | "escalate" }) =>
+      request<{ subject: string; body: string; model: string | null; count: number; task_ids: string[]; missing?: string[] }>(
+        "/api/tasks/v2/group-email", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
     v2Dismiss: (body: { ids: string[]; reason?: string; disposition?: string }) =>
       request<{ dismissed: number; skipped: number }>("/api/tasks/v2/dismiss", { method: "POST", body: JSON.stringify(body) }),
     // Active "Carrier Followup"-titled tasks grouped by carrier. Returns
@@ -537,6 +542,8 @@ export const api = {
   },
   emailStudio: {
     samples: () => request<{ data: EmailStudioSample[] }>("/api/email-studio/samples"),
+    drafts: (type: "carrier_group" | "customer_group", limit = 30) =>
+      request<{ data: EmailStudioDraft[] }>("/api/email-studio/drafts", { params: { type, limit } }),
     rewrite: (body: { key: string; text: string; instructions: string }) =>
       request<{ text: string; model: string | null; warnings: string[] }>("/api/email-studio/rewrite", { method: "POST", body: JSON.stringify(body), timeoutMs: 180_000 }),
     preview: (body: { type: EmailStudioType; tracking_numbers: string[]; notes?: string; group?: string; overrides?: Record<string, string> }) =>
@@ -649,6 +656,14 @@ export interface GovCall {
 }
 
 export type EmailStudioType = "carrier" | "customer" | "carrier_group" | "customer_group";
+// A group email a rep drafted for real (not a Studio preview).
+export interface EmailStudioDraft {
+  id: string; created_at: string; model: string | null; by: string | null;
+  recipient: string | null; count: number | null; tone: string | null; source: string | null;
+  subject: string | null; body: string; cost_usd: number | null;
+  rating: "up" | "down" | null; rating_reason: string | null;
+}
+
 export interface EmailStudioSample {
   tracking_number: string;
   shipment_id: string | null;
