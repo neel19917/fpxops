@@ -49,7 +49,8 @@ const FALLBACKS = {
   // Same Opus default as carrier_group for the same reason.
   "prompt.email_draft.customer_group.model": "claude-opus-5-5",
   "action.threshold": 0.7,
-  "action.auto_draft_enabled": true,
+  // Deprecated: nothing reads this. Emails are drafted on command only.
+  "action.auto_draft_enabled": false,
   // Auto-task generation filters (Tasks board → Task rules). modes null =
   // the legacy rule (LTL + Truckload; Parcel only with ui.tracking.show_parcels).
   "tasks.generate.modes": null,

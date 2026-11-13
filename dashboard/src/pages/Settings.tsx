@@ -102,7 +102,7 @@ const GROUPS: {
 
 const FRIENDLY_LABEL: Record<string, string> = {
   "action.threshold": "Action confidence threshold (0.0–1.0)",
-  "action.auto_draft_enabled": "Auto-draft email when action threshold is crossed",
+  "action.auto_draft_enabled": "Deprecated, no effect: emails are drafted on command only (drawer Email tab, Email Studio)",
   "prompt.system": "System persona prompt",
   "prompt.per_shipment": "Per-shipment analysis prompt",
   "prompt.per_shipment_logic": "Per-shipment classification logic",
