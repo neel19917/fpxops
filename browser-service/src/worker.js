@@ -1666,14 +1666,24 @@ async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
     // No file: say what the page's Excel buttons actually do, once per job.
     if (!file && lane.page && lane.current && !lane.current.exportProbed) {
       lane.current.exportProbed = true;
-      const probe = await lane.page.evaluate(() => [...document.querySelectorAll("input[type=button], button, a")]
-        .filter((e) => /excel/i.test((e.value || e.textContent || "") + " " + e.id))
-        .slice(0, 4).map((e) => {
-          const on = e.getAttribute("onclick") || e.getAttribute("ng-click") || "";
-          const fn = (/^\s*([A-Za-z_$][\w$]*)\s*\(/.exec(on) || [])[1];
-          const src = fn && typeof window[fn] === "function" ? String(window[fn]).replace(/\s+/g, " ").slice(0, 700) : "";
-          return `#${e.id || "?"} onclick="${on.slice(0, 120)}"${src ? ` → ${src}` : ""}`;
-        }).join(" || ")).catch((e) => `probe failed: ${e.message}`);
+      const probe = await lane.page.evaluate(() => {
+        const $ = window.jQuery;
+        const vis = (e) => !!(e.offsetWidth || e.offsetHeight);
+        return [...document.querySelectorAll("input[type=button], button, a")]
+          .filter((e) => /excel/i.test((e.value || e.textContent || "") + " " + e.id) && (vis(e) || e.id === "ExportExcelHistory"))
+          .slice(0, 3).map((e) => {
+            let src = "";
+            try {
+              const ev = $ && $._data ? $._data(e, "events") : null;
+              src = ev && ev.click ? ev.click.map((h) => String(h.handler).replace(/\s+/g, " ").slice(0, 500)).join(" ;; ") : "";
+              if (!src && $) {
+                const dev = $._data(document, "events");
+                src = dev && dev.click ? dev.click.filter((h) => h.selector && e.matches(h.selector)).map((h) => `[delegated ${h.selector}] ` + String(h.handler).replace(/\s+/g, " ").slice(0, 500)).join(" ;; ") : "";
+              }
+            } catch (x) { src = `err ${x.message}`; }
+            return `#${e.id || "?"} ${vis(e) ? "visible" : "hidden"} onclick="${(e.getAttribute("onclick") || "").slice(0, 100)}" handler: ${src || "none found"}`;
+          }).join(" || ");
+      }).catch((e) => `probe failed: ${e.message}`);
       logLine(lane, `What the Excel buttons do: ${probe || "none found"}`.slice(0, 1800));
     }
     if (file && (!fromGrid || file.rows.length >= fromGrid.rows.length)) return { ...file, gridTotal: fromGrid?.gridTotal || null, via: "download" };
