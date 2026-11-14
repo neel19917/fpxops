@@ -25,6 +25,7 @@ const ExtLoginPage    = lazy(() => import("./pages/ExtLogin").then((m) => ({ def
 const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
 const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
 const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
+const InvoicingPage   = lazy(() => import("./pages/Invoicing").then((m) => ({ default: m.InvoicingPage })));
 const ApiKeysPage     = lazy(() => import("./pages/ApiKeys").then((m) => ({ default: m.ApiKeysPage })));
 const UsersPage       = lazy(() => import("./pages/Users").then((m) => ({ default: m.UsersPage })));
 const ShareLinksPage  = lazy(() => import("./pages/ShareLinks").then((m) => ({ default: m.ShareLinksPage })));
@@ -56,6 +57,7 @@ const TAB_PATH: Record<TabId, string> = {
   analyses: "/analyses",
   gp: "/audits/gp",
   invoice: "/audits/invoice",
+  invoicing: "/invoicing",
   shares: "/shares",
   feedback: "/feedback",
   install: "/install",
@@ -92,6 +94,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/claude")) return "claude";
   if (pathname.startsWith("/audits/gp")) return "gp";
   if (pathname.startsWith("/audits/invoice")) return "invoice";
+  if (pathname.startsWith("/invoicing")) return "invoicing";
   if (pathname.startsWith("/email-studio")) return "emails";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
@@ -279,6 +282,7 @@ function AuthedApp() {
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
+            <Route path="/invoicing" element={<InvoicingPage />} />
             <Route path="/shares" element={<ShareLinksPage />} />
             <Route path="/feedback" element={<FeedbackPage />} />
             <Route path="/install" element={<InstallPage />} />

@@ -54,15 +54,15 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   onUrl?: (url: string) => void;
   /** Server's check: does this browser hold a FreightPOP login? */
   onSignedIn?: (signedIn: boolean) => void;
-  /** "scrape": read-only view of the user's running scrape window. */
-  target?: "tab" | "scrape";
+  /** "scrape" / "invoicing": read-only view of the user's running scrape window, or of their invoicing session's window. */
+  target?: "tab" | "scrape" | "invoicing";
   onEnded?: (reason: string) => void;
   /** True while the pane is hidden: the service stops encoding frames. */
   paused?: boolean;
   /** The connection dropped: whatever was loaded in the view can no longer be assumed. */
   onDisconnected?: () => void;
 }>(function HostedFreightPop({ onBridgeReady, onUrl, onSignedIn, target = "tab", onEnded, paused = false, onDisconnected }, ref) {
-  const watchOnly = target === "scrape";
+  const watchOnly = target !== "tab";
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // Keyboard focus target. A canvas can't reliably receive `paste` events in
@@ -581,7 +581,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
             "mt-3 text-xs px-3 py-1.5 rounded-full shadow ring-1 pointer-events-auto " +
             (status === "denied" ? "bg-rose-50 text-rose-800 ring-rose-200" : "bg-white text-slate-700 ring-slate-200")
           }>
-            {status === "connecting" ? (watchOnly ? "Connecting to the scrape…" : "Connecting to hosted FreightPOP…")
+            {status === "connecting" ? (target === "invoicing" ? "Connecting to the invoicing session…" : watchOnly ? "Connecting to the scrape…" : "Connecting to hosted FreightPOP…")
               : status === "reconnecting" ? "Reconnecting to hosted FreightPOP…"
               : null}
             {error ? <span className={status === "live" ? "" : "ml-1"}>{error}</span> : null}

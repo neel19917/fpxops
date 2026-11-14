@@ -4,24 +4,29 @@ import { api, type ScrapeRequest } from "../lib/api";
 import { hostedBrowser, type HostedStats } from "../lib/hostedBrowser";
 import {
   ERP_MONTH_CHOICES, EndpointMissingError, erpWorker, isErpRequest, pauseErpPull, requestErpPull, resumeErpPull,
+  LANE_NEEDS_UPDATE, downloadErpLog, stopErpPull,
   type ErpMonths,
   ERP_TYPE_CHOICES, type ErpShipmentType,
-  asGetInvoiceResult, asPullResult, getInvoiceCounts, getInvoicePauseLine, isGetInvoiceRequest, type ErpJobKind,
+  asGetInvoiceResult, asPullResult, getInvoiceCounts, getInvoicePauseLine, type ErpJobKind,
+  ERP_JOB_KINDS, asApprovalResult, requestKind,
 } from "../lib/erpPull";
 import { fmtNum, fmtRelative } from "../lib/format";
 import { HostedFreightPop } from "./HostedFreightPop";
 import { ScrapeLog } from "./ScrapeLog";
 
 // ERP audit pull: start it, watch the hosted browser do it, pause, resume or
-// stop it. The pull runs in the same hosted browser worker as Refresh All
-// (one automation at a time), so this reads the same /stats and request queue
-// as the Scraping page and reuses its live view and log.
+// stop it. The pull runs in the hosted browser's invoicing session, which is
+// separate from the scrape session (own window, queue, log, pause and stop),
+// so a scrape neither delays it nor shows up here. This reads only
+// /stats → worker.invoicing and the invoicing requests in the request queue.
 //
 // The same card also shows a "Get Invoice" run (started from an audit's
-// shipment table, after a person reviewed the selection): same worker, same
-// live view, log, pause and stop. Only one of the two can be under way.
+// shipment table, after a person reviewed the selection): same session, same
+// live view, log, pause and stop. So does an "approval check" (started from an
+// open audit): it takes FreightPOP's Recently Approved export and the server
+// matches it to the audit's shipments. Only one of the three can be under way.
 
-const POLL_MS = 5000;         // queued — same cadence as the Scraping page
+const POLL_MS = 5000;         // queued
 const POLL_RUNNING_MS = 2000; // running, for the live log
 
 function fmtDuration(ms: number | null | undefined): string {
@@ -46,8 +51,8 @@ interface ErpPullMonitorProps {
   onFinished?: (auditId: string) => void;
   /** A pull or invoice run that was under way has ended. */
   onSettled?: () => void;
-  /** A Get Invoice run the page just queued: the card picks it up and scrolls into view. */
-  started?: { requestId: string; auditId: string } | null;
+  /** A Get Invoice run or approval check the page just queued: the card picks it up and scrolls into view. */
+  started?: { requestId: string; auditId: string; kind?: "get_invoice" | "approval_check" } | null;
   onStatus?: (status: ErpMonitorStatus) => void;
 }
 
@@ -58,7 +63,7 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
   const [loading, setLoading] = useState(true);
   const [months, setMonths] = useState<ErpMonths>(3);
   const [shipType, setShipType] = useState<ErpShipmentType>("non-parcel");
-  // The request this panel started (the hosted browser may not label jobs yet).
+  // The pull request this panel started.
   const [reqId, setReqId] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [toggling, setToggling] = useState(false);
@@ -97,16 +102,17 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
   const me = stats?.me;
   const loggedIn = me?.freightpop?.loggedIn === true;
 
-  // Which of this card's two jobs is it? The hosted browser says so (`kind`);
-  // when it doesn't, go by the request it came from.
+  // Which of this card's three jobs is it? The invoicing session says so
+  // (`kind`); when it doesn't, go by the request it came from. Regular scrape
+  // requests have no kind here and are ignored.
   const kindOfId = (id: string): ErpJobKind | null => {
     if (id === reqId) return "erp_audit";
-    if (id === started?.requestId) return "get_invoice";
+    if (id === started?.requestId) return started.kind ?? "get_invoice";
     const r = requests.find((x) => x.id === id);
-    return !r ? null : isGetInvoiceRequest(r) ? "get_invoice" : isErpRequest(r) ? "erp_audit" : null;
+    return r ? requestKind(r) : null;
   };
   const kindOf = (j: { kind?: string; requestId: string }): ErpJobKind | null =>
-    j.kind ? (j.kind === "erp_audit" || j.kind === "get_invoice" ? j.kind : null) : kindOfId(j.requestId);
+    j.kind ? (ERP_JOB_KINDS.find((k) => k === j.kind) ?? null) : kindOfId(j.requestId);
 
   const current = worker?.current ?? null;
   const running = current && kindOf(current) ? current : null;
@@ -115,24 +121,25 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
   const last = !running && !queued && worker?.lastResult && kindOf(worker.lastResult) ? worker.lastResult : null;
   const jobKind: ErpJobKind | null = running ? kindOf(running) : waiting ? kindOfId(waiting.id) : last ? kindOf(last) : null;
   const gi = jobKind === "get_invoice";
+  const ac = jobKind === "approval_check";
   const lastResult = last?.ok ? (last.result ?? worker?.result ?? null) : null;
-  const result = gi ? null : asPullResult(lastResult);
+  const result = gi || ac ? null : asPullResult(lastResult);
+  const acResult = ac ? asApprovalResult(lastResult) : null;
   const giResult = gi ? asGetInvoiceResult(lastResult) : null;
   const giCounts = gi ? getInvoiceCounts(running ?? last) : null;
   const paused = !!(running?.paused ?? (running ? worker?.paused : false));
   // Set when the invoice run paused itself and is waiting for a person.
   const pauseLine = gi && paused ? getInvoicePauseLine(running?.log) : null;
-  const labelled = !!current?.kind; // hosted browser knows about these jobs
   const mine = !!running && running.user === me?.user;
-  // The audit a Get Invoice run belongs to, for the "Open the audit" button.
+  // The audit a Get Invoice run or approval check belongs to, for the "Open the audit" button.
   const giJobId = running?.requestId ?? waiting?.id ?? last?.requestId ?? null;
-  const giAuditId = !gi ? null
-    : giResult?.audit_id
+  const giAuditId = !gi && !ac ? null
+    : giResult?.audit_id || acResult?.audit_id
       || (giJobId && giJobId === started?.requestId ? started.auditId : null)
       // The API keeps the audit in the request's note: "audit=<uuid>;from=…".
       || /(?:^|;)audit=([0-9a-f-]{36})/i.exec(String((requests.find((r) => r.id === giJobId) as { note?: string | null } | undefined)?.note ?? ""))?.[1]
       || null;
-  const noun = gi ? "invoice run" : "pull";
+  const noun = gi ? "invoice run" : ac ? "approval check" : "pull";
 
   // Poll only while something is queued or running; one load on mount finds a
   // pull that is already under way.
@@ -166,10 +173,10 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
 
   const startDisabledReason = !hostedBrowser.enabled ? "Hosted browser isn't configured for this dashboard"
     : !worker ? (statsErr ? "Can't reach the hosted browser" : "Loading…")
-    : !worker.enabled ? `Hosted browser worker is off (${worker.reason})`
+    // An older hosted browser has no invoicing session. The scrape session is never used instead.
+    : !worker.ready ? LANE_NEEDS_UPDATE
+    : !worker.enabled ? `The invoicing session is off${worker.reason ? ` (${worker.reason})` : ""}`
     : !loggedIn ? "Sign in to FreightPOP in your hosted browser first (Scraping page)"
-    // A hosted browser that knows this job always reports `kind` (null when idle).
-    : worker.kind === undefined ? "The hosted browser needs its next update before it can run this"
     : null;
 
   const activeKind = active ? jobKind : null;
@@ -203,8 +210,10 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
 
   async function stop() {
     setStopping(true); setError(null); setConfirmStop(false);
-    try { await hostedBrowser.stopScrape(); setStopRequested(true); await load(); }
-    catch (e) { setError((e as Error).message); }
+    try { await stopErpPull(); setStopRequested(true); await load(); }
+    catch (e) {
+      setError(e instanceof EndpointMissingError ? "Stop needs the next hosted browser update. Nothing was stopped." : (e as Error).message);
+    }
     finally { if (alive.current) setStopping(false); }
   }
 
@@ -228,11 +237,13 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
     <section ref={sectionRef} className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-5 space-y-4 scroll-mt-4">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-slate-900">{active && gi ? "Getting invoices" : "Pull from FreightPOP"}</h2>
+          <h2 className="text-sm font-semibold text-slate-900">{active && gi ? "Getting invoices" : active && ac ? "Checking approvals" : "Pull from FreightPOP"}</h2>
           <p className="text-sm text-slate-500 mt-0.5">
             {active && gi
               ? "Pressing Get Invoice in FreightPOP on the shipments you picked, one at a time."
-              : "Runs FreightPOP's History Report for every customer and brings in the rows not exported to ERP."}
+              : active && ac
+                ? "Taking the Recently Approved list from FreightPOP's Audit page and matching it to the audit's shipments, to show who approved each invoice: EDI or a person. Nothing is changed in FreightPOP."
+              : "Runs FreightPOP's History Report for every customer and brings in the rows not exported to ERP. Runs in its own invoicing session in the hosted browser, separate from scraping."}
           </p>
         </div>
         {!active ? (
@@ -296,7 +307,7 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
               <span className="font-normal tabular-nums opacity-80">· {fmtDuration(now - new Date(running.startedAt).getTime())}</span>
             </div>
             <div className="flex items-center gap-2">
-              {gi && giAuditId && onFinished ? (
+              {(gi || ac) && giAuditId && onFinished ? (
                 <button onClick={() => onFinished(giAuditId)} className="text-xs text-violet-700 hover:text-violet-900 underline mr-1">
                   Open the audit
                 </button>
@@ -315,7 +326,7 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
 
           {confirmStop ? (
             <div className="rounded-lg bg-white ring-1 ring-rose-200 px-3 py-2 text-sm text-rose-900 flex items-center justify-between gap-3 flex-wrap">
-              <span>{gi ? "Stop the invoice run? Shipments already done stay done; the rest are left untouched." : "Stop the pull? Rows pulled so far may not be saved."}</span>
+              <span>{gi ? "Stop the invoice run? Shipments already done stay done; the rest are left untouched." : ac ? "Stop the approval check? The audit keeps what the last check found." : "Stop the pull? Rows pulled so far may not be saved."}</span>
               <span className="flex items-center gap-2">
                 <button onClick={stop} disabled={stopping} className="px-3 py-1 rounded-md bg-rose-600 text-white hover:bg-rose-700 text-xs font-medium disabled:opacity-50">Stop the {noun}</button>
                 <button onClick={() => setConfirmStop(false)} className="px-3 py-1 rounded-md ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 text-xs font-medium">Keep going</button>
@@ -362,20 +373,17 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
           <div className={"grid gap-3 " + (watch && mine ? "lg:grid-cols-[3fr_2fr]" : "")}>
             {watch && mine ? (
               <div className={"h-[420px] rounded-lg overflow-hidden ring-1 bg-slate-900 " + (paused ? "ring-amber-300" : "ring-violet-200")}>
-                <HostedFreightPop key={running.requestId} target="scrape" />
+                <HostedFreightPop key={running.requestId} target="invoicing" />
               </div>
             ) : null}
-            <ScrapeLog lines={running.log || []} total={running.logTotal} live />
+            <LaneLog lines={running.log || []} total={running.logTotal} live />
           </div>
-          {!labelled ? (
-            <div className="text-[11px] text-slate-500">The hosted browser is on an older version, so pausing may not be available yet.</div>
-          ) : null}
         </div>
       ) : queued ? (
         <div className="rounded-xl bg-amber-50 ring-1 ring-amber-200 p-4 text-sm text-amber-900 flex items-center gap-2">
           <Clock className="h-4 w-4 shrink-0" />
-          {current || worker?.queued?.length
-            ? `Waiting for the current scrape to finish. The ${noun} starts right after.`
+          {current || worker?.queued.some((q) => (q.requestId ?? q.id) !== waiting?.id)
+            ? `Another invoicing job is running. The ${noun} starts right after.`
             : `Starting within ${worker?.pollSeconds ?? 30}s…`}
         </div>
       ) : last?.ok && gi ? (
@@ -401,6 +409,28 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
           </div>
           {giResult?.failed ? <div className="mt-1 text-xs">Open the audit and hover a Failed pill to see why.</div> : null}
           {!giResult && last.note ? <div className="mt-1 break-words">{last.note}</div> : null}
+          <LastLog log={last.log} total={last.logTotal} open={logOpen} setOpen={setLogOpen} />
+        </div>
+      ) : last?.ok && ac ? (
+        <div className="rounded-xl p-4 text-sm ring-1 bg-emerald-50 ring-emerald-200 text-emerald-900">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="font-medium inline-flex items-center gap-2">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              {acResult
+                ? `Matched ${fmtNum(acResult.matched)} of ${fmtNum(acResult.matched + acResult.not_found)} ${acResult.matched + acResult.not_found === 1 ? "shipment" : "shipments"} to Recently Approved`
+                : "Approval check finished"}
+            </div>
+            {giAuditId && onFinished ? (
+              <button onClick={() => onFinished(giAuditId)} className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 text-sm font-medium">
+                Open the audit
+              </button>
+            ) : null}
+          </div>
+          <div className="mt-1 text-xs opacity-80">
+            {acResult ? `${fmtNum(acResult.approved_rows)} ${acResult.approved_rows === 1 ? "row" : "rows"} in Recently Approved · ` : ""}finished {fmtRelative(last.finishedAt)} · took {fmtDuration(last.durationMs)}
+          </div>
+          {acResult ? <div className="mt-1 text-xs">Open the audit to see who approved each invoice: EDI or a person.</div> : null}
+          {!acResult && last.note ? <div className="mt-1 break-words">{last.note}</div> : null}
           <LastLog log={last.log} total={last.logTotal} open={logOpen} setOpen={setLogOpen} />
         </div>
       ) : last?.ok ? (
@@ -431,10 +461,11 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
         <div className="rounded-xl p-4 text-sm ring-1 bg-rose-50 ring-rose-200 text-rose-900">
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="font-medium inline-flex items-center gap-2">
-              <XCircle className="h-4 w-4 shrink-0" /> {gi ? "Invoice run didn't finish" : "Pull failed"} {fmtRelative(last.finishedAt)}
+              <XCircle className="h-4 w-4 shrink-0" /> {gi ? "Invoice run didn't finish" : ac ? "Approval check didn't finish" : "Pull failed"} {fmtRelative(last.finishedAt)}
             </div>
-            {gi ? (
-              // No blind retry: the person picks and reviews the shipments again.
+            {gi || ac ? (
+              // No blind retry: the person picks and reviews the shipments again
+              // (or presses Check approvals again in the audit).
               giAuditId && onFinished ? (
                 <button onClick={() => onFinished(giAuditId)} className="px-3 py-1.5 rounded-lg ring-1 ring-rose-300 bg-white text-rose-800 hover:bg-rose-100 text-sm font-medium">
                   Open the audit
@@ -473,8 +504,31 @@ function LastLog({ log, total, open, setOpen }: {
   return (
     <details className="mt-2" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
       <summary className="text-xs cursor-pointer underline opacity-80 hover:opacity-100">{open ? "Hide" : "Show"} log ({fmtNum(total ?? log.length)} lines)</summary>
-      {open ? <div className="mt-2"><ScrapeLog lines={log} total={total} /></div> : null}
+      {open ? <div className="mt-2"><LaneLog lines={log} total={total} /></div> : null}
     </details>
+  );
+}
+
+/**
+ * The log viewer for an invoicing job. ScrapeLog's own "Download full log"
+ * link fetches the scrape session's log, so it is hidden here and replaced by
+ * one that fetches the invoicing session's.
+ */
+function LaneLog(props: React.ComponentProps<typeof ScrapeLog>) {
+  const [err, setErr] = useState<string | null>(null);
+  return (
+    <div className="min-w-0 [&_button[title*='unfiltered']]:hidden">
+      <ScrapeLog {...props} />
+      <div className="flex justify-end gap-2 text-[11px] text-slate-500 mt-0.5">
+        {err ? <span className="text-rose-600">{err}</span> : null}
+        <button
+          onClick={() => { setErr(null); downloadErpLog().catch((e) => setErr((e as Error).message)); }}
+          className="underline hover:text-slate-800"
+        >
+          Download full log
+        </button>
+      </div>
+    </div>
   );
 }
 

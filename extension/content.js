@@ -3613,6 +3613,8 @@ function fpxErpPoll() {
 // points Chromium's downloads at a folder, calls fpxErpClickExport(), reads
 // the .xlsx and answers with fpxErpDownloadDone().
 function erpExportCandidates() {
+  // The approval check has its own, narrower search (see apExportCandidates).
+  if (fpxErp && fpxErp.job === "approval_check") return apExportCandidates();
   const out = [];
   const seen = new Set();
   for (const el of document.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button], .k-button, .k-grid-excel, [ng-click], [data-ng-click], i, span, img")) {
@@ -4109,6 +4111,364 @@ async function erpAuditPull(months, runBy, shipmentType) {
       console.warn("[FPX-ERP] failed:", e?.message || e);
       state.done = { ok: false, note: String(e?.message || e), result: lastResult };
     }
+  }
+}
+
+// =====================================================================
+// APPROVAL CHECK (hosted browser job)
+//
+// Audit page → "Recently Approved" → hand the grid's Excel export to the
+// browser service, which matches it against an ERP audit's shipments (who
+// approved each one: the EDI or a person).
+//
+// Started by the browser service with erpApprovalCheck(runBy); it polls
+// fpxErpPoll() like the ERP audit pull. Pause / stop work the same way.
+//
+// HARD RULE — this job is read-only. On the Audit page it clicks exactly two
+// things: the AUDIT item in the top navigation and the "Recently Approved"
+// tab (plus, only when the browser service asks through fpxErpClickExport(),
+// an Excel export button). It never clicks approve / reject / dispute / pay /
+// edit controls, checkboxes or anything inside a grid row, and it never
+// changes a date range or page size: those are read and logged as shown.
+// =====================================================================
+const AP_GRID_MARK = "data-fpx-export-grid"; // on the Recently Approved grid, for the browser service
+const AP_TAB_RE = /^recently\s+approved(\s*[(\[]?\s*[\d,]+\s*[)\]]?)?$/i;
+const AP_TABLIKE = "[role=tab], .nav-tabs li, .nav-tabs a, .nav-pills li, .nav-pills a, .k-tabstrip-items .k-item, .k-tabstrip-items .k-link, md-tab-item, .md-tab";
+const AP_DANGER_RE = /\b(approve|reject|dispute|pay|delete|void|cancel|send|e-?mail|import|upload|erp|edi|accounting|template|quickbooks|netsuite|pdf|print)\b/i;
+
+function apText(el) { return ((el && (el.textContent || el.value)) || "").replace(/\s+/g, " ").trim(); }
+function apUniq(list, max = 30) { return [...new Set(list.filter(Boolean))].slice(0, max); }
+function apInRow(el) { return !!el.closest("tbody tr, .k-grid-content, .k-grid-header, .k-window, .modal, .k-animation-container"); }
+
+// The top-nav item whose text is exactly AUDIT. → { el } or { labels } (what the nav shows).
+function apFindAuditNav() {
+  const NAV = "nav, header, .navbar, .nav, [role=navigation], [role=menubar], .menu, .top-menu, .main-menu, .header";
+  const hits = [];
+  for (const el of document.querySelectorAll("a, button, li, span, div, [role=menuitem], [role=tab]")) {
+    if (!/^audit$/i.test(apText(el)) || !isVisibleForClick(el) || apInRow(el)) continue;
+    const r = el.getBoundingClientRect();
+    hits.push({ el, nav: el.closest(NAV) ? 1 : 0, top: r.top, depth: el.querySelectorAll("*").length });
+  }
+  if (hits.length) {
+    // In the navigation first, then the highest on the page, then the innermost element.
+    hits.sort((a, b) => b.nav - a.nav || a.top - b.top || a.depth - b.depth);
+    const inner = hits[0].el;
+    // Click the link itself: the <a>/<button> around the text, or the one inside an <li>.
+    const link = inner.closest("a, button, [role=menuitem], [ui-sref]");
+    const target = (link && /^audit$/i.test(apText(link)) ? link : null) ||
+      [...inner.querySelectorAll("a, button")].find(isVisibleForClick) || inner;
+    // Outside a recognised navigation bar only a real link in the top strip
+    // of the page counts: any other "Audit" text is not clicked.
+    const linkLike = target.matches("a, button, [role=menuitem], [ui-sref]");
+    if (hits[0].nav || (linkLike && hits[0].top < 140)) return { el: target, inNav: !!hits[0].nav };
+  }
+  const labels = [];
+  for (const el of document.querySelectorAll(`${NAV}`)) {
+    for (const a of el.querySelectorAll("a, button, [role=menuitem]")) {
+      const t = apText(a);
+      if (t && t.length <= 30 && isVisibleForClick(a)) labels.push(t);
+    }
+  }
+  // No recognised navigation bar: the links across the top of the page.
+  if (!labels.length) {
+    for (const a of document.querySelectorAll("a, button, [role=menuitem]")) {
+      const t = apText(a);
+      if (t && t.length <= 30 && isVisibleForClick(a) && a.getBoundingClientRect().top < 140) labels.push(t);
+    }
+  }
+  return { labels: apUniq(labels) };
+}
+
+function apTabIsActive(el) {
+  for (const n of [el, el.closest("li, .k-item, md-tab-item, [role=tab]"), el.parentElement]) {
+    if (!n) continue;
+    if (n.getAttribute("aria-selected") === "true") return true;
+    if (/(^|\s)(active|k-state-active|k-active|md-active|selected|current)(\s|$)/.test(String(n.className || ""))) return true;
+  }
+  return false;
+}
+
+// → { el, kind: "tab" | "heading", label } or null. A tab is clicked; a
+// section heading (the grid simply sits under it) is not.
+function apFindApprovedTab() {
+  const hits = [];
+  for (const el of document.querySelectorAll(`${AP_TABLIKE}, a, button, h1, h2, h3, h4, h5, legend, .panel-heading, .panel-title, .card-header, span, div, li, label`)) {
+    const text = apText(el);
+    if (text.length > 40 || !AP_TAB_RE.test(text) || !isVisibleForClick(el) || apInRow(el)) continue;
+    const tabby = el.matches(AP_TABLIKE) ? el : el.closest(AP_TABLIKE);
+    let score, kind = "tab", target = el;
+    if (tabby && AP_TAB_RE.test(apText(tabby))) { score = 10; target = tabby; }
+    else if (el.matches("a, button") || (el.closest("a, button") && AP_TAB_RE.test(apText(el.closest("a, button"))))) { score = 5; target = el.closest("a, button") || el; }
+    else if (el.matches("h1, h2, h3, h4, h5, legend, .panel-heading, .panel-title, .card-header")) { score = 3; kind = "heading"; }
+    else {
+      const clickable = el.hasAttribute("ng-click") || el.hasAttribute("data-ng-click") || el.hasAttribute("onclick") || window.getComputedStyle(el).cursor === "pointer";
+      score = clickable ? 2 : 1;
+      if (!clickable) kind = "heading";
+    }
+    hits.push({ el: target, kind, score, label: text, len: el.querySelectorAll("*").length });
+  }
+  if (!hits.length) return null;
+  hits.sort((a, b) => b.score - a.score || a.label.length - b.label.length || a.len - b.len);
+  return hits[0];
+}
+
+function apTabLabels() {
+  const seen = [];
+  for (const el of document.querySelectorAll("[role=tab], .nav-tabs > li, .nav-pills > li, .k-tabstrip-items .k-item, md-tab-item, .md-tab")) {
+    const t = apText(el);
+    if (t && t.length <= 40 && isVisibleForClick(el)) seen.push(t);
+  }
+  if (seen.length) return apUniq(seen);
+  for (const el of document.querySelectorAll("h1, h2, h3, h4, .panel-heading, .panel-title, .card-header")) {
+    const t = apText(el);
+    if (t && t.length <= 40 && isVisibleForClick(el) && !apInRow(el)) seen.push(t);
+  }
+  return apUniq(seen);
+}
+
+// The Recently Approved grid: inside the tab's pane when the tab names one,
+// the first grid after a section heading, else the biggest visible grid.
+function apFindGrid(tab) {
+  const grids = [...document.querySelectorAll(".k-grid")].filter(isVisibleForClick);
+  if (!grids.length) return null;
+  if (tab && tab.kind === "tab") {
+    const link = tab.el.matches("a") ? tab.el : tab.el.querySelector("a");
+    const id = tab.el.getAttribute("aria-controls") || (link && (link.getAttribute("aria-controls") || (/^#[\w-]+$/.test(link.getAttribute("href") || "") ? link.getAttribute("href").slice(1) : "")));
+    const pane = id ? document.getElementById(id) : null;
+    const inPane = pane ? grids.filter((g) => pane.contains(g)) : [];
+    if (inPane.length) return inPane[0];
+  }
+  if (tab && tab.kind === "heading") {
+    const after = grids.filter((g) => tab.el.compareDocumentPosition(g) & Node.DOCUMENT_POSITION_FOLLOWING);
+    if (after.length) return after[0];
+  }
+  const area = (g) => { const r = g.getBoundingClientRect(); return r.width * r.height; };
+  return grids.sort((a, b) => area(b) - area(a))[0];
+}
+
+function apGridRows(grid) {
+  return [...grid.querySelectorAll(".k-grid-content tbody tr, .k-grid-content-locked tbody tr, :scope > table > tbody > tr")]
+    .filter((tr) => !/k-grouping-row|k-group-footer|k-no-data|k-detail-row/.test(String(tr.className || ""))).length;
+}
+
+function apGridSig(grid) {
+  const pager = apText(grid.querySelector(".k-pager-info"));
+  const first = apText(grid.querySelector(".k-grid-content tbody tr, tbody tr")).slice(0, 200);
+  return `${pager}|${apGridRows(grid)}|${first}`;
+}
+
+function apLoading(grid) {
+  const scope = grid ? [grid, grid.parentElement].filter(Boolean) : [document];
+  return scope.some((s) => [...s.querySelectorAll(".k-loading-mask, .k-loading-image")].some(isVisibleForClick));
+}
+
+// The nearest container that holds the grid, its toolbar and its filters but
+// no other grid.
+function apGridScope(grid) {
+  const pane = grid.closest(".tab-pane, [role=tabpanel], .k-tabstrip > .k-content, md-tab-content");
+  if (pane) return pane;
+  let scope = grid;
+  for (let i = 0; i < 4 && scope.parentElement && scope.parentElement !== document.body; i++) {
+    const up = scope.parentElement;
+    if ([...up.querySelectorAll(".k-grid")].filter(isVisibleForClick).some((g) => g !== grid && !grid.contains(g))) break;
+    scope = up;
+  }
+  return scope;
+}
+
+// What the grid is showing — read only, nothing is changed.
+function apDescribeView(grid) {
+  const parts = [];
+  const scope = apGridScope(grid);
+  const dates = [];
+  for (const inp of scope.querySelectorAll("input")) {
+    if (!isVisibleForClick(inp) || apInRow(inp)) continue;
+    const v = String(inp.value || "").trim();
+    if (/^\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}$|^\d{4}-\d{2}-\d{2}$/.test(v)) dates.push(v);
+    else if (/\d{1,2}\/\d{1,2}\/\d{2,4}\s*(-|–|to)\s*\d{1,2}\/\d{1,2}\/\d{2,4}/i.test(v)) dates.push(v);
+  }
+  if (dates.length === 1) parts.push(`showing ${dates[0]}`);
+  else if (dates.length >= 2) parts.push(`showing ${dates[0]} to ${dates[1]}`);
+  for (const sel of scope.querySelectorAll("select")) {
+    if (!isVisibleForClick(sel) || apInRow(sel) || sel.closest(".k-pager-sizes, .k-pager-wrap, .k-pager")) continue;
+    const t = apText(sel.options[sel.selectedIndex]);
+    if (t && t.length <= 40 && /day|week|month|year|quarter|range|last|today|all/i.test(t)) parts.push(`range "${t}"`);
+  }
+  const sizes = grid.querySelector(".k-pager-sizes");
+  if (sizes) {
+    const sel = sizes.querySelector("select");
+    const size = (sel && sel.value) || apText(sizes.querySelector(".k-input, .k-input-value-text, .k-input-inner"));
+    if (size) parts.push(`page size ${String(size).slice(0, 12)}`);
+  }
+  const info = apText(grid.querySelector(".k-pager-info"));
+  if (info) parts.push(info.slice(0, 60));
+  return parts;
+}
+
+// Excel export button for the approval check: only inside the Recently
+// Approved section, never a row control, judged by what the button itself
+// says (text / title / tooltip), not by class names or handlers.
+function apExportCandidates() {
+  const grid = document.querySelector(`[${AP_GRID_MARK}]`);
+  if (!grid) return []; // no Recently Approved grid in hand: click nothing
+  const scope = apGridScope(grid);
+  const out = [];
+  const seen = new Set();
+  for (const el of scope.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button], .k-button, .k-grid-excel, i, span, img")) {
+    const target = el.closest("a, button, input[type=button], input[type=submit], [role=button], .k-button") || el;
+    if (seen.has(target) || !scope.contains(target) || !isVisibleForClick(target)) continue;
+    if (target.closest("tbody tr, .k-grid-content, .k-pager-wrap, .k-pager, .k-grid-header")) continue; // never a row, pager or column control
+    const text = apText(target);
+    if (text.length > 60) continue;
+    const said = [text, target.title, target.getAttribute("aria-label"), target.getAttribute("data-original-title"),
+      target.getAttribute("uib-tooltip"), target.getAttribute("tooltip"), el.title, el.getAttribute("alt"), el.getAttribute("aria-label"),
+    ].filter(Boolean).join(" | ");
+    if (AP_DANGER_RE.test(said)) continue;
+    // What the button does when its handler says so: never one that pushes
+    // data out or acts on invoices. ("Approved" in a handler name is the
+    // section's name, so approve is judged by the visible text above.)
+    const does = [target.getAttribute("ng-click"), target.getAttribute("data-ng-click"), target.getAttribute("onclick"), target.id].filter(Boolean).join(" | ");
+    if (/erp|quickbooks|netsuite|accounting|edi(?![a-z])|send|e-?mail|delete|void|reject|dispute|import|upload|submit|pay(?!load)/i.test(does)) continue;
+    // Only a button that is an Excel export: a bare "Export" could be anything.
+    let score = 0;
+    if (/(^|\s)k-grid-excel(\s|$)/.test(String(target.className || ""))) score += 10;
+    if (/excel|xlsx?\b|\.xls/i.test(said)) score += 8;
+    if (score <= 0) continue;
+    seen.add(target);
+    out.push({ el: target, score, desc: (text || target.title || target.getAttribute("aria-label") || String(target.className || target.tagName)).slice(0, 60) });
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
+async function erpApprovalCheck(runBy) {
+  if (fpxErp && !fpxErp.done) return; // already running in this page
+  stopRequested = false;
+  const state = { job: "approval_check", lines: [], counts: { approvedRows: 0 }, done: null };
+  fpxErp = state;
+  const where = () => window.location.hash || window.location.pathname;
+  const expired = "FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run";
+  let marked = null;
+
+  try {
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error(expired);
+    erpLog(`Approval check${runBy ? ` for ${runBy}` : ""} · read-only: nothing on the Audit page is approved, rejected or edited`);
+
+    // 1. The AUDIT item in the top navigation (it can take a moment to render).
+    let nav = null;
+    for (let i = 0; i < 40; i++) { // 20 s
+      nav = apFindAuditNav();
+      if (nav.el) break;
+      await erpCheckpoint();
+      await sleep(500);
+    }
+    if (!nav.el) throw new Error(`AUDIT was not found in FreightPOP's top navigation after 20s (page is ${where()}) — navigation shows: ${nav.labels.join(", ") || "nothing readable"}`);
+    const before = where();
+    erpLog(`Opening Audit · clicking "${apText(nav.el) || "AUDIT"}" in the ${nav.inNav ? "top navigation" : "page header"} (page is ${before})`);
+    simulateClick(nav.el);
+    await humanDelay(800, 1400);
+
+    // 2. The Audit page is up once its "Recently Approved" tab is there.
+    let tab = null;
+    for (let i = 0; i < 60; i++) { // 30 s
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw new Error(expired);
+      tab = apFindApprovedTab();
+      if (tab) break;
+      await sleep(500);
+    }
+    const after = where();
+    erpLog(after !== before ? `Audit page open · ${after}` : `The page address did not change after clicking AUDIT (still ${after})`, after !== before ? "info" : "warn");
+    if (!tab) {
+      const tabs = apTabLabels();
+      erpLog(`Tabs on the page: ${tabs.join(", ") || "none found"}`, "warn");
+      throw new Error(`"Recently Approved" tab not found on the Audit page — tabs seen: ${tabs.join(", ") || "none"} (waited 30s; page is ${after})`);
+    }
+
+    // 3. Show Recently Approved.
+    await erpCheckpoint();
+    const sigBefore = (() => { const g = apFindGrid(tab); return g ? apGridSig(g) : ""; })();
+    let clicked = false;
+    if (tab.kind === "heading") {
+      erpLog(`"${tab.label}" is a section on the page, not a tab — nothing to click`);
+    } else if (apTabIsActive(tab.el)) {
+      erpLog(`"${tab.label}" tab is already open`);
+    } else {
+      erpLog(`Opening the "${tab.label}" tab`);
+      simulateClick(tab.el.matches("li") ? ([...tab.el.querySelectorAll("a, .k-link")].find(isVisibleForClick) || tab.el) : tab.el);
+      clicked = true;
+      await humanDelay(800, 1400);
+      // The tab must be the open one before any grid is read: otherwise the
+      // grid on screen is another tab's and its rows are not approvals.
+      let open = false, seenTab = tab;
+      for (let i = 0; i < 30 && !open; i++) { // 15 s
+        await erpCheckpoint();
+        seenTab = apFindApprovedTab() || seenTab;
+        open = seenTab.kind === "tab" && apTabIsActive(seenTab.el);
+        if (!open) await sleep(500);
+      }
+      if (!open) {
+        const li = seenTab.el.closest("li, .k-item, md-tab-item, [role=tab]") || seenTab.el;
+        throw new Error(`Clicked the "${tab.label}" tab but it did not become the open tab within 15s — nothing was read ` +
+          `(tab is <${seenTab.el.tagName.toLowerCase()} class="${String(li.className || "").slice(0, 80)}" aria-selected="${li.getAttribute("aria-selected") || ""}">)`);
+      }
+    }
+
+    // 4. Its grid, loaded. Counts steps, so a pause doesn't use the limit up.
+    let grid = null, calm = 0, sawLoading = false, lastSig = null, settled = false;
+    for (let i = 0; i < 180; i++) { // 90 s
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw new Error(expired);
+      grid = apFindGrid(apFindApprovedTab() || tab);
+      if (!grid) { calm = 0; }
+      else if (apLoading(grid)) { sawLoading = true; calm = 0; }
+      else {
+        const sig = apGridSig(grid);
+        calm = sig === lastSig ? calm + 1 : 0;
+        lastSig = sig;
+        const rows = apGridRows(grid);
+        // Rows on screen: 2 quiet seconds after a load or a change, else 5.
+        // No rows: 8 quiet seconds before calling it empty.
+        const need = rows > 0 ? ((sawLoading || (clicked && sig !== sigBefore)) ? 4 : 10) : 16;
+        if (calm >= need) { settled = true; break; }
+      }
+      if (i > 0 && i % 30 === 0) erpLog(`Still loading Recently Approved · ${i / 2}s`);
+      await sleep(500);
+    }
+    if (!grid) throw new Error(`The Recently Approved grid never appeared (waited 90s; page is ${where()}; tabs seen: ${apTabLabels().join(", ") || "none"})`);
+    if (!settled) throw new Error("The Recently Approved grid was still loading after 90s");
+
+    for (const g of document.querySelectorAll(`[${AP_GRID_MARK}]`)) g.removeAttribute(AP_GRID_MARK);
+    grid.setAttribute(AP_GRID_MARK, "1");
+    marked = grid;
+
+    // 5. What it shows. Date range and page size are left exactly as they are.
+    const rowsOnScreen = apGridRows(grid);
+    const view = apDescribeView(grid);
+    erpLog(`Recently Approved · ${view.length ? view.join(" · ") : "no date range or pager could be read"} · ${erpNum(rowsOnScreen)} row(s) on screen`);
+    const pagerInfo = apText(grid.querySelector(".k-pager-info"));
+    if (rowsOnScreen === 0 || /no items to display/i.test(pagerInfo)) {
+      state.done = { ok: true, note: "Recently Approved is empty — nothing to match" };
+      return;
+    }
+
+    // 6. The browser service takes the grid's Excel export.
+    await erpCheckpoint();
+    erpLog("Taking FreightPOP's Excel export · Recently Approved");
+    const dl = await erpHandOffDownload("Recently Approved");
+    await erpCheckpoint(); // a stop during the hand-off ends as "stopped"
+    if (!dl || !dl.ok) throw new Error(`Recently Approved export not captured: ${(dl && dl.error) || "no reply"}`);
+    state.counts.approvedRows = Number(dl.rows) || 0;
+    state.done = { ok: true, note: `Recently Approved export captured · ${erpNum(state.counts.approvedRows)} rows` };
+  } catch (e) {
+    if (e && e.fpxStop) {
+      state.done = { ok: true, stopped: true, note: "Nothing was checked." };
+    } else {
+      console.warn("[FPX-ERP] approval check failed:", e?.message || e);
+      state.done = { ok: false, note: String(e?.message || e) };
+    }
+  } finally {
+    if (marked) marked.removeAttribute(AP_GRID_MARK);
   }
 }
 

@@ -15,6 +15,9 @@ import { config } from "./config.js";
 // ones, which Chrome drops on exit) are snapshotted to the profile and
 // restored on relaunch so the rep doesn't have to log in again every time.
 
+// `busy` is a count of the worker jobs holding the browser (the scrape lane
+// and the invoicing lane can each run one for the same user): the browser is
+// only free for the idle reaper, eviction and a login reset at 0.
 const pool = new Map(); // key -> { email, promise, browser, extensionId, refs, busy, lastUsed, saveTimer }
 
 export function profileKey(email) {
@@ -135,7 +138,8 @@ function entryStats(e) {
   return {
     user: e.email,
     tabs: e.refs,
-    busy: e.busy,
+    busy: e.busy > 0,
+    jobs: e.busy, // worker jobs holding this browser (0-2: one per lane)
     startedAt: e.startedAt ? new Date(e.startedAt).toISOString() : null,
     lastUsed: new Date(e.lastUsed).toISOString(),
     memoryMb: treeRssMb(e.browser?.process()?.pid),
@@ -150,13 +154,15 @@ export function userStatus(email) {
   const e = pool.get(profileKey(email));
   return {
     running: !!e?.browser,
-    ...(e ? entryStats(e) : { user: email, tabs: 0, busy: false, memoryMb: null }),
+    ...(e ? entryStats(e) : { user: email, tabs: 0, busy: false, jobs: 0, memoryMb: null }),
     hasProfile: hasProfile(email),
     freightpop: readState(email),
   };
 }
 
 // Acquire the user's browser (launching it if needed). Callers must release().
+// busy: a worker job holds it — counted, so the first of two jobs to finish
+// does not hand the browser to the reaper while the other is still running.
 export async function acquireUserBrowser(email, { busy = false } = {}) {
   if (!email) throw new Error("No user identity");
   const key = profileKey(email);
@@ -169,17 +175,18 @@ export async function acquireUserBrowser(email, { busy = false } = {}) {
       if (!idle) { const err = new Error("Hosted browser capacity reached — try again shortly"); err.code = "CAPACITY"; throw err; }
       await closeEntry(idle);
     }
-    entry = { email, key, refs: 0, busy: false, lastUsed: Date.now(), browser: null, extensionId: null };
+    entry = { email, key, refs: 0, busy: 0, lastUsed: Date.now(), browser: null, extensionId: null };
     entry.promise = launch(entry).catch((e) => { pool.delete(key); throw e; });
     pool.set(key, entry);
   }
   entry.refs++;
-  if (busy) entry.busy = true;
+  if (busy) entry.busy++;
   entry.lastUsed = Date.now();
   try {
     await entry.promise;
   } catch (e) {
     entry.refs--;
+    if (busy) entry.busy = Math.max(0, entry.busy - 1);
     throw e;
   }
   let released = false;
@@ -192,7 +199,7 @@ export async function acquireUserBrowser(email, { busy = false } = {}) {
       if (released) return;
       released = true;
       entry.refs = Math.max(0, entry.refs - 1);
-      if (busy) entry.busy = false;
+      if (busy) entry.busy = Math.max(0, entry.busy - 1);
       entry.lastUsed = Date.now();
       saveCookies(entry).catch((e) => console.warn(`[browser] cookie save for ${entry.email} failed:`, e.message));
     },
@@ -332,11 +339,11 @@ async function closeEntry(entry) {
 // Sign the user out of the hosted browser completely: close their Chromium
 // WITHOUT saving cookies, then delete their whole profile (cookies, FreightPOP
 // session, saved page). Their next view starts fresh on the FreightPOP login.
-// Refused while their browser is running a scrape.
+// Refused while their browser is running a scrape or an invoicing job.
 export async function resetUserProfile(email) {
   const key = profileKey(email);
   const entry = pool.get(key);
-  if (entry?.busy) throw Object.assign(new Error("A scrape is running in this browser — stop it first"), { status: 409 });
+  if (entry?.busy) throw Object.assign(new Error("A scrape or an invoicing job is running in this browser — stop it first"), { status: 409 });
   if (entry) {
     pool.delete(key);
     clearInterval(entry.saveTimer);

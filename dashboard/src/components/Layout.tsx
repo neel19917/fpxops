@@ -1,4 +1,4 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail, FileCheck2 } from "lucide-react";
 import { AskSearchTrigger } from "./AssistantPanel";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
@@ -6,7 +6,7 @@ import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoicing" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude";
 
 interface TabDef {
   id: TabId;
@@ -32,6 +32,7 @@ const ALL_TABS: TabDef[] = [
   { id: "tracking", label: "Tracking",       Icon: Package,      group: "more" },
   { id: "freightpop", label: "FreightPOP login", Icon: LogIn,     group: "more" },
   { id: "gp",       label: "GP Audits",      Icon: TrendingUp,   group: "primary" },
+  { id: "invoicing", label: "Invoicing",     Icon: FileCheck2,   group: "primary" },
   { id: "invoice",  label: "Invoice Audits", Icon: ReceiptText,  group: "primary" },
   { id: "notes",    label: "Notes",          Icon: NotebookPen,  group: "more" },
   { id: "analyses", label: "AI Analyses",    Icon: Sparkles,     group: "more" },

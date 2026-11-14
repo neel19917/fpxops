@@ -96,7 +96,10 @@ export function ScrapingPage() {
 
   const worker = stats?.worker;
   const me = stats?.me;
-  const pending = requests.filter((r) => r.status === "pending" || r.status === "claimed");
+  // Invoicing jobs (ERP pull, get invoices, approval check) run in their own
+  // session and never hold up a scrape, so they don't count as "queued" here.
+  const INVOICING_SCOPES = ["erp_audit", "get_invoice", "approval_check"];
+  const pending = requests.filter((r) => (r.status === "pending" || r.status === "claimed") && !INVOICING_SCOPES.includes(r.scope as string));
   // Which FreightPOP modes "Refresh all shipments" covers (remembered per browser).
   const [modes, setModes] = useState<string[]>(() => {
     try { const v = JSON.parse(localStorage.getItem("fpx.scrape.modes") || "null"); if (Array.isArray(v) && v.length) return v; } catch { /* ignore */ }

@@ -6,7 +6,7 @@ import { poolStats, closeAll, userStatus, selfTest, resetUserProfile } from "./b
 import { summary as usageSummary, flush as flushUsage } from "./usage.js";
 import { ViewerSession, egressStats, dropAllParked } from "./session.js";
 import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
-import { startScrapeWorker, workerBusy, workerState, requestStop, requestPause, requestResume, fullLog } from "./worker.js";
+import { startScrapeWorker, workerBusy, workerState, requestStop, requestPause, requestResume, fullLog, LANES } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
 import { chat, assistantEnabled, startAssistantIndexer, assistantIndexStatus, saveChatTurn, listChats, getChat, deleteChat } from "./assistant.js";
 
@@ -64,7 +64,9 @@ const server = http.createServer(async (req, res) => {
       sessions: sessions.size,
       // Count only — never list whose browsers are running on an unauthenticated endpoint.
       browsers: poolStats().length,
-      scrapeWorker: config.scrapeWorker ? (workerBusy() ? "busy" : "idle") : "off",
+      // One per lane: a deploy is only safe when BOTH are idle.
+      scrapeWorker: config.scrapeWorker ? (workerBusy("scrape") ? "busy" : "idle") : "off",
+      invoicingWorker: config.scrapeWorker ? (workerBusy("invoicing") ? "busy" : "idle") : "off",
       selfTest: selfTestResult,
       runHistory: supabaseEnabled ? "supabase" : "local",
       assistant: assistantEnabled,
@@ -114,7 +116,7 @@ async function handleApi(req, res, url, who) {
     if (resetting.has(email)) return json(res, 409, { error: "Already resetting" });
     resetting.add(email);
     try {
-      if (userStatus(email).busy) return json(res, 409, { error: "A scrape is running in this browser — stop it first" });
+      if (userStatus(email).busy) return json(res, 409, { error: "A scrape or an invoicing job is running in this browser — stop it first" });
       for (const s of [...sessions]) {
         if (s.who.email.toLowerCase() !== email) continue;
         try { s.ws.close(4011, "login reset"); } catch {}
@@ -156,17 +158,24 @@ async function handleApi(req, res, url, who) {
       schedules: listSchedules(who),
     });
   }
+  // Stop / pause / resume / log act on one lane: ?lane=scrape (default) or
+  // ?lane=invoicing (ERP audit pull, get invoices, approval check). The rule
+  // is the same for both, applied to that lane's running job.
+  const laneParam = url.searchParams.get("lane") || "scrape";
+  const lane = LANES.includes(laneParam) ? laneParam : null;
+  const laneCurrent = () => { const w = workerState(); return lane === "invoicing" ? w.invoicing.current : w.current; };
+  if (/^\/scrape\/(stop|pause|resume|log)$/.test(p) && !lane) return json(res, 400, { error: `Unknown lane "${laneParam}" — use ${LANES.join(" or ")}` });
   if (p === "/scrape/stop" && m === "POST") {
-    const cur = workerState().current;
+    const cur = laneCurrent();
     if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can stop this scrape" });
-    return json(res, 200, { stopping: requestStop(who.email) });
+    return json(res, 200, { stopping: requestStop(who.email, lane), lane });
   }
-  // Pause / resume the running job (scrape, ERP audit pull or get invoices). Same rule as stop.
+  // Pause / resume that lane's running job. Same rule as stop. The other lane is not touched.
   if ((p === "/scrape/pause" || p === "/scrape/resume") && m === "POST") {
-    const cur = workerState().current;
+    const cur = laneCurrent();
     if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can pause this run" });
-    const paused = p === "/scrape/pause" ? requestPause(who.email) : requestResume(who.email);
-    return json(res, 200, { ok: true, paused });
+    const paused = p === "/scrape/pause" ? requestPause(who.email, lane) : requestResume(who.email, lane);
+    return json(res, 200, { ok: true, paused, lane });
   }
   if (p === "/scrape/log" && m === "GET") {
     const runId = url.searchParams.get("run");
@@ -176,10 +185,10 @@ async function handleApi(req, res, url, who) {
       if (got.run.user !== who.email && !who.isAdmin) return json(res, 403, { error: "not your run" });
       return sendLog(res, `scrape-${runId.slice(0, 12)}.log`, got.text);
     }
-    const job = fullLog();
-    if (!job) return json(res, 404, { error: "no scrape log yet" });
+    const job = fullLog(lane);
+    if (!job) return json(res, 404, { error: lane === "invoicing" ? "no invoicing log yet" : "no scrape log yet" });
     if (job.user !== who.email && !who.isAdmin) return json(res, 403, { error: "not your run" });
-    return sendLog(res, `scrape-${String(job.requestId).slice(0, 12)}.log`, job.log.map((l) => `${l.t}\t${l.level}\t${l.text}`).join("\n"));
+    return sendLog(res, `${lane === "invoicing" ? "invoicing" : "scrape"}-${String(job.requestId).slice(0, 12)}.log`, job.log.map((l) => `${l.t}\t${l.level}\t${l.text}`).join("\n"));
   }
   // FreightPOP dashboard totals at the start / end of every run — company-wide
   // numbers, so everyone sees the trend (only the totals, not run details).
@@ -436,7 +445,8 @@ wss.on("connection", (ws, req) => {
           if (!who) { ws.close(4001, "unauthorized"); return; }
           // Mid login-reset: have the client retry in a moment (normal backoff).
           if (resetting.has(who.email.toLowerCase())) { ws.close(1013, "login reset in progress"); return; }
-          const target = msg.target === "scrape" ? "scrape" : "tab";
+          // "scrape" / "invoicing": watch that lane's job window, read-only.
+          const target = LANES.includes(msg.target) ? msg.target : "tab";
           // Per-user cap, server limit and registration: see admit().
           session = await withUserLock(who.email.toLowerCase(), () => admit(ws, who, target));
         } finally {

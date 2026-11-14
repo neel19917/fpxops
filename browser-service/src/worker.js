@@ -3,6 +3,8 @@ import { config } from "./config.js";
 import fs from "node:fs";
 import path from "node:path";
 import { readXlsx } from "./xlsxRead.js";
+import { filterSortXlsx, writeXlsx } from "./xlsxWrite.js";
+import { saveExcel, storageEnabled } from "./storage.js";
 import { recordScrape } from "./usage.js";
 import { recordRun } from "./runs.js";
 import { reindexAssistant } from "./assistant.js";
@@ -20,20 +22,66 @@ import { get as setting } from "./settings.js";
 //
 // MVP limitation: scope="selected" runs a full Refresh All too (the extension
 // has no "only these tracking numbers" mode yet).
-let busy = false;
 let enabled = false;
-// Live view of the running job for the dashboard's Scraping page.
-let current = null; // { requestId, user, scope, startedAt, status, statusAt }
-let stopFlag = false;
-let lastResult = null; // { requestId, user, ok, note, finishedAt, durationMs }
-let currentPage = null; // the window the running job is driving
-let currentExt = null;  // its content-script handle (ExtensionContexts), for pause
-// Pause: the job's content script holds at its next step while this is set
-// (self.__fpxPaused in its world). Time spent paused is added to every limit.
-let pauseFlag = false;
-let pausedAt = 0;  // when the current pause began (ms)
-let pausedMs = 0;  // earlier pauses of this job, summed
-const pausedTotal = () => pausedMs + (pauseFlag ? Date.now() - pausedAt : 0);
+
+// ── Lanes ──
+// Two independent job slots. Each runs one job at a time; the two run side by
+// side, also for the same user (same Chromium and FreightPOP login, each job
+// in a window of its own).
+//   scrape     Refresh All: manual rescrapes and schedules
+//   invoicing  erp_audit (History Report pull), get_invoice, approval_check
+// Everything a running job owns lives on its lane — nothing below is shared
+// between lanes, and every helper that touches job state takes the lane.
+const INVOICING_KINDS = ["erp_audit", "get_invoice", "approval_check"];
+const makeLane = (name) => ({
+  name,
+  busy: false,       // a job is running (the lane's lock)
+  claiming: false,   // a claim request is in flight: don't start a second job beside it
+  current: null,     // live view of the running job: { requestId, user, kind, scope, startedAt, status, statusAt, log, counts, … }
+  lastResult: null,  // the last finished job: its run summary + { requestId, log }
+  page: null,        // the window the running job is driving
+  ext: null,         // its content-script handle (ExtensionContexts), for pause
+  stopFlag: false,
+  // Pause: the job's content script holds at its next step while this is set
+  // (self.__fpxPaused in ITS window's world). Time spent paused is added to
+  // every limit.
+  pauseFlag: false,
+  pausedAt: 0,       // when the current pause began (ms)
+  pausedMs: 0,       // earlier pauses of this job, summed
+  pauseTimer: null,  // the 30-minute pause limit
+  authExpired: false, // this job's own window saw FreightPOP refuse the login (see startAuth)
+  // Jobs waiting for this lane inside the service: scheduled runs (scrape
+  // lane), and requests claimed while the lane was busy.
+  localQueue: [],    // { id, email, source, scheduleId, scheduleName, queuedAt, … }
+});
+const lanes = { scrape: makeLane("scrape"), invoicing: makeLane("invoicing") };
+const laneNamed = (name) => (name === "invoicing" ? lanes.invoicing : lanes.scrape);
+const laneForScope = (scope) => (INVOICING_KINDS.includes(scope) ? lanes.invoicing : lanes.scrape);
+export const LANES = Object.keys(lanes);
+
+const pausedTotal = (lane) => lane.pausedMs + (lane.pauseFlag ? Date.now() - lane.pausedAt : 0);
+
+// The FreightPOP login is per user, not per lane, and so is browser.js's
+// "expired" flag: it is raised by whichever of the user's windows gets the
+// 401s. A job clears it when it starts, to judge the login afresh from its
+// own window. With two lanes that clear could hide an expiry the other lane's
+// running job is about to report — so that job is told first, and each lane
+// also remembers what its own window saw (lane.authExpired, set by watchAuth
+// in runIn / runPageJob). An expired login therefore fails both lanes: the
+// running one through its own flag, the starting one as soon as its window
+// is refused too.
+function startAuth(lane, who) {
+  const email = String(who).toLowerCase();
+  if (isAuthExpired(who)) {
+    for (const other of Object.values(lanes)) {
+      if (other !== lane && other.current && String(other.current.user).toLowerCase() === email) other.authExpired = true;
+    }
+  }
+  clearAuthExpired(who);
+  lane.authExpired = false;
+}
+const authGone = (lane, who) => lane.authExpired || isAuthExpired(who);
+const watchLaneAuth = (lane, page, who) => watchAuth(page, who, () => { lane.authExpired = true; }, () => { lane.authExpired = false; });
 const EXPIRED = "Your FreightPOP login expired (FreightPOP rejects it) — open More → FreightPOP login, sign in again, then re-run";
 const LOG_CAP = 5000;  // kept in memory; /stats only ships the tail
 const LOG_TAIL = 400;
@@ -66,16 +114,16 @@ const LOG_TAIL = 400;
 //
 // `at` backdates an entry (ms); it is slotted in by time and leaves the
 // one-line status alone.
-function logLine(text, level = "info", at = null) {
-  if (!current || !text) return;
+function logLine(lane, text, level = "info", at = null) {
+  if (!lane.current || !text) return;
   const now = new Date().toISOString();
   const t = at ? new Date(at).toISOString() : now;
   const entry = { t, text: String(text).slice(0, 500), level };
-  let i = current.log.length;
-  if (at) while (i > 0 && current.log[i - 1].t > t) i--;
-  current.log.splice(i, 0, entry);
-  if (current.log.length > LOG_CAP) current.log.splice(0, current.log.length - LOG_CAP);
-  if (!at && level !== "data" && (!stopFlag || level !== "info")) { current.status = entry.text; current.statusAt = now; }
+  let i = lane.current.log.length;
+  if (at) while (i > 0 && lane.current.log[i - 1].t > t) i--;
+  lane.current.log.splice(i, 0, entry);
+  if (lane.current.log.length > LOG_CAP) lane.current.log.splice(0, lane.current.log.length - LOG_CAP);
+  if (!at && level !== "data" && (!lane.stopFlag || level !== "info")) { lane.current.status = entry.text; lane.current.statusAt = now; }
 }
 
 // One scraped row → the few fields an operator recognises. Runs INSIDE the
@@ -244,11 +292,13 @@ export function createScrapeLog() {
   };
 }
 
-// The live scrape window, for read-only watching from the dashboard. Only the
-// user whose browser it runs in may watch it.
-export function scrapePageFor(email) {
-  return current && current.user === email && currentPage && !currentPage.isClosed() ? currentPage : null;
+// A lane's live job window, for read-only watching from the dashboard. Only
+// the user whose browser it runs in may watch it.
+export function lanePageFor(laneName, email) {
+  const lane = laneNamed(laneName);
+  return lane.current && lane.current.user === email && lane.page && !lane.page.isClosed() ? lane.page : null;
 }
+export function scrapePageFor(email) { return lanePageFor("scrape", email); }
 
 export function startScrapeWorker() {
   if (!config.apiKey) {
@@ -262,111 +312,138 @@ export function startScrapeWorker() {
   api("/api/ops/rescrape/release-orphans", { method: "POST", body: JSON.stringify({ by: "fpx-browser" }) })
     .then((r) => { if (r?.released?.length) console.log(`[worker] closed ${r.released.length} request(s) interrupted by a restart`); })
     .catch((e) => console.warn("[worker] release-orphans failed:", e.message));
-  // setTimeout loop so an admin change to the poll interval applies live.
-  const loop = async () => {
-    await poll().catch((e) => console.error("[worker] poll error:", e.message));
-    setTimeout(loop, config.scrapePollMs);
-  };
-  loop();
+  // One loop per lane: poll() resolves only when the job it started has
+  // finished, so a shared loop would hold the other lane up for a whole job.
+  // setTimeout loops so an admin change to the poll interval applies live.
+  Object.values(lanes).forEach((lane, i) => {
+    const loop = async () => {
+      await poll(lane).catch((e) => console.error(`[worker] ${lane.name} poll error:`, e.message));
+      setTimeout(loop, config.scrapePollMs);
+    };
+    // Offset the lanes so their claim requests don't always land together.
+    setTimeout(loop, i * Math.min(2000, config.scrapePollMs / 2));
+  });
 }
 
-export function workerBusy() { return busy; }
+// laneName: "scrape" (default) | "invoicing".
+export function workerBusy(laneName = "scrape") { return laneNamed(laneName).busy; }
 
 // Trim logs to the tail for polling; the full log is at fullLog().
 const withTail = (job) => job && { ...job, log: job.log.slice(-LOG_TAIL), logTotal: job.log.length };
 
+const laneState = (lane) => ({
+  busy: lane.busy,
+  // The running job, else the last finished one. Scrape lane: "scrape".
+  // Invoicing lane: "erp_audit" | "get_invoice" | "approval_check".
+  kind: (lane.current || lane.lastResult)?.kind || null,
+  paused: !!lane.current && lane.pauseFlag,
+  current: withTail(lane.current),
+  lastResult: withTail(lane.lastResult),
+  // Once the job has finished: { audit_id, total, pending } for an ERP audit
+  // pull, { audit_id, total, ok, failed } for a get-invoices job,
+  // { audit_id, approved_rows, matched, not_found } for an approval check.
+  // Always null on the scrape lane.
+  result: lane.lastResult?.result || null,
+  queued: queuedJobs(lane.name),
+});
+
+// Served by /stats. The top level is the scrape lane (what the Scraping page
+// reads); `invoicing` is the other lane, same inner shapes.
 export function workerState() {
   return {
     enabled,
     reason: enabled ? null : (!config.scrapeWorker ? "SCRAPE_WORKER is off" : "FPX_API_KEY not set"),
     pollSeconds: config.scrapePollMs / 1000,
-    // "scrape" | "erp_audit" | "get_invoice" — the running job, else the last finished one.
-    kind: (current || lastResult)?.kind || null,
-    paused: !!current && pauseFlag,
-    // Once the job has finished: { audit_id, total, pending } for an ERP audit
-    // pull, { audit_id, total, ok, failed } for a get-invoices job.
-    result: lastResult?.result || null,
-    current: withTail(current),
-    lastResult: withTail(lastResult),
-    queued: queuedJobs(),
+    ...laneState(lanes.scrape),
+    invoicing: { enabled, ...laneState(lanes.invoicing) },
   };
 }
 
-// Full log of the running job, else the last finished one.
-export function fullLog() {
-  const job = current || lastResult;
+// Full log of a lane's running job, else its last finished one.
+export function fullLog(laneName = "scrape") {
+  const lane = laneNamed(laneName);
+  const job = lane.current || lane.lastResult;
   return job ? { requestId: job.requestId, user: job.user, counts: job.counts || null, log: job.log } : null;
 }
 
-// Ask the running Refresh All to stop. The extension finishes the row it's on.
-export function requestStop(byEmail) {
-  if (!current) return false;
-  console.log(`[worker] stop requested by ${byEmail} for ${current.requestId}`);
-  stopJob(current.kind === "erp_audit"
+// Ask a lane's running job to stop. A Refresh All finishes the row it's on.
+export function requestStop(byEmail, laneName = "scrape") {
+  const lane = laneNamed(laneName);
+  if (!lane.current) return false;
+  console.log(`[worker] stop requested by ${byEmail} for ${lane.current.requestId}`);
+  stopJob(lane, lane.current.kind === "erp_audit" || lane.current.kind === "approval_check"
     ? `Stop requested by ${byEmail} — stopping at the next step…`
-    : current.kind === "get_invoice"
+    : lane.current.kind === "get_invoice"
       ? `Stop requested by ${byEmail} — stopping after the shipment it is on…`
       : `Stop requested by ${byEmail} — finishing the current row…`);
   return true;
 }
 
-function stopJob(line) {
-  stopFlag = true;
+function stopJob(lane, line) {
+  lane.stopFlag = true;
   // A stop gets through a pause; drop the pause so the job can wind down.
-  clearTimeout(pauseTimer);
-  if (pauseFlag) { pausedMs += Date.now() - pausedAt; pauseFlag = false; current.paused = false; pushPause(); }
-  logLine(line, "warn");
+  clearTimeout(lane.pauseTimer);
+  if (lane.pauseFlag) { lane.pausedMs += Date.now() - lane.pausedAt; lane.pauseFlag = false; lane.current.paused = false; pushPause(lane); }
+  logLine(lane, line, "warn");
 }
 
 // How a stopped job's note starts: "Stopped by user", or why it stopped itself.
-const stoppedBecause = () => current?.stopReason || "Stopped by user";
+const stoppedBecause = (lane) => lane.current?.stopReason || "Stopped by user";
 
-// Pause / resume the running job (scrape, ERP audit pull or get invoices).
+// Pause / resume a lane's running job (scrape lane: the scrape; invoicing
+// lane: ERP audit pull, get invoices or approval check). The other lane is
+// not touched.
 // Returns whether it is paused now. The job holds at its next step, not
 // mid-click.
 const PAUSE_LIMIT_MS = 30 * 60 * 1000;
-let pauseTimer = null;
-export function requestPause(byEmail) { return setPaused(true, byEmail); }
-export function requestResume(byEmail) { return setPaused(false, byEmail); }
+export function requestPause(byEmail, laneName = "scrape") { return setPaused(laneNamed(laneName), true, byEmail); }
+export function requestResume(byEmail, laneName = "scrape") { return setPaused(laneNamed(laneName), false, byEmail); }
 
 // `line`: the job pausing itself (get invoices) — logged in place of
 // "Paused by …". Everything else is the same pause as the button.
-function setPaused(on, byEmail, line = null) {
-  if (!current || stopFlag) return false;
-  if (pauseFlag === on) {
-    if (on && line) logLine(line, "warn"); // already paused by someone: still say why
-    return pauseFlag;
+function setPaused(lane, on, byEmail, line = null) {
+  if (!lane.current || lane.stopFlag) return false;
+  if (lane.pauseFlag === on) {
+    if (on && line) logLine(lane, line, "warn"); // already paused by someone: still say why
+    return lane.pauseFlag;
   }
-  if (on) pausedAt = Date.now(); else pausedMs += Date.now() - pausedAt;
-  // A pause holds the one-job-at-a-time lock, so it can't be open-ended.
-  clearTimeout(pauseTimer);
-  if (on) pauseTimer = setTimeout(pauseLimitReached, PAUSE_LIMIT_MS);
-  pauseFlag = on;
-  current.paused = on;
-  console.log(`[worker] ${on ? "pause" : "resume"} requested by ${byEmail || "the job"} for ${current.requestId}`);
-  logLine(line || (on ? `Paused by ${byEmail}` : `Resumed by ${byEmail}`), on ? "warn" : "info");
-  pushPause();
-  return pauseFlag;
+  if (on) lane.pausedAt = Date.now(); else lane.pausedMs += Date.now() - lane.pausedAt;
+  // A pause holds the lane's one-job-at-a-time lock, so it can't be open-ended.
+  clearTimeout(lane.pauseTimer);
+  if (on) {
+    // Bound to this job: a timer that outlives it must not act on the next one.
+    const job = lane.current;
+    lane.pauseTimer = setTimeout(() => { if (lane.current === job) pauseLimitReached(lane); }, PAUSE_LIMIT_MS);
+  }
+  lane.pauseFlag = on;
+  lane.current.paused = on;
+  console.log(`[worker] ${on ? "pause" : "resume"} requested by ${byEmail || "the job"} for ${lane.current.requestId}`);
+  logLine(lane, line || (on ? `Paused by ${byEmail}` : `Resumed by ${byEmail}`), on ? "warn" : "info");
+  pushPause(lane);
+  return lane.pauseFlag;
 }
 
-// 30 minutes paused. A scrape or an ERP audit pull carries on by itself. A
+// 30 minutes paused. A scrape, an ERP audit pull or an approval check carries
+// on by itself. A
 // get-invoices job stops instead: it pauses because a person has to look, and
 // clicking on unattended is the wrong default.
-function pauseLimitReached() {
-  if (!pauseFlag || !current) return;
-  if (current.kind === "get_invoice") {
-    current.stopReason = "Stopped: nobody resumed within 30 minutes";
-    console.log(`[worker] pause limit reached for ${current.requestId} — stopping`);
-    stopJob(current.stopReason);
+function pauseLimitReached(lane) {
+  if (!lane.pauseFlag || !lane.current) return;
+  if (lane.current.kind === "get_invoice") {
+    lane.current.stopReason = "Stopped: nobody resumed within 30 minutes";
+    console.log(`[worker] pause limit reached for ${lane.current.requestId} — stopping`);
+    stopJob(lane, lane.current.stopReason);
   } else {
-    setPaused(false, "the 30-minute pause limit");
+    setPaused(lane, false, "the 30-minute pause limit");
   }
 }
 
-// Tell the job's content script. Also re-sent on every poll tick while
-// paused, so a page that reloaded mid-pause stays paused.
-function pushPause() {
-  currentExt?.evaluate(`self.__fpxPaused = ${pauseFlag ? "true" : "false"}; 'ok'`, { awaitPromise: false }).catch(() => {});
+// Tell the job's content script — the one in this lane's window only
+// (self.__fpxPaused lives in each page's own content-script world). Also
+// re-sent on every poll tick while paused, so a page that reloaded mid-pause
+// stays paused.
+function pushPause(lane) {
+  lane.ext?.evaluate(`self.__fpxPaused = ${lane.pauseFlag ? "true" : "false"}; 'ok'`, { awaitPromise: false }).catch(() => {});
 }
 
 async function api(path, init = {}) {
@@ -378,12 +455,12 @@ async function api(path, init = {}) {
   return res.json();
 }
 
-// Jobs from the scheduler wait here (the API queue holds manual requests).
-// One scrape runs at a time across the whole service.
-const localQueue = []; // { id, email, source: "schedule", scheduleId, scheduleName, queuedAt }
-
+// Jobs from the scheduler wait in the scrape lane's localQueue (the API queue
+// holds manual requests). Schedules only ever go to the scrape lane; one
+// scrape runs at a time across the whole service.
 export function enqueueScheduled(schedule) {
-  if (current?.scheduleId === schedule.id || localQueue.some((j) => j.scheduleId === schedule.id)) {
+  const lane = lanes.scrape;
+  if (lane.current?.scheduleId === schedule.id || lane.localQueue.some((j) => j.scheduleId === schedule.id)) {
     return { queued: false, reason: "already queued or running" };
   }
   const job = {
@@ -393,35 +470,38 @@ export function enqueueScheduled(schedule) {
     modes: Array.isArray(schedule.modes) && schedule.modes.length ? schedule.modes : null,
     queuedAt: new Date().toISOString(),
   };
-  localQueue.push(job);
+  lane.localQueue.push(job);
   console.log(`[worker] queued scheduled run ${job.id} for ${job.email} (${schedule.name || schedule.id})`);
-  setImmediate(() => poll().catch((e) => console.error("[worker] poll error:", e.message)));
+  setImmediate(() => poll(lane).catch((e) => console.error("[worker] poll error:", e.message)));
   return { queued: true, job };
 }
 
-export function queuedJobs() {
-  return localQueue.map(({ id, email, source, scheduleId, scheduleName, queuedAt }) => ({ id, user: email, source, scheduleId, scheduleName, queuedAt }));
+export function queuedJobs(laneName = "scrape") {
+  return laneNamed(laneName).localQueue.map(({ id, email, source, scheduleId, scheduleName, queuedAt }) => ({ id, user: email, source, scheduleId, scheduleName, queuedAt }));
 }
 
-let claiming = false; // a claim request is in flight: don't start a second job beside it
-async function poll() {
-  if (busy || claiming || !enabled) return;
-  if (localQueue.length) {
-    const job = localQueue.shift();
-    return runJob(job);
+// A lane only takes a job while it is idle. Resolves when the job it started
+// (if any) has finished.
+async function poll(lane) {
+  if (lane.busy || lane.claiming || !enabled) return;
+  if (lane.localQueue.length) {
+    const job = lane.localQueue.shift();
+    return runJob(lane, job);
   }
-  return claimAndRun();
+  return claimAndRun(lane);
 }
 
-async function claimAndRun() {
-  // caps: the API only hands scope "erp_audit" / "get_invoice" rows to a
-  // worker that says it can run them (an older build would run one as a full
-  // rescrape).
+async function claimAndRun(lane) {
+  // only: the API hands this lane its own kind of request and nothing else
+  // (scrape = everything that is not an invoicing scope).
+  // caps: the API only hands scope "erp_audit" / "get_invoice" /
+  // "approval_check" rows to a worker that says it can run them (an older
+  // build would run one as a full rescrape). Sent by both lanes.
   let request;
-  claiming = true;
+  lane.claiming = true;
   try {
-    ({ request } = await api(`/api/ops/rescrape/pending?claim=1&by=${encodeURIComponent("fpx-browser")}&caps=erp_audit,get_invoice`));
-  } finally { claiming = false; }
+    ({ request } = await api(`/api/ops/rescrape/pending?claim=1&by=${encodeURIComponent("fpx-browser")}&only=${lane.name}&caps=${INVOICING_KINDS.join(",")}`));
+  } finally { lane.claiming = false; }
   if (!request) return;
   const job = {
     id: request.id, apiRequestId: request.id, email: String(request.requested_by || ""), source: "manual", scope: request.scope,
@@ -430,11 +510,23 @@ async function claimAndRun() {
     months: request.scope === "erp_audit" ? monthsFromNote(request.note) : null,
     shipmentType: request.scope === "erp_audit" ? typeFromNote(request.note) : null,
     getInvoice: request.scope === "get_invoice" ? getInvoiceFromRequest(request) : null,
+    approvalAuditId: request.scope === "approval_check" ? auditFromNote(request.note) : null,
+    requestNote: String(request.note || "").slice(0, 200),
   };
+  // An API that does not know `only` yet hands out whatever is oldest: a
+  // request is run by the lane its scope belongs to, never by the one that
+  // happened to claim it. It is already claimed, so it waits there.
+  const owner = laneForScope(job.scope);
+  if (owner !== lane) {
+    console.warn(`[worker] ${lane.name} lane was handed a ${job.scope || "scrape"} request (${job.id}) — passing it to the ${owner.name} lane`);
+    owner.localQueue.push(job);
+    setImmediate(() => poll(owner).catch((e) => console.error(`[worker] ${owner.name} poll error:`, e.message)));
+    return;
+  }
   // A scheduled job may have started while the claim was in flight: this one
   // is already claimed, so it waits its turn instead of running beside it.
-  if (busy) { localQueue.push(job); return; }
-  return runJob(job);
+  if (lane.busy) { lane.localQueue.push(job); return; }
+  return runJob(lane, job);
 }
 
 // A get-invoices request: the shipment ids are in tracking_numbers and the
@@ -458,6 +550,12 @@ export function getInvoiceFromRequest(request) {
   };
 }
 
+// "audit=<uuid>" in an approval-check request's note → the uuid, else null.
+export function auditFromNote(note) {
+  const m = /(?:^|;)\s*audit\s*=\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*(?:;|$)/i.exec(String(note || ""));
+  return m ? m[1].toLowerCase() : null;
+}
+
 // "type=parcel|both|non-parcel" in an ERP audit request's note (non-parcel when absent).
 export function typeFromNote(note) {
   const m = /type\s*=\s*(non-parcel|parcel|both)/i.exec(String(note || ""));
@@ -473,18 +571,23 @@ export function monthsFromNote(note) {
 
 // Run one job (manual or scheduled) end to end, then record it in the
 // persistent run history with its full log.
-async function runJob(job) {
-  busy = true;
-  stopFlag = false;
-  pauseFlag = false; pausedAt = 0; pausedMs = 0;
+async function runJob(lane, job) {
+  lane.busy = true;
+  lane.stopFlag = false;
+  clearTimeout(lane.pauseTimer);
+  lane.pauseFlag = false; lane.pausedAt = 0; lane.pausedMs = 0;
+  lane.authExpired = false;
   const email = job.email;
   const startedAt = Date.now();
-  // One lock, three kinds of job: a Refresh All scrape, an ERP audit pull, or
-  // get invoices (click GET INVOICE on the shipments picked from an audit).
-  const kind = job.scope === "erp_audit" ? "erp_audit" : job.scope === "get_invoice" ? "get_invoice" : "scrape";
+  // Scrape lane: a Refresh All scrape. Invoicing lane: an ERP audit pull,
+  // get invoices (click GET INVOICE on the shipments picked from an audit), or
+  // an approval check (match an audit against the Audit page's Recently Approved).
+  const kind = INVOICING_KINDS.includes(job.scope) ? job.scope : "scrape";
   const gi = kind === "get_invoice" ? job.getInvoice || { shipmentIds: [] } : null;
-  current = {
-    kind, paused: false, result: null, months: kind === "erp_audit" ? job.months || 3 : null, shipmentType: kind === "erp_audit" ? job.shipmentType || "non-parcel" : null,
+  // `cur` is this job's own record. Everything below reads and writes it
+  // through `cur`, so the summary, the log and the result are this job's.
+  const cur = lane.current = {
+    lane: lane.name, kind, paused: false, result: null, months: kind === "erp_audit" ? job.months || 3 : null, shipmentType: kind === "erp_audit" ? job.shipmentType || "non-parcel" : null,
     requestId: job.id, user: email, scope: job.scope || "all", source: job.source, modes: job.modes || null,
     scheduleId: job.scheduleId || null, scheduleName: job.scheduleName || null,
     startedAt: new Date(startedAt).toISOString(), status: "Starting…", statusAt: new Date().toISOString(), log: [],
@@ -496,16 +599,20 @@ async function runJob(job) {
     fpAfter: null,  // tile reading when the run ended
   };
   if (kind === "erp_audit") {
-    Object.assign(current.counts, { reportRows: 0, notExported: 0, uploaded: 0 });
-    logLine(`Claimed ERP audit pull · last ${current.months} month(s) · ${current.shipmentType} — running as ${email || "unknown user"}`);
+    Object.assign(cur.counts, { reportRows: 0, notExported: 0, uploaded: 0 });
+    logLine(lane, `Claimed ERP audit pull · last ${cur.months} month(s) · ${cur.shipmentType} — running as ${email || "unknown user"}`);
+  } else if (kind === "approval_check") {
+    cur.counts = { approvedRows: 0, matched: 0, notFound: 0 };
+    cur.auditId = job.approvalAuditId || null;
+    logLine(lane, `Claimed approval check · audit ${String(job.approvalAuditId || "?").slice(0, 8)} — running as ${email || "unknown user"}`);
   } else if (kind === "get_invoice") {
-    current.counts = { total: gi.shipmentIds.length, done: 0, ok: 0, failed: 0 };
-    current.auditId = gi.auditId || null;
-    logLine(`Claimed get invoices · ${gi.shipmentIds.length} shipment(s) · report ${gi.from || "?"} to ${gi.to || "?"} · audit ${String(gi.auditId || "?").slice(0, 8)}` +
+    cur.counts = { total: gi.shipmentIds.length, done: 0, ok: 0, failed: 0 };
+    cur.auditId = gi.auditId || null;
+    logLine(lane, `Claimed get invoices · ${gi.shipmentIds.length} shipment(s) · report ${gi.from || "?"} to ${gi.to || "?"} · audit ${String(gi.auditId || "?").slice(0, 8)}` +
       `${gi.pauseFirst ? " · pauses after the first" : ""} — running as ${email || "unknown user"}`);
   } else {
-    if (job.modes) logLine(`Limited to ${job.modes.join(" + ")} shipments`);
-    logLine(job.source === "schedule"
+    if (job.modes) logLine(lane, `Limited to ${job.modes.join(" + ")} shipments`);
+    logLine(lane, job.source === "schedule"
       ? `Scheduled run${job.scheduleName ? ` "${job.scheduleName}"` : ""} — running as ${email}`
       : `Claimed request — running as ${email || "unknown user"}`);
   }
@@ -517,14 +624,17 @@ async function runJob(job) {
     if (!hasProfile(email)) throw new Error(`${email} hasn't logged in to FreightPOP in the hosted view yet`);
     let result;
     if (kind === "erp_audit") {
-      result = await runErpAudit(email, current.months, current.shipmentType);
+      result = await runErpAudit(lane, email, cur.months, cur.shipmentType);
     } else if (kind === "get_invoice") {
       if (!gi.auditId || !gi.from || !gi.to) throw new Error(`The request's note could not be read ("${gi.note || ""}") — expected audit=<id>;from=YYYY-MM-DD;to=YYYY-MM-DD;pause_first=1|0`);
       if (!gi.shipmentIds.length) throw new Error("The request has no shipment ids (tracking_numbers is empty)");
-      result = await runGetInvoices(email, gi);
+      result = await runGetInvoices(lane, email, gi);
+    } else if (kind === "approval_check") {
+      if (!job.approvalAuditId) throw new Error(`The request's note could not be read ("${job.requestNote || ""}") — expected audit=<id>`);
+      result = await runApprovalCheck(lane, email, job.approvalAuditId);
     } else {
-      if (current) current.tasksBefore = await taskSnapshot();
-      result = await runRefreshAll(email, job.modes || null);
+      cur.tasksBefore = await taskSnapshot();
+      result = await runRefreshAll(lane, email, job.modes || null);
     }
     ok = true; note = result;
     console.log(`[worker] ${job.id} done: ${result}`);
@@ -536,63 +646,74 @@ async function runJob(job) {
       await api(`/api/ops/rescrape/${job.apiRequestId}/complete`, {
         method: "POST",
         body: JSON.stringify(ok
-          ? { note: note.slice(0, 500), result_count: kind === "erp_audit" ? current?.counts?.uploaded ?? 0 : kind === "get_invoice" ? current?.counts?.ok ?? 0 : current?.counts?.saved ?? null }
+          ? { note: note.slice(0, 500), result_count: kind === "erp_audit" ? cur.counts?.uploaded ?? 0 : kind === "get_invoice" ? cur.counts?.ok ?? 0 : kind === "approval_check" ? cur.counts?.matched ?? 0 : cur.counts?.saved ?? null }
           : { error: true, note: String(note).slice(0, 500) }),
       }).catch((e) => console.warn("[worker] complete failed:", e.message));
     }
     if (email.includes("@")) recordScrape(email, Date.now() - startedAt, ok);
-    const tasksAfter = current?.tasksBefore ? await taskSnapshot() : null;
-    logLine(ok ? `Finished: ${note}` : `Failed: ${note}`, ok ? "done" : "error");
+    const tasksAfter = cur.tasksBefore ? await taskSnapshot() : null;
+    logLine(lane, ok ? `Finished: ${note}` : `Failed: ${note}`, ok ? "done" : "error");
     // Get invoices: what was done, whether it finished, stopped or failed.
-    if (kind === "get_invoice" && current) {
-      const c = current.counts || {};
-      current.result = { audit_id: gi.auditId || null, total: c.total ?? gi.shipmentIds.length, ok: c.ok || 0, failed: c.failed || 0 };
+    if (kind === "get_invoice") {
+      const c = cur.counts || {};
+      cur.result = { audit_id: gi.auditId || null, total: c.total ?? gi.shipmentIds.length, ok: c.ok || 0, failed: c.failed || 0 };
+    }
+    // Approval check: what was matched (zeros when it failed or was stopped).
+    if (kind === "approval_check") {
+      const c = cur.counts || {};
+      cur.result = { audit_id: job.approvalAuditId || null, approved_rows: c.approvedRows || 0, matched: c.matched || 0, not_found: c.notFound || 0 };
     }
     const finishedAt = new Date().toISOString();
     const summary = {
       id: job.id, source: job.source, user: email, kind,
       // ERP audit pull: the audit it made ({ audit_id, total, pending }).
       // Get invoices: { audit_id, total, ok, failed }.
-      result: current?.result || null,
+      // Approval check: { audit_id, approved_rows, matched, not_found }.
+      result: cur.result || null,
       scheduleId: job.scheduleId || null, scheduleName: job.scheduleName || null,
       startedAt: new Date(startedAt).toISOString(), finishedAt, durationMs: Date.now() - startedAt,
       ok, note: String(note).slice(0, 500), modes: job.modes || null,
-      counts: current?.counts ? { ...current.counts, total: current.total ?? current.counts.total ?? null } : null,
+      counts: cur.counts ? { ...cur.counts, total: cur.total ?? cur.counts.total ?? null } : null,
       // FreightPOP dashboard totals at the start and end of the run (trends).
-      fpBefore: current?.fpBefore || null,
-      fpAfter: current?.fpAfter || (current?.fpCounts ? { ...current.fpCounts, at: current.fpCountsAt } : null),
+      fpBefore: cur.fpBefore || null,
+      fpAfter: cur.fpAfter || (cur.fpCounts ? { ...cur.fpCounts, at: cur.fpCountsAt } : null),
       // The task board (segments, health flags, shipment dispositions) at the
       // start and end of the run.
-      tasksBefore: current?.tasksBefore || null,
+      tasksBefore: cur.tasksBefore || null,
       tasksAfter,
     };
-    recordRun(summary, current?.log || []);
+    recordRun(summary, cur.log || []);
     if (kind === "scrape") {
       // Fresh data → rebuild the Ask FPX search index and embed what changed.
       reindexAssistant("scrape").catch(() => {});
       // Email everyone subscribed to "scrape finished" (Scraping page).
       notifyRunDone(summary).catch(() => {});
     }
-    lastResult = { ...summary, requestId: job.id, log: current?.log || [] };
-    current = null;
-    clearTimeout(pauseTimer);
-    pauseFlag = false; pausedAt = 0; pausedMs = 0;
-    busy = false;
+    // Only this lane's state is touched: the other lane's job, log, pause and
+    // window are its own.
+    lane.lastResult = { ...summary, requestId: job.id, log: cur.log || [] };
+    lane.current = null;
+    clearTimeout(lane.pauseTimer);
+    lane.pauseTimer = null;
+    lane.stopFlag = false;
+    lane.pauseFlag = false; lane.pausedAt = 0; lane.pausedMs = 0;
+    lane.authExpired = false;
+    lane.busy = false;
     // Something may have been queued while we ran.
-    if (localQueue.length) setImmediate(() => poll().catch(() => {}));
+    if (lane.localQueue.length) setImmediate(() => poll(lane).catch(() => {}));
   }
 }
 
-async function runRefreshAll(email, modes = null) {
+async function runRefreshAll(lane, email, modes = null) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runIn(lease.browser, dashboardUrlFor(email), email, modes);
+    return await runIn(lane, lease.browser, dashboardUrlFor(email), email, modes);
   } finally {
     lease.release();
   }
 }
 
-async function runIn(browser, url, who, modes = null) {
+async function runIn(lane, browser, url, who, modes = null) {
   const worker = await getServiceWorker(browser);
   // Same sentinel trick as extension-headless/run.js: content.js reports
   // progress/completion to the service worker via chrome.runtime.sendMessage.
@@ -672,10 +793,10 @@ async function runIn(browser, url, who, modes = null) {
   await worker.evaluate(`self.__fpxSummarize = ${summarizeRow.toString()}; true`);
   const scrapeLog = createScrapeLog();
 
-  clearAuthExpired(who);
+  startAuth(lane, who);
   const page = await openWindowPage(browser, url);
-  currentPage = page;
-  const offAuth = watchAuth(page, who);
+  lane.page = page;
+  const offAuth = watchLaneAuth(lane, page, who);
   try {
     if (/\/login/i.test(page.url())) {
       throw new Error("Your FreightPOP session expired — log in again through the dashboard's hosted view");
@@ -683,45 +804,45 @@ async function runIn(browser, url, who, modes = null) {
     const cdp = await page.createCDPSession();
     const ext = new ExtensionContexts(cdp);
     await ext.init();
-    currentExt = ext;
+    lane.ext = ext;
     // Contexts created before Runtime.enable are replayed on enable, but give
     // the content script (document_idle) a moment to attach.
     const t0 = Date.now();
     while (!ext.ready && Date.now() - t0 < 30_000) await sleep(1000);
-    logLine(`Opened ${page.url()} — waiting for the shipment grid…`);
+    logLine(lane, `Opened ${page.url()} — waiting for the shipment grid…`);
     // Don't start until rows are on screen — otherwise run() "finishes" an
     // empty page in seconds and reports Done with 0 shipments.
     let gridReady = false;
     for (let i = 0; i < 6 && !gridReady; i++) {
       if (/#\/login|\/login\b/i.test(page.url())) throw new Error("Your FreightPOP session expired — open FreightPOP on the Scraping page and log in again");
-      if (isAuthExpired(who)) throw new Error(EXPIRED);
+      if (authGone(lane, who)) throw new Error(EXPIRED);
       gridReady = (await ext.evaluate("fpxEnsureGridReady(10000)").catch(() => ({ value: false }))).value === true;
     }
-    if (!gridReady && isAuthExpired(who)) throw new Error(EXPIRED);
+    if (!gridReady && authGone(lane, who)) throw new Error(EXPIRED);
     if (!gridReady) {
       const why = (await ext.evaluate("fpxDescribeFrameState()").catch(() => ({ value: "" }))).value;
       throw new Error(`FreightPOP's shipment grid never loaded on ${page.url()}${why ? ` (${why})` : ""}`);
     }
     const total = await readGridTotal(page);
-    if (current && total != null) current.total = total;
+    if (lane.current && total != null) lane.current.total = total;
     let counts = await readDashboardCounts(page);
     if (!counts || Object.keys(counts).length < 5) { await sleep(3000); counts = (await readDashboardCounts(page)) || counts; }
-    noteCounts(counts);
-    logLine(total != null ? `Grid loaded — ${total} shipment(s) in the grid. Starting Refresh All` : "Grid loaded — starting Refresh All");
+    noteCounts(lane, counts);
+    logLine(lane, total != null ? `Grid loaded — ${total} shipment(s) in the grid. Starting Refresh All` : "Grid loaded — starting Refresh All");
     const pageSize = Number(setting("browser.scrape_page_size")) || 50;
     await ext.evaluate(`fpxScrapePageSize = ${pageSize}; 'ok'`).catch(() => {});
     // Mode filter (LTL / Truckload / Parcel) — content.js applies it on the grid.
     await ext.evaluate(`fpxScrapeModes = ${JSON.stringify(modes && modes.length ? modes : null)}; 'ok'`).catch(() => {});
-    if (pauseFlag) pushPause(); // paused while it was starting up
+    if (lane.pauseFlag) pushPause(lane); // paused while it was starting up
     await ext.evaluate("run(); 'started'", { awaitPromise: false });
 
     const deadline = Date.now() + config.scrapeTimeoutMs;
     let lastStatus = "";
     let tick = 0;
     // Paused time doesn't count towards the limit.
-    while (Date.now() < deadline + pausedTotal()) {
+    while (Date.now() < deadline + pausedTotal(lane)) {
       await sleep(2000);
-      if (pauseFlag) pushPause();
+      if (lane.pauseFlag) pushPause(lane);
       const { done, status, lines } = await worker.evaluate(() => ({
         done: self.__fpxDone, status: self.__fpxStatus, lines: (self.__fpxLog || []).splice(0),
       }));
@@ -730,36 +851,36 @@ async function runIn(browser, url, who, modes = null) {
         // A new page: re-read the pager so its lines can say "Page 3 of 27".
         if (got.pageStart) {
           const pager = await readPager(page);
-          if (current && pager?.total != null) current.total = pager.total;
+          if (lane.current && pager?.total != null) lane.current.total = pager.total;
           scrapeLog.setPages(pagesFrom(pager, got.pageStart));
         }
-        for (const o of got.lines) logLine(o.text, o.level, o.at);
-        const c = current?.counts;
+        for (const o of got.lines) logLine(lane, o.text, o.level, o.at);
+        const c = lane.current?.counts;
         if (c) for (const [k, n] of Object.entries(got.counts)) c[k] = (c[k] || 0) + n;
       }
       if (status && status !== lastStatus) {
         lastStatus = status;
         console.log(`[worker] ${status}`);
-        if (current && !stopFlag) { current.status = status; current.statusAt = new Date().toISOString(); }
+        if (lane.current && !lane.stopFlag) { lane.current.status = status; lane.current.statusAt = new Date().toISOString(); }
       }
       if (done) {
-        for (const o of scrapeLog.finish()) logLine(o.text, o.level);
+        for (const o of scrapeLog.finish()) logLine(lane, o.text, o.level);
         // The run's "after" snapshot of FreightPOP's dashboard totals.
         const end = await readDashboardCounts(page);
-        if (current && end) { noteCounts(end); current.fpAfter = { ...end, at: new Date().toISOString() }; }
-        return stopFlag ? `Stopped by user. ${done}` : done;
+        if (lane.current && end) { noteCounts(lane, end); lane.current.fpAfter = { ...end, at: new Date().toISOString() }; }
+        return lane.stopFlag ? `Stopped by user. ${done}` : done;
       }
       // Keep the totals fresh (shipments get added/delivered mid-run):
       // FreightPOP's dashboard tiles every ~10s, the grid pager every ~30s.
       ++tick;
-      if (tick % 5 === 0 && current) {
-        noteCounts(await readDashboardCounts(page));
+      if (tick % 5 === 0 && lane.current) {
+        noteCounts(lane, await readDashboardCounts(page));
       }
-      if (tick % 15 === 0 && current) {
+      if (tick % 15 === 0 && lane.current) {
         const t = await readGridTotal(page);
-        if (t != null) current.total = t;
+        if (t != null) lane.current.total = t;
       }
-      if (stopFlag && !page.__fpxStopSentAt) {
+      if (lane.stopFlag && !page.__fpxStopSentAt) {
         page.__fpxStopSentAt = Date.now();
         await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
       }
@@ -773,8 +894,7 @@ async function runIn(browser, url, who, modes = null) {
     throw new Error(`Timed out after ${config.scrapeTimeoutMs / 60000} min (last status: ${lastStatus || "none"})`);
   } finally {
     offAuth();
-    currentPage = null;
-    currentExt = null;
+    if (lane.page === page) { lane.page = null; lane.ext = null; }
     await page.close().catch(() => {});
   }
 }
@@ -786,10 +906,10 @@ async function runIn(browser, url, who, modes = null) {
 // The page work is erpAuditPull() in the extension's content.js; this opens
 // the window (so the read-only live view shows it, like a scrape), relays its
 // log lines, and passes stop / pause on.
-async function runErpAudit(email, months, shipmentType) {
+async function runErpAudit(lane, email, months, shipmentType) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runErpIn(lease.browser, dashboardUrlFor(email), email, months, shipmentType);
+    return await runErpIn(lane, lease.browser, dashboardUrlFor(email), email, months, shipmentType);
   } finally {
     lease.release();
   }
@@ -809,11 +929,11 @@ const ERP_LIMIT_MS = 45 * 60_000; // whole pull, not counting paused time
 //   onPoll(r, ctx) optional, after the log lines and counts of one poll;
 //                  true = it answered a hand-off, skip the rest of this tick
 // ctx: { browser, page, cdp, ext, who }
-async function runPageJob(browser, url, who, job) {
-  clearAuthExpired(who);
+async function runPageJob(lane, browser, url, who, job) {
+  startAuth(lane, who);
   const page = await openWindowPage(browser, url);
-  currentPage = page;
-  const offAuth = watchAuth(page, who);
+  lane.page = page;
+  const offAuth = watchLaneAuth(lane, page, who);
   const onLogin = () => /#\/login|\/login\b/i.test(page.url());
   let cleanup = null;
   try {
@@ -821,86 +941,92 @@ async function runPageJob(browser, url, who, job) {
     const cdp = await page.createCDPSession();
     const ext = new ExtensionContexts(cdp);
     await ext.init();
-    currentExt = ext;
+    lane.ext = ext;
     const t0 = Date.now();
     while (!ext.ready && Date.now() - t0 < 30_000) await sleep(1000);
     if (onLogin()) throw new Error("Your FreightPOP session expired — open FreightPOP on the Scraping page and log in again");
-    if (isAuthExpired(who)) throw new Error(EXPIRED);
+    if (authGone(lane, who)) throw new Error(EXPIRED);
     if (!ext.ready) throw new Error(`FreightPOP never finished loading on ${page.url()} (the extension did not attach to the page)`);
-    logLine(`Opened ${page.url()} — waiting for FreightPOP to load…`);
+    logLine(lane, `Opened ${page.url()} — waiting for FreightPOP to load…`);
     // The shipment grid on screen = signed in and the app is up. Not needed
     // for the report itself, so its absence is a warning, not a failure.
     let appUp = false;
     for (let i = 0; i < 3 && !appUp; i++) {
       if (onLogin()) throw new Error("Your FreightPOP session expired — open FreightPOP on the Scraping page and log in again");
-      if (isAuthExpired(who)) throw new Error(EXPIRED);
+      if (authGone(lane, who)) throw new Error(EXPIRED);
       appUp = (await ext.evaluate("fpxEnsureGridReady(10000)").catch(() => ({ value: false }))).value === true;
     }
-    if (!appUp && isAuthExpired(who)) throw new Error(EXPIRED);
-    if (!appUp) logLine("FreightPOP's start page did not finish loading — going to Transactions anyway", "warn");
+    if (!appUp && authGone(lane, who)) throw new Error(EXPIRED);
+    if (!appUp) logLine(lane, "FreightPOP's start page did not finish loading — going to Transactions anyway", "warn");
     const has = (await ext.evaluate(job.has).catch(() => ({ value: false }))).value === true;
     if (!has) throw new Error(job.missing);
 
     const ctx = { browser, page, cdp, ext, who };
     if (job.setup) cleanup = await job.setup(ctx);
-    if (pauseFlag) pushPause(); // paused while it was starting up
+    if (lane.pauseFlag) pushPause(lane); // paused while it was starting up
     await ext.evaluate(job.start, { awaitPromise: false });
 
     const startedAt = Date.now();
     let lost = 0;
     // Paused time doesn't count towards the limit.
-    while (Date.now() < startedAt + job.limitMs + pausedTotal()) {
+    while (Date.now() < startedAt + job.limitMs + pausedTotal(lane)) {
       await sleep(1500);
       if (job.blocked?.()) continue;
-      if (pauseFlag) pushPause();
+      if (lane.pauseFlag) pushPause(lane);
       const r = (await ext.evaluate("fpxErpPoll()").catch(() => null))?.value;
       if (!r || !r.started) {
         if (job.blocked?.()) continue; // the prompt opened while this poll was on its way
         // The page (and the job running in it) went away.
         if (onLogin()) throw new Error("Redirected to FreightPOP login mid-run — sign in again, then re-run");
-        if (isAuthExpired(who)) throw new Error(EXPIRED);
+        if (authGone(lane, who)) throw new Error(EXPIRED);
         if (++lost >= 10) throw new Error(`The FreightPOP page reloaded mid-run and the ${job.noun} was lost — re-run it`);
         continue;
       }
       lost = 0;
-      for (const l of r.lines || []) logLine(l.text, l.level || "info");
-      if (current && r.counts) Object.assign(current.counts, r.counts);
+      for (const l of r.lines || []) logLine(lane, l.text, l.level || "info");
+      if (lane.current && r.counts) Object.assign(lane.current.counts, r.counts);
       if (job.onPoll && (await job.onPoll(r, ctx))) continue;
       if (r.done) {
-        if (current && r.done.result) current.result = r.done.result;
+        if (lane.current && r.done.result) lane.current.result = r.done.result;
         if (!r.done.ok) {
-          if (onLogin() || isAuthExpired(who)) throw new Error(`${EXPIRED} (${r.done.note})`);
+          if (onLogin() || authGone(lane, who)) throw new Error(`${EXPIRED} (${r.done.note})`);
           throw new Error(r.done.note || `The ${job.noun} failed`);
         }
-        return r.done.stopped ? `${stoppedBecause()}. ${r.done.note}` : r.done.note;
+        return r.done.stopped ? `${stoppedBecause(lane)}. ${r.done.note}` : r.done.note;
       }
-      if (stopFlag && !page.__fpxStopSentAt) {
+      if (lane.stopFlag && !page.__fpxStopSentAt) {
         page.__fpxStopSentAt = Date.now();
         await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
       }
       // If the extension never acknowledges the stop, give up after 2 min.
       if (page.__fpxStopSentAt && Date.now() - page.__fpxStopSentAt > 120_000) {
-        return `${stoppedBecause()} (last step: ${current?.status || "none"})`;
+        return `${stoppedBecause(lane)} (last step: ${lane.current?.status || "none"})`;
       }
       if (onLogin()) throw new Error("Redirected to FreightPOP login mid-run — sign in again, then re-run");
     }
     await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
-    throw new Error(`Timed out after ${job.limitMs / 60000} min (last step: ${current?.status || "none"})`);
+    throw new Error(`Timed out after ${job.limitMs / 60000} min (last step: ${lane.current?.status || "none"})`);
   } finally {
     if (cleanup) await Promise.resolve().then(cleanup).catch(() => {});
     offAuth();
-    currentPage = null;
-    currentExt = null;
+    if (lane.page === page) { lane.page = null; lane.ext = null; }
     await page.close().catch(() => {});
   }
 }
 
-function runErpIn(browser, url, who, months, shipmentType) {
+async function runErpIn(lane, browser, url, who, months, shipmentType) {
   // Rows from FreightPOP's Excel export, all tabs together.
   const excelRows = [];
+  const excelFiles = []; // the workbooks themselves, one per tab captured
   let excelHeaders = [];
   let excelFailed = false;
-  return runPageJob(browser, url, who, {
+  // For the Excel copy kept in storage (saved once, after the last upload).
+  let usedExcel = false;
+  let excelResp = null; // the API answer to the one Excel upload
+  const screenRows = [];
+  let filesSaved = false;
+  let saving = null; // the save, finished after the page work
+  return runPageJob(lane, browser, url, who, {
     noun: "pull",
     limitMs: ERP_LIMIT_MS,
     has: "typeof erpAuditPull === 'function' && typeof fpxErpPoll === 'function'",
@@ -911,13 +1037,13 @@ function runErpIn(browser, url, who, months, shipmentType) {
       if (r.download && !r.done) {
         let answer;
         try {
-          const got = await captureExport(browser, cdp, ext, current?.requestId || "job");
+          const got = await captureExport(lane, browser, cdp, ext, lane.current?.requestId || "job");
           const before = excelRows.length;
           const dup = before && got.rows.length === before && JSON.stringify(got.rows[0]) === JSON.stringify(excelRows[0]);
-          if (dup) logLine(`Excel export · ${r.download.label} · same rows as the previous tab, counted once`, "warn");
-          else excelRows.push(...got.rows);
+          if (dup) logLine(lane, `Excel export · ${r.download.label} · same rows as the previous tab, counted once`, "warn");
+          else { excelRows.push(...got.rows); if (got.buf) excelFiles.push(got.buf); }
           if (!excelHeaders.length) excelHeaders = got.headers;
-          logLine(`Excel export · ${r.download.label} · ${got.file} · ${got.rows.length.toLocaleString("en-US")} rows · ${got.headers.length} columns · button "${got.clicked}"`);
+          logLine(lane, `Excel export · ${r.download.label} · ${got.file} · ${got.rows.length.toLocaleString("en-US")} rows · ${got.headers.length} columns · button "${got.clicked}"`);
           answer = { ok: true, rows: got.rows.length, file: got.file };
         } catch (e) {
           excelFailed = true;
@@ -929,6 +1055,7 @@ function runErpIn(browser, url, who, months, shipmentType) {
       // The page has rows ready: fetch them in slices and post them from here.
       if (r.upload && !r.done) {
         let answer;
+        let lastPart = false;
         try {
           const meta = JSON.parse((await ext.evaluate("fpxErpTakeMeta()")).value || "null");
           if (!meta) throw new Error("the page had no upload waiting");
@@ -943,23 +1070,44 @@ function runErpIn(browser, url, who, months, shipmentType) {
           const fromExcel = !excelFailed && excelRows.length ? notExportedSorted(excelRows) : null;
           if (fromExcel && !fromExcel.error && !body.audit_id) {
             send = fromExcel.rows;
+            usedExcel = true;
             if (body.run) body.run.total_report_rows = excelRows.length;
-            logLine(`Source: FreightPOP Excel export · ${excelRows.length.toLocaleString("en-US")} rows · ${send.length.toLocaleString("en-US")} not exported to ERP` +
+            logLine(lane, `Source: FreightPOP Excel export · ${excelRows.length.toLocaleString("en-US")} rows · ${send.length.toLocaleString("en-US")} not exported to ERP` +
               (send.length !== rows.length ? ` (the report on screen gave ${rows.length.toLocaleString("en-US")})` : ""), send.length !== rows.length ? "warn" : "info");
           } else {
-            logLine(`Source: rows read from the report on screen${fromExcel?.error ? ` (${fromExcel.error})` : ""}`, fromExcel?.error ? "warn" : "info");
+            logLine(lane, `Source: rows read from the report on screen${fromExcel?.error ? ` (${fromExcel.error})` : ""}`, fromExcel?.error ? "warn" : "info");
           }
-          const resp = await api("/api/audits/invoice/from-history", { method: "POST", body: JSON.stringify({ ...body, rows: send }) });
+          let resp;
+          if (usedExcel && body.audit_id) {
+            // The Excel export already went up whole with the first part:
+            // later parts from the page would only duplicate rows.
+            resp = excelResp;
+          } else {
+            // With the Excel export there is one post, so it is the final one.
+            const post = usedExcel ? { ...body, final: true, rows: send } : { ...body, rows: send };
+            resp = await api("/api/audits/invoice/from-history", { method: "POST", body: JSON.stringify(post) });
+            if (usedExcel) excelResp = resp;
+          }
           answer = { ok: true, ...resp };
+          if (!usedExcel) screenRows.push(...rows);
+          lastPart = usedExcel || body.final !== false;
         } catch (e) {
           answer = { ok: false, error: e.message };
         }
         await ext.evaluate(`fpxErpDeliver(${JSON.stringify(answer)})`).catch(() => {});
+        // Keep the Excel files with the audit: once, after the only / last
+        // part (the Excel export goes up whole with the first part). The page
+        // already has its answer and the save is not waited for here, so a slow
+        // one holds nothing up.
+        if (answer.ok && answer.audit_id && !filesSaved && lastPart) {
+          filesSaved = true;
+          saving = saveErpExcel(lane, answer.audit_id, usedExcel ? { files: excelFiles, total: excelRows.length } : { rows: screenRows });
+        }
         return true;
       }
       return false;
     },
-  });
+  }).finally(() => saving); // saveErpExcel never rejects
 }
 
 // ── Get invoices ────────────────────────────────────────────────────────────
@@ -973,16 +1121,16 @@ function runErpIn(browser, url, who, months, shipmentType) {
 // window, a file download, a browser prompt.
 const GET_INVOICE_LIMIT_MS = 90 * 60_000; // whole job, not counting paused time
 
-async function runGetInvoices(email, gi) {
+async function runGetInvoices(lane, email, gi) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runGetInvoicesIn(lease.browser, dashboardUrlFor(email), email, gi);
+    return await runGetInvoicesIn(lane, lease.browser, dashboardUrlFor(email), email, gi);
   } finally {
     lease.release();
   }
 }
 
-async function runGetInvoicesIn(browser, url, who, gi) {
+async function runGetInvoicesIn(lane, browser, url, who, gi) {
   // Results not yet saved to the audit. A failed save never fails the job:
   // it is logged and sent again with the next batch.
   const unsaved = [];
@@ -996,11 +1144,11 @@ async function runGetInvoicesIn(browser, url, who, gi) {
       // The API counts the rows it could not write but does not name them:
       // the whole batch goes again (saving a result twice is harmless).
       if (resp?.failed) throw new Error(`the API could not write ${resp.failed} of them`);
-      if (resp?.unknown) logLine(`${resp.unknown} of ${batch.length} result(s) are for shipments that are not in audit ${String(gi.auditId).slice(0, 8)}`, "warn");
+      if (resp?.unknown) logLine(lane, `${resp.unknown} of ${batch.length} result(s) are for shipments that are not in audit ${String(gi.auditId).slice(0, 8)}`, "warn");
       unsaved.splice(0, batch.length);
       return true;
     } catch (e) {
-      logLine(`Could not save ${batch.length} result(s) to the audit (${String(e.message).slice(0, 200)}) — ${again ? "trying again" : "they go with the next batch"}`, "warn");
+      logLine(lane, `Could not save ${batch.length} result(s) to the audit (${String(e.message).slice(0, 200)}) — ${again ? "trying again" : "they go with the next batch"}`, "warn");
       return false;
     }
   };
@@ -1010,7 +1158,7 @@ async function runGetInvoicesIn(browser, url, who, gi) {
       if (i) await sleep(3000);
       await save(i < 2);
     }
-    if (unsaved.length) logLine(`${unsaved.length} result(s) could not be saved to the audit: ${unsaved.map((r) => `${r.shipment_id} ${r.ok ? "OK" : "failed"}`).join(", ")}`.slice(0, 500), "error");
+    if (unsaved.length) logLine(lane, `${unsaved.length} result(s) could not be saved to the audit: ${unsaved.map((r) => `${r.shipment_id} ${r.ok ? "OK" : "failed"}`).join(", ")}`.slice(0, 500), "error");
     return unsaved.length;
   };
 
@@ -1018,7 +1166,7 @@ async function runGetInvoicesIn(browser, url, who, gi) {
   let lastPauseId = 0;
   let note;
   try {
-    note = await runPageJob(browser, url, who, {
+    note = await runPageJob(lane, browser, url, who, {
       noun: "get-invoices job",
       limitMs: GET_INVOICE_LIMIT_MS,
       has: "typeof erpGetInvoices === 'function' && typeof fpxErpNote === 'function' && typeof fpxErpPoll === 'function'",
@@ -1038,16 +1186,16 @@ async function runGetInvoicesIn(browser, url, who, gi) {
             if (d.type() === "alert") { await d.accept(); tell({ kind: "alert", text }); return; }
             if (d.type() === "beforeunload") {
               await d.dismiss(); // stay on the page
-              logLine("FreightPOP tried to leave the page — stayed on it", "warn");
+              logLine(lane, "FreightPOP tried to leave the page — stayed on it", "warn");
               return;
             }
             promptOpen = true;
-            setPaused(true, null, `Get Invoice · FreightPOP is asking in a browser prompt: "${text}" — buttons: OK, Cancel. Nothing was chosen. Press Resume to cancel it and carry on with the next shipment`);
-            while (!ended && pauseFlag && !stopFlag) await sleep(500);
+            setPaused(lane, true, null, `Get Invoice · FreightPOP is asking in a browser prompt: "${text}" — buttons: OK, Cancel. Nothing was chosen. Press Resume to cancel it and carry on with the next shipment`);
+            while (!ended && lane.pauseFlag && !lane.stopFlag) await sleep(500);
             await d.dismiss();
             tell({ kind: "confirm", text });
           } catch (e) {
-            logLine(`A browser prompt could not be closed (${e.message})`, "warn");
+            logLine(lane, `A browser prompt could not be closed (${e.message})`, "warn");
           } finally {
             promptOpen = false;
           }
@@ -1065,14 +1213,14 @@ async function runGetInvoicesIn(browser, url, who, gi) {
             try { const u = new URL(t.url()); where = u.protocol.startsWith("http") ? u.host + u.pathname : u.protocol; } catch { /* blank */ }
             const p = await t.page().catch(() => null);
             if (p && !p.isClosed()) await p.close().catch(() => {});
-            logLine(`Get Invoice · the new window${where ? ` (${where.slice(0, 120)})` : ""} was closed`);
+            logLine(lane, `Get Invoice · the new window${where ? ` (${where.slice(0, 120)})` : ""} was closed`);
           } catch { /* the window went away by itself */ }
         };
         browser.on("targetcreated", onTarget);
 
         // File downloads: let them land in a folder of this job so they can be
         // seen starting; the folder is removed when the job ends.
-        const dir = path.join(path.dirname(config.profileRoot), "erp-downloads", `gi-${String(current?.requestId || "job").replace(/[^a-zA-Z0-9_-]/g, "")}`);
+        const dir = path.join(path.dirname(config.profileRoot), "erp-downloads", `gi-${String(lane.current?.requestId || "job").replace(/[^a-zA-Z0-9_-]/g, "")}`);
         fs.mkdirSync(dir, { recursive: true });
         await cdp.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir }).catch(() => {});
         await cdp.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: dir, eventsEnabled: true }).catch(() => {});
@@ -1103,7 +1251,7 @@ async function runGetInvoicesIn(browser, url, who, gi) {
         // The page asks for a pause: the same pause as the button, with its line.
         if (r.pause && r.pause.id > lastPauseId && !r.done) {
           lastPauseId = r.pause.id;
-          setPaused(true, null, String(r.pause.text || "Paused by the job — press Resume to continue"));
+          setPaused(lane, true, null, String(r.pause.text || "Paused by the job — press Resume to continue"));
         }
         return false;
       },
@@ -1116,10 +1264,130 @@ async function runGetInvoicesIn(browser, url, who, gi) {
   return left ? `${note} · ${left} result(s) not saved to the audit` : note;
 }
 
+// ── Approval check ──────────────────────────────────────────────────────────
+// A second look at an ERP audit: in the requester's own hosted browser, open
+// FreightPOP's Audit page, take the Excel export of "Recently Approved" and
+// hand every row to the API, which matches them against the audit's shipments
+// (approved by EDI, or by which person). The page work is erpApprovalCheck()
+// in the extension's content.js — it opens the page and the tab and clicks
+// nothing else. The export is kept as <audit id>/recently-approved.xlsx.
+const APPROVAL_LIMIT_MS = 20 * 60_000; // page work, not counting paused time
+const APPROVAL_POST_MAX_BYTES = 12 * 1024 * 1024; // per POST; the API's limit is 20 MB
+
+async function runApprovalCheck(lane, email, auditId) {
+  const lease = await acquireUserBrowser(email, { busy: true });
+  try {
+    return await runApprovalCheckIn(lane, lease.browser, dashboardUrlFor(email), email, auditId);
+  } finally {
+    lease.release();
+  }
+}
+
+async function runApprovalCheckIn(lane, browser, url, who, auditId) {
+  let got = null; // the Recently Approved export: { rows, headers, buf, file }
+  const note = await runPageJob(lane, browser, url, who, {
+    noun: "approval check",
+    limitMs: APPROVAL_LIMIT_MS,
+    has: "typeof erpApprovalCheck === 'function' && typeof fpxErpPoll === 'function'",
+    missing: "The extension in the hosted browser has no approval check (needs version 4.12 or later) — redeploy the browser service",
+    start: `erpApprovalCheck(${JSON.stringify(String(who))}); 'started'`,
+    onPoll: async (r, { cdp, ext }) => {
+      // The page has Recently Approved on screen and wants its Excel captured.
+      if (!r.download || r.done) return false;
+      let answer;
+      try {
+        got = await captureExport(lane, browser, cdp, ext, lane.current?.requestId || "job");
+        if (lane.current) lane.current.counts.approvedRows = got.rows.length;
+        logLine(lane, `Excel export · ${r.download.label} · ${got.file} · ${num(got.rows.length)} rows · ${got.headers.length} columns · button "${got.clicked}"`);
+        // A grid that exports only the page on screen gives fewer rows than it holds.
+        if (got.gridTotal && got.gridTotal > got.rows.length) {
+          logLine(lane, `The Recently Approved grid holds ${num(got.gridTotal)} rows but its Excel export has ${num(got.rows.length)} — only those are matched (FreightPOP exports the page on screen)`, "warn");
+        }
+        answer = { ok: true, rows: got.rows.length, file: got.file };
+      } catch (e) {
+        got = null;
+        answer = { ok: false, error: e.message };
+      }
+      await ext.evaluate(`fpxErpDownloadDone(${JSON.stringify(answer)})`).catch(() => {});
+      return true;
+    },
+  });
+  // Stopped, or Recently Approved was empty: the page's own sentence stands.
+  if (!got) return note;
+  if (lane.stopFlag) return `${stoppedBecause(lane)}. The Recently Approved export was read (${num(got.rows.length)} rows) but not matched against the audit.`;
+
+  if (got.buf) await saveExcelFiles(lane, auditId, [{ name: "recently-approved.xlsx", buf: got.buf, rows: got.rows.length }]);
+
+  logLine(lane, `Matching · ${num(got.rows.length)} approved rows against audit ${String(auditId).slice(0, 8)} · columns: ${got.headers.join(", ")}`.slice(0, 500));
+  const resp = await postApprovals(lane, auditId, who, got.headers, got.rows);
+  const matched = Number(resp?.matched) || 0;
+  const notFound = Number(resp?.not_found) || 0;
+  const approvedRows = got.rows.length; // the API counts its last part only
+  const unsaved = Number(resp?.failed) || 0;
+  if (unsaved) logLine(lane, `The API could not save ${num(unsaved)} of the matched shipments — run the approval check again`, "warn");
+  if (lane.current) Object.assign(lane.current.counts, { approvedRows, matched, notFound });
+
+  // "EDI 180 · Shaun Smith 20 · others 12"
+  const byEdi = Number(resp?.by_edi) || 0;
+  const people = Object.entries(resp?.by_person || {}).map(([name, n]) => [String(name), Number(n) || 0])
+    .filter(([name, n]) => n > 0 && !/^edi$/i.test(name.trim())).sort((a, b) => b[1] - a[1]);
+  const others = people.slice(3).reduce((sum, p) => sum + p[1], 0);
+  const who3 = [`EDI ${num(byEdi)}`, ...people.slice(0, 3).map(([name, n]) => `${name.slice(0, 40)} ${num(n)}`), ...(others ? [`others ${num(others)}`] : [])].join(" · ");
+  const cu = resp?.columns_used || {};
+  const cols = [["shipment", cu.shipment], ["approved by", cu.approved_by], ["approved at", cu.approved_at], ["amount", cu.amount]]
+    .map(([label, col]) => `${label} ${col ? `"${col}"` : "not found"}`).join(", ");
+  const head = `${num(matched)} of ${num(matched + notFound)} shipments`;
+  logLine(lane, `Approvals matched · ${head} · ${who3} · columns used: ${cols}`.slice(0, 500),
+    !matched || !cu.approved_by ? "warn" : "done");
+  return `${head} of audit ${String(auditId).slice(0, 8)} are in Recently Approved (${num(approvedRows)} approved rows) · ${who3}` + (unsaved ? ` · ${num(unsaved)} not saved, run it again` : "");
+}
+
+// Every row of the Recently Approved export → the API, in one POST when it
+// fits, else parts of at most ~12 MB; the answer to the final part is the
+// match. A 422 (the API found no shipment-id column) fails with its message.
+async function postApprovals(lane, auditId, by, columns, rows) {
+  const posts = [[]];
+  let size = 0;
+  for (const r of rows) {
+    const bytes = Buffer.byteLength(JSON.stringify(r)) + 1;
+    if (size + bytes > APPROVAL_POST_MAX_BYTES && posts[posts.length - 1].length) { posts.push([]); size = 0; }
+    posts[posts.length - 1].push(r);
+    size += bytes;
+  }
+  const path_ = `/api/audits/invoice/${encodeURIComponent(auditId)}/approval-results`;
+  let resp = null;
+  for (let i = 0; i < posts.length; i++) {
+    const part = posts.length > 1 ? ` (part ${i + 1} of ${posts.length})` : "";
+    let res;
+    try {
+      res = await fetch(`${config.apiUrl}${path_}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": config.apiKey },
+        body: JSON.stringify({ by, columns, rows: posts[i], part: i + 1, final: i === posts.length - 1 }),
+        signal: AbortSignal.timeout(180_000),
+      });
+    } catch (e) {
+      throw new Error(`Sending the approved rows to the API failed${part}: ${e.name === "TimeoutError" ? "no answer after 3 min" : e.message}`);
+    }
+    const text = await res.text().catch(() => "");
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* not JSON */ }
+    if (res.status === 422) {
+      const seen = Array.isArray(json?.columns) && json.columns.length ? json.columns : columns;
+      throw new Error(`${json?.error || "The API could not find a shipment id column in the Recently Approved export"} — columns in the export: ${seen.join(", ")}`.slice(0, 480));
+    }
+    if (!res.ok) throw new Error(`POST ${path_} → ${res.status} ${(json?.error || text).slice(0, 200)}${part}`);
+    resp = json;
+    if (posts.length > 1) logLine(lane, `Sent part ${i + 1} of ${posts.length} · ${num(posts[i].length)} rows`);
+  }
+  if (!resp || typeof resp !== "object") throw new Error(`POST ${path_} returned no JSON`);
+  return resp;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Click the report's Excel export and read the file Chromium saves.
-// → { rows, headers, file, clicked }
+// → { rows, headers, file, clicked, buf } — buf is the .xlsx itself.
 // The same file "Export to Excel" would save, taken straight from the grid:
 // ask the report's Kendo grid to build its Excel workbook, keep the bytes and
 // skip the browser's download step (which never delivered a file here).
@@ -1133,7 +1401,12 @@ async function kendoExport(page) {
       if (!kendo.ooxml || !kendo.ooxml.Workbook) return resolve({ error: "the page's Kendo build has no Excel export" });
       const grids = $(".k-grid").filter(":visible").toArray().map((el) => $(el).data("kendoGrid")).filter(Boolean);
       if (!grids.length) return resolve({ error: "no report grid on the page" });
-      const grid = grids.sort((a, b) => (b.dataSource.total() || 0) - (a.dataSource.total() || 0))[0];
+      // The page work may have marked the grid it means (approval check);
+      // otherwise the largest one on screen.
+      const mark = $("[data-fpx-export-grid]");
+      const marked = mark.length ? mark.find(".k-grid, [data-role=grid]").addBack().toArray().map((el) => $(el).data("kendoGrid")).filter(Boolean)[0] : null;
+      if (mark.length && !marked) return resolve({ error: "the grid the page marked for export is not a Kendo grid" });
+      const grid = marked || grids.sort((a, b) => (b.dataSource.total() || 0) - (a.dataSource.total() || 0))[0];
       if (typeof grid.saveAsExcel !== "function") return resolve({ error: "the report grid has no Excel export" });
       const timer = setTimeout(() => { grid.unbind("excelExport", onExport); resolve({ error: "the grid took over 3 minutes to build the Excel file" }); }, 180000);
       function onExport(e) {
@@ -1157,13 +1430,13 @@ async function kendoExport(page) {
   if (buf.length < 100) throw new Error("the grid returned an empty Excel file");
   const { headers, rows } = readXlsx(buf);
   if (!rows.length) throw new Error("the Excel file has no rows");
-  return { rows, headers, file: `Excel export (${(buf.length / 1024 / 1024).toFixed(1)} MB, built in ${Math.round((Date.now() - t0) / 1000)}s)`, clicked: "Export to Excel" };
+  return { rows, headers, buf, gridTotal: Number(out.rows) || null, file: `Excel export (${(buf.length / 1024 / 1024).toFixed(1)} MB, built in ${Math.round((Date.now() - t0) / 1000)}s)`, clicked: "Export to Excel" };
 }
 
-async function captureExport(browser, cdp, ext, jobId) {
-  if (currentPage) {
-    try { return await kendoExport(currentPage); }
-    catch (e) { logLine(`Excel export from the grid failed (${e.message}) — trying the Export to Excel button`, "warn"); }
+async function captureExport(lane, browser, cdp, ext, jobId) {
+  if (lane.page) {
+    try { return await kendoExport(lane.page); }
+    catch (e) { logLine(lane, `Excel export from the grid failed (${e.message}) — trying the Export to Excel button`, "warn"); }
   }
   const dir = path.join(path.dirname(config.profileRoot), "erp-downloads", String(jobId).replace(/[^a-zA-Z0-9_-]/g, ""));
   fs.mkdirSync(dir, { recursive: true });
@@ -1191,9 +1464,10 @@ async function captureExport(browser, cdp, ext, jobId) {
     if (size > 0 && last === size) {
       try {
         if (!/\.xlsx$/i.test(done[0])) throw new Error(`the export is "${done[0]}", not an .xlsx file`);
-        const { headers, rows } = readXlsx(fs.readFileSync(file));
+        const buf = fs.readFileSync(file);
+        const { headers, rows } = readXlsx(buf);
         if (!rows.length) throw new Error(`"${done[0]}" has no rows`);
-        return { rows, headers, file: done[0], clicked: click.clicked };
+        return { rows, headers, buf, file: done[0], clicked: click.clicked };
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
@@ -1205,29 +1479,109 @@ async function captureExport(browser, cdp, ext, jobId) {
   throw new Error(`clicked "${click.clicked}" but no file arrived within 45s${partial.length ? ` (still downloading: ${partial.join(", ")})` : ""}${click.others?.length ? ` — other candidates: ${click.others.join(", ")}` : ""}`);
 }
 
+// The "not exported to ERP, highest charge first" rule, shared by the rows
+// that are uploaded and the Excel copy that is kept.
+const normKey = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+const exportedKey = (keys) => keys.find((k) => normKey(k) === "exportedtoerp") || keys.find((k) => normKey(k).includes("export") && normKey(k).includes("erp")) || null;
+const isNotExported = (v) => v === null || v === undefined || ["", "0", "0.0", "false", "no", "n"].includes(String(v).trim().toLowerCase());
+function markedUpRate(r) {
+  const v = r["Shipment Marked-Up Rate"];
+  if (v === null || v === undefined || v === "") return null;
+  const x = parseFloat(String(v).replace(/[^0-9.\-]/g, ""));
+  return Number.isFinite(x) ? x : null;
+}
+function byRateDesc(x, y) {
+  const a = markedUpRate(x), b = markedUpRate(y);
+  if (a === null && b === null) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  return b - a;
+}
+
 // Rows of the export that are not exported to ERP, highest charge first.
 // → { rows } or { error }
 function notExportedSorted(all) {
-  const norm = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
-  const keys = Object.keys(all[0] || {});
-  const key = keys.find((k) => norm(k) === "exportedtoerp") || keys.find((k) => norm(k).includes("export") && norm(k).includes("erp"));
+  const key = exportedKey(Object.keys(all[0] || {}));
   if (!key) return { error: 'the Excel file has no "Exported to ERP" column' };
-  const notExported = (v) => v === null || v === undefined || ["", "0", "0.0", "false", "no", "n"].includes(String(v).trim().toLowerCase());
-  const rate = (r) => {
-    const v = r["Shipment Marked-Up Rate"];
-    if (v === null || v === undefined || v === "") return null;
-    const x = parseFloat(String(v).replace(/[^0-9.\-]/g, ""));
-    return Number.isFinite(x) ? x : null;
-  };
-  const rows = all.filter((r) => notExported(r[key])).map((r) => (key === "Exported to ERP" ? r : { ...r, "Exported to ERP": r[key] }));
-  rows.sort((x, y) => {
-    const a = rate(x), b = rate(y);
-    if (a === null && b === null) return 0;
-    if (a === null) return 1;
-    if (b === null) return -1;
-    return b - a;
-  });
+  const rows = all.filter((r) => isNotExported(r[key])).map((r) => (key === "Exported to ERP" ? r : { ...r, "Exported to ERP": r[key] }));
+  rows.sort(byRateDesc);
   return { rows };
+}
+
+// ── Excel copies kept with an audit (Supabase Storage, private bucket) ──
+const mb = (buf) => `${(buf.length / 1024 / 1024).toFixed(1)} MB`;
+const num = (n) => Number(n || 0).toLocaleString("en-US");
+
+// Save [{ name, buf, rows }] under <audit id>/ and say so in one line. Never
+// throws: a file that could not be kept is a warning, not a failed job.
+async function saveExcelFiles(lane, auditId, files) {
+  if (!files.length) return;
+  if (!storageEnabled) {
+    logLine(lane, `Excel not saved (${files.map((f) => f.name).join(", ")}) — SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set on the browser service`, "warn");
+    return;
+  }
+  const saved = [];
+  for (const f of files) {
+    try {
+      await saveExcel(`${auditId}/${f.name}`, f.buf);
+      saved.push(`${f.name} (${num(f.rows)} rows, ${mb(f.buf)})`);
+    } catch (e) {
+      logLine(lane, `Excel not saved · ${f.name} (${String(e.message).slice(0, 300)})`, "warn");
+    }
+  }
+  if (saved.length) logLine(lane, `Excel saved · ${saved.join(" · ")}`);
+}
+
+// The ERP pull's files. With FreightPOP's Excel export captured:
+// not-exported.xlsx is that same workbook (layout, titles, column order and
+// styles untouched) holding only the not-exported rows, highest charge first,
+// and full.xlsx is the export as it came. Without it: not-exported.xlsx is a
+// plain workbook of the rows read from the screen, and there is no full file.
+//   src: { files: Buffer[], total } | { rows: object[] }
+async function saveErpExcel(lane, auditId, src) {
+  const out = [];
+  try {
+    if (src.files?.length) {
+      const [first, ...more] = src.files;
+      const key = exportedKey(readXlsx(first).headers);
+      if (!key) throw new Error('the Excel file has no "Exported to ERP" column');
+      const keep = (k) => (r) => isNotExported(r[k]);
+      const add = (name, buf, rows) => out.push({ name, buf, rows: rows ?? readXlsx(buf).rows.length });
+      let merged = null;
+      if (more.length) {
+        // Two tabs captured (type "both"): one workbook with the rows of both.
+        try {
+          merged = { part: filterSortXlsx(first, { keep: keep(key), compare: byRateDesc, more }), full: filterSortXlsx(first, { more }) };
+        } catch (e) {
+          logLine(lane, `The tabs' Excel files could not be joined into one (${String(e.message).slice(0, 200)}) — saving one file per tab`, "warn");
+        }
+      }
+      if (merged) {
+        add("not-exported.xlsx", merged.part);
+        add("full.xlsx", merged.full, src.total);
+      } else {
+        // One tab — or tabs with different columns: each as FreightPOP gave it.
+        src.files.forEach((file, i) => {
+          const tag = i ? `-${i + 1}` : "";
+          const k = exportedKey(readXlsx(file).headers);
+          if (k) add(`not-exported${tag}.xlsx`, filterSortXlsx(file, { keep: keep(k), compare: byRateDesc }));
+          else logLine(lane, `Tab ${i + 1}'s Excel file has no "Exported to ERP" column — no not-exported${tag}.xlsx for it`, "warn");
+          add(`full${tag}.xlsx`, file, more.length ? undefined : src.total);
+        });
+      }
+    } else if (src.rows?.length) {
+      // Title order of the first row; rows leave blank cells out, so titles
+      // that first show up further down are added after those.
+      const headers = [];
+      const seen = new Set();
+      for (const r of src.rows) for (const k of Object.keys(r)) if (!seen.has(k)) { seen.add(k); headers.push(k); }
+      out.push({ name: "not-exported.xlsx", buf: writeXlsx(headers, src.rows), rows: src.rows.length });
+      logLine(lane, "FreightPOP's Excel export was not captured — not-exported.xlsx is built from the rows read on screen (plain layout), and there is no full.xlsx", "warn");
+    }
+  } catch (e) {
+    logLine(lane, `Excel files could not be built (${String(e.message).slice(0, 300)})`, "warn");
+  }
+  await saveExcelFiles(lane, auditId, out);
 }
 
 // The Tasks board in numbers, from the API (null if it can't be read — a
@@ -1240,11 +1594,11 @@ async function taskSnapshot() {
 // Remember the latest tile reading; the first complete one (all five tiles)
 // is the run's "before" snapshot — FreightPOP fills the tiles a moment after
 // the grid, so the very first read can be partial.
-function noteCounts(c) {
-  if (!current || !c) return;
+function noteCounts(lane, c) {
+  if (!lane.current || !c) return;
   const at = new Date().toISOString();
-  current.fpCounts = c; current.fpCountsAt = at;
-  if (!current.fpBefore && Object.keys(c).length >= 5) current.fpBefore = { ...c, at };
+  lane.current.fpCounts = c; lane.current.fpCountsAt = at;
+  if (!lane.current.fpBefore && Object.keys(c).length >= 5) lane.current.fpBefore = { ...c, at };
 }
 
 // FreightPOP's dashboard tiles (TOTAL / BOOKED / IN TRANSIT / ISSUES /

@@ -66,6 +66,8 @@ const DEFAULT_CORS_ORIGINS = [
 const rawOrigins = (process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS)
   .split(",").map((s) => s.trim()).filter(Boolean);
 app.use(cors({
+  // Lets the dashboard read the filename of a downloaded file.
+  exposedHeaders: ["Content-Disposition"],
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // curl / server-to-server
     const ok = rawOrigins.some((o) => {

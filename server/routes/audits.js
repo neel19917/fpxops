@@ -3,6 +3,9 @@ import { supabase } from "../lib/supabase.js";
 import { analyzeGpAuditRun, analyzeInvoiceAuditRun } from "./analyze.js";
 import { auditHistoryRows } from "../lib/historyAudit.js";
 import { MAX_GET_INVOICE_IDS, isUuid, normalizeResult, mergeResult, updateRowsRaw } from "../lib/getInvoice.js";
+import {
+  approvalColumnNames, findApprovalColumns, matchApprovals, mergeApproval, summarizeApprovals,
+} from "../lib/approvalMatch.js";
 
 export const auditsRouter = Router();
 
@@ -66,19 +69,17 @@ auditsRouter.get("/invoice", async (_req, res) => {
   res.json({ data: data || [] });
 });
 
-auditsRouter.get("/invoice/:id", async (req, res) => {
-  const { data: run, error } = await supabase.from("fpx_invoice_audits").select("*").eq("id", req.params.id).maybeSingle();
-  if (error) return res.status(500).json({ error: error.message });
-  if (!run) return res.status(404).json({ error: "Invoice audit not found" });
-  // Page through the rows (Supabase caps a single read at 1000) in a fixed
-  // order so pages never overlap. ERP-pending runs can hold thousands of rows.
+// Every row of an audit. Pages through them (Supabase caps a single read at
+// 1000) in a fixed order so pages never overlap; ERP-pending runs can hold
+// thousands of rows. Returns { rows, error }.
+async function loadAuditRows(auditId, columns = "*") {
   const PAGE = 1000;
   const MAX_ROWS = 10000;
   const rows = [];
   let byCreated = true; // falls back to id-only if the table has no created_at
   for (let from = 0; from < MAX_ROWS; from += PAGE) {
     const page = () => {
-      let q = supabase.from("fpx_invoice_audit_rows").select("*").eq("audit_id", run.id);
+      let q = supabase.from("fpx_invoice_audit_rows").select(columns).eq("audit_id", auditId);
       if (byCreated) q = q.order("created_at", { ascending: true });
       return q.order("id", { ascending: true }).range(from, from + PAGE - 1);
     };
@@ -87,23 +88,109 @@ auditsRouter.get("/invoice/:id", async (req, res) => {
       byCreated = false;
       ({ data, error: rowErr } = await page());
     }
-    if (rowErr) return res.status(500).json({ error: rowErr.message });
+    if (rowErr) return { rows, error: rowErr.message };
     rows.push(...(data || []));
     if (!data || data.length < PAGE) break;
   }
+  return { rows, error: null };
+}
+
+// The Excel files the hosted browser keeps for an ERP pull, in the private
+// Storage bucket "erp-pulls" at <audit_id>/<file>.
+const ERP_BUCKET = "erp-pulls";
+const XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const EXCEL_FILES = {
+  "not-exported": { object: "not-exported.xlsx", key: "not_exported", label: "TransactionsData-not-exported" },
+  full: { object: "full.xlsx", key: "full", label: "TransactionsData-full" },
+  "recently-approved": { object: "recently-approved.xlsx", key: "recently_approved", label: "RecentlyApproved" },
+};
+
+// Which of a pull's Excel files exist: { not_exported, full, recently_approved }.
+// Never throws. `ok` is false when Storage could not be read (all false then).
+async function listPullFiles(auditId) {
+  const files = { not_exported: false, full: false, recently_approved: false };
+  try {
+    const { data, error } = await supabase.storage.from(ERP_BUCKET).list(String(auditId), { limit: 100 });
+    if (error) return { files, ok: false };
+    const names = new Set((data || []).map((o) => o?.name));
+    for (const f of Object.values(EXCEL_FILES)) files[f.key] = names.has(f.object);
+    return { files, ok: true };
+  } catch {
+    return { files, ok: false };
+  }
+}
+
+// GET /audits/invoice/:id → { run, rows }. For an ERP pull also:
+//   files: { not_exported, full, recently_approved }  which Excel files can be
+//     downloaded from /audits/invoice/:id/excel (all false if Storage can't be read)
+//   approval_summary: { checked_at, matched, not_found, by_edi, by_unknown,
+//     by_person: { name: count } } read from the rows' raw.approval, or null
+//     when no approval check has run.
+auditsRouter.get("/invoice/:id", async (req, res) => {
+  const { data: run, error } = await supabase.from("fpx_invoice_audits").select("*").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!run) return res.status(404).json({ error: "Invoice audit not found" });
+  const isErpPull = run.shipment_type === "erp_pending";
+  const [loaded, listed] = await Promise.all([
+    loadAuditRows(run.id),
+    isErpPull ? listPullFiles(run.id) : null,
+  ]);
+  if (loaded.error) return res.status(500).json({ error: loaded.error });
+  const rows = loaded.rows;
   // Rows go out whole (select *), so raw.get_invoice — the state of a "get
-  // invoices" run for that shipment — reaches the dashboard as stored.
-  // ERP-pending rows are ranked by charge (biggest first) when they are stored;
-  // the charge lives in jsonb, so put them back in that order here.
-  if (run.shipment_type === "erp_pending") {
+  // invoices" run for that shipment — and raw.approval reach the dashboard as
+  // stored. ERP-pending rows are ranked by charge (biggest first) when they
+  // are stored; the charge lives in jsonb, so put them back in that order here.
+  if (isErpPull) {
     const rank = (r) => (Number.isFinite(Number(r.raw?.rank)) && r.raw?.rank !== null ? Number(r.raw.rank) : Infinity);
     rows.sort((a, b) => {
       const ra = rank(a);
       const rb = rank(b);
       return ra === rb ? 0 : ra < rb ? -1 : 1;
     });
+    return res.json({ run, rows, files: listed.files, approval_summary: summarizeApprovals(rows) });
   }
   res.json({ run, rows });
+});
+
+// GET /audits/invoice/:id/excel?which=not-exported|full|recently-approved
+// Sends one of the pull's Excel files as a download (default not-exported).
+// 400 for an unknown `which`; 404 { error: "No Excel file was saved for this
+// pull" } when it isn't in Storage; 502 when Storage can't be read.
+auditsRouter.get("/invoice/:id/excel", async (req, res) => {
+  const which = req.query.which === undefined || req.query.which === "" ? "not-exported" : String(req.query.which);
+  const file = Object.hasOwn(EXCEL_FILES, which) ? EXCEL_FILES[which] : null;
+  if (!file) return res.status(400).json({ error: "which must be not-exported, full or recently-approved" });
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
+  const { data: run, error } = await supabase
+    .from("fpx_invoice_audits").select("id, shipment_type, date_from, date_to").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!run) return res.status(404).json({ error: "Invoice audit not found" });
+  const missing = () => res.status(404).json({ error: "No Excel file was saved for this pull" });
+  if (run.shipment_type !== "erp_pending") return missing();
+
+  let blob = null;
+  try {
+    const { data, error: dlErr } = await supabase.storage.from(ERP_BUCKET).download(`${run.id}/${file.object}`);
+    if (!dlErr) blob = data;
+  } catch { /* handled below */ }
+  if (!blob) {
+    // A missing object and a Storage outage both come back as an error, so
+    // look in the folder to tell them apart.
+    const listed = await listPullFiles(run.id);
+    if (listed.ok && !listed.files[file.key]) return missing();
+    return res.status(502).json({ error: "Could not read the Excel file from storage. Try again." });
+  }
+  const bytes = Buffer.from(await blob.arrayBuffer());
+  const day = (v) => String(v || "").slice(0, 10).replace(/[^0-9A-Za-z-]/g, "");
+  const range = day(run.date_from) && day(run.date_to) ? `-${day(run.date_from)}_to_${day(run.date_to)}` : "";
+  res.set({
+    "Content-Type": XLSX_TYPE,
+    "Content-Disposition": `attachment; filename="${file.label}${range}.xlsx"`,
+    "Content-Length": String(bytes.length),
+    "Cache-Control": "private, no-store",
+  });
+  res.send(bytes);
 });
 
 // POST /audits/invoice/from-history — ERP-pending audit fed by FreightPOP's
@@ -262,6 +349,92 @@ auditsRouter.post("/invoice/:id/get-invoice-results", async (req, res) => {
   }
   if (failedShipments.size) console.warn(`[FPX] get-invoice results for ${run.id}: ${failedShipments.size} shipment(s) not saved`);
   res.json({ updated, unknown, failed: failedShipments.size });
+});
+
+// POST /audits/invoice/:id/approval-results — the hosted browser posts the rows
+// of FreightPOP's Audit → "Recently Approved" Excel export, and they are
+// matched to the shipments of an ERP pull.
+// Body: { by, columns: string[], rows: object[] (keyed by column), part?, final? }
+// A big export can be sent in parts: every part but the last sends
+// final: false, the last sends final: true. A call without `part` is taken as
+// the whole export unless it says final: false. `part` itself is not read.
+// Each row of the audit gets raw.approval (see lib/approvalMatch.js); no other
+// column, and no other key of raw, is written. Shipments not in the export are
+// marked not_found only on the last part, and an approval already stored is
+// never taken away.
+// 422 { error, columns } when the export has no shipment column.
+// Responds { matched, not_found, approved_rows, by_edi, by_unknown, by_person,
+// columns_used, failed, final }: matched … by_person describe the audit's rows
+// as they now stand (all parts so far), approved_rows is the rows in this
+// call, failed is rows whose save failed (send the call again).
+auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.rows)) return res.status(400).json({ error: "body.rows must be a list" });
+  if (body.columns !== undefined && body.columns !== null && !Array.isArray(body.columns)) {
+    return res.status(400).json({ error: "body.columns must be a list" });
+  }
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
+  const { data: run, error } = await supabase
+    .from("fpx_invoice_audits").select("id, shipment_type").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!run) return res.status(404).json({ error: "Invoice audit not found" });
+  if (run.shipment_type !== "erp_pending") {
+    return res.status(400).json({ error: "That audit is not an ERP pull" });
+  }
+
+  const columns = approvalColumnNames(body.columns, body.rows);
+  const columnsUsed = findApprovalColumns(columns);
+  if (!columnsUsed.shipment) {
+    return res.status(422).json({ error: "Could not find a shipment column in the Recently Approved export", columns });
+  }
+
+  const loaded = await loadAuditRows(run.id, "id, shipment_id, raw");
+  if (loaded.error) return res.status(500).json({ error: loaded.error });
+  const auditRows = loaded.rows;
+
+  const hasPart = body.part !== undefined && body.part !== null && body.part !== "";
+  const final = hasPart ? body.final === true : body.final !== false;
+  const checked_by = String(body.by || req.apiKey?.name || req.user?.email || "").trim() || null;
+  const checked_at = new Date().toISOString();
+  const { results } = matchApprovals(auditRows, body.rows, columns);
+
+  // Rows as they stand after this call, for the numbers in the response. A row
+  // whose save fails keeps what it had.
+  const after = auditRows.slice();
+  const changes = [];
+  auditRows.forEach((row, i) => {
+    const next = mergeApproval(row.raw, results[i], { checked_at, checked_by, final });
+    if (next) changes.push({ i, id: row.id, raw: next });
+  });
+  let failed = 0;
+  const WRITE_CHUNK = 20;
+  for (let i = 0; i < changes.length; i += WRITE_CHUNK) {
+    await Promise.all(changes.slice(i, i + WRITE_CHUNK).map(async (c) => {
+      let failedWrite = false;
+      try {
+        const { error: wErr } = await supabase.from("fpx_invoice_audit_rows").update({ raw: c.raw }).eq("id", c.id);
+        failedWrite = !!wErr;
+      } catch {
+        failedWrite = true;
+      }
+      if (failedWrite) failed += 1;
+      else after[c.i] = { ...auditRows[c.i], raw: c.raw };
+    }));
+  }
+  if (failed) console.warn(`[FPX] approval results for ${run.id}: ${failed} row(s) not saved`);
+
+  const now = summarizeApprovals(after) || { matched: 0, not_found: 0, by_edi: 0, by_unknown: 0, by_person: {} };
+  res.json({
+    matched: now.matched,
+    not_found: now.not_found,
+    approved_rows: body.rows.length,
+    by_edi: now.by_edi,
+    by_unknown: now.by_unknown,
+    by_person: now.by_person,
+    columns_used: columnsUsed,
+    failed,
+    final,
+  });
 });
 
 auditsRouter.post("/invoice", async (req, res) => {

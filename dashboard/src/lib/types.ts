@@ -183,6 +183,51 @@ export interface InvoiceAudit {
   // not exported to ERP). Anything else is a carrier-bill upload.
   shipment_type?: string | null;
   carrier_bill_file?: string | null;
+  // ERP pulls only. The API sends these next to `run` on GET /api/audits/invoice/:id;
+  // they are also accepted on the run itself.
+  files?: InvoiceAuditFiles | null;
+  approval_summary?: ApprovalSummary | null;
+}
+
+// Which of FreightPOP's own .xlsx files were kept for an ERP pull.
+export interface InvoiceAuditFiles {
+  not_exported?: boolean;
+  full?: boolean;
+  recently_approved?: boolean;
+}
+
+// Result of the last approval check on an ERP pull (matched against
+// FreightPOP's Audit → Recently Approved export). null = never checked.
+export interface ApprovalSummary {
+  checked_at: string | null;
+  matched: number;
+  not_found: number;
+  by_edi: number;
+  by_unknown: number;
+  by_person: Record<string, number>;
+}
+
+export type ApprovalByKind = "edi" | "person" | "unknown";
+// raw.approval on an ERP audit row. Absent = never checked.
+export interface ApprovalState {
+  status: "approved" | "not_found" | (string & {});
+  approved_by?: string | null;
+  approved_by_kind?: ApprovalByKind | (string & {}) | null;
+  approved_by_raw?: string | null;
+  approved_at?: string | null;
+  amount?: number | string | null;
+  invoice?: string | number | null;
+  matches?: number | null;
+  checked_at?: string | null;
+  checked_by?: string | null;
+}
+
+/** What GET /api/audits/invoice/:id returns. */
+export interface InvoiceAuditDetail {
+  run: InvoiceAudit;
+  rows: InvoiceAuditRow[];
+  files?: InvoiceAuditFiles | null;
+  approval_summary?: ApprovalSummary | null;
 }
 
 export type InvoiceAuditRowStatus = "match" | "discrepancy" | "no_invoice" | "error";
@@ -208,6 +253,8 @@ export interface InvoiceAuditRowRaw {
   // Set once someone asks FPX to press FreightPOP's GET INVOICE button for
   // this shipment. Absent = never requested.
   get_invoice?: GetInvoiceState | null;
+  // Set by an approval check. Absent = never checked.
+  approval?: ApprovalState | null;
   [key: string]: unknown;
 }
 

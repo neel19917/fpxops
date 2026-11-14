@@ -5,6 +5,7 @@ import {
   GET_INVOICE_SCOPE, isUuid, normalizeShipmentIds, missingShipmentIds,
   buildGetInvoiceNote, parseGetInvoiceNote, markRequested, resetRequested, updateRowsRaw,
 } from "../lib/getInvoice.js";
+import { APPROVAL_CHECK_SCOPE } from "../lib/approvalMatch.js";
 
 export const opsRouter = Router();
 
@@ -29,12 +30,18 @@ export const opsRouter = Router();
 // in tracking_numbers and the rest in note as
 // "audit=<uuid>;from=<date_from>;to=<date_to>;pause_first=<1|0>". Only one
 // such run may be queued or running at a time (409 otherwise).
-const SCOPES = ["all", "selected", "erp_audit", GET_INVOICE_SCOPE];
-// Only the hosted browser knows how to run an ERP audit pull or a get-invoice
-// run. Any other claimer would treat the row as a full rescrape, so it is
+//
+// scope "approval_check": { audit_id } asks the hosted browser to take the
+// Excel export of FreightPOP's Audit → "Recently Approved" and post it to
+// /audits/invoice/<audit_id>/approval-results, which says for each shipment of
+// that ERP pull whether its invoice was approved and by whom. The audit
+// travels in note as "audit=<uuid>". One at a time (409 otherwise).
+const SCOPES = ["all", "selected", "erp_audit", GET_INVOICE_SCOPE, APPROVAL_CHECK_SCOPE];
+// Only the hosted browser knows how to run an ERP audit pull, a get-invoice
+// run or an approval check. Any other claimer would treat the row as a full rescrape, so it is
 // never handed one.
 const HOSTED_WORKER = "fpx-browser";
-const HOSTED_ONLY_SCOPES = ["erp_audit", GET_INVOICE_SCOPE];
+const HOSTED_ONLY_SCOPES = ["erp_audit", GET_INVOICE_SCOPE, APPROVAL_CHECK_SCOPE];
 
 // Puts the rows of a get-invoice request that are still waiting ("requested")
 // back to "not_started". Rows that already have a result are left alone.
@@ -124,9 +131,47 @@ async function requestGetInvoice(req, res) {
   return res.json({ request: data });
 }
 
+async function requestApprovalCheck(req, res) {
+  const auditId = String(req.body?.audit_id || "").trim();
+  if (!auditId) return res.status(400).json({ error: "audit_id required" });
+  if (!isUuid(auditId)) return res.status(404).json({ error: "Invoice audit not found" });
+  const { data: audit, error: aErr } = await supabase
+    .from("fpx_invoice_audits").select("id, shipment_type").eq("id", auditId).maybeSingle();
+  if (aErr) return res.status(500).json({ error: aErr.message });
+  if (!audit) return res.status(404).json({ error: "Invoice audit not found" });
+  if (audit.shipment_type !== "erp_pending") {
+    return res.status(400).json({ error: "That audit is not an ERP pull" });
+  }
+
+  const { data: busy, error: bErr } = await supabase
+    .from("fpx_scrape_requests").select("id")
+    .eq("scope", APPROVAL_CHECK_SCOPE).in("status", ["pending", "claimed"]).limit(1);
+  if (bErr) return res.status(500).json({ error: bErr.message });
+  if (busy?.[0]) return res.status(409).json({ error: "An approval check is already queued or running" });
+
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .insert({
+      scope: APPROVAL_CHECK_SCOPE,
+      note: `audit=${audit.id}`,
+      requested_by: req.user?.email || req.apiKey?.name || null,
+    })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "rescrape_request",
+    entity_type: "scrape_request",
+    entity_id: data.id,
+    summary: "Requested approval check",
+    metadata: { scope: APPROVAL_CHECK_SCOPE, audit_id: audit.id },
+  });
+  return res.json({ request: data });
+}
+
 opsRouter.post("/rescrape", async (req, res) => {
   const scope = SCOPES.includes(req.body?.scope) ? req.body.scope : "all";
   if (scope === GET_INVOICE_SCOPE) return requestGetInvoice(req, res);
+  if (scope === APPROVAL_CHECK_SCOPE) return requestApprovalCheck(req, res);
   if (scope === "erp_audit") {
     const rawMonths = req.body?.months;
     const months = rawMonths === undefined || rawMonths === null || rawMonths === "" ? 3 : Number(rawMonths);
@@ -232,17 +277,27 @@ async function expireStaleGetInvoiceRequests() {
   }
 }
 
+// And for approval checks (nothing to reset on the rows).
+async function expireStaleApprovalChecks() {
+  const cutoff = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  await supabase.from("fpx_scrape_requests")
+    .update({ status: "error", completed_at: new Date().toISOString(), note: "Not picked up — the hosted browser needs an update before it can check approvals." })
+    .eq("status", "pending").eq("scope", APPROVAL_CHECK_SCOPE).lt("requested_at", cutoff);
+}
+
 // GET /ops/rescrape/pending?claim=1&by=<name>&caps=<a,b> — extension poll. With claim=1 it
 // atomically flips the oldest pending request to 'claimed' (guarded on
 // status='pending' so two pollers can't grab the same one).
 //
 // Rows come back whole, so the caller sees scope ("all" | "selected" |
-// "erp_audit" | "get_invoice") and, for erp_audit, note "months=N". erp_audit
-// and get_invoice rows are only handed to a claimer named "fpx-browser" (the
-// hosted worker) whose caps list names that scope, e.g.
-// caps=erp_audit,get_invoice: anyone else claiming skips past them to the
-// next shipment rescrape. A get_invoice row carries the shipment ids in
-// tracking_numbers and note "audit=<uuid>;from=…;to=…;pause_first=<1|0>".
+// "erp_audit" | "get_invoice" | "approval_check") and, for erp_audit, note
+// "months=N". erp_audit, get_invoice and approval_check rows are only handed
+// to a claimer named "fpx-browser" (the hosted worker) whose caps list names
+// that scope, e.g. caps=erp_audit,get_invoice,approval_check: anyone else
+// claiming skips past them to the next shipment rescrape. A get_invoice row
+// carries the shipment ids in tracking_numbers and note
+// "audit=<uuid>;from=…;to=…;pause_first=<1|0>"; an approval_check row carries
+// note "audit=<uuid>".
 opsRouter.get("/rescrape/pending", async (req, res) => {
   const claim = req.query.claim === "1" || req.query.claim === "true";
   const by = req.query.by ? String(req.query.by) : (req.apiKey?.name || null);
@@ -256,11 +311,18 @@ opsRouter.get("/rescrape/pending", async (req, res) => {
   // have waited, so they don't sit "queued" forever. Same for get-invoice runs.
   if (claim && by === HOSTED_WORKER && !caps.includes("erp_audit")) await expireStaleErpRequests();
   if (claim && by === HOSTED_WORKER && !caps.includes(GET_INVOICE_SCOPE)) await expireStaleGetInvoiceRequests();
+  if (claim && by === HOSTED_WORKER && !caps.includes(APPROVAL_CHECK_SCOPE)) await expireStaleApprovalChecks();
   if (claim) {
     for (const hostedScope of HOSTED_ONLY_SCOPES) {
       if (by !== HOSTED_WORKER || !caps.includes(hostedScope)) query = query.neq("scope", hostedScope);
     }
   }
+  // only=scrape | invoicing: the hosted worker runs shipment scrapes and the
+  // invoicing jobs (ERP pull, get invoices, approval check) in two separate
+  // sessions, each polling for its own kind.
+  const only = String(req.query.only || "");
+  if (only === "invoicing") query = query.in("scope", HOSTED_ONLY_SCOPES);
+  else if (only === "scrape") query = query.not("scope", "in", `(${HOSTED_ONLY_SCOPES.join(",")})`);
   const { data: rows, error } = await query
     .order("requested_at", { ascending: true }).limit(1);
   if (error) return res.status(500).json({ error: error.message });

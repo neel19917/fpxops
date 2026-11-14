@@ -1,16 +1,19 @@
 import { Fragment, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
-import { ArrowDown, ArrowUp, Download, Sparkles, X } from "lucide-react";
+import { ArrowDown, ArrowUp, CheckCircle2, Download, Sparkles, X } from "lucide-react";
 import { api } from "../lib/api";
-import { fmtDate, fmtDateTime, fmtNum, fmtPct } from "../lib/format";
-import type { GetInvoiceState, GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditRow } from "../lib/types";
+import { fmtDate, fmtDateTime, fmtNum, fmtPct, fmtRelative } from "../lib/format";
+import type { ApprovalState, ApprovalSummary, GetInvoiceState, GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditDetail, InvoiceAuditFiles, InvoiceAuditRow } from "../lib/types";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
 import { ErpPullMonitor, type ErpMonitorStatus } from "../components/ErpPullMonitor";
-import { GetInvoiceModal, InvoicePill, type GetInvoiceItem } from "../components/GetInvoiceModal";
-import { GET_INVOICE_MAX, getInvoiceLabel } from "../lib/erpPull";
+import { ApprovalPill, GetInvoiceModal, InvoicePill, type GetInvoiceItem } from "../components/GetInvoiceModal";
+import {
+  APPROVAL_SCOPE, GET_INVOICE_MAX, approvalDate, approvalGroup, approvalLabel, downloadAuditExcel, getInvoiceLabel, isShaun,
+  requestApprovalCheck, toApprovalState, type ApprovalGroup, type AuditExcelWhich,
+} from "../lib/erpPull";
 
 interface ReanalyzeButtonProps {
   busy: boolean;
@@ -230,6 +233,9 @@ interface ErpRow {
   flags: string[];
   // Get Invoice state (raw.get_invoice); null = never requested.
   gi: GetInvoiceState | null;
+  // Who approved the invoice (raw.approval); null = never checked.
+  ap: ApprovalState | null;
+  apGroup: ApprovalGroup | null;
   notes: string | null;
   search: string;
   source: InvoiceAuditRow;
@@ -252,6 +258,7 @@ function toErpRow(row: InvoiceAuditRow): ErpRow {
   const customer = row.customer_name ?? "";
   const carrier = row.carrier ?? "";
   const shipped = raw.shipped_date ? String(raw.shipped_date) : null;
+  const ap = toApprovalState(raw.approval);
   return {
     id: row.id,
     rank: toNum(raw.rank),
@@ -268,13 +275,35 @@ function toErpRow(row: InvoiceAuditRow): ErpRow {
     status: row.status ?? "",
     flags: Array.isArray(raw.flags) ? raw.flags.map(String) : [],
     gi: toInvoiceState(raw.get_invoice),
+    ap,
+    apGroup: approvalGroup(ap),
     notes: row.ai_notes,
     search: `${shipment} ${customer} ${carrier}`.toLowerCase(),
     source: row,
   };
 }
 
-type ErpColKey = "rank" | "shipment" | "customer" | "carrier" | "shipped" | "charge" | "cost" | "gp" | "invoice" | "diff" | "status" | "getInvoice" | "flags";
+// Quick filters on who approved the invoice. "person" includes Shaun; "others" is everyone but him.
+type ApprovalFilter = "all" | "approved" | "edi" | "shaun" | "person" | "others" | "unknown" | "not_approved";
+
+function matchesApproval(r: ErpRow, filter: ApprovalFilter): boolean {
+  const g = r.apGroup;
+  switch (filter) {
+    case "all": return true;
+    case "approved": return g != null && g !== "not_approved";
+    case "person": return g === "shaun" || g === "person";
+    case "others": return g === "person";
+    default: return g === filter;
+  }
+}
+
+// In the CSV an Unknown approver carries FreightPOP's own text, since there is no hover there.
+function approvalCsv(r: ErpRow): string {
+  const label = approvalLabel(r.ap);
+  return r.apGroup === "unknown" && r.ap?.approved_by_raw ? `${label} (${r.ap.approved_by_raw})` : label;
+}
+
+type ErpColKey = "rank" | "shipment" | "customer" | "carrier" | "shipped" | "charge" | "cost" | "gp" | "invoice" | "diff" | "status" | "getInvoice" | "approvedBy" | "flags";
 
 interface ErpCol {
   key: ErpColKey;
@@ -318,6 +347,11 @@ const ERP_COLS: ErpCol[] = [
     cell: (r) => <InvoicePill state={r.gi} />,
   },
   {
+    key: "approvedBy", label: "Approved by", firstDir: "asc",
+    sortValue: (r) => approvalLabel(r.ap) || null, csvValue: approvalCsv,
+    cell: (r) => <ApprovalPill state={r.ap} />,
+  },
+  {
     key: "flags", label: "Flags", firstDir: "desc",
     sortValue: (r) => r.flags.length, csvValue: (r) => r.flags.join("; "),
     cell: (r) => r.flags.length === 0 ? <span className="text-slate-300">—</span> : (
@@ -352,10 +386,18 @@ function csvCell(v: number | string | null): string {
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
+// The table shows these in the Approved by pill's hover; the CSV gets them as columns.
+const approvedOnly = (r: ErpRow) => (r.apGroup && r.apGroup !== "not_approved" ? r.ap : null);
+const ERP_CSV_COLS: Pick<ErpCol, "label" | "csvValue">[] = ERP_COLS.flatMap((c): Pick<ErpCol, "label" | "csvValue">[] => c.key !== "approvedBy" ? [c] : [
+  c,
+  { label: "Approved date", csvValue: (r) => approvalDate(approvedOnly(r)) },
+  { label: "Approved amount", csvValue: (r) => { const a = approvedOnly(r)?.amount; return a == null || a === "" ? null : cents(toNum(a)) ?? String(a); } },
+]);
+
 function downloadErpCsv(rows: ErpRow[], run: InvoiceAudit) {
   const lines = [
-    ERP_COLS.map((c) => csvCell(c.label)).join(","),
-    ...rows.map((r) => ERP_COLS.map((c) => csvCell(c.csvValue(r))).join(",")),
+    ERP_CSV_COLS.map((c) => csvCell(c.label)).join(","),
+    ...rows.map((r) => ERP_CSV_COLS.map((c) => csvCell(c.csvValue(r))).join(",")),
   ];
   // The BOM tells Excel the file is UTF-8, so accented names open cleanly.
   const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
@@ -386,6 +428,17 @@ function ErpRowDetail({ row }: { row: ErpRow }) {
   const extras = ERP_EXTRA_FIELDS
     .map((f) => ({ label: f.label, value: f.value(row.source) }))
     .filter((f) => f.value != null && f.value !== "");
+  const ap = row.ap;
+  const apAmount = toNum(ap?.amount);
+  const approval = !ap || !row.apGroup ? null
+    : row.apGroup === "not_approved"
+      ? `Not in FreightPOP's Recently Approved list${ap.checked_at ? ` when checked ${fmtDateTime(ap.checked_at)}` : ""}.`
+      : [
+        `Approved by ${row.apGroup === "unknown" ? (ap.approved_by_raw ? `"${ap.approved_by_raw}"` : "someone FreightPOP doesn't name") : approvalLabel(ap)}${row.apGroup === "edi" ? " (automatic)" : ""}`,
+        approvalDate(ap) ? `on ${approvalDate(ap)}` : null,
+        apAmount != null ? `amount ${fmtMoney(apAmount)}` : ap.amount ? `amount ${ap.amount}` : null,
+        ap.invoice ? `invoice ${ap.invoice}` : null,
+      ].filter(Boolean).join(" · ");
   return (
     <div className="space-y-2">
       {extras.length ? (
@@ -394,12 +447,13 @@ function ErpRowDetail({ row }: { row: ErpRow }) {
         </div>
       ) : null}
       {row.flags.length ? <div className="text-xs text-slate-600">Flags: {row.flags.join(" · ")}</div> : null}
+      {approval ? <div className="text-xs text-slate-600">{approval}</div> : null}
       {row.notes ? (
         <div className="text-xs bg-sky-50 ring-1 ring-sky-100 text-slate-700 px-2.5 py-1.5 rounded-md whitespace-pre-wrap">
           <span className="font-semibold text-sky-700">AI</span> · {row.notes}
         </div>
       ) : null}
-      {!extras.length && !row.flags.length && !row.notes ? <div className="text-xs text-slate-500">Nothing more recorded for this shipment.</div> : null}
+      {!extras.length && !row.flags.length && !row.notes && !approval ? <div className="text-xs text-slate-500">Nothing more recorded for this shipment.</div> : null}
     </div>
   );
 }
@@ -411,9 +465,75 @@ interface ErpRowsTableProps {
   getInvoiceBlocked?: string | null;
   /** A Get Invoice run was queued for this audit (request id). */
   onInvoicesStarted?: (requestId: string) => void;
+  /** The last approval check on this pull; null = never checked. */
+  approvalSummary?: ApprovalSummary | null;
 }
 
-function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted }: ErpRowsTableProps) {
+const count = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+// "Approved: 212 of 1,307 · by EDI 180 · by Shaun 20 · by others 12 · not
+// approved yet 1,095 · checked 5m ago". Each figure filters the table.
+function ApprovalStrip({ summary, value, onPick }: { summary: ApprovalSummary; value: ApprovalFilter; onPick: (f: ApprovalFilter) => void }) {
+  const [namesOpen, setNamesOpen] = useState(false);
+  const people = Object.entries(summary.by_person ?? {}).map(([name, n]) => [name, count(n)] as const).sort((a, b) => b[1] - a[1]);
+  const shauns = people.filter(([name]) => isShaun(name));
+  const others = people.filter(([name]) => !isShaun(name));
+  const othersTotal = others.reduce((t, [, n]) => t + n, 0);
+  const matched = count(summary.matched);
+  const notFound = count(summary.not_found);
+  const unknown = count(summary.by_unknown);
+  const figure = (filter: ApprovalFilter, n: number, hint: string, strong = false) => (
+    <button
+      onClick={() => onPick(value === filter ? "all" : filter)}
+      aria-pressed={value === filter}
+      title={value === filter ? "Show all shipments again" : hint}
+      className={"tabular-nums rounded px-1 -mx-0.5 underline decoration-dotted underline-offset-2 " + (value === filter ? "bg-sky-600 text-white no-underline" : "text-slate-900 hover:bg-slate-200") + (strong ? " font-semibold" : " font-medium")}
+    >
+      {fmtNum(n)}
+    </button>
+  );
+  const dot = <span className="text-slate-300" aria-hidden="true">·</span>;
+  return (
+    <div className="shrink-0 mb-2 rounded-lg bg-slate-50 ring-1 ring-slate-200 px-3 py-2 text-xs text-slate-600">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span><span className="font-medium text-slate-700">Approved:</span> {figure("approved", matched, "Show the approved shipments", true)} of {fmtNum(matched + notFound)}</span>
+        {dot}
+        <span>by EDI {figure("edi", count(summary.by_edi), "Show the ones EDI approved automatically")}</span>
+        {dot}
+        {shauns.length === 0 ? (
+          <span>by Shaun {figure("shaun", 0, "Show the ones Shaun approved")}</span>
+        ) : shauns.map(([name, n], i) => (
+          <Fragment key={name}>
+            {i > 0 ? dot : null}
+            <span>by <span className="font-medium text-violet-700">{name}</span> {figure("shaun", n, `Show the ones ${name} approved`)}</span>
+          </Fragment>
+        ))}
+        {dot}
+        <span title={others.length ? others.map(([name, n]) => `${name}: ${fmtNum(n)}`).join("\n") : "Nobody else approved any of these"}>
+          by others {figure("others", othersTotal, "Show the ones other people approved")}
+          {others.length ? (
+            <button onClick={() => setNamesOpen((v) => !v)} aria-expanded={namesOpen} className="ml-1 text-sky-700 hover:text-sky-900 underline">
+              {namesOpen ? "hide names" : "who?"}
+            </button>
+          ) : null}
+        </span>
+        {unknown > 0 ? <>{dot}<span title="Approved, but FreightPOP's list doesn't say clearly by whom. Hover a grey Unknown pill to see its text.">unknown {figure("unknown", unknown, "Show the approved ones with no clear approver")}</span></> : null}
+        {dot}
+        <span>not approved yet {figure("not_approved", notFound, "Show the ones not in Recently Approved")}</span>
+        {summary.checked_at ? <>{dot}<span title={fmtDateTime(summary.checked_at)}>checked {fmtRelative(summary.checked_at)}</span></> : null}
+      </div>
+      {namesOpen && others.length ? (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {others.map(([name, n]) => (
+            <span key={name} className="rounded-full bg-violet-100 text-violet-700 px-2 py-0.5 whitespace-nowrap">{name} <span className="tabular-nums font-medium">{fmtNum(n)}</span></span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted, approvalSummary }: ErpRowsTableProps) {
   const all = useMemo(() => rows.map(toErpRow), [rows]);
   const [sortKey, setSortKey] = useState<ErpColKey>("charge");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
@@ -423,6 +543,7 @@ function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted }: ErpRo
   const [limit, setLimit] = useState(ERP_PAGE_SIZE);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [notRequestedOnly, setNotRequestedOnly] = useState(false);
+  const [approval, setApproval] = useState<ApprovalFilter>("all");
   // Shipments ticked for Get Invoice (audit row ids). Survives filter changes.
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [anchorId, setAnchorId] = useState<string | null>(null); // last row ticked, for shift-click
@@ -440,19 +561,32 @@ function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted }: ErpRo
   }, [all]);
   const flaggedCount = useMemo(() => all.filter((r) => r.flags.length > 0).length, [all]);
   const notRequestedCount = useMemo(() => all.filter(notRequested).length, [all]);
+  // Shipments per approver group, for the quick filters. Empty until a check has run.
+  const approvalCounts = useMemo(() => {
+    const c = { checked: 0, edi: 0, shaun: 0, person: 0, not_approved: 0 };
+    for (const r of all) {
+      if (!r.apGroup) continue;
+      c.checked++;
+      if (r.apGroup === "edi") c.edi++;
+      else if (r.apGroup === "shaun") { c.shaun++; c.person++; }
+      else if (r.apGroup === "person") c.person++;
+      else if (r.apGroup === "not_approved") c.not_approved++;
+    }
+    return c;
+  }, [all]);
 
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
     const col = ERP_COLS.find((c) => c.key === sortKey) ?? ERP_COLS[0];
     return all
-      .filter((r) => (status === "all" || r.status === status) && (!flaggedOnly || r.flags.length > 0) && (!notRequestedOnly || notRequested(r)) && (!q || r.search.includes(q)))
+      .filter((r) => (status === "all" || r.status === status) && (!flaggedOnly || r.flags.length > 0) && (!notRequestedOnly || notRequested(r)) && matchesApproval(r, approval) && (!q || r.search.includes(q)))
       .sort((a, b) => compareErp(a, b, col, sortDir));
-  }, [all, query, status, flaggedOnly, notRequestedOnly, sortKey, sortDir]);
+  }, [all, query, status, flaggedOnly, notRequestedOnly, approval, sortKey, sortDir]);
 
   const totals = useMemo(() => shown.reduce((t, r) => ({ charge: t.charge + (r.charge ?? 0), cost: t.cost + (r.cost ?? 0) }), { charge: 0, cost: 0 }), [shown]);
 
   // Any change to what is shown starts again from the first page.
-  useEffect(() => { setLimit(ERP_PAGE_SIZE); }, [query, status, flaggedOnly, notRequestedOnly, sortKey, sortDir]);
+  useEffect(() => { setLimit(ERP_PAGE_SIZE); }, [query, status, flaggedOnly, notRequestedOnly, approval, sortKey, sortDir]);
 
   // ── Selection for Get Invoice ──
   const selectedRows = useMemo(() => all.filter((r) => selected.has(r.id)), [all, selected]);
@@ -494,7 +628,7 @@ function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted }: ErpRo
   const modalItems = useMemo<GetInvoiceItem[]>(() => selectedRows.map((r) => ({
     id: r.id, shipment: r.shipment, customer: r.customer, carrier: r.carrier, charge: r.charge, invoice: r.invoice,
     status: r.status, statusLabel: statusLabel(r.status), statusCls: STATUS_META[r.status]?.cls ?? "bg-slate-100 text-slate-700",
-    flags: r.flags, invoiceState: r.gi,
+    flags: r.flags, invoiceState: r.gi, approval: r.ap,
   })), [selectedRows]);
   const getDisabledReason = selCount === 0 ? "Tick the shipments you want invoices for first" : getInvoiceBlocked || null;
   const colCount = ERP_COLS.length + 1;
@@ -509,8 +643,26 @@ function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted }: ErpRo
   const visible = shown.slice(0, limit);
   const filtered = shown.length !== all.length;
 
+  const approvalChips: [ApprovalFilter, string, number][] = [
+    ["edi", "Approved by EDI", approvalCounts.edi],
+    ["shaun", "Approved by Shaun", approvalCounts.shaun],
+    ["person", "Approved by a person", approvalCounts.person],
+    ["not_approved", "Not approved yet", approvalCounts.not_approved],
+  ];
+
   return (
     <>
+      {approvalSummary ? <ApprovalStrip summary={approvalSummary} value={approval} onPick={setApproval} /> : null}
+      {approvalSummary || approvalCounts.checked > 0 ? (
+        <div className="shrink-0 flex flex-wrap items-center gap-2 mb-2">
+          {approvalChips.map(([key, label, n]) => (
+            <button key={key} className={chip(approval === key)} aria-pressed={approval === key} onClick={() => setApproval(approval === key ? "all" : key)}>
+              {label} {fmtNum(n)}
+            </button>
+          ))}
+          {approval !== "all" ? <button onClick={() => setApproval("all")} className="text-xs text-slate-500 underline hover:text-slate-900">Clear</button> : null}
+        </div>
+      ) : null}
       <div className="shrink-0 flex flex-wrap items-center gap-2 mb-2">
         <input
           value={query}
@@ -537,10 +689,10 @@ function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted }: ErpRo
           onClick={() => downloadErpCsv(shown, run)}
           disabled={shown.length === 0}
           className="ml-auto text-xs px-3 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50 inline-flex items-center gap-1.5"
-          title="Downloads the rows below, with the current filters and sort order"
+          title="Downloads the rows below as a CSV, with the current filters and sort order. For FreightPOP's own Excel file, use Download Excel (FreightPOP format) at the top."
         >
           <Download className="h-3.5 w-3.5" />
-          Download Excel (CSV)
+          Download this table (CSV)
         </button>
       </div>
       <div className="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-slate-500 mb-2">
@@ -692,10 +844,53 @@ function WidePanel({ open, onClose, title, subtitle, children }: { open: boolean
   );
 }
 
+// FreightPOP's own .xlsx files, kept with each pull: same columns as FreightPOP's
+// export, so they drop straight into the team's macros and workbooks.
+function ExcelDownloads({ auditId, files }: { auditId: string; files: InvoiceAuditFiles | null }) {
+  const [busy, setBusy] = useState<AuditExcelWhich | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  async function download(which: AuditExcelWhich) {
+    if (busy) return;
+    setBusy(which); setError(null);
+    try { await downloadAuditExcel(auditId, which); }
+    catch (e) { setError((e as Error).message || "Could not download the file."); }
+    finally { setBusy(null); }
+  }
+  const kept = files?.not_exported === true;
+  const link = "text-xs text-sky-700 hover:text-sky-900 underline disabled:opacity-50";
+  return (
+    <>
+      <button
+        onClick={() => download("not-exported")}
+        disabled={!kept || !!busy}
+        title={kept
+          ? "FreightPOP's own Excel export for this pull: only the rows with Exported to ERP = false, sorted by charge, same columns as FreightPOP"
+          : "No Excel file was kept for this pull — run a new pull"}
+        className="px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        <Download className="h-3.5 w-3.5" />
+        {busy === "not-exported" ? "Downloading…" : "Download Excel (FreightPOP format)"}
+      </button>
+      {files?.full ? (
+        <button onClick={() => download("full")} disabled={!!busy} className={link} title="The whole report FreightPOP exported, including rows already exported to ERP (.xlsx)">
+          {busy === "full" ? "Downloading…" : "Full report"}
+        </button>
+      ) : null}
+      {files?.recently_approved ? (
+        <button onClick={() => download("recently-approved")} disabled={!!busy} className={link} title="FreightPOP's Recently Approved export from the last approval check (.xlsx)">
+          {busy === "recently-approved" ? "Downloading…" : "Recently approved"}
+        </button>
+      ) : null}
+      {!kept ? <span className="text-xs text-slate-500">No Excel file was kept for this pull — run a new pull</span> : null}
+      {error ? <span role="alert" className="text-xs text-rose-700 break-words">{error}</span> : null}
+    </>
+  );
+}
+
 export function InvoiceAuditsPage() {
   const [rows, setRows] = useState<InvoiceAudit[]>([]);
   const [loading, setLoading] = useState(true);
-  const [detail, setDetail] = useState<{ run: InvoiceAudit; rows: InvoiceAuditRow[] } | null>(null);
+  const [detail, setDetail] = useState<InvoiceAuditDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [reanBusy, setReanBusy] = useState(false);
   const [reanError, setReanError] = useState<string | null>(null);
@@ -703,9 +898,11 @@ export function InvoiceAuditsPage() {
   const [detailNonce, setDetailNonce] = useState(0);
   // A run we know is an ERP pull before the list or the run itself has loaded.
   const [erpHintId, setErpHintId] = useState<string | null>(null);
-  // What the monitor card is doing, and the Get Invoice run this page last queued.
+  // What the monitor card is doing, and the Get Invoice run or approval check this page last queued.
   const [monitor, setMonitor] = useState<ErpMonitorStatus | null>(null);
-  const [invoiceRun, setInvoiceRun] = useState<{ requestId: string; auditId: string } | null>(null);
+  const [invoiceRun, setInvoiceRun] = useState<{ requestId: string; auditId: string; kind: "get_invoice" | "approval_check" } | null>(null);
+  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
 
   // The open run lives in the URL (?run=<id>) so it can be linked to.
   const [params, setParams] = useSearchParams();
@@ -726,6 +923,7 @@ export function InvoiceAuditsPage() {
   useEffect(() => {
     setReanError(null);
     setDetailError(null);
+    setApprovalError(null);
     if (!openId) { setDetail(null); return; }
     setDetail((prev) => (prev && prev.run.id === openId ? prev : null));
     let cancelled = false;
@@ -751,7 +949,8 @@ export function InvoiceAuditsPage() {
     }
   }
 
-  // Re-read the open run without blanking it (pills move from Requested to Done).
+  // Re-read the open run without blanking it (pills move from Requested to Done,
+  // and the Approved by column fills in when an approval check finishes).
   const refreshOpenRun = useCallback(() => {
     if (!openId) return;
     api.audits.invoice.get(openId)
@@ -759,22 +958,46 @@ export function InvoiceAuditsPage() {
       .catch(() => { /* keep what is shown; the next refresh tries again */ });
   }, [openId]);
   const onSettled = useCallback(() => { void loadList(); refreshOpenRun(); }, [loadList, refreshOpenRun]);
-  const invoicesRunning = monitor?.active === "get_invoice";
+  const approvalsRunning = monitor?.active === "approval_check";
+  const jobUpdatingRows = monitor?.active === "get_invoice" || approvalsRunning;
   useEffect(() => {
-    if (!invoicesRunning || !openId) return;
+    if (!jobUpdatingRows || !openId) return;
     const id = setInterval(() => { if (document.visibilityState === "visible") refreshOpenRun(); }, 10_000);
     return () => clearInterval(id);
-  }, [invoicesRunning, openId, refreshOpenRun]);
+  }, [jobUpdatingRows, openId, refreshOpenRun]);
 
   // The person confirmed the modal: step out of the run so the monitor card,
   // which sits behind the panel, is what they see.
   function onInvoicesStarted(requestId: string) {
-    if (openId) setInvoiceRun({ requestId, auditId: openId });
+    if (openId) setInvoiceRun({ requestId, auditId: openId, kind: "get_invoice" });
     setOpenId(null);
   }
+  // One hosted-browser job at a time: a pull, an invoice run or an approval check.
   const getInvoiceBlocked = monitor?.active === "get_invoice" ? "An invoice run is already queued or running"
     : monitor?.active === "erp_audit" ? "A pull from FreightPOP is queued or running. Wait for it to finish"
+    : monitor?.active === "approval_check" ? "An approval check is queued or running. Wait for it to finish"
     : monitor?.blocked ?? null;
+
+  // Unlike Get Invoice, the run stays open: the check changes nothing in
+  // FreightPOP, and the table fills in by itself when it finishes.
+  async function checkApprovals() {
+    if (!openId || approvalBusy) return;
+    const auditId = openId;
+    setApprovalBusy(true); setApprovalError(null);
+    try {
+      const res = await requestApprovalCheck(auditId);
+      if ((res.request?.scope as string) !== APPROVAL_SCOPE) {
+        // A server that doesn't know this job yet answers with a regular scrape request.
+        setApprovalError("The server queued a regular scrape instead of the approval check. Check approvals needs the next server update.");
+      } else {
+        setInvoiceRun({ requestId: res.request.id, auditId, kind: "approval_check" });
+      }
+    } catch (e) {
+      setApprovalError((e as Error).message || "Could not start the approval check.");
+    } finally {
+      setApprovalBusy(false);
+    }
+  }
 
   function onPullFinished(auditId: string) {
     setErpHintId(auditId);
@@ -786,6 +1009,9 @@ export function InvoiceAuditsPage() {
   const openRun = openId ? (detail?.run.id === openId ? detail.run : rows.find((r) => r.id === openId)) : undefined;
   const erpOpen = !!openId && (openRun ? isErpRun(openRun) : erpHintId === openId);
   const erpDetail = erpOpen && detail && detail.run.id === openId ? detail : null;
+  const erpFiles = erpDetail ? erpDetail.files ?? erpDetail.run.files ?? null : null;
+  const approvalSummary = erpDetail ? erpDetail.approval_summary ?? erpDetail.run.approval_summary ?? null : null;
+  const approvalBlocked = approvalsRunning ? "An approval check is already queued or running" : getInvoiceBlocked;
 
   return (
     <div className="space-y-4">
@@ -898,10 +1124,30 @@ export function InvoiceAuditsPage() {
           <>
             <div className="shrink-0">
               <div className="flex justify-between items-center mb-4 gap-2 flex-wrap">
-                <ReanalyzeButton busy={reanBusy} onClick={reanalyze} summaryOnly />
+                <div className="flex items-center gap-x-3 gap-y-2 flex-wrap">
+                  <ExcelDownloads key={erpDetail.run.id} auditId={erpDetail.run.id} files={erpFiles} />
+                  <button
+                    onClick={checkApprovals}
+                    disabled={!!approvalBlocked || approvalBusy}
+                    title={approvalBlocked || "Takes FreightPOP's Recently Approved list and shows who approved each invoice here: EDI or a person. Nothing is changed in FreightPOP."}
+                    className="text-xs px-3 py-1.5 rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 font-medium inline-flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <CheckCircle2 className={`h-3.5 w-3.5 ${approvalsRunning ? "animate-pulse" : ""}`} />
+                    {approvalBusy ? "Queuing…" : approvalsRunning ? "Checking approvals…" : approvalSummary ? "Check approvals again" : "Check approvals"}
+                  </button>
+                  <ReanalyzeButton busy={reanBusy} onClick={reanalyze} summaryOnly />
+                </div>
                 <ShareButton resourceType="invoice_audit" resourceId={erpDetail.run.id} defaultLabel={`Not exported to ERP ${fmtDate(erpDetail.run.date_from)}–${fmtDate(erpDetail.run.date_to)}`} />
               </div>
               {reanError ? <div className="mb-3"><ErrorBlock compact>{reanError}</ErrorBlock></div> : null}
+              {approvalError ? <div className="mb-3"><ErrorBlock compact>{approvalError}</ErrorBlock></div> : null}
+              {approvalsRunning ? (
+                <div role="status" className="mb-3 text-xs text-violet-900 bg-violet-50 ring-1 ring-violet-200 rounded-lg px-3 py-2">
+                  Checking approvals in the invoicing session. The Approved by column fills in when it finishes. Close this panel to watch it or stop it.
+                </div>
+              ) : approvalBlocked && !approvalSummary ? (
+                <div className="mb-3 text-xs text-slate-500">Check approvals can't start yet: {approvalBlocked}.</div>
+              ) : null}
               <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4 mb-4">
                 <Field label="Range">{fmtDate(erpDetail.run.date_from)} → {fmtDate(erpDetail.run.date_to)}</Field>
                 <Field label="Shipments">{fmtNum(erpDetail.run.total_rows)}</Field>
@@ -922,7 +1168,7 @@ export function InvoiceAuditsPage() {
                 </div>
               ) : null}
             </div>
-            <ErpRowsTable key={erpDetail.run.id} run={erpDetail.run} rows={erpDetail.rows} getInvoiceBlocked={getInvoiceBlocked} onInvoicesStarted={onInvoicesStarted} />
+            <ErpRowsTable key={erpDetail.run.id} run={erpDetail.run} rows={erpDetail.rows} getInvoiceBlocked={getInvoiceBlocked} onInvoicesStarted={onInvoicesStarted} approvalSummary={approvalSummary} />
           </>
         ) : detailError && erpOpen ? <ErrorBlock compact>{detailError}</ErrorBlock> : <LoadingState variant="inline" />}
       </WidePanel>

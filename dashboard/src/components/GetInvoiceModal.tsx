@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, FileText, X } from "lucide-react";
 import type { ScrapeRequest } from "../lib/api";
-import { GET_INVOICE_MAX, GET_INVOICE_SCOPE, getInvoiceLabel, requestGetInvoices } from "../lib/erpPull";
+import { GET_INVOICE_MAX, GET_INVOICE_SCOPE, approvalDate, approvalGroup, approvalLabel, getInvoiceLabel, requestGetInvoices, type ApprovalGroup } from "../lib/erpPull";
 import { fmtDateTime, fmtNum } from "../lib/format";
-import type { GetInvoiceState } from "../lib/types";
+import type { ApprovalState, GetInvoiceState } from "../lib/types";
 
 // The human-in-the-loop step before FPX presses FreightPOP's GET INVOICE
 // button: the person sees exactly which shipments are about to be invoiced,
@@ -23,6 +23,8 @@ export interface GetInvoiceItem {
   statusCls: string;
   flags: string[];
   invoiceState: GetInvoiceState | null;
+  /** Who approved the invoice, from the last approval check; null = never checked. */
+  approval?: ApprovalState | null;
 }
 
 const PILL_CLS: Record<string, string> = {
@@ -53,6 +55,42 @@ export function InvoicePill({ state }: { state: GetInvoiceState | null }) {
 function fmtMoney(n: number | null): string {
   if (n == null) return "—";
   return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+
+const APPROVAL_CLS: Record<ApprovalGroup, string> = {
+  edi: "bg-blue-100 text-blue-700",
+  shaun: "bg-violet-600 text-white",
+  person: "bg-violet-100 text-violet-700",
+  unknown: "bg-slate-100 text-slate-600",
+  not_approved: "bg-amber-100 text-amber-800",
+};
+
+/**
+ * Small pill for who approved a shipment's invoice in FreightPOP: EDI, a
+ * person's name, Unknown, or Not approved. Nothing when it was never checked.
+ * Hover shows the approved date, amount and invoice number.
+ */
+export function ApprovalPill({ state }: { state: ApprovalState | null | undefined }) {
+  const group = approvalGroup(state);
+  if (!state || !group) return null;
+  const approved = group !== "not_approved";
+  const amount = typeof state.amount === "number" ? fmtMoney(state.amount) : state.amount ? String(state.amount) : "";
+  const date = approvalDate(state);
+  const title = [
+    group === "edi" ? "Approved automatically by EDI" : null,
+    group === "unknown" ? (state.approved_by_raw ? `FreightPOP says: "${state.approved_by_raw}"` : "FreightPOP doesn't say who approved it") : null,
+    group === "not_approved" ? "Not in FreightPOP's Recently Approved list when last checked" : null,
+    approved && date ? `Approved ${date}` : null,
+    approved && amount ? `Amount ${amount}` : null,
+    approved && state.invoice ? `Invoice ${state.invoice}` : null,
+    approved && (state.matches ?? 0) > 1 ? `${fmtNum(state.matches)} lines in Recently Approved for this shipment` : null,
+    state.checked_at ? `Checked ${fmtDateTime(state.checked_at)}${state.checked_by ? ` by ${state.checked_by}` : ""}` : null,
+  ].filter(Boolean).join("\n");
+  return (
+    <span title={title || undefined} className={"text-xs rounded-full px-2 py-0.5 whitespace-nowrap " + APPROVAL_CLS[group] + (group === "shaun" ? " font-medium" : "")}>
+      {approvalLabel(state)}
+    </span>
+  );
 }
 
 const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
@@ -112,6 +150,8 @@ export function GetInvoiceModal({ auditId, items, onClose, onStarted }: Props) {
     }
     return out;
   }, [chosen]);
+  // The column only appears once an approval check has been run on this audit.
+  const anyApproval = useMemo(() => items.some((i) => !!i.approval), [items]);
   const warnedIds = useMemo(() => new Set(warnings.flatMap((w) => w.ids)), [warnings]);
 
   function toggle(id: string) {
@@ -217,6 +257,7 @@ export function GetInvoiceModal({ auditId, items, onClose, onStarted }: Props) {
                   <th className="px-3 py-2 font-medium text-right whitespace-nowrap">Invoice amount</th>
                   <th className="px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">Invoice</th>
+                  {anyApproval ? <th className="px-3 py-2 font-medium whitespace-nowrap">Approved by</th> : null}
                   <th className="px-3 py-2 font-medium">Flags</th>
                 </tr>
               </thead>
@@ -242,6 +283,7 @@ export function GetInvoiceModal({ auditId, items, onClose, onStarted }: Props) {
                       <td className="px-3 py-1.5 text-right tabular-nums whitespace-nowrap">{fmtMoney(i.invoice)}</td>
                       <td className="px-3 py-1.5"><span className={"text-xs rounded-full px-2 py-0.5 whitespace-nowrap " + i.statusCls}>{i.statusLabel}</span></td>
                       <td className="px-3 py-1.5"><InvoicePill state={i.invoiceState} /></td>
+                      {anyApproval ? <td className="px-3 py-1.5"><ApprovalPill state={i.approval} /></td> : null}
                       <td className="px-3 py-1.5">
                         {i.flags.length === 0 ? <span className="text-slate-300">—</span> : (
                           <span className="flex flex-wrap gap-1">

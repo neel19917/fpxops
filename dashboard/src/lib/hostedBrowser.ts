@@ -28,6 +28,24 @@ export interface HostedWorkerState {
   lastResult: { requestId: string; user: string; ok: boolean; note: string; finishedAt: string; durationMs: number; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null } | null;
 }
 
+// The service's second session ("lane"): the three invoicing jobs run here, in
+// their own window with their own queue, log, pause and stop. The top-level
+// worker fields describe the scrape lane only.
+export type HostedLane = "scrape" | "invoicing";
+export type HostedInvoicingKind = "erp_audit" | "get_invoice" | "approval_check";
+export interface HostedInvoicingLane {
+  enabled: boolean;
+  busy: boolean;
+  kind: HostedInvoicingKind | null;
+  paused: boolean;
+  current: (NonNullable<HostedWorkerState["current"]> & { kind?: HostedInvoicingKind; paused?: boolean }) | null;
+  lastResult: (NonNullable<HostedWorkerState["lastResult"]> & { kind?: HostedInvoicingKind; result?: unknown }) | null;
+  result: unknown;
+  queued: { id?: string; requestId?: string; user?: string; kind?: string; queuedAt?: string }[];
+  reason?: string | null;
+  pollSeconds?: number;
+}
+
 export interface HostedUsageUser {
   email: string;
   sessions: number;
@@ -110,7 +128,7 @@ export interface HostedStats {
   isAdmin?: boolean;
   runs?: ScrapeRun[];
   schedules?: ScrapeSchedule[];
-  worker: HostedWorkerState & { queued?: { id: string; user: string; source: string; scheduleId: string; scheduleName: string | null; queuedAt: string }[] };
+  worker: HostedWorkerState & { queued?: { id: string; user: string; source: string; scheduleId: string; scheduleName: string | null; queuedAt: string }[]; invoicing?: HostedInvoicingLane };
   usage: {
     days: number;
     users: HostedUsageUser[];
