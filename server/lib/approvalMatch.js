@@ -24,6 +24,9 @@ const CANDIDATES = {
   approved_at: ["Approved Date", "Approval Date", "Approved On", "Invoice Approved Date", "Date Approved", "Modified Date"],
   amount: ["Approved Amount", "Approved Invoice Amount", "Invoice Amount", "Amount", "Total"],
   invoice: ["Invoice Number", "Invoice #", "Carrier Invoice", "Invoice No"],
+  // FreightPOP's Recently Approved export has no shipment id; it is matched
+  // to a shipment by its tracking (PRO) number.
+  tracking: ["Tracking Number", "Tracking", "Tracking #", "Tracking No", "PRO Number", "PRO"],
 };
 
 // Looser tests, tried in order when no listed spelling is present. Each takes
@@ -49,6 +52,9 @@ const CONTAINS = {
   invoice: [
     (k) => k.includes("invoicenumber") || /invoice(num|no)$/.test(k),
   ],
+  tracking: [
+    (k) => k.includes("trackingnumber") || /tracking(num|no)$/.test(k),
+  ],
 };
 
 // Which column of the export holds what. Returns the header exactly as it was
@@ -59,7 +65,7 @@ export function findApprovalColumns(columns) {
     .filter((c) => c !== null && c !== undefined && String(c).trim() !== "")
     .map((c) => String(c));
   const keyed = names.map((name) => ({ name, key: normKey(name) }));
-  const out = { shipment: null, approved_by: null, approved_at: null, amount: null, invoice: null };
+  const out = { shipment: null, approved_by: null, approved_at: null, amount: null, invoice: null, tracking: null };
   const used = new Set();
   const take = (field, col) => { out[field] = col.name; used.add(col.name); };
   for (const field of Object.keys(out)) {
@@ -260,11 +266,14 @@ export function matchApprovals(auditRows, approvedRows, columns, { people = [] }
   const headers = approvalColumnNames(columns, approved);
   const cols = findApprovalColumns(headers);
 
-  // shipment id → { row, time, count }
+  // shipment id (or "t:" + tracking number) → { row, time, count }
   const best = new Map();
-  if (cols.shipment) {
+  const keyCol = cols.shipment || cols.tracking;
+  const prefix = cols.shipment ? "" : "t:";
+  if (keyCol) {
     for (const row of approved) {
-      const id = normalizeShipmentId(cell(row, cols.shipment, headers));
+      const raw = normalizeShipmentId(cell(row, keyCol, headers));
+      const id = raw ? prefix + raw : "";
       if (!id) continue;
       const time = approvalTime(cell(row, cols.approved_at, headers));
       const had = best.get(id);
@@ -281,7 +290,11 @@ export function matchApprovals(auditRows, approvedRows, columns, { people = [] }
   const people_counts = {};
   const results = audit.map((a) => {
     const shipment_id = a?.shipment_id ?? null;
-    const hit = best.get(normalizeShipmentId(shipment_id));
+    // By shipment id when the export has one, else by tracking number.
+    const trackingKey = normalizeShipmentId(a?.raw?.tracking ?? a?.tracking_number ?? null);
+    const hit = cols.shipment
+      ? best.get(normalizeShipmentId(shipment_id))
+      : (trackingKey ? best.get("t:" + trackingKey) : undefined);
     if (!hit) {
       summary.not_found += 1;
       return { shipment_id, status: "not_found", matches: 0 };

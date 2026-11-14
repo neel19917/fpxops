@@ -1440,7 +1440,11 @@ async function kendoExport(page) {
         } catch (err) { clearTimeout(timer); resolve({ error: "building the Excel file failed: " + (err && err.message || err) }); }
       }
       grid.bind("excelExport", onExport);
-      grid.saveAsExcel();
+      // Every row, not just the page on screen (Recently Approved shows 10
+      // of 155). Only this export call is affected; the setting is put back.
+      const excelBefore = grid.options.excel;
+      grid.options.excel = Object.assign({}, excelBefore, { allPages: true });
+      try { grid.saveAsExcel(); } finally { setTimeout(() => { grid.options.excel = excelBefore; }, 0); }
     } catch (err) { resolve({ error: String(err && err.message || err) }); }
   }));
   if (out.error) throw new Error(out.error);

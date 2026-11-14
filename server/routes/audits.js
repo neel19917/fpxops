@@ -384,8 +384,8 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
 
   const columns = approvalColumnNames(body.columns, body.rows);
   const columnsUsed = findApprovalColumns(columns);
-  if (!columnsUsed.shipment) {
-    return res.status(422).json({ error: "Could not find a shipment column in the Recently Approved export", columns });
+  if (!columnsUsed.shipment && !columnsUsed.tracking) {
+    return res.status(422).json({ error: "Could not find a shipment or tracking number column in the Recently Approved export", columns });
   }
 
   const loaded = await loadAuditRows(run.id, "id, shipment_id, raw");

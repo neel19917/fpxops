@@ -18,11 +18,11 @@ describe("findApprovalColumns", () => {
   it("finds the listed spellings, whatever the case, spacing or punctuation", () => {
     assert.deepEqual(findApprovalColumns(COLS), {
       shipment: "ShipmentID", approved_by: "Approved By", approved_at: "Approved Date",
-      amount: "Approved Amount", invoice: "Invoice Number",
+      amount: "Approved Amount", invoice: "Invoice Number", tracking: null,
     });
     assert.deepEqual(findApprovalColumns(["shipment_id", "APPROVEDBY", "approval  date", "Invoice Amount ($)", "Invoice #"]), {
       shipment: "shipment_id", approved_by: "APPROVEDBY", approved_at: "approval  date",
-      amount: "Invoice Amount ($)", invoice: "Invoice #",
+      amount: "Invoice Amount ($)", invoice: "Invoice #", tracking: null,
     });
     assert.equal(findApprovalColumns(["Shipment #"]).shipment, "Shipment #");
     assert.equal(findApprovalColumns(["Shipment No."]).shipment, "Shipment No.");
@@ -46,7 +46,7 @@ describe("findApprovalColumns", () => {
     const c = findApprovalColumns(["FP Shipment ID", "Invoice Approved By Name", "Last Approved Date/Time", "Total Approved Amount (USD)", "Carrier Invoice Number"]);
     assert.deepEqual(c, {
       shipment: "FP Shipment ID", approved_by: "Invoice Approved By Name", approved_at: "Last Approved Date/Time",
-      amount: "Total Approved Amount (USD)", invoice: "Carrier Invoice Number",
+      amount: "Total Approved Amount (USD)", invoice: "Carrier Invoice Number", tracking: null,
     });
   });
 
@@ -56,7 +56,7 @@ describe("findApprovalColumns", () => {
 
   it("returns null for what is missing, and never throws on odd input", () => {
     assert.deepEqual(findApprovalColumns(["Carrier", "Approved By"]), {
-      shipment: null, approved_by: "Approved By", approved_at: null, amount: null, invoice: null,
+      shipment: null, approved_by: "Approved By", approved_at: null, amount: null, invoice: null, tracking: null,
     });
     for (const bad of [undefined, null, "ShipmentID", {}, [], [null, "", 3]]) {
       assert.equal(findApprovalColumns(bad).shipment, null);
@@ -403,4 +403,25 @@ describe("summarizeApprovals", () => {
     });
     assert.deepEqual(Object.entries(out.by_person), [["Shaun", 2], ["Dana", 1]]);
   });
+});
+
+it("matches by tracking number when the export has no shipment column", async () => {
+  const { matchApprovals } = await import("../lib/approvalMatch.js");
+  const columns = ["Carrier", "Approved Date", "Invoice Number", "Tracking Number", "Invoice Amount", "Approved By"];
+  const audit = [
+    { shipment_id: "13413021", raw: { tracking: "047976058" } },
+    { shipment_id: "13413022", raw: { tracking: "PRO-9" } },
+    { shipment_id: "13413023", raw: {} },
+  ];
+  const approved = [
+    { Carrier: "ABF", "Approved Date": "11/12/2026", "Invoice Number": "INV1", "Tracking Number": "47976058", "Invoice Amount": "449.39", "Approved By": "EDI" },
+    { Carrier: "XPO", "Approved Date": "11/13/2026", "Invoice Number": "INV2", "Tracking Number": "pro-9", "Invoice Amount": "100", "Approved By": "shaun.smith@x.com" },
+  ];
+  const { results, summary, columns_used } = matchApprovals(audit, approved, columns);
+  assert.equal(columns_used.shipment, null);
+  assert.equal(columns_used.tracking, "Tracking Number");
+  assert.deepEqual(results.map((r) => r.status), ["approved", "approved", "not_found"]);
+  assert.equal(results[0].approved_by_kind, "edi");
+  assert.equal(results[1].approved_by, "Shaun Smith");
+  assert.equal(summary.matched, 2);
 });
