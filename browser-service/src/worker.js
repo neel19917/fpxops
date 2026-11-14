@@ -1660,7 +1660,7 @@ async function kendoExport(page) {
 async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
   if (opts.buttonFirst) {
     let file = null, fromGrid = null, why = "";
-    try { file = await captureExport(lane, browser, cdp, ext, jobId, { buttonOnly: true, waitMs: 180_000 }); }
+    try { file = await captureExport(lane, browser, cdp, ext, jobId, { buttonOnly: true, waitMs: 30_000 }); }
     catch (e) { why = e.message; }
     try { if (lane.page) fromGrid = await kendoExport(lane.page); } catch { /* the file stands on its own */ }
     if (file && (!fromGrid || file.rows.length >= fromGrid.rows.length)) return { ...file, gridTotal: fromGrid?.gridTotal || null, via: "download" };
@@ -1686,7 +1686,42 @@ async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
     await root.detach().catch(() => {});
   } catch { /* page-level setting may be enough */ }
 
+  // The hosted browser does not write the button's file to disk (no file has
+  // ever arrived), so the file is also caught where the page hands it to the
+  // browser: Kendo's saveAs. Same bytes the button would have downloaded.
+  const hooked = opts.buttonOnly && lane.page ? await lane.page.evaluate(() => {
+    const k = window.kendo;
+    window.__fpxSaved = null;
+    if (!k || typeof k.saveAs !== "function") return false;
+    if (!k.__fpxSaveAs) {
+      k.__fpxSaveAs = k.saveAs;
+      k.saveAs = (o) => { if (window.__fpxCatch) window.__fpxSaved = { data: o && o.dataURI, name: o && o.fileName }; else k.__fpxSaveAs(o); };
+    }
+    window.__fpxCatch = true;
+    return true;
+  }).catch(() => false) : false;
+  const takeSaved = async () => {
+    if (!hooked) return null;
+    const got = await lane.page.evaluate(async () => {
+      const s = window.__fpxSaved;
+      if (!s || !s.data) return null;
+      let uri = s.data;
+      if (typeof uri !== "string") {
+        uri = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(s.data); });
+      } else if (uri.startsWith("blob:")) {
+        const b = await (await fetch(uri)).blob();
+        uri = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(b); });
+      }
+      window.__fpxSaved = null;
+      return { uri, name: String(s.name || "export.xlsx") };
+    }).catch(() => null);
+    if (!got || !/^data:[^,]*;base64,/.test(got.uri)) return null;
+    return { buf: Buffer.from(got.uri.slice(got.uri.indexOf(",") + 1), "base64"), name: got.name };
+  };
+  const unhook = () => (hooked ? lane.page.evaluate(() => { window.__fpxCatch = false; window.__fpxSaved = null; }).catch(() => {}) : null);
+
   const click = JSON.parse((await ext.evaluate("fpxErpClickExport()")).value || "{}");
+  if (click.error) await unhook();
   if (click.error) throw new Error(`${click.error}${click.buttons?.length ? ` — buttons on the page: ${click.buttons.join(", ")}` : ""}`);
 
   const waitMs = opts.waitMs || 45_000;
@@ -1694,6 +1729,14 @@ async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
   let last = null;
   while (Date.now() < until) {
     await sleep(1000);
+    const saved = await takeSaved();
+    if (saved) {
+      await unhook();
+      fs.rmSync(dir, { recursive: true, force: true });
+      const { headers, rows } = readXlsx(saved.buf);
+      if (!rows.length) throw new Error(`"${saved.name}" has no rows`);
+      return { rows, headers, buf: saved.buf, file: saved.name, clicked: click.clicked };
+    }
     const done = fs.readdirSync(dir).filter((f) => !/\.(crdownload|tmp|part)$/i.test(f));
     if (!done.length) continue;
     const file = path.join(dir, done[0]);
@@ -1711,6 +1754,7 @@ async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
     }
     last = size;
   }
+  await unhook();
   const partial = fs.readdirSync(dir);
   fs.rmSync(dir, { recursive: true, force: true });
   throw new Error(`clicked "${click.clicked}" but no file arrived within ${Math.round(waitMs / 1000)}s${partial.length ? ` (still downloading: ${partial.join(", ")})` : ""}${click.others?.length ? ` — other candidates: ${click.others.join(", ")}` : ""}`);
