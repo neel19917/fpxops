@@ -7,6 +7,7 @@ import {
   approvalColumnNames, findApprovalColumns, matchApprovals, mergeApproval, summarizeApprovals,
   normalizeApprovalSource,
 } from "../lib/approvalMatch.js";
+import { transactionRows, upsertTransactions, approvalRows, upsertApprovals } from "../lib/erpStore.js";
 
 export const auditsRouter = Router();
 
@@ -376,6 +377,10 @@ auditsRouter.post("/invoice/:id/get-invoice-results", async (req, res) => {
 // already approved it only fills in blank fields. `final` changes nothing.
 // 400 for an unknown source. 422 { error, columns } when the export has
 // neither a shipment nor a tracking number column.
+// The approvals of the call are also kept in fpx_audit_approvals (one row per
+// tracking number + invoice number, both sources; History rows that are not
+// approvals are left out). That can never fail the call: the response carries
+// stored_approvals: { upserted, failed }.
 // Responds { source, matched, not_found, approved_rows, by_edi, by_unknown,
 // by_person, by_source, newly_matched, dropped: { not_approved,
 // no_approval_info }, columns_used, failed, final }: matched … by_source
@@ -450,6 +455,18 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
   }
   if (failed) console.warn(`[FPX] approval results for ${run.id}: ${failed} row(s) not saved`);
 
+  // Keep the approvals themselves, whether or not they matched a row of this
+  // pull. Waited for, but a failure here never fails the call.
+  const storedApprovals = { upserted: 0, failed: 0 };
+  try {
+    const mapped = approvalRows(body.rows, columns, { source, seenAt: checked_at });
+    const out = await upsertApprovals(supabase, mapped.rows);
+    storedApprovals.upserted = out.upserted;
+    storedApprovals.failed = out.failed;
+  } catch (e) {
+    console.warn(`[FPX] approval results for ${run.id}: approvals not stored: ${e?.message || e}`);
+  }
+
   const now = summarizeApprovals(after)
     || { matched: 0, not_found: 0, by_edi: 0, by_unknown: 0, by_person: {}, by_source: { recently_approved: 0, history: 0 } };
   res.json({
@@ -466,7 +483,146 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
     columns_used: columnsUsed,
     failed,
     final,
+    stored_approvals: storedApprovals,
   });
+});
+
+// ---------- ERP data kept in Supabase ----------
+// fpx_erp_transactions (every shipment of the History Report), fpx_audit_approvals
+// (every approved carrier invoice) and the view fpx_erp_invoicing that matches
+// them by tracking number. See lib/erpStore.js.
+
+// POST /audits/erp/transactions — the hosted browser posts ALL rows of the
+// Transactions History Report (exported to ERP or not), keyed by FreightPOP's
+// column titles. Each shipment is inserted or brought up to date.
+// Body: { audit_id?: uuid, shipment_type?: string, rows: object[], part?, final? }
+// A big report can be sent in several calls; `part` and `final` are not read.
+// Responds { received, stored, skipped_no_id, failed } (+ error when failed):
+// rows in the call, shipments saved (several rows for one shipment count
+// once), rows without a shipment id, shipments whose save failed (send the
+// call again). Always 200 once the body is valid.
+auditsRouter.post("/erp/transactions", async (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.rows)) return res.status(400).json({ error: "body.rows must be a list" });
+  const hasAudit = body.audit_id !== undefined && body.audit_id !== null && body.audit_id !== "";
+  if (hasAudit && !isUuid(body.audit_id)) return res.status(400).json({ error: "body.audit_id must be an audit id" });
+  const shipmentType = typeof body.shipment_type === "string" ? body.shipment_type.trim().slice(0, 40) : "";
+  const mapped = transactionRows(body.rows, {
+    auditId: hasAudit ? body.audit_id : undefined,
+    shipmentType: shipmentType || undefined,
+    seenAt: new Date().toISOString(),
+  });
+  let out = { upserted: 0, failed: mapped.rows.length };
+  try {
+    out = await upsertTransactions(supabase, mapped.rows);
+  } catch (e) {
+    out.error = e?.message || String(e);
+  }
+  res.json({
+    received: mapped.received,
+    stored: out.upserted,
+    skipped_no_id: mapped.skipped_no_id,
+    failed: out.failed,
+    ...(out.error ? { error: out.error } : {}),
+  });
+});
+
+const ERP_BUCKETS = ["exported", "approved_ready", "invoice_not_approved", "no_invoice"];
+const APPROVER_KINDS = ["edi", "person", "unknown"];
+
+// The `q` and `approved_by_kind` filters of the invoicing list, on a query of
+// the fpx_erp_invoicing view.
+function erpInvoicingFilters(query, { q, kind }) {
+  let out = query;
+  if (kind) out = out.eq("approved_by_kind", kind);
+  if (q) {
+    const like = `"%${q}%"`;
+    out = out.or(["shipment_id", "tracking_number", "customer_name", "carrier"].map((c) => `${c}.ilike.${like}`).join(","));
+  }
+  return out;
+}
+
+// GET /audits/erp/invoicing?bucket=&approved_by_kind=&q=&limit=&offset=
+// Each shipment with its latest approval (the fpx_erp_invoicing view), biggest
+// charge first.
+//   bucket            exported | approved_ready | invoice_not_approved | no_invoice
+//   approved_by_kind  edi | person | unknown
+//   q                 part of a shipment id, tracking number, customer or carrier
+//   limit             default 200, at most 1000;  offset  default 0
+// Responds { data, counts: { exported, approved_ready, invoice_not_approved,
+// no_invoice }, totals: { all, matching }, limit, offset }. counts are per
+// bucket with `q` and `approved_by_kind` applied (not `bucket`); a count that
+// could not be read is null. totals.all is their sum, totals.matching the rows
+// the whole filter matches (for paging).
+auditsRouter.get("/erp/invoicing", async (req, res) => {
+  const one = (v) => (Array.isArray(v) ? v[0] : v);
+  const bucket = String(one(req.query.bucket) ?? "").trim();
+  if (bucket && !ERP_BUCKETS.includes(bucket)) {
+    return res.status(400).json({ error: `bucket must be one of ${ERP_BUCKETS.join(", ")}` });
+  }
+  const kind = String(one(req.query.approved_by_kind) ?? "").trim().toLowerCase();
+  if (kind && !APPROVER_KINDS.includes(kind)) {
+    return res.status(400).json({ error: `approved_by_kind must be one of ${APPROVER_KINDS.join(", ")}` });
+  }
+  // Quotes and backslashes would break out of the quoted filter value.
+  const q = String(one(req.query.q) ?? "").replace(/["\\]/g, "").trim().slice(0, 100);
+  const int = (v, fallback) => {
+    const n = Number.parseInt(String(one(v) ?? ""), 10);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const limit = Math.min(1000, Math.max(1, int(req.query.limit, 200)));
+  const offset = Math.max(0, int(req.query.offset, 0));
+
+  let list = erpInvoicingFilters(supabase.from("fpx_erp_invoicing").select("*"), { q, kind });
+  if (bucket) list = list.eq("bucket", bucket);
+  list = list
+    .order("charge", { ascending: false, nullsFirst: false })
+    .order("shipment_id", { ascending: true })
+    .range(offset, offset + limit - 1);
+  const countOf = async (b) => {
+    try {
+      const { count, error } = await erpInvoicingFilters(
+        supabase.from("fpx_erp_invoicing").select("shipment_id", { count: "exact", head: true }), { q, kind },
+      ).eq("bucket", b);
+      return error ? null : count || 0;
+    } catch {
+      return null;
+    }
+  };
+  const [{ data, error }, ...bucketCounts] = await Promise.all([list, ...ERP_BUCKETS.map(countOf)]);
+  if (error) return res.status(500).json({ error: error.message });
+  const counts = Object.fromEntries(ERP_BUCKETS.map((b, i) => [b, bucketCounts[i]]));
+  const known = bucketCounts.every((c) => c !== null);
+  const all = known ? bucketCounts.reduce((a, c) => a + c, 0) : null;
+  res.json({
+    data: data || [],
+    counts,
+    totals: { all, matching: bucket ? counts[bucket] : all },
+    limit,
+    offset,
+  });
+});
+
+// GET /audits/erp/summary → how much is stored and how fresh it is:
+// { transactions: { rows, last_seen_at }, approvals: { rows, last_seen_at } }.
+auditsRouter.get("/erp/summary", async (_req, res) => {
+  const about = async (table, key) => {
+    const [counted, latest] = await Promise.all([
+      supabase.from(table).select(key, { count: "exact", head: true }),
+      supabase.from(table).select("last_seen_at").order("last_seen_at", { ascending: false }).limit(1),
+    ]);
+    if (counted.error || latest.error) throw new Error((counted.error || latest.error).message);
+    return { rows: counted.count || 0, last_seen_at: latest.data?.[0]?.last_seen_at ?? null };
+  };
+  try {
+    const [transactions, approvals] = await Promise.all([
+      about("fpx_erp_transactions", "shipment_id"),
+      about("fpx_audit_approvals", "approval_key"),
+    ]);
+    res.json({ transactions, approvals });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
 });
 
 auditsRouter.post("/invoice", async (req, res) => {

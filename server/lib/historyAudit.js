@@ -8,7 +8,7 @@
 // Report headers arrive with slightly different spellings ("ShipmentID",
 // "Shipment Id", "shipment_id"), so every lookup goes through this: lower-case,
 // letters and digits only.
-const normKey = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+export const normKey = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
 
 // Each field lists the header spellings we accept (compared after normKey).
 const FIELDS = {
@@ -39,7 +39,7 @@ const FIELD_KEYS = Object.fromEntries(
 
 // One normalised view of a report row. First spelling wins when two headers
 // normalise to the same key.
-function indexRow(row) {
+export function indexRow(row) {
   const idx = new Map();
   if (!row || typeof row !== "object") return idx;
   for (const [k, v] of Object.entries(row)) {
@@ -49,7 +49,7 @@ function indexRow(row) {
   return idx;
 }
 
-function pick(idx, field) {
+export function pick(idx, field) {
   for (const k of FIELD_KEYS[field]) {
     if (idx.has(k)) return idx.get(k);
   }
@@ -57,7 +57,7 @@ function pick(idx, field) {
 }
 
 // Trimmed text, or null when the cell is empty.
-function text(value) {
+export function text(value) {
   if (value === null || value === undefined) return null;
   const s = String(value).trim();
   return s === "" ? null : s;

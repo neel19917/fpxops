@@ -1044,6 +1044,11 @@ async function runErpIn(lane, browser, url, who, months, shipmentType) {
   const screenRows = [];
   let filesSaved = false;
   let saving = null; // the save, finished after the page work
+  // The copy of every report row to Supabase (the API's durable table),
+  // started with the save and finished after the page work too.
+  let excelScreen = []; // the screen rows that came with the Excel upload
+  let copying = null;
+  const cur = lane.current;
   return runPageJob(lane, browser, url, who, {
     noun: "pull",
     limitMs: ERP_LIMIT_MS,
@@ -1091,23 +1096,10 @@ async function runErpIn(lane, browser, url, who, months, shipmentType) {
             // report on screen has (the approved invoice amounts and dates).
             // The saved file stays exactly as FreightPOP wrote it; the audit
             // takes those values from the screen rows of the same shipment.
-            const rowKey = (r) => `${String(r["ShipmentID"] ?? "").trim()}|${String(r["Tracking"] ?? "").trim()}`;
-            const onScreen = new Map(rows.map((r) => [rowKey(r), r]));
-            let filledRows = 0;
-            send = fromExcel.rows.map((r) => {
-              const scr = onScreen.get(rowKey(r));
-              if (!scr) return r;
-              let out = r;
-              for (const [k, v] of Object.entries(scr)) {
-                const has = out[k] !== undefined && out[k] !== null && String(out[k]).trim() !== "";
-                if (!has && v !== undefined && v !== null && String(v).trim() !== "") {
-                  if (out === r) out = { ...r };
-                  out[k] = v;
-                }
-              }
-              if (out !== r) filledRows++;
-              return out;
-            });
+            const filled = fillBlanksFromScreen(fromExcel.rows, rows);
+            send = filled.rows;
+            const filledRows = filled.filled;
+            excelScreen = rows;
             if (filledRows) logLine(lane, `Filled in values the Excel export leaves blank (approved invoice amounts and dates) from the report on screen · ${filledRows.toLocaleString("en-US")} shipments`);
             usedExcel = true;
             if (body.run) body.run.total_report_rows = excelRows.length;
@@ -1141,12 +1133,21 @@ async function runErpIn(lane, browser, url, who, months, shipmentType) {
         if (answer.ok && answer.audit_id && !filesSaved && lastPart) {
           filesSaved = true;
           saving = saveErpExcel(lane, answer.audit_id, usedExcel ? { files: excelFiles, total: excelRows.length } : { rows: screenRows });
+          // Every row of the report (exported or not) → Supabase. Same
+          // footing as the save: not waited for here, never fails the pull.
+          copying = copyErpTransactions(lane, answer.audit_id, String(shipmentType || "non-parcel"),
+            usedExcel ? { excel: excelRows, screen: excelScreen } : { screen: screenRows });
         }
         return true;
       }
       return false;
     },
-  }).finally(() => saving); // saveErpExcel never rejects
+  }).finally(async () => {
+    // Neither of these rejects.
+    await saving;
+    const copied = await copying;
+    if (copied && cur?.result && typeof cur.result === "object") cur.result = { ...cur.result, copied };
+  });
 }
 
 // ── Get invoices ────────────────────────────────────────────────────────────
@@ -1659,6 +1660,123 @@ function notExportedSorted(all) {
   const rows = all.filter((r) => isNotExported(r[key])).map((r) => (key === "Exported to ERP" ? r : { ...r, "Exported to ERP": r[key] }));
   rows.sort(byRateDesc);
   return { rows };
+}
+
+// FreightPOP's Excel export leaves some columns blank that the report on
+// screen has (the approved invoice amounts and dates). Each Excel row takes
+// the values it lacks from the screen row of the same shipment; rows with
+// nothing to take are returned as they are. → { rows, filled }
+const erpRowKey = (r) => `${String(r["ShipmentID"] ?? "").trim()}|${String(r["Tracking"] ?? "").trim()}`;
+const isBlank = (v) => v === undefined || v === null || String(v).trim() === "";
+function fillBlanksFromScreen(excel, screen) {
+  if (!screen?.length) return { rows: excel, filled: 0 };
+  const onScreen = new Map(screen.map((r) => [erpRowKey(r), r]));
+  let filled = 0;
+  const rows = excel.map((r) => {
+    const scr = onScreen.get(erpRowKey(r));
+    if (!scr) return r;
+    let out = r;
+    for (const [k, v] of Object.entries(scr)) {
+      if (isBlank(out[k]) && !isBlank(v)) {
+        if (out === r) out = { ...r };
+        out[k] = v;
+      }
+    }
+    if (out !== r) filled++;
+    return out;
+  });
+  return { rows, filled };
+}
+
+// ── The report's rows kept in Supabase (the API's durable table) ──
+// Every row of the History Report, exported to ERP or not, goes to the API,
+// which upserts by shipment id. Parts of at most ~8 MB of JSON and 1,500 rows;
+// a part is sent once more after a network error or a 5xx (an upsert, so a
+// repeat is safe). Never throws: the audit is already saved when this runs.
+//   src: { excel: object[], screen: object[] } — the Excel export's rows, with
+//        the screen rows that fill its blanks | { screen: object[] } — no
+//        Excel export, only the not-exported rows read on screen
+// → { received, stored, failed, … } for the job's result, or null (no rows)
+const ERP_COPY_PATH = "/api/audits/erp/transactions";
+const ERP_COPY_MAX_BYTES = 8 * 1024 * 1024;
+const ERP_COPY_MAX_ROWS = 1500;
+
+async function copyErpTransactions(lane, auditId, shipmentType, src) {
+  const sum = { received: 0, stored: 0, skipped_no_id: 0, failed: 0 };
+  let total = 0;
+  try {
+    let rows;
+    if (src.excel?.length) {
+      rows = fillBlanksFromScreen(src.excel, src.screen).rows;
+      // Same column title the audit's rows carry, whatever the export calls it.
+      const key = exportedKey(Object.keys(rows[0] || {}));
+      if (key && key !== "Exported to ERP") rows = rows.map((r) => ({ ...r, "Exported to ERP": r[key] }));
+    } else {
+      rows = src.screen || [];
+      if (rows.length) logLine(lane, "FreightPOP's Excel export was not captured — only the shipments not exported to ERP are copied to Supabase; exported shipments were not copied this time", "warn");
+    }
+    total = rows.length;
+    if (!total) return null;
+
+    const posts = [[]];
+    let size = 0;
+    for (const r of rows) {
+      const bytes = Buffer.byteLength(JSON.stringify(r)) + 1;
+      const last = posts[posts.length - 1];
+      if (last.length && (size + bytes > ERP_COPY_MAX_BYTES || last.length >= ERP_COPY_MAX_ROWS)) { posts.push([]); size = 0; }
+      posts[posts.length - 1].push(r);
+      size += bytes;
+    }
+
+    for (let i = 0; i < posts.length; i++) {
+      const part = posts.length > 1 ? ` (part ${i + 1} of ${posts.length})` : "";
+      const body = JSON.stringify({ audit_id: auditId, shipment_type: shipmentType, rows: posts[i], part: i + 1, final: i === posts.length - 1 });
+      let out;
+      for (let attempt = 0; ; attempt++) {
+        out = await postErpCopyPart(body);
+        if (!(out.error || out.status >= 500) || attempt === 1) break;
+        await sleep(2000);
+      }
+      if (out.error) throw new Error(`${out.error}${part}`);
+      // No such route (Express's own 404, not an answer from the route).
+      if (out.status === 404 && !out.json?.error) {
+        logLine(lane, "Copy to Supabase skipped — the API needs its next update", "warn");
+        return { received: sum.received, stored: sum.stored, failed: sum.failed, skipped: true };
+      }
+      if (out.status < 200 || out.status >= 300) throw new Error(`the API answered ${out.status} ${String(out.json?.error || out.text || "").slice(0, 200)}`.trim() + part);
+      if (!out.json || typeof out.json !== "object") throw new Error(`the API's answer was not JSON${part}`);
+      // Counts are per part.
+      for (const k of Object.keys(sum)) sum[k] += Number(out.json[k]) || 0;
+    }
+
+    const bits = [`${num(sum.stored)} stored`];
+    if (sum.skipped_no_id) bits.push(`${num(sum.skipped_no_id)} without a shipment id`);
+    if (sum.failed) bits.push(`${num(sum.failed)} not stored`);
+    logLine(lane, `Copied to Supabase · ${num(sum.received || total)} shipments (${bits.join(", ")})`, sum.failed ? "warn" : "info");
+    return { received: sum.received, stored: sum.stored, failed: sum.failed, skipped_no_id: sum.skipped_no_id };
+  } catch (e) {
+    const before = sum.stored ? ` (${num(sum.stored)} of ${num(total)} shipments were stored before it)` : "";
+    logLine(lane, `Copy to Supabase failed: ${String(e.message).slice(0, 300)}${before} — the audit itself is saved`, "warn");
+    return { received: sum.received, stored: sum.stored, failed: sum.failed + Math.max(0, total - sum.received), skipped_no_id: sum.skipped_no_id, error: String(e.message).slice(0, 300) };
+  }
+}
+
+// One POST of one part. → { status, json, text } | { error } (no answer)
+async function postErpCopyPart(body) {
+  try {
+    const res = await fetch(`${config.apiUrl}${ERP_COPY_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": config.apiKey },
+      body,
+      signal: AbortSignal.timeout(180_000),
+    });
+    const text = await res.text().catch(() => "");
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* not JSON */ }
+    return { status: res.status, json, text };
+  } catch (e) {
+    return { error: e.name === "TimeoutError" ? "no answer from the API after 3 min" : `the API could not be reached (${e.cause?.message || e.message})` };
+  }
 }
 
 // ── Excel copies kept with an audit (Supabase Storage, private bucket) ──
