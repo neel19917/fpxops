@@ -1419,7 +1419,22 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId, histOnly) {
   let hist = null; // the History export, same shape
   let approvedDone = !!histOnly; // the page is past Recently Approved
   let pageError = null;
-  const call = (resumed) => `erpApprovalCheck(${JSON.stringify(String(who))}, ${resumed}, ${JSON.stringify({ historyFrom: range.from, historyTo: range.to, skipApproved: approvedDone && (resumed || !!histOnly) })}); 'started'`;
+  // FreightPOP's History search fails (rate limit) on more than ~3 months:
+  // the range is searched in windows of at most 90 days, newest first.
+  const historyRanges = [];
+  {
+    const d = (v) => new Date(+v.slice(6, 10), +v.slice(0, 2) - 1, +v.slice(3, 5));
+    const start = d(range.from);
+    let end = d(range.to);
+    while (end >= start && historyRanges.length < 12) {
+      let from = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 89);
+      if (from < start) from = start;
+      historyRanges.push([mdy(from), mdy(end)]);
+      end = new Date(from.getFullYear(), from.getMonth(), from.getDate() - 1);
+    }
+    if (historyRanges.length > 1) logLine(lane, `History is searched in ${historyRanges.length} windows of up to 90 days: ${historyRanges.map((w) => `${w[0]}–${w[1]}`).join(", ")}`);
+  }
+  const call = (resumed) => `erpApprovalCheck(${JSON.stringify(String(who))}, ${resumed}, ${JSON.stringify({ historyRanges, historyFrom: range.from, historyTo: range.to, skipApproved: approvedDone && (resumed || !!histOnly) })}); 'started'`;
   let note;
   try {
     note = await runPageJob(lane, browser, url, who, {
@@ -1441,8 +1456,17 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId, histOnly) {
         try {
           // History: the grid's own workbook only — no export button is clicked on that tab.
           const cap = history ? await kendoExport(lane.page) : await captureExport(lane, browser, cdp, ext, lane.current?.requestId || "job");
-          if (history) hist = cap; else got = cap;
-          if (lane.current) lane.current.counts[history ? "historyRows" : "approvedRows"] = cap.rows.length;
+          if (history) {
+            // Several windows: their rows add up into one History export.
+            if (hist) {
+              const rows = [...hist.rows, ...cap.rows];
+              const headers = hist.headers.length ? hist.headers : cap.headers;
+              let buf = null;
+              try { buf = writeXlsx(headers, rows); } catch { /* the file is a convenience */ }
+              hist = { ...cap, rows, headers, buf };
+            } else hist = cap;
+          } else got = cap;
+          if (lane.current) lane.current.counts[history ? "historyRows" : "approvedRows"] = (history ? hist : cap).rows.length;
           logLine(lane, `Excel export · ${r.download.label} · ${cap.file} · ${num(cap.rows.length)} rows · ${cap.headers.length} columns · ${history ? "taken from the grid, no button clicked" : `button "${cap.clicked}"`}`);
           // A grid that exports only the page on screen gives fewer rows than it holds.
           if (cap.gridTotal && cap.gridTotal > cap.rows.length) {
@@ -1450,7 +1474,7 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId, histOnly) {
           }
           answer = { ok: true, rows: cap.rows.length, file: cap.file };
         } catch (e) {
-          if (history) hist = null; else got = null;
+          if (!history) got = null; // History keeps the windows already read
           answer = { ok: false, error: e.message };
         }
         if (!history) approvedDone = true;

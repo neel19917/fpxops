@@ -4695,11 +4695,14 @@ async function apHistoryPhase(from, to, mark) {
   // f. The grid, loaded. A long range can take a while: up to 3 minutes.
   // After the range was applied, rows that look the same as before must stay
   // quiet for 20s (a slow search with no loading mask), an empty grid 30s.
+  // Rows already on screen from an earlier search are not the answer to this
+  // one: unless the grid visibly reloads, wait 5 min before reading it.
+  const hadRows = !!grid && apGridRows(grid) > 0;
   const waited = await apWaitGrid({
     find: findGrid, label: "History", steps: 840, // 7 min: the search alone has taken 95 s to over 3 min
     changed: (sig) => sig !== sigBefore,
     need: ({ rows, sawLoading, changed }) => (rows > 0
-      ? ((sawLoading || changed) ? 4 : (applied ? 40 : 10))
+      ? ((sawLoading || changed) ? 4 : (applied ? (hadRows ? 600 : 40) : 10))
       : (sawLoading ? 16 : (applied ? 60 : 16))),
   });
   grid = waited.grid;
@@ -4858,9 +4861,23 @@ async function erpApprovalCheck(runBy, resumed = false, opts = null) {
     let historyNote;
     try {
       if (!opts.historyFrom || !opts.historyTo) throw new Error("the browser service sent no date range (it needs redeploying)");
-      const h = await apHistoryPhase(String(opts.historyFrom), String(opts.historyTo), mark);
-      state.counts.historyRows = h.rows;
-      historyNote = h.note;
+      // FreightPOP's History search fails on ranges over about 3 months, so a
+      // long range comes as several windows, searched one after another.
+      const windows = Array.isArray(opts.historyRanges) && opts.historyRanges.length
+        ? opts.historyRanges : [[opts.historyFrom, opts.historyTo]];
+      const notes = [];
+      let total = 0;
+      for (let w = 0; w < windows.length; w++) {
+        if (w > 0) {
+          erpLog(`History · window ${w + 1} of ${windows.length} · waiting 20s so FreightPOP isn't asked too fast`);
+          for (let i = 0; i < 40; i++) { await erpCheckpoint(); await sleep(500); }
+        }
+        const h = await apHistoryPhase(String(windows[w][0]), String(windows[w][1]), mark);
+        total += Number(h.rows) || 0;
+        notes.push(h.note);
+        state.counts.historyRows = total;
+      }
+      historyNote = notes.join(" · ");
     } catch (e) {
       if (e && e.fpxStop) throw e;
       console.warn("[FPX-ERP] approval check, History:", e?.message || e);
