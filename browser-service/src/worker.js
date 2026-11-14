@@ -1663,6 +1663,19 @@ async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
     try { file = await captureExport(lane, browser, cdp, ext, jobId, { buttonOnly: true, waitMs: 30_000 }); }
     catch (e) { why = e.message; }
     try { if (lane.page) fromGrid = await kendoExport(lane.page); } catch { /* the file stands on its own */ }
+    // No file: say what the page's Excel buttons actually do, once per job.
+    if (!file && lane.page && lane.current && !lane.current.exportProbed) {
+      lane.current.exportProbed = true;
+      const probe = await lane.page.evaluate(() => [...document.querySelectorAll("input[type=button], button, a")]
+        .filter((e) => /excel/i.test((e.value || e.textContent || "") + " " + e.id))
+        .slice(0, 4).map((e) => {
+          const on = e.getAttribute("onclick") || e.getAttribute("ng-click") || "";
+          const fn = (/^\s*([A-Za-z_$][\w$]*)\s*\(/.exec(on) || [])[1];
+          const src = fn && typeof window[fn] === "function" ? String(window[fn]).replace(/\s+/g, " ").slice(0, 700) : "";
+          return `#${e.id || "?"} onclick="${on.slice(0, 120)}"${src ? ` → ${src}` : ""}`;
+        }).join(" || ")).catch((e) => `probe failed: ${e.message}`);
+      logLine(lane, `What the Excel buttons do: ${probe || "none found"}`.slice(0, 1800));
+    }
     if (file && (!fromGrid || file.rows.length >= fromGrid.rows.length)) return { ...file, gridTotal: fromGrid?.gridTotal || null, via: "download" };
     if (!fromGrid) throw new Error(why || "the Excel export could not be captured");
     logLine(lane, file
