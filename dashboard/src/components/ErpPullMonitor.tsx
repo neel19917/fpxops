@@ -7,7 +7,7 @@ import {
   LANE_NEEDS_UPDATE, downloadErpLog, stopErpPull,
   type ErpMonths,
   ERP_TYPE_CHOICES, type ErpShipmentType,
-  asGetInvoiceResult, asPullResult, getInvoiceCounts, getInvoicePauseLine, type ErpJobKind,
+  asGetInvoiceResult, asPullResult, getInvoiceCounts, getInvoicePauseLine, type ErpJobKind, type GetInvoiceCounts,
   ERP_JOB_KINDS, asApprovalResult, requestKind,
 } from "../lib/erpPull";
 import { fmtNum, fmtRelative } from "../lib/format";
@@ -38,12 +38,39 @@ function fmtDuration(ms: number | null | undefined): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-/** What the page needs to know to enable or disable its own start buttons. */
+/**
+ * What the page needs to know to enable or disable its own start buttons, and
+ * to show the running job (with Pause, Resume and Stop) somewhere of its own.
+ */
 export interface ErpMonitorStatus {
   /** The job that is queued or running here, if any. */
   active: ErpJobKind | null;
   /** Why a hosted-browser job can't be started right now (not signed in, worker off…). */
   blocked: string | null;
+  /** The invoicing session is working on the job now. */
+  running: boolean;
+  /** The job is in the queue and has not started yet. */
+  queued: boolean;
+  /** The running job is paused, by a person or by itself. */
+  paused: boolean;
+  /** The running job's latest step line. */
+  statusText: string | null;
+  /** When the running job started (ISO). */
+  startedAt: string | null;
+  /** A running Get Invoice job's progress. */
+  counts: GetInvoiceCounts | null;
+  /** Why a Get Invoice job paused itself and is waiting for a person ("First invoice done…", "Needs a decision: …"). */
+  pauseLine: string | null;
+  /** The running job belongs to the signed-in person (only then is there a live view to watch). */
+  mine: boolean;
+  /** The latest thing that went wrong with Pause, Resume, Stop or starting a pull. */
+  error: string | null;
+  /** `pause`: a pause or resume is on its way. `stop`: a stop is on its way, or the job is stopping. */
+  busy: { pause: boolean; stop: boolean };
+  /** These three are the same functions for the card's whole life. Stop does not ask first: the caller does. */
+  pause: () => Promise<void>;
+  resume: () => Promise<void>;
+  stop: () => Promise<void>;
 }
 
 interface ErpPullMonitorProps {
@@ -54,9 +81,15 @@ interface ErpPullMonitorProps {
   /** A Get Invoice run or approval check the page just queued: the card picks it up and scrolls into view. */
   started?: { requestId: string; auditId: string; kind?: "get_invoice" | "approval_check" } | null;
   onStatus?: (status: ErpMonitorStatus) => void;
+  /**
+   * False while the card is folded away or off screen: the live view of the
+   * session is then not loaded at all (the log and the controls still are).
+   * Left out, the card behaves as it always has.
+   */
+  liveView?: boolean;
 }
 
-export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: ErpPullMonitorProps) {
+export function ErpPullMonitor({ onFinished, onSettled, started, onStatus, liveView = true }: ErpPullMonitorProps) {
   const [stats, setStats] = useState<HostedStats | null>(null);
   const [statsErr, setStatsErr] = useState<string | null>(null);
   const [requests, setRequests] = useState<ScrapeRequest[]>([]);
@@ -179,8 +212,53 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
     : !loggedIn ? "Sign in to FreightPOP in your hosted browser first (Scraping page)"
     : null;
 
+  // Pause, resume and stop the invoicing session's job. They touch nothing but
+  // setters and `load`, so they stay the same functions and can be handed to the page.
+  const setPaused = useCallback(async (want: boolean) => {
+    setToggling(true); setError(null); setPauseNote(null);
+    try {
+      await (want ? pauseErpPull() : resumeErpPull());
+      await load();
+    } catch (e) {
+      if (!alive.current) return;
+      if (e instanceof EndpointMissingError) setPauseNote("Pause needs the next hosted browser update");
+      else setError((e as Error).message);
+    } finally { if (alive.current) setToggling(false); }
+  }, [load]);
+  const pause = useCallback(() => setPaused(true), [setPaused]);
+  const resume = useCallback(() => setPaused(false), [setPaused]);
+  const stop = useCallback(async () => {
+    setStopping(true); setError(null); setConfirmStop(false);
+    try { await stopErpPull(); if (alive.current) setStopRequested(true); await load(); }
+    catch (e) {
+      if (alive.current) setError(e instanceof EndpointMissingError ? "Stop needs the next hosted browser update. Nothing was stopped." : (e as Error).message);
+    }
+    finally { if (alive.current) setStopping(false); }
+  }, [load]);
+
   const activeKind = active ? jobKind : null;
-  useEffect(() => { onStatus?.({ active: activeKind, blocked: startDisabledReason }); }, [onStatus, activeKind, startDisabledReason]);
+  const statusText = running ? String(running.status ?? "") || null : null;
+  const startedAt = running?.startedAt ?? null;
+  const liveCounts = running ? giCounts : null;
+  const cTotal = liveCounts?.total ?? null;
+  const cDone = liveCounts?.done ?? 0;
+  const cOk = liveCounts?.ok ?? 0;
+  const cFailed = liveCounts?.failed ?? 0;
+  const statusError = error ?? pauseNote;
+  const stopBusy = stopping || stopRequested;
+  useEffect(() => {
+    onStatus?.({
+      active: activeKind, blocked: startDisabledReason,
+      running: isRunning, queued, paused, statusText, startedAt,
+      counts: cTotal == null ? null : { total: cTotal, done: cDone, ok: cOk, failed: cFailed },
+      pauseLine, mine, error: statusError,
+      busy: { pause: toggling, stop: stopBusy },
+      pause, resume, stop,
+    });
+  }, [
+    onStatus, activeKind, startDisabledReason, isRunning, queued, paused, statusText, startedAt,
+    cTotal, cDone, cOk, cFailed, pauseLine, mine, statusError, toggling, stopBusy, pause, resume, stop,
+  ]);
 
   async function start() {
     setStarting(true); setError(null);
@@ -197,33 +275,13 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
     finally { if (alive.current) setStarting(false); }
   }
 
-  async function togglePause() {
-    setToggling(true); setError(null); setPauseNote(null);
-    try {
-      await (paused ? resumeErpPull() : pauseErpPull());
-      await load();
-    } catch (e) {
-      if (e instanceof EndpointMissingError) setPauseNote("Pause needs the next hosted browser update");
-      else setError((e as Error).message);
-    } finally { if (alive.current) setToggling(false); }
-  }
-
-  async function stop() {
-    setStopping(true); setError(null); setConfirmStop(false);
-    try { await stopErpPull(); setStopRequested(true); await load(); }
-    catch (e) {
-      setError(e instanceof EndpointMissingError ? "Stop needs the next hosted browser update. Nothing was stopped." : (e as Error).message);
-    }
-    finally { if (alive.current) setStopping(false); }
-  }
-
   const lastError = last && !last.ok
     ? ([...(last.log || [])].reverse().find((l) => l.level === "error")?.text || last.note || `The ${noun} failed.`)
     : null;
 
   const pauseButton = (
     <button
-      onClick={togglePause}
+      onClick={paused ? resume : pause}
       disabled={toggling || stopping || stopRequested}
       className={"px-3 py-1.5 rounded-lg ring-1 inline-flex items-center gap-1.5 text-sm font-medium disabled:opacity-50 shrink-0 "
         + (paused ? "bg-amber-500 text-white ring-amber-500 hover:bg-amber-600" : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")}
@@ -370,8 +428,8 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
               {watch ? "Hide live view" : "Watch live"}
             </button>
           ) : null}
-          <div className={"grid gap-3 " + (watch && mine ? "lg:grid-cols-[3fr_2fr]" : "")}>
-            {watch && mine ? (
+          <div className={"grid gap-3 " + (watch && mine && liveView ? "lg:grid-cols-[3fr_2fr]" : "")}>
+            {watch && mine && liveView ? (
               <div className={"h-[420px] rounded-lg overflow-hidden ring-1 bg-slate-900 " + (paused ? "ring-amber-300" : "ring-violet-200")}>
                 <HostedFreightPop key={running.requestId} target="invoicing" />
               </div>
@@ -511,27 +569,9 @@ function LastLog({ log, total, open, setOpen }: {
   );
 }
 
-/**
- * The log viewer for an invoicing job. ScrapeLog's own "Download full log"
- * link fetches the scrape session's log, so it is hidden here and replaced by
- * one that fetches the invoicing session's.
- */
+/** The log viewer for an invoicing job: its download fetches the invoicing session's log. */
 function LaneLog(props: React.ComponentProps<typeof ScrapeLog>) {
-  const [err, setErr] = useState<string | null>(null);
-  return (
-    <div className="min-w-0 [&_button[title*='unfiltered']]:hidden">
-      <ScrapeLog {...props} />
-      <div className="flex justify-end gap-2 text-[11px] text-slate-500 mt-0.5">
-        {err ? <span className="text-rose-600">{err}</span> : null}
-        <button
-          onClick={() => { setErr(null); downloadErpLog().catch((e) => setErr((e as Error).message)); }}
-          className="underline hover:text-slate-800"
-        >
-          Download full log
-        </button>
-      </div>
-    </div>
-  );
+  return <ScrapeLog {...props} onDownload={downloadErpLog} />;
 }
 
 function Note({ tone, children }: { tone: "warn" | "danger"; children: React.ReactNode }) {

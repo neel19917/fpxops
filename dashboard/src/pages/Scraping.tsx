@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Clock, ExternalLink, LogIn, Maximize2, Minimize2, MonitorPlay, Play, Square, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock, ExternalLink, LogIn, Maximize2, Minimize2, MonitorPlay, Pause, Play, Square, XCircle } from "lucide-react";
 import { api, type ScrapeRequest } from "../lib/api";
 import { hostedBrowser, type HostedStats, type ScrapeCounts, type FpTotals, type TaskSnapshot } from "../lib/hostedBrowser";
 import { FpTotalsTrend, FpBeforeAfter } from "../components/FpTotalsTrend";
@@ -52,6 +52,8 @@ export function ScrapingPage() {
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [pausing, setPausing] = useState(false); // a pause / resume request is in flight
+  const [pauseErr, setPauseErr] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [watch, setWatch] = useState(true);
@@ -86,7 +88,7 @@ export function ScrapingPage() {
   }, []);
 
   const isRunning = !!stats?.worker.current;
-  useEffect(() => { if (!isRunning) setFull(false); }, [isRunning]);
+  useEffect(() => { if (!isRunning) { setFull(false); setPauseErr(null); } }, [isRunning]);
   useEffect(() => {
     load();
     const id = setInterval(() => { if (document.visibilityState === "visible") load(); }, isRunning ? POLL_RUNNING_MS : POLL_MS);
@@ -107,6 +109,8 @@ export function ScrapingPage() {
   });
   useEffect(() => { try { localStorage.setItem("fpx.scrape.modes", JSON.stringify(modes)); } catch { /* ignore */ } }, [modes]);
   const running = worker?.current || null;
+  // Either field says so; an older service sends neither.
+  const paused = !!running && (running.paused === true || worker?.paused === true);
   const loggedIn = me?.freightpop?.loggedIn === true;
   const canStart = !!worker?.enabled && loggedIn && !running && !pending.length && !worker?.queued?.length && !starting;
 
@@ -124,6 +128,15 @@ export function ScrapingPage() {
     try { await hostedBrowser.stopScrape(); await load(); }
     catch (e) { setNotice((e as Error).message); }
     finally { setStopping(false); }
+  }
+
+  async function togglePause() {
+    setPausing(true); setPauseErr(null);
+    try {
+      if (paused) await hostedBrowser.resumeScrape(); else await hostedBrowser.pauseScrape();
+      await load();
+    } catch (e) { setPauseErr((e as Error).message); }
+    finally { setPausing(false); }
   }
 
   function openMyFreightPop() {
@@ -221,13 +234,25 @@ export function ScrapingPage() {
             ) : null}
           </div>
           {running ? (
-            <button
-              onClick={stop}
-              disabled={stopping}
-              className="px-4 py-2 rounded-lg ring-1 ring-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-50"
-            >
-              <Square className="h-4 w-4" /> {stopping ? "Stopping…" : "Stop"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={togglePause}
+                disabled={pausing || stopping}
+                title={paused ? "Carry on from where it paused" : "Pause this run. It resumes by itself after 30 minutes."}
+                className={"px-4 py-2 rounded-lg ring-1 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-50 "
+                  + (paused ? "ring-amber-300 bg-amber-100 text-amber-900 hover:bg-amber-200" : "ring-slate-200 bg-white text-slate-700 hover:bg-slate-50")}
+              >
+                {paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+                {pausing ? (paused ? "Resuming…" : "Pausing…") : paused ? "Resume" : "Pause"}
+              </button>
+              <button
+                onClick={stop}
+                disabled={stopping}
+                className="px-4 py-2 rounded-lg ring-1 ring-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-50"
+              >
+                <Square className="h-4 w-4" /> {stopping ? "Stopping…" : "Stop"}
+              </button>
+            </div>
           ) : (
             <div className="flex items-center gap-3 flex-wrap justify-end">
             <div className="grid grid-cols-[auto_auto_auto] items-center gap-x-2 gap-y-1.5">
@@ -254,11 +279,21 @@ export function ScrapingPage() {
         </div>
 
         {running ? (
-          <div className="rounded-xl bg-violet-50 ring-1 ring-violet-200 p-4 space-y-2">
+          <div className={"rounded-xl ring-1 p-4 space-y-2 " + (paused ? "bg-amber-50 ring-amber-300" : "bg-violet-50 ring-violet-200")}>
+            {pauseErr ? (
+              <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 text-rose-800 text-sm px-3 py-2 flex items-start gap-2">
+                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" /> <span className="break-words">{pauseErr}</span>
+              </div>
+            ) : null}
+            {paused ? (
+              <div className="rounded-lg bg-amber-100 ring-1 ring-amber-300 text-amber-900 text-sm font-medium px-3 py-2 flex items-center gap-2">
+                <Pause className="h-4 w-4 shrink-0" /> Paused — resumes by itself after 30 minutes
+              </div>
+            ) : null}
             <div className="flex items-center justify-between gap-3 text-sm">
               <span className="font-medium text-violet-900 inline-flex items-center gap-2">
-                <span className="h-2 w-2 rounded-full bg-violet-500 animate-pulse" />
-                {running.source === "schedule" ? `Scheduled run${running.scheduleName ? ` "${running.scheduleName}"` : ""}` : "Running"}
+                <span className={"h-2 w-2 rounded-full " + (paused ? "bg-amber-500" : "bg-violet-500 animate-pulse")} />
+                {running.source === "schedule" ? `Scheduled run${running.scheduleName ? ` "${running.scheduleName}"` : ""}` : paused ? "Paused" : "Running"}
                 {running.user !== me?.user ? <span className="font-normal text-violet-700">for {running.user}</span> : null}
               </span>
               <span className="text-violet-800 tabular-nums">
@@ -289,8 +324,9 @@ export function ScrapingPage() {
                 <div className="flex items-center justify-between gap-3 text-sm text-slate-200">
                   <div className="min-w-0">
                     <div className="font-medium inline-flex items-center gap-2">
-                      <span className="h-2 w-2 rounded-full bg-violet-400 animate-pulse" />
+                      <span className={"h-2 w-2 rounded-full " + (paused ? "bg-amber-400" : "bg-violet-400 animate-pulse")} />
                       {running.source === "schedule" ? `Scheduled run${running.scheduleName ? ` "${running.scheduleName}"` : ""}` : "Refresh All"} · {fmtDuration(since(running.startedAt, now))}
+                      {paused ? <span className="text-amber-300">· Paused, resumes by itself after 30 minutes</span> : null}
                     </div>
                     <div className="text-xs text-slate-400 truncate">{running.status}</div>
                     <div className="mt-1 max-w-md [&_*]:!text-slate-300"><ProgressBar processed={running.counts?.processed ?? 0} total={running.total ?? null} startedAt={running.startedAt} now={now} /></div>

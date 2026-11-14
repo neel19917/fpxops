@@ -23,8 +23,12 @@ export interface HostedWorkerState {
   enabled: boolean;
   reason: string | null;
   pollSeconds: number;
+  /** The scrape lane is paused. Absent on an older service. */
+  paused?: boolean;
   current: { requestId: string; user: string; scope: string; source?: "manual" | "schedule"; scheduleName?: string | null; startedAt: string; status: string; statusAt: string; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null; total?: number | null;
-    fpCounts?: Record<string, number> | null; fpCountsAt?: string | null } | null;
+    fpCounts?: Record<string, number> | null; fpCountsAt?: string | null;
+    /** The run is paused (a pause resumes by itself after 30 minutes). Absent on an older service. */
+    paused?: boolean } | null;
   lastResult: { requestId: string; user: string; ok: boolean; note: string; finishedAt: string; durationMs: number; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null } | null;
 }
 
@@ -145,13 +149,31 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    if (body?.error) throw new Error(`Hosted browser: ${body.error}`);
+    if (body?.error) throw new HostedBrowserError(`Hosted browser: ${body.error}`, res.status);
     // A bare 404 means the hosted browser is running an older version that
     // doesn't have this endpoint yet (e.g. mid-rollout).
-    if (res.status === 404) throw new Error("The hosted browser hasn't been updated with this feature yet — try again after its next deploy.");
-    throw new Error(`Hosted browser returned ${res.status}`);
+    if (res.status === 404) throw new HostedBrowserError("The hosted browser hasn't been updated with this feature yet — try again after its next deploy.", res.status);
+    throw new HostedBrowserError(`Hosted browser returned ${res.status}`, res.status);
   }
   return res.json() as Promise<T>;
+}
+
+/** A failed call to the hosted browser, with the HTTP status it answered with. */
+export class HostedBrowserError extends Error {
+  status: number;
+  constructor(message: string, status: number) { super(message); this.name = "HostedBrowserError"; this.status = status; }
+}
+
+// Pause / resume the running scrape. An older service has no such endpoint and
+// answers 404 or 405.
+export const PAUSE_NEEDS_UPDATE = "Pause needs the next hosted browser update";
+async function setScrapePaused(action: "pause" | "resume") {
+  try {
+    return await call<{ ok: boolean; paused: boolean; lane: HostedLane }>(`/scrape/${action}?lane=scrape`, { method: "POST" });
+  } catch (e) {
+    if (e instanceof HostedBrowserError && (e.status === 404 || e.status === 405)) throw new Error(PAUSE_NEEDS_UPDATE);
+    throw e;
+  }
 }
 
 // "Ask FPX" assistant (browser-service/src/assistant.js).
@@ -263,6 +285,9 @@ export const hostedBrowser = {
   enabled: !!HOSTED_BROWSER_URL,
   stats: (days = 30) => call<HostedStats>(`/stats?days=${days}`),
   stopScrape: () => call<{ stopping: boolean }>("/scrape/stop", { method: "POST" }),
+  /** Pause the running scrape; it resumes by itself after 30 minutes. */
+  pauseScrape: () => setScrapePaused("pause"),
+  resumeScrape: () => setScrapePaused("resume"),
   pipeline: () => call<{
     scrape: { running: boolean | null; lastRun: { startedAt: string; finishedAt: string; ok: boolean; saved: number | null; note: string } | null };
     assistant: { index: { at: number; ok: boolean; rows: number; ms: number }; embeddings: { running: boolean; at: number; embedded: number; lastError: string | null } } | null;

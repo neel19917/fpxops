@@ -15,7 +15,7 @@ import { ErpPullMonitor, type ErpMonitorStatus } from "../components/ErpPullMoni
 import { ErrorBlock } from "../components/ErrorBlock";
 import { GetInvoiceModal, type GetInvoiceItem } from "../components/GetInvoiceModal";
 import { BucketCards, BucketCardsSkeleton, type BucketCard } from "../components/invoicing/BucketCards";
-import { Counted, MenuAction, MoreMenu, ProgressStrip, Segmented, SelectionBar, type StepState } from "../components/invoicing/Controls";
+import { Counted, MenuAction, MoreMenu, ProgressStrip, Segmented, SelectionBar, type StepState, type StripControls } from "../components/invoicing/Controls";
 import { ShipmentTable } from "../components/invoicing/ShipmentTable";
 import { ago, byCharge, dayLabel, plural, sumCharge, toRow, type BucketKey, type Row } from "../components/invoicing/model";
 
@@ -266,6 +266,10 @@ export function InvoicingPage() {
   // press Resume, so its live session opens by itself. A refresh needs nobody:
   // its session stays folded behind the strip.
   useEffect(() => { if (activeKind === "get_invoice") setMonitorOpen(true); }, [activeKind]);
+  // Whenever a job pauses itself to wait for a person, the live view opens
+  // (again, if it was folded away): it is what the person has to look at.
+  const pauseLine = monitor?.pauseLine ?? null;
+  useEffect(() => { if (pauseLine) setMonitorOpen(true); }, [pauseLine]);
 
   const busy = !!activeKind || chainRunning || !!starting;
   const blocked = busy ? "A FreightPOP job is already queued or running. Wait for it to finish."
@@ -425,8 +429,31 @@ export function InvoicingPage() {
     : chain?.state === "failed" ? "failed" as const
     : chain?.state === "stopped" ? "stopped" as const
     : "done" as const;
+  // Pause / Resume and Stop sit on the strip itself while the session is working on the job.
+  const jobRunning = !!monitor?.running && !!activeKind;
+  const stripControls: StripControls | null = monitor && jobRunning ? {
+    paused: monitor.paused,
+    pauseLine: monitor.pauseLine,
+    busy: monitor.busy,
+    error: monitor.error,
+    stopQuestion: activeKind === "get_invoice" ? "Stop the invoice run? Shipments already done stay done; the rest are left untouched."
+      : activeKind === "approval_check" ? "Stop the approval check? The list keeps what the last check found."
+      : "Stop the pull? Rows pulled so far may not be saved, and approvals will not be checked.",
+    stopLabel: activeKind === "get_invoice" ? "Stop the invoice run" : activeKind === "approval_check" ? "Stop the approval check" : "Stop the pull",
+    onPause: () => { void monitor.pause(); },
+    onResume: () => { void monitor.resume(); },
+    onStop: () => { void monitor.stop(); },
+  } : null;
+  const counts = jobRunning ? monitor?.counts ?? null : null;
+  const stripProgress = counts ? `${fmtNum(counts.done)} of ${fmtNum(counts.total)} · ${fmtNum(counts.ok)} done · ${fmtNum(counts.failed)} failed` : null;
+  // The approval check waits on FreightPOP's Audit History search, which is slow: say so, and count the time.
+  const approvalsWorking = jobRunning && activeKind === "approval_check";
+  const startedMs = approvalsWorking && monitor?.startedAt ? Date.parse(monitor.startedAt) : NaN;
   const stripText = stripTone === "done" ? "Done. The lists below are up to date."
     : stripTone !== "working" ? (chain?.message ?? "")
+    : jobRunning && monitor?.busy.stop ? "Stopping…"
+    // The job's own latest step line, once it has one.
+    : jobRunning && monitor?.statusText ? monitor.statusText
     : invoiceRun ? "Pressing Get Invoice in FreightPOP on the shipments you picked, one at a time. It pauses after the first one for you to check."
     : step1 === "running" ? "Reading FreightPOP's History Report in the invoicing session…"
     : step2 === "running" ? "Reading Recently Approved and History in the invoicing session…"
@@ -555,7 +582,7 @@ export function InvoicingPage() {
               ) : null}
               <MenuAction
                 title={monitorOpen ? "Hide the invoicing session" : "Show the invoicing session"}
-                hint="The live view of FPX working in FreightPOP, with its log, Pause and Stop."
+                hint="The live view of FPX working in FreightPOP, with its log."
                 onClick={() => setMonitorOpen((v) => !v)}
               />
             </div>
@@ -580,13 +607,19 @@ export function InvoicingPage() {
           expanded={monitorOpen}
           onToggle={() => setMonitorOpen((v) => !v)}
           onDismiss={stripTone === "working" ? undefined : () => putChain(null)}
+          controls={stripControls}
+          progress={stripProgress}
+          hint={approvalsWorking ? "FreightPOP's history search usually takes 2–5 minutes." : null}
+          since={Number.isFinite(startedMs) ? startedMs : null}
         />
       ) : null}
 
-      {/* Live view, log, Pause / Resume / Stop. Stays mounted even when folded
-          away: it is also what tells this page that a job is under way or has ended. */}
+      {/* Live view and log. Stays mounted even when folded away: it is also what
+          tells this page that a job is under way or has ended, and what the
+          strip's Pause / Resume / Stop act through. Folded away, it does not
+          load the live view. */}
       <div className={monitorOpen ? "" : "hidden"}>
-        <ErpPullMonitor key={monitorKey} onFinished={onOpenAudit} onSettled={onSettled} started={started} onStatus={setMonitor} />
+        <ErpPullMonitor key={monitorKey} onFinished={onOpenAudit} onSettled={onSettled} started={started} onStatus={setMonitor} liveView={monitorOpen} />
       </div>
 
       {loadError ? (

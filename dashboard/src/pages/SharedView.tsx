@@ -116,7 +116,7 @@ export function SharedViewPage({ token }: Props) {
       <main className="max-w-[1200px] mx-auto p-6">
         {meta.resource_type === "shipment"      && <SharedShipment data={data as { shipment: Shipment; analyses: AiAnalysis[] }} />}
         {meta.resource_type === "gp_audit"      && <SharedGp data={data as { run: GpAudit; rows: GpAuditRow[] }} />}
-        {meta.resource_type === "invoice_audit" && <SharedInv data={data as { run: InvoiceAudit; rows: InvoiceAuditRow[] }} />}
+        {meta.resource_type === "invoice_audit" && <SharedInv data={data as SharedInvData} />}
         {meta.resource_type === "analysis"      && <SharedAnalysis data={data as { analysis: AiAnalysis }} />}
       </main>
     </div>
@@ -322,7 +322,153 @@ function SharedGp({ data }: { data: { run: GpAudit; rows: GpAuditRow[] } }) {
   );
 }
 
-function SharedInv({ data }: { data: { run: InvoiceAudit; rows: InvoiceAuditRow[] } }) {
+// What /share/:token sends for an invoice audit. total_rows / truncated come
+// from newer servers; approved_count only for an ERP pull.
+interface SharedInvData {
+  run: InvoiceAudit;
+  rows: InvoiceAuditRow[];
+  total_rows?: number | null;
+  truncated?: boolean;
+  approved_count?: number | null;
+}
+
+const ERP_PAGE_SIZE = 200;
+const ERP_STATUS: Record<string, { label: string; cls: string }> = {
+  match: { label: "Match", cls: "bg-emerald-100 text-emerald-700" },
+  discrepancy: { label: "Discrepancy", cls: "bg-rose-100 text-rose-700" },
+  no_invoice: { label: "No invoice yet", cls: "bg-slate-100 text-slate-700" },
+  error: { label: "Error", cls: "bg-amber-100 text-amber-800" },
+};
+
+// Dollars with cents. The History Report can hand a number over as text.
+function fmtMoney(v: number | string | null | undefined): string {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = typeof v === "number" ? v : Number(String(v).replace(/[$,\s]/g, ""));
+  if (!Number.isFinite(n)) return String(v);
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+
+// A plain "2026-11-03" is parsed as UTC and would show as the day before in
+// US time zones, so pin it to local midnight.
+function fmtDay(s: string | null | undefined): string {
+  if (!s) return "—";
+  return fmtDate(/^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T00:00:00` : s);
+}
+
+// Read-only table for a shared ERP pull: ranked by charge, 200 rows at a time.
+function SharedErpPull({ data }: { data: SharedInvData }) {
+  const [shown, setShown] = useState(ERP_PAGE_SIZE);
+  const { run, rows } = data;
+  const total = data.total_rows ?? run.total_rows ?? rows.length;
+  const visible = rows.slice(0, shown);
+  const left = rows.length - visible.length;
+  return (
+    <div className="bg-white rounded-2xl ring-1 ring-slate-200 p-6">
+      <h2 className="text-lg font-semibold flex items-center gap-2"><ReceiptText className="h-5 w-5 text-amber-600" /> ERP pull</h2>
+      <p className="text-sm text-slate-500 mt-0.5">Shipments not yet exported to ERP, highest charge first.</p>
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mt-3 text-sm">
+        <Stat label="Date range" value={`${fmtDay(run.date_from)} → ${fmtDay(run.date_to)}`} />
+        <Stat label="Shipments" value={fmtNum(total)} />
+        <Stat label="Match" value={fmtNum(run.match_count)} />
+        <Stat label="Discrepancy" value={fmtNum(run.discrepancy_count)} />
+        <Stat label="No invoice yet" value={fmtNum(run.unmatched_count)} />
+        {data.approved_count != null ? <Stat label="Approved" value={fmtNum(data.approved_count)} /> : null}
+      </div>
+      {data.truncated ? (
+        <div className="mt-4 rounded-lg bg-amber-50 ring-1 ring-amber-200 px-3 py-2 text-sm text-amber-900 flex items-start gap-2">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+          <span>
+            This pull has {fmtNum(total)} shipments. A shared link shows the {fmtNum(rows.length)} with the highest charge;
+            the rest are not on this page.
+          </span>
+        </div>
+      ) : null}
+      {run.exec_summary ? (
+        <pre className="mt-4 text-xs bg-slate-50 ring-1 ring-slate-200 p-3 rounded-lg whitespace-pre-wrap">{run.exec_summary}</pre>
+      ) : null}
+      <h3 className="text-sm font-semibold mt-5 mb-2">
+        Showing {fmtNum(visible.length)} of {fmtNum(rows.length)} shipments
+      </h3>
+      <div className="overflow-x-auto rounded-lg ring-1 ring-slate-200">
+        <table className="min-w-full text-sm">
+          <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-3 py-2 text-right font-medium">Rank</th>
+              <th className="px-3 py-2 text-left font-medium">Shipment</th>
+              <th className="px-3 py-2 text-left font-medium">Customer</th>
+              <th className="px-3 py-2 text-left font-medium">Carrier</th>
+              <th className="px-3 py-2 text-left font-medium">Shipped</th>
+              <th className="px-3 py-2 text-right font-medium">Charge</th>
+              <th className="px-3 py-2 text-right font-medium">Cost</th>
+              <th className="px-3 py-2 text-right font-medium">Invoice amount</th>
+              <th className="px-3 py-2 text-right font-medium">Difference</th>
+              <th className="px-3 py-2 text-left font-medium">Status</th>
+              <th className="px-3 py-2 text-left font-medium">Approved by</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {visible.map((r) => {
+              const raw = r.raw || {};
+              const st = ERP_STATUS[r.status || ""];
+              const approval = raw.approval || null;
+              const flags = Array.isArray(raw.flags) ? raw.flags : [];
+              const diff = r.difference;
+              return (
+                <tr key={r.id} className="align-top">
+                  <td className="px-3 py-2 text-right tabular-nums text-slate-500">{raw.rank ?? "—"}</td>
+                  <td className="px-3 py-2 font-medium whitespace-nowrap">{r.shipment_id || "—"}</td>
+                  <td className="px-3 py-2">{r.customer_name || "—"}</td>
+                  <td className="px-3 py-2">{r.carrier || "—"}</td>
+                  <td className="px-3 py-2 whitespace-nowrap">{fmtDay(raw.shipped_date)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(raw.charge)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(r.shipment_cost)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(r.bill_amount)}</td>
+                  <td className={"px-3 py-2 text-right tabular-nums " + (diff != null && Math.abs(diff) > 0.01 ? "text-rose-700" : "")}>
+                    {fmtMoney(diff)}
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className={"inline-block rounded-full px-2 py-0.5 text-xs font-medium whitespace-nowrap " + (st?.cls || "bg-slate-100 text-slate-700")}>
+                      {st?.label || r.status || "—"}
+                    </span>
+                    {flags.length > 0 ? <div className="mt-1 text-xs text-slate-500">{flags.join(" · ")}</div> : null}
+                  </td>
+                  <td className="px-3 py-2">
+                    {approval?.status === "approved" ? (
+                      <>
+                        <div>{approval.approved_by || (approval.approved_by_kind === "edi" ? "EDI" : "Approved")}</div>
+                        {approval.approved_at ? <div className="text-xs text-slate-500">{fmtDay(approval.approved_at)}</div> : null}
+                      </>
+                    ) : approval ? (
+                      <span className="text-slate-500">Not approved</span>
+                    ) : (
+                      <span className="text-slate-400">—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {rows.length === 0 ? (
+              <tr><td colSpan={11} className="px-3 py-6 text-center text-slate-500">No shipments in this pull.</td></tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+      {left > 0 ? (
+        <div className="mt-3 flex justify-center">
+          <button
+            onClick={() => setShown((n) => n + ERP_PAGE_SIZE)}
+            className="px-4 py-2 text-sm font-medium rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+          >
+            Show more ({fmtNum(Math.min(ERP_PAGE_SIZE, left))} of {fmtNum(left)} left)
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SharedInv({ data }: { data: SharedInvData }) {
+  if (data.run.shipment_type === "erp_pending") return <SharedErpPull data={data} />;
   return (
     <div className="bg-white rounded-2xl ring-1 ring-slate-200 p-6">
       <h2 className="text-lg font-semibold flex items-center gap-2"><ReceiptText className="h-5 w-5 text-amber-600" /> Invoice Audit</h2>
@@ -334,6 +480,11 @@ function SharedInv({ data }: { data: { run: InvoiceAudit; rows: InvoiceAuditRow[
       </div>
       {data.run.exec_summary ? (
         <pre className="mt-4 text-xs bg-slate-50 ring-1 ring-slate-200 p-3 rounded-lg whitespace-pre-wrap">{data.run.exec_summary}</pre>
+      ) : null}
+      {data.truncated ? (
+        <div className="mt-4 text-sm text-amber-800">
+          This audit has {fmtNum(data.total_rows ?? data.run.total_rows)} rows. A shared link shows the first {fmtNum(data.rows.length)}.
+        </div>
       ) : null}
       <h3 className="text-sm font-semibold mt-5 mb-2">Rows ({data.rows.length})</h3>
       <div className="divide-y divide-slate-100">
