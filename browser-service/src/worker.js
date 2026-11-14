@@ -1420,19 +1420,19 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId, histOnly) {
   let approvedDone = !!histOnly; // the page is past Recently Approved
   let pageError = null;
   // FreightPOP's History search fails (rate limit) on more than ~3 months:
-  // the range is searched in windows of at most 90 days, newest first.
+  // the range is searched in windows of at most 30 days, newest first (a 3-month window has failed).
   const historyRanges = [];
   {
     const d = (v) => new Date(+v.slice(6, 10), +v.slice(0, 2) - 1, +v.slice(3, 5));
     const start = d(range.from);
     let end = d(range.to);
     while (end >= start && historyRanges.length < 12) {
-      let from = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 89);
+      let from = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 29);
       if (from < start) from = start;
       historyRanges.push([mdy(from), mdy(end)]);
       end = new Date(from.getFullYear(), from.getMonth(), from.getDate() - 1);
     }
-    if (historyRanges.length > 1) logLine(lane, `History is searched in ${historyRanges.length} windows of up to 90 days: ${historyRanges.map((w) => `${w[0]}–${w[1]}`).join(", ")}`);
+    if (historyRanges.length > 1) logLine(lane, `History is searched in ${historyRanges.length} windows of up to 30 days: ${historyRanges.map((w) => `${w[0]}–${w[1]}`).join(", ")}`);
   }
   const call = (resumed) => `erpApprovalCheck(${JSON.stringify(String(who))}, ${resumed}, ${JSON.stringify({ historyRanges, historyFrom: range.from, historyTo: range.to, skipApproved: approvedDone && (resumed || !!histOnly) })}); 'started'`;
   let note;
