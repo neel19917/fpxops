@@ -1086,7 +1086,28 @@ async function runErpIn(lane, browser, url, who, months, shipmentType) {
           let send = rows;
           const fromExcel = !excelFailed && excelRows.length ? notExportedSorted(excelRows) : null;
           if (fromExcel && !fromExcel.error && !body.audit_id) {
-            send = fromExcel.rows;
+            // FreightPOP's Excel export leaves some columns blank that the
+            // report on screen has (the approved invoice amounts and dates).
+            // The saved file stays exactly as FreightPOP wrote it; the audit
+            // takes those values from the screen rows of the same shipment.
+            const rowKey = (r) => `${String(r["ShipmentID"] ?? "").trim()}|${String(r["Tracking"] ?? "").trim()}`;
+            const onScreen = new Map(rows.map((r) => [rowKey(r), r]));
+            let filledRows = 0;
+            send = fromExcel.rows.map((r) => {
+              const scr = onScreen.get(rowKey(r));
+              if (!scr) return r;
+              let out = r;
+              for (const [k, v] of Object.entries(scr)) {
+                const has = out[k] !== undefined && out[k] !== null && String(out[k]).trim() !== "";
+                if (!has && v !== undefined && v !== null && String(v).trim() !== "") {
+                  if (out === r) out = { ...r };
+                  out[k] = v;
+                }
+              }
+              if (out !== r) filledRows++;
+              return out;
+            });
+            if (filledRows) logLine(lane, `Filled in values the Excel export leaves blank (approved invoice amounts and dates) from the report on screen · ${filledRows.toLocaleString("en-US")} shipments`);
             usedExcel = true;
             if (body.run) body.run.total_report_rows = excelRows.length;
             logLine(lane, `Source: FreightPOP Excel export · ${excelRows.length.toLocaleString("en-US")} rows · ${send.length.toLocaleString("en-US")} not exported to ERP` +
