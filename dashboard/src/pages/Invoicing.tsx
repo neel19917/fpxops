@@ -1,136 +1,41 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { AlertTriangle, Check, ChevronRight, FileText, Loader2, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
+import { RefreshCw, Search } from "lucide-react";
 import { api, type ScrapeRequest } from "../lib/api";
 import { hostedBrowser } from "../lib/hostedBrowser";
 import {
   APPROVAL_SCOPE, ERP_MONTH_CHOICES, ERP_TYPE_CHOICES, GET_INVOICE_MAX,
-  approvalDate, approvalGroup, asApprovalResult, asPullResult, erpWorker, getInvoiceLabel, isErpRequest,
-  requestApprovalCheck, requestErpPull, toApprovalState,
-  type ApprovalGroup, type ErpMonths, type ErpShipmentType,
+  asApprovalResult, asPullResult, downloadAuditExcel, erpWorker, isErpRequest,
+  requestApprovalCheck, requestErpPull,
+  type ErpMonths, type ErpShipmentType,
 } from "../lib/erpPull";
-import { fmtDateTime, fmtNum } from "../lib/format";
-import type { ApprovalState, GetInvoiceState, InvoiceAudit, InvoiceAuditDetail, InvoiceAuditRow } from "../lib/types";
+import { fmtNum } from "../lib/format";
+import type { InvoiceAudit, InvoiceAuditDetail } from "../lib/types";
 import { ErpPullMonitor, type ErpMonitorStatus } from "../components/ErpPullMonitor";
 import { ErrorBlock } from "../components/ErrorBlock";
-import { ApprovalPill, GetInvoiceModal, InvoicePill, type GetInvoiceItem } from "../components/GetInvoiceModal";
-import { LoadingState } from "../components/LoadingState";
+import { GetInvoiceModal, type GetInvoiceItem } from "../components/GetInvoiceModal";
+import { BucketCards, BucketCardsSkeleton, type BucketCard } from "../components/invoicing/BucketCards";
+import { Counted, MenuAction, MoreMenu, ProgressStrip, Segmented, SelectionBar, type StepState } from "../components/invoicing/Controls";
+import { ShipmentTable } from "../components/invoicing/ShipmentTable";
+import { ago, byCharge, dayLabel, plural, sumCharge, toRow, type BucketKey, type Row } from "../components/invoicing/model";
 
 // Invoicing: one simple page for the person who sends invoices. It shows the
-// latest list of shipments not yet exported to ERP in three plain groups:
-// ready to invoice (approved in FreightPOP), waiting on approval, and invoice
-// sent. One button refreshes both FreightPOP reads back to back in the hosted
-// browser. The detailed table stays on Invoice Audits.
+// latest list of shipments not yet exported to ERP in three buckets: approved
+// (ready to invoice), not approved, and invoice sent. The bucket rules are in
+// components/invoicing/model.ts. One button refreshes both FreightPOP reads
+// back to back in the hosted browser. The detailed table stays on Invoice Audits.
 
 const PAGE_SIZE = 200;
 const REFRESH_MS = 10_000;
 const CHAIN_KEY = "fpx.invoicing.refresh";
 const CHAIN_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 
-type TabKey = "ready" | "waiting" | "sent";
-const TAB_KEYS: readonly TabKey[] = ["ready", "waiting", "sent"];
-type ReadyFilter = "all" | "edi" | "shaun" | "others";
-type SentFilter = "done" | "requested" | "failed";
-
-// ── Rows ──
-
-interface Row {
-  id: string;
-  shipment: string;
-  customer: string;
-  carrier: string;
-  shippedTs: number | null;
-  shippedText: string;
-  charge: number | null;
-  invoice: number | null;
-  status: string;
-  flags: string[];
-  ap: ApprovalState | null;
-  apGroup: ApprovalGroup | null;
-  gi: GetInvoiceState | null;
-  search: string;
-}
-
-// FreightPOP's report values can be numbers or text ("$1,234.50", "(12.00)").
-function toNum(v: unknown): number | null {
-  if (v == null || v === "") return null;
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  const text = String(v).trim();
-  const negative = /^\(.*\)$/.test(text);
-  const n = Number(text.replace(/[$,\s()]/g, ""));
-  if (text === "" || !Number.isFinite(n)) return null;
-  return negative ? -n : n;
-}
-
-// A date-only string is UTC midnight, which shows as the day before in US time zones.
-function toDate(s: string | null | undefined): Date | null {
-  if (!s) return null;
-  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T00:00:00` : s);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-function dayLabel(s: string | null | undefined, withYear = false): string {
-  const d = toDate(s);
-  if (!d) return s ? String(s) : "";
-  return d.toLocaleDateString(undefined, withYear ? { month: "short", day: "numeric", year: "numeric" } : { month: "short", day: "numeric" });
-}
-
-function toInvoiceState(v: unknown): GetInvoiceState | null {
-  if (!v || typeof v !== "object") return null;
-  const state = v as GetInvoiceState;
-  return typeof state.status === "string" && getInvoiceLabel(state.status) ? state : null;
-}
-
-function toRow(row: InvoiceAuditRow): Row {
-  const raw = row.raw ?? {};
-  const shipment = row.shipment_id ?? "";
-  const customer = row.customer_name ?? "";
-  const carrier = row.carrier ?? "";
-  const shipped = raw.shipped_date ? String(raw.shipped_date) : null;
-  const ap = toApprovalState(raw.approval);
-  return {
-    id: row.id,
-    shipment, customer, carrier,
-    shippedTs: toDate(shipped)?.getTime() ?? null,
-    shippedText: shipped ? dayLabel(shipped, true) : "",
-    charge: toNum(raw.charge),
-    invoice: toNum(row.bill_amount),
-    status: row.status ?? "",
-    flags: Array.isArray(raw.flags) ? raw.flags.map(String) : [],
-    ap,
-    apGroup: approvalGroup(ap),
-    gi: toInvoiceState(raw.get_invoice),
-    search: `${shipment} ${customer} ${carrier}`.toLowerCase(),
-  };
-}
-
-// The three lists. A shipment is in at most one of ready / waiting / sent.
-const isApproved = (r: Row) => r.ap?.status === "approved";
-const isReady = (r: Row) => isApproved(r) && r.gi?.status !== "done" && r.gi?.status !== "requested";
-const isWaiting = (r: Row) => !isApproved(r) && r.gi?.status !== "done" && r.gi?.status !== "requested";
-const isSent = (r: Row) => r.gi?.status === "done";
-const isRequested = (r: Row) => r.gi?.status === "requested";
-const isFailed = (r: Row) => r.gi?.status === "failed";
-
-const byCharge = (a: Row, b: Row) => (b.charge ?? -Infinity) - (a.charge ?? -Infinity) || a.shipment.localeCompare(b.shipment);
-const sumCharge = (rows: Row[]) => rows.reduce((t, r) => t + (r.charge ?? 0), 0);
-
-function fmtMoney(n: number | null): string {
-  if (n == null) return "—";
-  return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
-}
-
-function ago(s: string | null | undefined, now: number): string {
-  const t = s ? Date.parse(s) : NaN;
-  if (!Number.isFinite(t)) return "";
-  const min = Math.max(0, Math.round((now - t) / 60_000));
-  if (min < 1) return "just now";
-  if (min < 60) return `${min} min ago`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr} hr ago`;
-  const day = Math.round(hr / 24);
-  return `${day} ${day === 1 ? "day" : "days"} ago`;
-}
+const BUCKETS: readonly BucketKey[] = ["approved", "not-approved", "sent"];
+// Links made before the buckets were renamed still open the right one.
+const OLD_TABS: Record<string, BucketKey> = { ready: "approved", waiting: "not-approved" };
+type ApprovedFilter = "all" | "shaun" | "edi" | "person" | "none" | "failed";
+type WaitingFilter = "received" | "none";
+type SentFilter = "done" | "requested";
 
 // The audit result of each shipment, in the words the review step uses.
 const AUDIT_STATUS: Record<string, { label: string; cls: string }> = {
@@ -190,60 +95,6 @@ async function jobOutcome(requestId: string): Promise<Outcome | null> {
   return { ok: r.status === "done", stopped: /^stopped/i.test(note), note, auditId: null };
 }
 
-type StepState = "idle" | "queued" | "running" | "done" | "failed" | "stopped" | "skipped";
-
-function Step({ n, title, state, detail }: { n: number; title: string; state: StepState; detail: string }) {
-  const live = state === "running" || state === "queued";
-  const bubble = state === "done" ? "bg-emerald-600 text-white"
-    : live ? "bg-violet-600 text-white"
-    : state === "failed" ? "bg-rose-600 text-white"
-    : state === "stopped" ? "bg-amber-500 text-white"
-    : "bg-slate-100 text-slate-500";
-  return (
-    <div className="flex items-start gap-3 min-w-0 flex-1" aria-current={live ? "step" : undefined}>
-      <span className={"h-7 w-7 shrink-0 rounded-full inline-flex items-center justify-center text-sm font-semibold " + bubble}>
-        {state === "done" ? <Check className="h-4 w-4" /> : live ? <Loader2 className="h-4 w-4 animate-spin" /> : state === "failed" ? <X className="h-4 w-4" /> : n}
-      </span>
-      <div className="min-w-0">
-        <div className={"text-sm font-medium " + (state === "skipped" ? "text-slate-400" : "text-slate-900")}>{title}</div>
-        <div className={"text-xs mt-0.5 break-words " + (state === "failed" ? "text-rose-700" : state === "stopped" ? "text-amber-800" : "text-slate-500")}>{detail}</div>
-      </div>
-    </div>
-  );
-}
-
-function Segmented<T extends string | number>({ label, value, choices, onPick, disabled }: {
-  label: string; value: T; choices: readonly (readonly [T, string])[]; onPick: (v: T) => void; disabled?: boolean;
-}) {
-  return (
-    <div className="inline-flex rounded-lg ring-1 ring-slate-200 overflow-hidden" role="group" aria-label={label}>
-      {choices.map(([id, text]) => (
-        <button
-          key={String(id)}
-          onClick={() => onPick(id)}
-          disabled={disabled}
-          aria-pressed={value === id}
-          className={"px-2.5 py-1.5 text-xs font-medium " + (value === id ? "bg-violet-600 text-white" : "bg-white text-slate-700 hover:bg-slate-50")}
-        >
-          {text}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function Chip({ on, onClick, children }: { on: boolean; onClick: () => void; children: ReactNode }) {
-  return (
-    <button
-      onClick={onClick}
-      aria-pressed={on}
-      className={"px-3 py-1 rounded-full text-xs font-medium ring-1 whitespace-nowrap " + (on ? "bg-slate-900 text-white ring-slate-900" : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50")}
-    >
-      {children}
-    </button>
-  );
-}
-
 const MONTH_CHOICES = ERP_MONTH_CHOICES.map((m) => [m, `${m} ${m === 1 ? "month" : "months"}`] as const);
 
 // ── Page ──
@@ -252,8 +103,8 @@ export function InvoicingPage() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const tabParam = params.get("tab");
-  const tab: TabKey = TAB_KEYS.find((t) => t === tabParam) ?? "ready";
-  const setTab = useCallback((t: TabKey) => {
+  const tab: BucketKey = BUCKETS.find((t) => t === tabParam) ?? OLD_TABS[tabParam ?? ""] ?? "approved";
+  const setTab = useCallback((t: BucketKey) => {
     setParams((p) => { const n = new URLSearchParams(p); n.set("tab", t); return n; }, { replace: true });
   }, [setParams]);
 
@@ -266,11 +117,10 @@ export function InvoicingPage() {
   const [monitorKey, setMonitorKey] = useState(0);
   const [monitorOpen, setMonitorOpen] = useState(false);
   const [started, setStarted] = useState<{ requestId: string; auditId: string; kind: "get_invoice" | "approval_check" } | null>(null);
-  const monitorWrap = useRef<HTMLDivElement>(null);
 
   const [months, setMonths] = useState<ErpMonths>(3);
   const [shipType, setShipType] = useState<ErpShipmentType>("non-parcel");
-  const [optionsOpen, setOptionsOpen] = useState(false);
+  const [excel, setExcel] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
   const [starting, setStarting] = useState<"refresh" | "approvals" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -286,8 +136,9 @@ export function InvoicingPage() {
   }, []);
 
   const [query, setQuery] = useState("");
-  const [readyFilter, setReadyFilter] = useState<ReadyFilter>("all");
-  const [sentFilter, setSentFilter] = useState<SentFilter>("done");
+  const [approvedFilter, setApprovedFilter] = useState<ApprovedFilter>("all");
+  const [waitingPick, setWaitingPick] = useState<WaitingFilter | null>(null);
+  const [sentPick, setSentPick] = useState<SentFilter>("done");
   const [limit, setLimit] = useState(PAGE_SIZE);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [modalItems, setModalItems] = useState<GetInvoiceItem[] | null>(null);
@@ -335,7 +186,6 @@ export function InvoicingPage() {
         throw new Error("The server queued a regular scrape instead of the approval check. It needs the next server update.");
       }
       setStarted({ requestId: res.request.id, auditId: forAudit, kind: "approval_check" });
-      setMonitorOpen(true);
       putChain({ step: 2, state: "running", full, requestId: res.request.id, auditId: forAudit, startedAt: Date.now() });
     } catch (e) {
       const message = (e as Error).message || "Could not start the approval check.";
@@ -399,7 +249,7 @@ export function InvoicingPage() {
     const id = setInterval(() => { if (document.visibilityState === "visible") void loadData(); }, REFRESH_MS);
     return () => clearInterval(id);
   }, [activeKind, loadData]);
-  // The card below normally says when a job ends. This covers the cases where
+  // The session card normally says when a job ends. This covers the cases where
   // it never saw the job (it ended at once, or the page was reloaded).
   const chainRunning = chain?.state === "running";
   useEffect(() => {
@@ -411,10 +261,10 @@ export function InvoicingPage() {
     const id = setInterval(() => setNow(Date.now()), 60_000);
     return () => clearInterval(id);
   }, []);
-  useEffect(() => { if (activeKind) setMonitorOpen(true); }, [activeKind]);
-  useEffect(() => {
-    if (monitorKey > 0) monitorWrap.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [monitorKey]);
+  // An invoice run pauses after its first shipment and waits for a person to
+  // press Resume, so its live session opens by itself. A refresh needs nobody:
+  // its session stays folded behind the strip.
+  useEffect(() => { if (activeKind === "get_invoice") setMonitorOpen(true); }, [activeKind]);
 
   const busy = !!activeKind || chainRunning || !!starting;
   const blocked = busy ? "A FreightPOP job is already queued or running. Wait for it to finish."
@@ -433,7 +283,6 @@ export function InvoicingPage() {
       const requestedAt = Date.parse(res.request.requested_at);
       putChain({ step: 1, state: "running", full: true, requestId: res.request.id, auditId: null, startedAt: Number.isFinite(requestedAt) ? requestedAt : Date.now() });
       setStarted(null);
-      setMonitorOpen(true);
       // A fresh card finds the job in the queue and starts following it.
       setMonitorKey((k) => k + 1);
     } catch (e) {
@@ -450,45 +299,77 @@ export function InvoicingPage() {
     setStarting(null);
   }
 
-  // ── Lists ──
+
+  async function downloadExcel() {
+    if (!auditId || excel.busy) return;
+    setExcel({ busy: true, error: null });
+    try {
+      await downloadAuditExcel(auditId, "not-exported");
+      setExcel({ busy: false, error: null });
+    } catch (e) {
+      setExcel({ busy: false, error: (e as Error).message || "Could not download the file." });
+    }
+  }
+
+  // ── Buckets ──
 
   const rows = useMemo(() => (detail?.rows ?? []).map(toRow), [detail]);
-  const anyChecked = useMemo(() => rows.some((r) => !!r.ap), [rows]);
-  const lists = useMemo(() => ({
-    ready: rows.filter(isReady).sort(byCharge),
-    waiting: rows.filter(isWaiting).sort(byCharge),
-    sent: rows.filter(isSent).sort(byCharge),
-    requested: rows.filter(isRequested).sort(byCharge),
-    failed: rows.filter(isFailed).sort(byCharge),
-  }), [rows]);
-  const readyCounts = useMemo(() => ({
-    edi: lists.ready.filter((r) => r.apGroup === "edi").length,
-    shaun: lists.ready.filter((r) => r.apGroup === "shaun").length,
-    others: lists.ready.filter((r) => r.apGroup === "person" || r.apGroup === "unknown").length,
-  }), [lists.ready]);
+  const lists = useMemo(() => {
+    const inBucket = (b: BucketKey) => rows.filter((r) => r.bucket === b).sort(byCharge);
+    const approved = inBucket("approved");
+    const notApproved = inBucket("not-approved");
+    const inSent = inBucket("sent");
+    return {
+      approved,
+      notApproved,
+      received: notApproved.filter((r) => r.waiting === "received"),
+      noInvoice: notApproved.filter((r) => r.waiting === "none"),
+      sent: inSent.filter((r) => r.gi?.status === "done"),
+      requested: inSent.filter((r) => r.gi?.status === "requested"),
+    };
+  }, [rows]);
+  const approvedBy = useMemo(() => {
+    const n = { shaun: 0, edi: 0, person: 0, none: 0, failed: 0 };
+    for (const r of lists.approved) {
+      if (r.approver) n[r.approver] += 1;
+      if (r.failed) n.failed += 1;
+    }
+    return n;
+  }, [lists.approved]);
+
+  const checkedAt = useMemo(() => {
+    const summary = detail?.approval_summary ?? detail?.run.approval_summary ?? null;
+    if (summary?.checked_at) return summary.checked_at;
+    let latest: string | null = null;
+    for (const r of rows) if (r.ap?.checked_at && (!latest || r.ap.checked_at > latest)) latest = r.ap.checked_at;
+    return latest;
+  }, [detail, rows]);
+  const anyChecked = useMemo(() => !!checkedAt || rows.some((r) => !!r.ap), [checkedAt, rows]);
+
+  // A filter whose group is hidden (nobody in it) falls back to the first one.
+  const approvedView: ApprovedFilter = (approvedFilter === "person" || approvedFilter === "failed") && !approvedBy[approvedFilter] ? "all" : approvedFilter;
+  const waitingView: WaitingFilter = waitingPick ?? (lists.received.length || !lists.noInvoice.length ? "received" : "none");
+  const sentView: SentFilter = sentPick === "requested" && !lists.requested.length ? "done" : sentPick;
 
   const q = query.trim().toLowerCase();
   const visible = useMemo(() => {
-    const base = tab === "ready"
-      ? lists.ready.filter((r) => readyFilter === "all" || (readyFilter === "others" ? r.apGroup === "person" || r.apGroup === "unknown" : r.apGroup === readyFilter))
-      : tab === "waiting" ? lists.waiting
-      : sentFilter === "failed" ? lists.failed : sentFilter === "requested" ? lists.requested : lists.sent;
+    const base = tab === "approved"
+      ? (approvedView === "all" ? lists.approved
+        : approvedView === "failed" ? lists.approved.filter((r) => r.failed)
+        : lists.approved.filter((r) => r.approver === approvedView))
+      : tab === "not-approved" ? (waitingView === "received" ? lists.received : lists.noInvoice)
+      : sentView === "requested" ? lists.requested : lists.sent;
     return q ? base.filter((r) => r.search.includes(q)) : base;
-  }, [tab, lists, readyFilter, sentFilter, q]);
-  useEffect(() => { setLimit(PAGE_SIZE); }, [tab, readyFilter, sentFilter, q, auditId]);
+  }, [tab, lists, approvedView, waitingView, sentView, q]);
+  useEffect(() => { setLimit(PAGE_SIZE); }, [tab, approvedView, waitingView, sentView, q, auditId]);
   useEffect(() => { setSelected(new Set()); }, [auditId]);
-  // The group a filter points at can empty out (a failed one is retried).
-  useEffect(() => {
-    if (sentFilter === "failed" && !lists.failed.length) setSentFilter("done");
-    else if (sentFilter === "requested" && !lists.requested.length) setSentFilter("done");
-  }, [sentFilter, lists.failed.length, lists.requested.length]);
 
-  // Only shipments still ready count as picked (one just sent drops out by itself).
-  const picked = useMemo(() => lists.ready.filter((r) => selected.has(r.id)), [lists.ready, selected]);
-  const batch = useMemo(() => visible.slice(0, GET_INVOICE_MAX), [visible]);
-  const batchPicked = tab === "ready" && batch.length > 0 && batch.every((r) => selected.has(r.id));
+  // Only shipments still approved and unsent count as picked (one just sent drops out by itself).
+  const picked = useMemo(() => lists.approved.filter((r) => selected.has(r.id)), [lists.approved, selected]);
+  const batch = useMemo(() => (tab === "approved" ? visible.slice(0, GET_INVOICE_MAX) : []), [tab, visible]);
+  const batchPicked = batch.length > 0 && batch.every((r) => selected.has(r.id));
   const atCap = picked.length >= GET_INVOICE_MAX;
-  const moreAfterBatch = atCap && lists.ready.length > picked.length;
+  const moreAfterBatch = atCap && lists.approved.length > picked.length;
 
   function toggleRow(id: string) {
     setSelected((prev) => {
@@ -502,20 +383,10 @@ export function InvoicingPage() {
   function toggleAll() {
     setSelected(batchPicked ? new Set() : new Set(batch.map((r) => r.id)));
   }
-  function retryFailed(r: Row) {
-    setSelected(() => {
-      const next = new Set(picked.map((x) => x.id));
-      if (next.size < GET_INVOICE_MAX) next.add(r.id);
-      return next;
-    });
-    setReadyFilter("all");
-    setQuery("");
-    setTab("ready");
-  }
 
   function openModal() {
     if (!picked.length) return;
-    setModalItems(picked.map((r) => ({
+    setModalItems(picked.map((r: Row) => ({
       id: r.id, shipment: r.shipment, customer: r.customer, carrier: r.carrier, charge: r.charge, invoice: r.invoice,
       status: r.status,
       statusLabel: AUDIT_STATUS[r.status]?.label ?? (r.status || "—"),
@@ -527,22 +398,18 @@ export function InvoicingPage() {
     if (auditId) setStarted({ requestId: request.id, auditId, kind: "get_invoice" });
     setModalItems(null);
     setSelected(new Set());
+    // The strip now belongs to the invoice run, not to a refresh that already ended.
+    if (chainRef.current && chainRef.current.state !== "running") putChain(null);
     setMonitorOpen(true);
     void loadData();
   }
 
-  // ── Header and steps ──
+  // ── Header and progress ──
 
   const run = detail?.run ?? null;
-  const checkedAt = useMemo(() => {
-    const summary = detail?.approval_summary ?? detail?.run.approval_summary ?? null;
-    if (summary?.checked_at) return summary.checked_at;
-    let latest: string | null = null;
-    for (const r of rows) if (r.ap?.checked_at && (!latest || r.ap.checked_at > latest)) latest = r.ap.checked_at;
-    return latest;
-  }, [detail, rows]);
+  const files = detail?.files ?? run?.files ?? null;
   const range = run && run.date_from && run.date_to ? `${dayLabel(run.date_from)} – ${dayLabel(run.date_to)}` : null;
-  const approvalsLine = !anyChecked ? "approvals not checked yet" : checkedAt ? `approvals checked ${ago(checkedAt, now)}` : "approvals checked";
+  const firstRun = !loading && !detail && !loadError;
 
   const step1: StepState = chain
     ? (chain.step === 1 ? (chain.state === "running" ? (activeKind === "erp_audit" ? "running" : "queued") : chain.state) : chain.full ? "done" : "idle")
@@ -551,326 +418,290 @@ export function InvoicingPage() {
     ? (chain.step === 2 ? (chain.state === "running" ? (activeKind === "approval_check" ? "running" : "queued") : chain.state)
       : chain.state === "running" ? "idle" : "skipped")
     : activeKind === "approval_check" ? "running" : "idle";
-  const step1Detail = step1 === "running" ? "Reading FreightPOP's History Report in the invoicing session…"
-    : step1 === "queued" ? "Waiting for the invoicing session…"
-    : step1 === "failed" || step1 === "stopped" ? (chain?.message ?? "")
-    : step1 === "done" ? "Done"
-    : run ? `Last pulled ${ago(run.created_at, now)}` : "Not pulled yet";
-  const step2Detail = step2 === "running" ? "Reading Recently Approved in the invoicing session…"
-    : step2 === "queued" ? "Waiting for the invoicing session…"
-    : step2 === "failed" || step2 === "stopped" ? (chain?.message ?? "")
-    : step2 === "done" ? "Done. The lists below are up to date."
-    : step2 === "skipped" ? "Not started"
-    : chain?.step === 1 && chain.state === "running" ? "Starts by itself when step 1 finishes"
-    : anyChecked && checkedAt ? `Last checked ${ago(checkedAt, now)}` : "Not checked yet";
+  const invoiceRun = activeKind === "get_invoice" && !chainRunning;
+  const stripShown = !!activeKind || !!chain || !!starting;
+  const stripTone = activeKind || chainRunning || starting ? "working" as const
+    : chain?.state === "failed" ? "failed" as const
+    : chain?.state === "stopped" ? "stopped" as const
+    : "done" as const;
+  const stripText = stripTone === "done" ? "Done. The lists below are up to date."
+    : stripTone !== "working" ? (chain?.message ?? "")
+    : invoiceRun ? "Pressing Get Invoice in FreightPOP on the shipments you picked, one at a time. It pauses after the first one for you to check."
+    : step1 === "running" ? "Reading FreightPOP's History Report in the invoicing session…"
+    : step2 === "running" ? "Reading Recently Approved in the invoicing session…"
+    : step1 === "queued" || step2 === "queued" ? "Waiting for the invoicing session…"
+    : "Starting…";
 
-  const tabs: { key: TabKey; label: string; hint: string; rows: Row[]; accent: string }[] = [
-    { key: "ready", label: "Ready to invoice", hint: "Approved in FreightPOP, invoice not sent", rows: lists.ready, accent: "text-emerald-700" },
-    { key: "waiting", label: "Waiting on approval", hint: anyChecked ? "Not approved in FreightPOP yet" : "Approvals not checked yet", rows: lists.waiting, accent: "text-amber-700" },
-    { key: "sent", label: "Invoice sent", hint: lists.failed.length ? `${fmtNum(lists.failed.length)} failed, see inside` : "Get Invoice was pressed", rows: lists.sent, accent: "text-slate-900" },
-  ];
-  const shown = visible.slice(0, limit);
-  const showApproval = tab !== "waiting";
-  const showResult = tab === "sent";
-  const colCount = 5 + (tab === "ready" ? 1 : 0) + (showApproval ? 2 : 0) + (showResult ? 1 : 0);
   const getInvoiceBlocked = activeKind || chainRunning ? "A FreightPOP job is queued or running. Wait for it to finish." : monitor?.blocked ?? null;
 
+  // ── Cards and the selected bucket's panel ──
+
+  const n = fmtNum;
+  const approvedParts = [
+    approvedBy.shaun ? `${n(approvedBy.shaun)} by Shaun` : "",
+    approvedBy.edi ? `${n(approvedBy.edi)} by EDI` : "",
+    approvedBy.person ? `${n(approvedBy.person)} by others` : "",
+    approvedBy.none ? `${n(approvedBy.none)} approver not listed` : "",
+  ].filter(Boolean);
+  const cards: BucketCard[] = [
+    {
+      key: "approved", label: "Approved · ready to invoice", count: lists.approved.length, total: sumCharge(lists.approved),
+      breakdown: !lists.approved.length ? "Nothing waiting for its invoice"
+        : !anyChecked ? "Approver names appear after a refresh"
+        : approvedParts.join(" · "),
+    },
+    {
+      key: "not-approved", label: "Not approved", count: lists.notApproved.length, total: sumCharge(lists.notApproved),
+      breakdown: lists.notApproved.length
+        ? `${n(lists.received.length)} invoice not approved · ${n(lists.noInvoice.length)} no invoice yet`
+        : "Nothing waiting on approval",
+    },
+    {
+      key: "sent", label: "Invoice sent", count: lists.sent.length, total: sumCharge(lists.sent),
+      breakdown: lists.requested.length ? `${n(lists.requested.length)} more in progress`
+        : lists.sent.length ? "Get Invoice was pressed in FreightPOP"
+        : "None sent from this list yet",
+    },
+  ];
+
+  const count = tab === "approved" ? lists.approved.length : tab === "not-approved" ? lists.notApproved.length : lists.sent.length;
+  const heading = tab === "approved"
+    ? (count ? `${n(count)} ${plural(count, "shipment is", "shipments are")} approved and ready. Select the ones to invoice.` : "Nothing is approved and ready right now.")
+    : tab === "not-approved"
+      ? (count ? `${n(count)} ${plural(count, "shipment is", "shipments are")} not approved yet.` : "Nothing is waiting on approval.")
+      : (count ? `${n(count)} ${plural(count, "invoice was", "invoices were")} sent from this list.` : "No invoices have been sent from this list yet.");
+  const subheading = tab === "approved"
+    ? (!count ? "Shipments appear here once their carrier invoice is approved in FreightPOP."
+      : !anyChecked ? "FreightPOP's report shows an approved carrier invoice for each. Approver names appear after the next refresh."
+      : "FreightPOP shows an approved carrier invoice for each. Nothing is sent until you review the list.")
+    : tab === "not-approved"
+      ? (!count ? "Every shipment on this list is approved or already invoiced."
+        : waitingView === "received" ? "A carrier invoice arrived for these, but nobody has approved it in FreightPOP. Once approved, they move to Approved on the next refresh."
+        : "No carrier invoice has arrived for these yet. Nothing to do until one does.")
+      : lists.requested.length ? `${n(lists.requested.length)} more ${plural(lists.requested.length, "is", "are")} being sent now.`
+      : "Get Invoice was pressed in FreightPOP for these shipments.";
+
+  const shown = visible.slice(0, limit);
+  const empty = q ? "Nothing matches that search."
+    : tab === "approved" ? (
+      approvedView === "all" ? "Nothing is approved and ready right now."
+      : approvedView === "shaun" ? "None of the approved shipments were approved by Shaun."
+      : approvedView === "edi" ? "None of the approved shipments were approved by EDI."
+      : "Nothing here."
+    )
+    : tab === "not-approved" ? (waitingView === "received" ? "No carrier invoices are waiting on approval." : "Every shipment here has a carrier invoice.")
+    : sentView === "done" ? "No invoices have been sent from this list yet." : "Nothing in progress.";
+
+  const refreshButton = (
+    <button
+      type="button"
+      onClick={refreshAll}
+      disabled={!!blocked}
+      title={blocked || undefined}
+      className="px-4 py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2"
+    >
+      <RefreshCw className={"h-4 w-4 " + (starting === "refresh" || chainRunning ? "animate-spin" : "")} aria-hidden="true" />
+      {starting === "refresh" ? "Starting…" : chainRunning ? "Refreshing…" : "Refresh from FreightPOP"}
+    </button>
+  );
+  const quietLink = "text-sm text-slate-500 hover:text-slate-900 underline underline-offset-2 decoration-slate-300 rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 disabled:opacity-50";
+
   return (
-    <div className="space-y-4">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
+    <div className="space-y-6">
+      <header className="flex items-start justify-between gap-4 flex-wrap">
         <div className="min-w-0">
-          <h1 className="text-lg font-semibold text-slate-900">Invoicing</h1>
-          <p className="text-sm text-slate-600 mt-0.5">
-            {run ? (
-              <>From FreightPOP{range ? ` · ${range}` : ""} · pulled {ago(run.created_at, now)} · {approvalsLine}</>
-            ) : loading ? "Loading the latest list from FreightPOP…" : "Shipments that are approved and ready for their invoice."}
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Invoicing</h1>
+          <p className="text-sm text-slate-600 mt-1">
+            {run
+              ? <>Shipments not yet exported to ERP{range ? ` · ${range}` : ""} · updated {ago(run.created_at, now)}</>
+              : loading ? "Loading the latest list from FreightPOP…"
+              : "See which shipments are approved, and send their invoices in bulk."}
           </p>
+          {run ? (
+            <div className="mt-2 flex items-center gap-x-4 gap-y-1 flex-wrap">
+              {files?.not_exported === true ? (
+                <button type="button" onClick={downloadExcel} disabled={excel.busy} className={quietLink}>
+                  {excel.busy ? "Downloading…" : "Download Excel (FreightPOP format)"}
+                </button>
+              ) : null}
+              <Link to={`/audits/invoice?run=${encodeURIComponent(run.id)}`} className={quietLink}>Open the full audit</Link>
+              {excel.error ? <span className="text-sm text-rose-700">{excel.error}</span> : null}
+            </div>
+          ) : null}
         </div>
-        {run ? (
-          <Link to={`/audits/invoice?run=${encodeURIComponent(run.id)}`} className="text-sm text-sky-700 hover:text-sky-900 underline whitespace-nowrap">
-            Open the full audit
-          </Link>
-        ) : null}
-      </div>
-
-      {/* Refresh: both FreightPOP reads, one after the other. */}
-      <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-5 space-y-4">
-        <div className="flex items-start justify-between gap-4 flex-wrap">
-          <div className="flex items-start gap-3 flex-1 min-w-[280px] flex-wrap sm:flex-nowrap">
-            <Step n={1} title="Shipments not exported to ERP" state={step1} detail={step1Detail} />
-            <ChevronRight className="h-4 w-4 text-slate-300 mt-1.5 shrink-0 hidden sm:block" />
-            <Step n={2} title="Recently approved" state={step2} detail={step2Detail} />
-          </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            {run ? (
-              <button
-                onClick={approvalsOnly}
-                disabled={!!blocked}
-                title={blocked || "Use this when the list was pulled recently"}
-                className="px-3 py-2 rounded-lg ring-1 ring-slate-200 bg-white text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                <ShieldCheck className="h-4 w-4" /> {starting === "approvals" ? "Starting…" : "Check approvals only"}
-              </button>
-            ) : null}
-            <button
-              onClick={refreshAll}
-              disabled={!!blocked}
-              title={blocked || undefined}
-              className="px-4 py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              <RefreshCw className={"h-4 w-4 " + (starting === "refresh" ? "animate-spin" : "")} /> {starting === "refresh" ? "Starting…" : "Refresh from FreightPOP"}
-            </button>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-x-4 gap-y-2 flex-wrap text-xs text-slate-500">
-          <button onClick={() => setOptionsOpen((v) => !v)} aria-expanded={optionsOpen} className="underline hover:text-slate-800">
-            {optionsOpen ? "Hide options" : "Options"}
-          </button>
-          {optionsOpen ? (
-            <>
-              <span className="inline-flex items-center gap-2">Last <Segmented label="Months to pull" value={months} choices={MONTH_CHOICES} onPick={setMonths} disabled={busy} /></span>
+        <div className="flex items-center gap-2">
+          <MoreMenu>
+            <div className="space-y-2">
+              <div className="text-xs font-medium text-slate-500">What a refresh reads</div>
+              <Segmented label="Months to read" value={months} choices={MONTH_CHOICES} onPick={setMonths} disabled={busy} />
               <Segmented label="Shipment type" value={shipType} choices={ERP_TYPE_CHOICES} onPick={setShipType} disabled={busy} />
-            </>
-          ) : (
-            <span>Last {months} {months === 1 ? "month" : "months"} · {ERP_TYPE_CHOICES.find(([id]) => id === shipType)?.[1]}</span>
-          )}
-          <button onClick={() => setMonitorOpen((v) => !v)} className="underline hover:text-slate-800 ml-auto" disabled={!!activeKind}>
-            {monitorOpen || activeKind ? (activeKind ? "The invoicing session is shown below" : "Hide the invoicing session") : "Show the invoicing session"}
-          </button>
+            </div>
+            <div className="border-t border-slate-100 pt-3 space-y-1">
+              {run ? (
+                <MenuAction
+                  title={starting === "approvals" ? "Starting…" : "Check approvals only"}
+                  hint={`Quicker: keeps this list and only re-reads who approved what. ${anyChecked && checkedAt ? `Last checked ${ago(checkedAt, now)}.` : "Not checked yet."}`}
+                  onClick={approvalsOnly}
+                  disabled={!!blocked}
+                  disabledReason={blocked || undefined}
+                />
+              ) : null}
+              <MenuAction
+                title={monitorOpen ? "Hide the invoicing session" : "Show the invoicing session"}
+                hint="The live view of FPX working in FreightPOP, with its log, Pause and Stop."
+                onClick={() => setMonitorOpen((v) => !v)}
+              />
+            </div>
+          </MoreMenu>
+          {firstRun ? null : refreshButton}
         </div>
+      </header>
 
-        {actionError ? <ErrorBlock compact>{actionError}</ErrorBlock> : null}
-        {!busy && monitor?.blocked && monitor.blocked !== "Loading…" ? (
-          <ErrorBlock tone="warning" compact>
-            {monitor.blocked}
-            {/sign in/i.test(monitor.blocked) ? <> <Link to="/scraping" className="underline">Open Scraping</Link></> : null}
-          </ErrorBlock>
-        ) : null}
-      </section>
+      {actionError ? <ErrorBlock compact>{actionError}</ErrorBlock> : null}
+      {!busy && monitor?.blocked && monitor.blocked !== "Loading…" ? (
+        <ErrorBlock tone="warning" compact>
+          {monitor.blocked}
+          {/sign in/i.test(monitor.blocked) ? <> <Link to="/scraping" className="underline">Open Scraping</Link></> : null}
+        </ErrorBlock>
+      ) : null}
 
-      {/* Live view, log, Pause / Resume / Stop. Stays mounted: it is also what
-          tells this page that a job is under way or has ended. */}
-      <div ref={monitorWrap} className={"scroll-mt-4 " + (monitorOpen || activeKind ? "" : "hidden")}>
+      {stripShown ? (
+        <ProgressStrip
+          steps={invoiceRun ? null : [{ title: "Shipment list", state: step1 }, { title: "Approvals", state: step2 }]}
+          text={stripText}
+          tone={stripTone}
+          expanded={monitorOpen}
+          onToggle={() => setMonitorOpen((v) => !v)}
+          onDismiss={stripTone === "working" ? undefined : () => putChain(null)}
+        />
+      ) : null}
+
+      {/* Live view, log, Pause / Resume / Stop. Stays mounted even when folded
+          away: it is also what tells this page that a job is under way or has ended. */}
+      <div className={monitorOpen ? "" : "hidden"}>
         <ErpPullMonitor key={monitorKey} onFinished={onOpenAudit} onSettled={onSettled} started={started} onStatus={setMonitor} />
       </div>
 
-      {loadError ? <ErrorBlock>Could not load the list: {loadError} <button onClick={() => { setLoading(true); void loadData(); }} className="underline ml-1">Try again</button></ErrorBlock> : null}
+      {loadError ? (
+        <ErrorBlock>
+          Could not load the list: {loadError}{" "}
+          <button type="button" onClick={() => { setLoading(true); void loadData(); }} className="underline ml-1">Try again</button>
+        </ErrorBlock>
+      ) : null}
 
       {loading && !detail ? (
-        <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm"><LoadingState label="Loading the latest list from FreightPOP…" /></div>
-      ) : !detail ? (
-        loadError ? null : (
-          <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-10 text-center">
-            <FileText className="h-8 w-8 text-slate-300 mx-auto" />
-            <h2 className="mt-3 text-base font-semibold text-slate-900">Nothing pulled from FreightPOP yet</h2>
-            <p className="mt-1 text-sm text-slate-600 max-w-xl mx-auto">
-              This page shows which shipments are approved and ready for their invoice, which are still waiting on approval,
-              and which already had their invoice sent. Press <span className="font-medium">Refresh from FreightPOP</span> above:
-              FPX reads the shipments not exported to ERP and the Recently Approved list in its own invoicing session in the hosted browser, one after the other, separate from scraping.
-            </p>
+        <div role="status" aria-label="Loading the latest list from FreightPOP" className="space-y-6">
+          <BucketCardsSkeleton />
+          <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-6 space-y-4" aria-hidden="true">
+            <div className="h-5 w-96 max-w-full rounded bg-slate-100 animate-pulse" />
+            {[0, 1, 2, 3, 4].map((i) => <div key={i} className="h-10 rounded bg-slate-50 animate-pulse" />)}
           </div>
-        )
+        </div>
+      ) : !detail ? (
+        firstRun ? (
+          <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm px-6 py-20 text-center">
+            <h2 className="text-lg font-semibold text-slate-900">Nothing read from FreightPOP yet</h2>
+            <p className="mt-2 text-sm text-slate-600 max-w-lg mx-auto leading-relaxed">
+              Press the button and FPX reads two things from FreightPOP, one after the other: the shipments not yet exported to ERP,
+              and who approved their invoices. You then see which shipments are approved, which are not, and can send the approved ones their invoice in bulk.
+            </p>
+            <div className="mt-6 flex justify-center">{refreshButton}</div>
+            <p className="mt-3 text-xs text-slate-500">It runs in its own invoicing session in the hosted browser, separate from scraping. Nothing is changed in FreightPOP.</p>
+          </section>
+        ) : null
       ) : (
         <>
-          <div className="grid gap-3 sm:grid-cols-3" role="tablist" aria-label="Shipments">
-            {tabs.map((t) => (
-              <button
-                key={t.key}
-                role="tab"
-                aria-selected={tab === t.key}
-                onClick={() => setTab(t.key)}
-                className={"text-left rounded-2xl p-4 ring-1 shadow-sm transition-colors " + (tab === t.key ? "bg-white ring-2 ring-violet-500" : "bg-white ring-slate-200 hover:bg-slate-50")}
-              >
-                <div className="text-sm font-medium text-slate-700">{t.label}</div>
-                <div className="mt-1 flex items-baseline gap-2 flex-wrap">
-                  <span className={"text-3xl font-semibold tabular-nums " + t.accent}>{t.key === "waiting" && !anyChecked ? "—" : fmtNum(t.rows.length)}</span>
-                  <span className="text-sm text-slate-600 tabular-nums">{t.key === "waiting" && !anyChecked ? "" : fmtMoney(sumCharge(t.rows))}</span>
-                </div>
-                <div className="text-xs text-slate-500 mt-1">{t.hint}</div>
-              </button>
-            ))}
-          </div>
+          <BucketCards cards={cards} selected={tab} onSelect={setTab} />
 
-          <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm">
-            <div className="p-4 flex items-center justify-between gap-3 flex-wrap border-b border-slate-100">
-              <div className="flex items-center gap-2 flex-wrap">
-                {tab === "ready" ? (
-                  <>
-                    <Chip on={readyFilter === "all"} onClick={() => setReadyFilter("all")}>All {fmtNum(lists.ready.length)}</Chip>
-                    <Chip on={readyFilter === "edi"} onClick={() => setReadyFilter("edi")}>Approved by EDI {fmtNum(readyCounts.edi)}</Chip>
-                    <Chip on={readyFilter === "shaun"} onClick={() => setReadyFilter("shaun")}>Approved by Shaun {fmtNum(readyCounts.shaun)}</Chip>
-                    <Chip on={readyFilter === "others"} onClick={() => setReadyFilter("others")}>Approved by others {fmtNum(readyCounts.others)}</Chip>
-                  </>
-                ) : tab === "sent" ? (
-                  <>
-                    <Chip on={sentFilter === "done"} onClick={() => setSentFilter("done")}>Sent {fmtNum(lists.sent.length)}</Chip>
-                    {lists.requested.length ? <Chip on={sentFilter === "requested"} onClick={() => setSentFilter("requested")}>In progress {fmtNum(lists.requested.length)}</Chip> : null}
-                    {lists.failed.length ? <Chip on={sentFilter === "failed"} onClick={() => setSentFilter("failed")}>Failed {fmtNum(lists.failed.length)}</Chip> : null}
-                  </>
-                ) : (
-                  <span className="text-sm text-slate-600">Shipments FreightPOP has not approved yet. Nothing to do here until they are.</span>
-                )}
+          <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm overflow-hidden" aria-label={cards.find((c) => c.key === tab)?.label}>
+            <div className="px-6 pt-6 pb-4 space-y-4">
+              <div>
+                <h2 className="text-base font-semibold text-slate-900">{heading}</h2>
+                <p className="text-sm text-slate-500 mt-1 max-w-3xl">{subheading}</p>
               </div>
-              <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                {tab === "approved" ? (
+                  <Segmented<ApprovedFilter>
+                    label="Approved by"
+                    value={approvedView}
+                    onPick={setApprovedFilter}
+                    choices={[
+                      ["all", <Counted n={lists.approved.length}>All</Counted>],
+                      ["shaun", <Counted n={approvedBy.shaun}>By Shaun</Counted>],
+                      ["edi", <Counted n={approvedBy.edi}>By EDI</Counted>],
+                      ...(approvedBy.person ? [["person", <Counted n={approvedBy.person}>By others</Counted>] as const] : []),
+                      ["none", <Counted n={approvedBy.none}>Approver not listed</Counted>],
+                      ...(approvedBy.failed ? [["failed", <Counted n={approvedBy.failed}>Failed last time</Counted>] as const] : []),
+                    ]}
+                  />
+                ) : tab === "not-approved" ? (
+                  <Segmented<WaitingFilter>
+                    label="Why not approved"
+                    value={waitingView}
+                    onPick={setWaitingPick}
+                    choices={[
+                      ["received", <Counted n={lists.received.length}>Invoice not approved</Counted>],
+                      ["none", <Counted n={lists.noInvoice.length}>No invoice yet</Counted>],
+                    ]}
+                  />
+                ) : lists.requested.length ? (
+                  <Segmented<SentFilter>
+                    label="Invoice status"
+                    value={sentView}
+                    onPick={setSentPick}
+                    choices={[
+                      ["done", <Counted n={lists.sent.length}>Sent</Counted>],
+                      ["requested", <Counted n={lists.requested.length}>In progress</Counted>],
+                    ]}
+                  />
+                ) : <span />}
                 <label className="relative">
                   <span className="sr-only">Search shipment, customer or carrier</span>
-                  <Search className="h-4 w-4 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                  <Search className="h-4 w-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" aria-hidden="true" />
                   <input
+                    type="search"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
                     placeholder="Search shipment, customer or carrier"
-                    className="pl-8 pr-3 py-1.5 w-72 max-w-full rounded-lg ring-1 ring-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-violet-400"
+                    className="pl-9 pr-3 py-2 w-80 max-w-full rounded-lg ring-1 ring-slate-200 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500"
                   />
                 </label>
-                {tab === "ready" ? (
-                  <button
-                    onClick={openModal}
-                    disabled={!picked.length || !!getInvoiceBlocked}
-                    title={getInvoiceBlocked || (!picked.length ? "Tick the shipments to invoice first" : undefined)}
-                    className="px-4 py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    <FileText className="h-4 w-4" /> Get invoices ({fmtNum(picked.length)})
-                  </button>
-                ) : null}
               </div>
             </div>
 
-            {tab === "ready" && picked.length ? (
-              <div className="px-4 py-2 text-sm bg-violet-50 text-violet-900 flex items-center justify-between gap-3 flex-wrap">
-                <span>
-                  {moreAfterBatch
-                    ? `${fmtNum(GET_INVOICE_MAX)} selected — run the next batch after this one`
-                    : `${fmtNum(picked.length)} selected`} · {fmtMoney(sumCharge(picked))} in charges
-                </span>
-                <button onClick={() => setSelected(new Set())} className="text-xs underline hover:text-violet-700">Clear</button>
-              </div>
-            ) : null}
-            {tab === "sent" && sentFilter === "failed" ? (
-              <div className="px-4 py-2 text-sm bg-rose-50 text-rose-900">
-                Get Invoice did not go through on these. The reason is next to each one. Use Try again to put it back on the Ready list, ticked.
-              </div>
-            ) : null}
-
-            {tab === "waiting" && !anyChecked ? (
-              <div className="p-10 text-center">
-                <AlertTriangle className="h-7 w-7 text-amber-500 mx-auto" />
-                <h2 className="mt-3 text-base font-semibold text-slate-900">Approvals have not been checked yet</h2>
-                <p className="mt-1 text-sm text-slate-600 max-w-xl mx-auto">
-                  FPX has the {fmtNum(rows.length)} {rows.length === 1 ? "shipment" : "shipments"} not exported to ERP, but has not yet looked at FreightPOP's
-                  Recently Approved list to see which of them are approved.
-                </p>
-                <button
-                  onClick={approvalsOnly}
-                  disabled={!!blocked}
-                  title={blocked || undefined}
-                  className="mt-4 px-4 py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  <ShieldCheck className="h-4 w-4" /> {starting === "approvals" ? "Starting…" : "Check approvals"}
-                </button>
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead className="bg-slate-50">
-                    <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500">
-                      {tab === "ready" ? (
-                        <th className="px-4 py-2.5 w-8">
-                          <input
-                            type="checkbox"
-                            checked={batchPicked}
-                            onChange={toggleAll}
-                            disabled={!batch.length}
-                            aria-label={visible.length > GET_INVOICE_MAX ? `Select the ${GET_INVOICE_MAX} highest charges` : "Select all"}
-                            title={visible.length > GET_INVOICE_MAX ? `Selects the ${GET_INVOICE_MAX} highest charges: one run's worth` : "Select all"}
-                            className="rounded border-slate-300 text-violet-600"
-                          />
-                        </th>
-                      ) : null}
-                      <th className="px-4 py-2.5 font-medium">Shipment</th>
-                      <th className="px-4 py-2.5 font-medium">Customer</th>
-                      <th className="px-4 py-2.5 font-medium">Carrier</th>
-                      <th className="px-4 py-2.5 font-medium">Shipped</th>
-                      <th className="px-4 py-2.5 font-medium text-right">Charge</th>
-                      {showApproval ? <th className="px-4 py-2.5 font-medium whitespace-nowrap">Approved by</th> : null}
-                      {showApproval ? <th className="px-4 py-2.5 font-medium whitespace-nowrap">Approved on</th> : null}
-                      {showResult ? <th className="px-4 py-2.5 font-medium">Result</th> : null}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {shown.length === 0 ? (
-                      <tr>
-                        <td colSpan={colCount} className="p-8 text-center text-slate-500">
-                          {q ? "Nothing matches that search."
-                            : tab === "ready" ? (anyChecked ? "Nothing is ready to invoice right now." : "Approvals have not been checked yet, so nothing is marked ready. Press Check approvals only above.")
-                            : tab === "waiting" ? "Nothing is waiting on approval."
-                            : sentFilter === "done" ? "No invoices sent from this list yet." : "Nothing here."}
-                        </td>
-                      </tr>
-                    ) : shown.map((r) => {
-                      const on = tab === "ready" && selected.has(r.id);
-                      const full = tab === "ready" && !on && atCap;
-                      const when = r.gi?.at || r.gi?.requested_at;
-                      return (
-                        <tr
-                          key={r.id}
-                          onClick={tab === "ready" && !full ? () => toggleRow(r.id) : undefined}
-                          className={(tab === "ready" ? "cursor-pointer " : "") + (on ? "bg-violet-50/60" : "hover:bg-slate-50")}
-                        >
-                          {tab === "ready" ? (
-                            <td className="px-4 py-2">
-                              <input
-                                type="checkbox"
-                                checked={on}
-                                disabled={full}
-                                onChange={() => toggleRow(r.id)}
-                                onClick={(e) => e.stopPropagation()}
-                                aria-label={`Select shipment ${r.shipment}`}
-                                title={full ? `Up to ${GET_INVOICE_MAX} at a time` : undefined}
-                                className="rounded border-slate-300 text-violet-600"
-                              />
-                            </td>
-                          ) : null}
-                          <td className="px-4 py-2 font-medium text-slate-900 whitespace-nowrap">
-                            {r.shipment || "—"}
-                            {tab === "ready" && isFailed(r) ? <span className="ml-2"><InvoicePill state={r.gi} /></span> : null}
-                          </td>
-                          <td className="px-4 py-2">{r.customer || "—"}</td>
-                          <td className="px-4 py-2">{r.carrier || "—"}</td>
-                          <td className="px-4 py-2 whitespace-nowrap text-slate-600">{r.shippedText || "—"}</td>
-                          <td className="px-4 py-2 text-right tabular-nums whitespace-nowrap">{fmtMoney(r.charge)}</td>
-                          {showApproval ? <td className="px-4 py-2">{r.ap ? <ApprovalPill state={r.ap} /> : <span className="text-slate-400 text-xs">Not checked</span>}</td> : null}
-                          {showApproval ? <td className="px-4 py-2 whitespace-nowrap text-slate-600">{isApproved(r) ? approvalDate(r.ap) || "—" : "—"}</td> : null}
-                          {showResult ? (
-                            <td className="px-4 py-2">
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <InvoicePill state={r.gi} />
-                                {when ? <span className="text-xs text-slate-500 whitespace-nowrap">{fmtDateTime(when)}</span> : null}
-                                {sentFilter === "failed" ? (
-                                  isReady(r)
-                                    ? <button onClick={() => retryFailed(r)} className="text-xs text-sky-700 hover:text-sky-900 underline whitespace-nowrap">Try again</button>
-                                    : <span className="text-xs text-slate-500 whitespace-nowrap">Not approved yet</span>
-                                ) : null}
-                              </div>
-                              {r.gi?.note ? <div className={"text-xs mt-0.5 break-words max-w-md " + (sentFilter === "failed" ? "text-rose-700" : "text-slate-500")}>{r.gi.note}</div> : null}
-                            </td>
-                          ) : null}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {visible.length > shown.length ? (
-              <div className="p-3 text-center border-t border-slate-100">
-                <button onClick={() => setLimit((n) => n + PAGE_SIZE)} className="text-sm text-sky-700 hover:text-sky-900 underline">
-                  Show more ({fmtNum(shown.length)} of {fmtNum(visible.length)} shown)
-                </button>
-              </div>
-            ) : null}
+            <div className="border-t border-slate-200">
+              <ShipmentTable
+                bucket={tab}
+                rows={shown}
+                empty={empty}
+                selected={selected}
+                atCap={atCap}
+                allPicked={batchPicked}
+                canPickAll={batch.length > 0}
+                capped={visible.length > GET_INVOICE_MAX}
+                onToggle={toggleRow}
+                onToggleAll={toggleAll}
+                footer={visible.length > shown.length ? (
+                  <div className="p-4 text-center border-t border-slate-100">
+                    <button type="button" onClick={() => setLimit((v) => v + PAGE_SIZE)} className={quietLink}>
+                      Show more ({n(shown.length)} of {n(visible.length)} shown)
+                    </button>
+                  </div>
+                ) : null}
+              />
+            </div>
           </section>
+
+          {picked.length ? (
+            <SelectionBar
+              count={picked.length}
+              total={sumCharge(picked)}
+              moreAfterBatch={moreAfterBatch}
+              blocked={getInvoiceBlocked}
+              onGet={openModal}
+              onClear={() => setSelected(new Set())}
+            />
+          ) : null}
         </>
       )}
 
