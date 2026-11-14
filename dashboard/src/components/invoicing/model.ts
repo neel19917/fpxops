@@ -40,6 +40,8 @@ export interface Row {
   approver: ApproverGroup | null;
   approverName: string;
   approvedOn: string;
+  /** Notes from FreightPOP's Audit page for this shipment's invoice. */
+  notes: string;
   waiting: WaitingGroup | null;
   /** The last Get Invoice try on this shipment failed. */
   failed: boolean;
@@ -120,9 +122,10 @@ export function toRow(row: InvoiceAuditRow): Row {
     flags, ap, gi, bucket, approver,
     approverName: approver === "shaun" || approver === "person" ? String(ap?.approved_by ?? "") : "",
     approvedOn: approvedByCheck ? approvalDate(ap) : "",
+    notes: approvedByCheck ? String(ap?.notes ?? "").trim() : "",
     waiting: bucket !== "not-approved" ? null : flagged ? "received" : "none",
     failed: sent === "failed",
-    search: `${shipment} ${customer} ${carrier}`.toLowerCase(),
+    search: `${shipment} ${customer} ${carrier} ${approvedByCheck ? String(ap?.notes ?? "") : ""}`.toLowerCase(),
   };
 }
 

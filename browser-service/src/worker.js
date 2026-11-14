@@ -345,7 +345,7 @@ const laneState = (lane) => ({
   lastResult: withTail(lane.lastResult),
   // Once the job has finished: { audit_id, total, pending } for an ERP audit
   // pull, { audit_id, total, ok, failed } for a get-invoices job,
-  // { audit_id, approved_rows, matched, not_found } for an approval check.
+  // { audit_id, approved_rows, history_rows, matched, not_found } for an approval check.
   // Always null on the scrape lane.
   result: lane.lastResult?.result || null,
   queued: queuedJobs(lane.name),
@@ -606,7 +606,7 @@ async function runJob(lane, job) {
     Object.assign(cur.counts, { reportRows: 0, notExported: 0, uploaded: 0 });
     logLine(lane, `Claimed ERP audit pull · last ${cur.months} month(s) · ${cur.shipmentType} — running as ${email || "unknown user"}`);
   } else if (kind === "approval_check") {
-    cur.counts = { approvedRows: 0, matched: 0, notFound: 0 };
+    cur.counts = { approvedRows: 0, historyRows: 0, matched: 0, notFound: 0 };
     cur.auditId = job.approvalAuditId || null;
     logLine(lane, `Claimed approval check · audit ${String(job.approvalAuditId || "?").slice(0, 8)} — running as ${email || "unknown user"}`);
   } else if (kind === "get_invoice") {
@@ -665,14 +665,14 @@ async function runJob(lane, job) {
     // Approval check: what was matched (zeros when it failed or was stopped).
     if (kind === "approval_check") {
       const c = cur.counts || {};
-      cur.result = { audit_id: job.approvalAuditId || null, approved_rows: c.approvedRows || 0, matched: c.matched || 0, not_found: c.notFound || 0 };
+      cur.result = { audit_id: job.approvalAuditId || null, approved_rows: c.approvedRows || 0, history_rows: c.historyRows || 0, matched: c.matched || 0, not_found: c.notFound || 0 };
     }
     const finishedAt = new Date().toISOString();
     const summary = {
       id: job.id, source: job.source, user: email, kind,
       // ERP audit pull: the audit it made ({ audit_id, total, pending }).
       // Get invoices: { audit_id, total, ok, failed }.
-      // Approval check: { audit_id, approved_rows, matched, not_found }.
+      // Approval check: { audit_id, approved_rows, history_rows, matched, not_found }.
       result: cur.result || null,
       scheduleId: job.scheduleId || null, scheduleName: job.scheduleName || null,
       startedAt: new Date(startedAt).toISOString(), finishedAt, durationMs: Date.now() - startedAt,
@@ -992,7 +992,8 @@ async function runPageJob(lane, browser, url, who, job) {
             restarts++; lost = 0;
             logLine(lane, `FreightPOP moved to another page (${page.url().replace(/^https?:\/\/[^/]+/, "")}) — carrying on there`);
             if (lane.pauseFlag) pushPause(lane);
-            await ext.evaluate(job.restart || job.start, { awaitPromise: false }).catch(() => {});
+            const restart = typeof job.restart === "function" ? job.restart() : job.restart;
+            await ext.evaluate(restart || job.start, { awaitPromise: false }).catch(() => {});
             continue;
           }
         }
@@ -1306,11 +1307,18 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
 // A second look at an ERP audit: in the requester's own hosted browser, open
 // FreightPOP's Audit page, take the Excel export of "Recently Approved" and
 // hand every row to the API, which matches them against the audit's shipments
-// (approved by EDI, or by which person). The page work is erpApprovalCheck()
-// in the extension's content.js — it opens the page and the tab and clicks
-// nothing else. The export is kept as <audit id>/recently-approved.xlsx.
-const APPROVAL_LIMIT_MS = 20 * 60_000; // page work, not counting paused time
+// (approved by EDI, or by which person). Then the same for the "History" tab
+// over a longer range — 60 days before the pull's start date to today —
+// because Recently Approved only reaches back a short while. The page work is
+// erpApprovalCheck() in the extension's content.js — it opens the page and
+// the two tabs, sets History's date range and clicks nothing else. The
+// exports are kept as <audit id>/recently-approved.xlsx and
+// <audit id>/audit-history.xlsx. A History that could not be read or matched
+// is a warning: the Recently Approved result stands.
+const APPROVAL_LIMIT_MS = 30 * 60_000; // page work, not counting paused time
 const APPROVAL_POST_MAX_BYTES = 12 * 1024 * 1024; // per POST; the API's limit is 20 MB
+const HISTORY_EXTRA_DAYS = 60;    // History starts this long before the pull's start date
+const HISTORY_FALLBACK_DAYS = 150; // … or this long before today when the pull's dates can't be read
 
 async function runApprovalCheck(lane, email, auditId) {
   const lease = await acquireUserBrowser(email, { busy: true });
@@ -1321,71 +1329,172 @@ async function runApprovalCheck(lane, email, auditId) {
   }
 }
 
-async function runApprovalCheckIn(lane, browser, url, who, auditId) {
-  let got = null; // the Recently Approved export: { rows, headers, buf, file }
-  const note = await runPageJob(lane, browser, url, who, {
-    noun: "approval check",
-    resumeOnReload: true,
-    limitMs: APPROVAL_LIMIT_MS,
-    has: "typeof erpApprovalCheck === 'function' && typeof fpxErpPoll === 'function'",
-    missing: "The extension in the hosted browser has no approval check (needs version 4.12 or later) — redeploy the browser service",
-    start: `erpApprovalCheck(${JSON.stringify(String(who))}); 'started'`,
-    restart: `erpApprovalCheck(${JSON.stringify(String(who))}, true); 'started'`,
-    onPoll: async (r, { cdp, ext }) => {
-      // The page has Recently Approved on screen and wants its Excel captured.
-      if (!r.download || r.done) return false;
-      let answer;
-      try {
-        got = await captureExport(lane, browser, cdp, ext, lane.current?.requestId || "job");
-        if (lane.current) lane.current.counts.approvedRows = got.rows.length;
-        logLine(lane, `Excel export · ${r.download.label} · ${got.file} · ${num(got.rows.length)} rows · ${got.headers.length} columns · button "${got.clicked}"`);
-        // A grid that exports only the page on screen gives fewer rows than it holds.
-        if (got.gridTotal && got.gridTotal > got.rows.length) {
-          logLine(lane, `The Recently Approved grid holds ${num(got.gridTotal)} rows but its Excel export has ${num(got.rows.length)} — only those are matched (FreightPOP exports the page on screen)`, "warn");
-        }
-        answer = { ok: true, rows: got.rows.length, file: got.file };
-      } catch (e) {
-        got = null;
-        answer = { ok: false, error: e.message };
-      }
-      await ext.evaluate(`fpxErpDownloadDone(${JSON.stringify(answer)})`).catch(() => {});
-      return true;
-    },
-  });
-  // Stopped, or Recently Approved was empty: the page's own sentence stands.
-  if (!got) return note;
-  if (lane.stopFlag) return `${stoppedBecause(lane)}. The Recently Approved export was read (${num(got.rows.length)} rows) but not matched against the audit.`;
+// MM/DD/YYYY, the format FreightPOP's date fields take.
+const mdy = (d) => `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
 
-  if (got.buf) await saveExcelFiles(lane, auditId, [{ name: "recently-approved.xlsx", buf: got.buf, rows: got.rows.length }]);
+// The History tab's range: 60 days before the pull's date_from … today.
+// → { from, to } as MM/DD/YYYY. Never throws.
+async function historyRange(lane, auditId) {
+  const today = new Date();
+  let from = null, why = "";
+  try {
+    const r = await api(`/api/audits/invoice/${encodeURIComponent(auditId)}`, { signal: AbortSignal.timeout(60_000) });
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(r?.run?.date_from || ""));
+    if (!m) why = "the audit has no start date";
+    else {
+      const start = new Date(+m[1], +m[2] - 1, +m[3]);
+      from = new Date(+m[1], +m[2] - 1, +m[3] - HISTORY_EXTRA_DAYS);
+      if (Number.isNaN(from.getTime()) || from > today) { why = `the audit's start date reads ${r.run.date_from}`; from = null; }
+      else logLine(lane, `History range · ${mdy(from)} to ${mdy(today)} (${HISTORY_EXTRA_DAYS} days before the pull's start date ${mdy(start)}, to today)`);
+    }
+  } catch (e) {
+    why = `the audit's dates could not be read (${String(e.name === "TimeoutError" ? "no answer after 60s" : e.message).slice(0, 160)})`;
+  }
+  if (!from) {
+    from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - HISTORY_FALLBACK_DAYS);
+    logLine(lane, `History range · ${mdy(from)} to ${mdy(today)} — the last ${HISTORY_FALLBACK_DAYS} days, because ${why}`, "warn");
+  }
+  return { from: mdy(from), to: mdy(today) };
+}
 
-  logLine(lane, `Matching · ${num(got.rows.length)} approved rows against audit ${String(auditId).slice(0, 8)} · columns: ${got.headers.join(", ")}`.slice(0, 500));
-  const resp = await postApprovals(lane, auditId, who, got.headers, got.rows);
-  const matched = Number(resp?.matched) || 0;
-  const notFound = Number(resp?.not_found) || 0;
-  const approvedRows = got.rows.length; // the API counts its last part only
-  const unsaved = Number(resp?.failed) || 0;
-  if (unsaved) logLine(lane, `The API could not save ${num(unsaved)} of the matched shipments — run the approval check again`, "warn");
-  if (lane.current) Object.assign(lane.current.counts, { approvedRows, matched, notFound });
-
-  // "EDI 180 · Shaun Smith 20 · others 12"
+// "EDI 180 · Shaun Smith 20 · others 12" and which columns the API read.
+function approvalAnswer(resp) {
   const byEdi = Number(resp?.by_edi) || 0;
   const people = Object.entries(resp?.by_person || {}).map(([name, n]) => [String(name), Number(n) || 0])
     .filter(([name, n]) => n > 0 && !/^edi$/i.test(name.trim())).sort((a, b) => b[1] - a[1]);
   const others = people.slice(3).reduce((sum, p) => sum + p[1], 0);
-  const who3 = [`EDI ${num(byEdi)}`, ...people.slice(0, 3).map(([name, n]) => `${name.slice(0, 40)} ${num(n)}`), ...(others ? [`others ${num(others)}`] : [])].join(" · ");
+  const who = [`EDI ${num(byEdi)}`, ...people.slice(0, 3).map(([name, n]) => `${name.slice(0, 40)} ${num(n)}`), ...(others ? [`others ${num(others)}`] : [])].join(" · ");
   const cu = resp?.columns_used || {};
-  const cols = [["shipment", cu.shipment], ["approved by", cu.approved_by], ["approved at", cu.approved_at], ["amount", cu.amount]]
+  const cols = [["shipment", cu.shipment], ["tracking", cu.tracking], ["approved by", cu.approved_by], ["approved at", cu.approved_at], ["amount", cu.amount]]
+    .filter(([label, col]) => col || label !== "tracking")
     .map(([label, col]) => `${label} ${col ? `"${col}"` : "not found"}`).join(", ");
-  const head = `${num(matched)} of ${num(matched + notFound)} shipments`;
-  logLine(lane, `Approvals matched · ${head} · ${who3} · columns used: ${cols}`.slice(0, 500),
-    !matched || !cu.approved_by ? "warn" : "done");
-  return `${head} of audit ${String(auditId).slice(0, 8)} are in Recently Approved (${num(approvedRows)} approved rows) · ${who3}` + (unsaved ? ` · ${num(unsaved)} not saved, run it again` : "");
+  return { who, cols, cu };
 }
 
-// Every row of the Recently Approved export → the API, in one POST when it
-// fits, else parts of at most ~12 MB; the answer to the final part is the
-// match. A 422 (the API found no shipment-id column) fails with its message.
-async function postApprovals(lane, auditId, by, columns, rows) {
+async function runApprovalCheckIn(lane, browser, url, who, auditId) {
+  const range = await historyRange(lane, auditId);
+  let got = null;  // the Recently Approved export: { rows, headers, buf, file }
+  let hist = null; // the History export, same shape
+  let approvedDone = false; // the page is past Recently Approved
+  let pageError = null;
+  const call = (resumed) => `erpApprovalCheck(${JSON.stringify(String(who))}, ${resumed}, ${JSON.stringify({ historyFrom: range.from, historyTo: range.to, skipApproved: resumed && approvedDone })}); 'started'`;
+  let note;
+  try {
+    note = await runPageJob(lane, browser, url, who, {
+      noun: "approval check",
+      resumeOnReload: true,
+      limitMs: APPROVAL_LIMIT_MS,
+      has: "typeof erpApprovalCheck === 'function' && typeof fpxErpPoll === 'function'",
+      missing: "The extension in the hosted browser has no approval check (needs version 4.12 or later) — redeploy the browser service",
+      start: call(false),
+      // Built when it is needed: after Recently Approved was handed over, a
+      // page that reloads goes straight on to History.
+      restart: () => call(true),
+      onPoll: async (r, { cdp, ext }) => {
+        if (r.phase === "history") approvedDone = true;
+        // The page has a tab's grid on screen and wants its Excel captured.
+        if (!r.download || r.done) return false;
+        const history = r.download.label === "History";
+        let answer;
+        try {
+          // History: the grid's own workbook only — no export button is clicked on that tab.
+          const cap = history ? await kendoExport(lane.page) : await captureExport(lane, browser, cdp, ext, lane.current?.requestId || "job");
+          if (history) hist = cap; else got = cap;
+          if (lane.current) lane.current.counts[history ? "historyRows" : "approvedRows"] = cap.rows.length;
+          logLine(lane, `Excel export · ${r.download.label} · ${cap.file} · ${num(cap.rows.length)} rows · ${cap.headers.length} columns · ${history ? "taken from the grid, no button clicked" : `button "${cap.clicked}"`}`);
+          // A grid that exports only the page on screen gives fewer rows than it holds.
+          if (cap.gridTotal && cap.gridTotal > cap.rows.length) {
+            logLine(lane, `The ${r.download.label} grid holds ${num(cap.gridTotal)} rows but its Excel export has ${num(cap.rows.length)} — only those are matched (FreightPOP exports the page on screen)`, "warn");
+          }
+          answer = { ok: true, rows: cap.rows.length, file: cap.file };
+        } catch (e) {
+          if (history) hist = null; else got = null;
+          answer = { ok: false, error: e.message };
+        }
+        if (!history) approvedDone = true;
+        await ext.evaluate(`fpxErpDownloadDone(${JSON.stringify(answer)})`).catch(() => {});
+        return true;
+      },
+    });
+  } catch (e) {
+    // The page work ended badly while on History, after Recently Approved
+    // was dealt with: keep what was read.
+    if (!approvedDone) throw e;
+    pageError = e.message;
+    note = `${got ? "Recently Approved was read" : "Recently Approved is empty"} · History not read: ${String(e.message).slice(0, 300)}`;
+    logLine(lane, `History not read: ${String(e.message).slice(0, 400)}`, "warn");
+  }
+  // Stopped, or both tabs were empty / unread: the page's own sentence stands.
+  if (!got && !hist) return note;
+  if (lane.stopFlag) {
+    return `${stoppedBecause(lane)}. ${[got && `Recently Approved (${num(got.rows.length)} rows)`, hist && `History (${num(hist.rows.length)} rows)`].filter(Boolean).join(" and ")} was read but not matched against the audit.`;
+  }
+
+  const short = String(auditId).slice(0, 8);
+  await saveExcelFiles(lane, auditId, [
+    ...(got?.buf ? [{ name: "recently-approved.xlsx", buf: got.buf, rows: got.rows.length }] : []),
+    ...(hist?.buf ? [{ name: "audit-history.xlsx", buf: hist.buf, rows: hist.rows.length }] : []),
+  ]);
+
+  let matched = 0, notFound = 0, unsaved = 0;
+  const parts = []; // the final note, one piece per source
+
+  // 1. Recently Approved. A failure here fails the job, as before.
+  if (got) {
+    logLine(lane, `Matching · ${num(got.rows.length)} approved rows against audit ${short} · columns: ${got.headers.join(", ")}`.slice(0, 500));
+    const resp = await postApprovals(lane, auditId, who, "recently_approved", got.headers, got.rows);
+    matched = Number(resp?.matched) || 0;
+    notFound = Number(resp?.not_found) || 0;
+    unsaved = Number(resp?.failed) || 0;
+    if (unsaved) logLine(lane, `The API could not save ${num(unsaved)} of the matched shipments — run the approval check again`, "warn");
+    // approvedRows: the export's rows (the API counts its last part only).
+    if (lane.current) Object.assign(lane.current.counts, { approvedRows: got.rows.length, matched, notFound });
+    const a = approvalAnswer(resp);
+    const head = `${num(matched)} of ${num(matched + notFound)} shipments`;
+    logLine(lane, `Approvals matched · ${head} · ${a.who} · columns used: ${a.cols}`.slice(0, 500), !matched || !a.cu.approved_by ? "warn" : "done");
+    parts.push(`${head} of audit ${short} are in Recently Approved (${num(got.rows.length)} approved rows) · ${a.who}`);
+  } else {
+    parts.push("Recently Approved is empty");
+  }
+
+  // 2. History. Nothing here fails the job.
+  if (hist) {
+    const before = matched;
+    try {
+      logLine(lane, `Matching · ${num(hist.rows.length)} History rows (${range.from} to ${range.to}) against audit ${short} · columns: ${hist.headers.join(", ")}`.slice(0, 500));
+      const resp = await postApprovals(lane, auditId, who, "history", hist.headers, hist.rows);
+      // The API's numbers describe the audit as it now stands (both sources).
+      matched = Number(resp?.matched) || 0;
+      notFound = Number(resp?.not_found) || 0;
+      const histUnsaved = Number(resp?.failed) || 0;
+      unsaved += histUnsaved;
+      if (histUnsaved) logLine(lane, `The API could not save ${num(histUnsaved)} of the shipments matched in History — run the approval check again`, "warn");
+      const more = Math.max(0, matched - before);
+      if (lane.current) Object.assign(lane.current.counts, { historyRows: hist.rows.length, matched, notFound });
+      const a = approvalAnswer(resp);
+      logLine(lane, `History matched · ${num(more)} more shipment${more === 1 ? "" : "s"} · ${a.who} · columns used: ${a.cols}`.slice(0, 500), a.cu.approved_by ? "done" : "warn");
+      parts.push(`History ${range.from} to ${range.to} (${num(hist.rows.length)} rows) adds ${num(more)} · now ${num(matched)} of ${num(matched + notFound)} · ${a.who}`);
+    } catch (e) {
+      // A 422 (no usable columns) names the export's columns in its message.
+      logLine(lane, `History not matched: ${e.message}`.slice(0, 500), "warn");
+      parts.push(`History was read (${num(hist.rows.length)} rows) but not matched: ${String(e.message).slice(0, 120)}`);
+    }
+  } else {
+    // What the page said about History ("History not read: …", "History is empty …").
+    const at = String(note || "").indexOf("History ");
+    const said = pageError ? `History not read: ${pageError}` : at >= 0 ? String(note).slice(at) : "";
+    parts.push((said || "History not read (the extension in the hosted browser may be older than 4.17 — redeploy the browser service)").slice(0, 200));
+  }
+  return parts.join(" · ") + (unsaved ? ` · ${num(unsaved)} not saved, run it again` : "");
+}
+
+// Every row of one Audit-page export → the API, in one POST when it fits,
+// else parts of at most ~12 MB; the answer to the final part is the match.
+//   source: "recently_approved" | "history" — which tab the rows came from
+// A 422 (the API found no usable column) fails with its message and the
+// export's columns; the error carries status 422.
+async function postApprovals(lane, auditId, by, source, columns, rows) {
+  const what = source === "history" ? "History" : "Recently Approved";
   const posts = [[]];
   let size = 0;
   for (const r of rows) {
@@ -1403,18 +1512,18 @@ async function postApprovals(lane, auditId, by, columns, rows) {
       res = await fetch(`${config.apiUrl}${path_}`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": config.apiKey },
-        body: JSON.stringify({ by, columns, rows: posts[i], part: i + 1, final: i === posts.length - 1 }),
+        body: JSON.stringify({ by, source, columns, rows: posts[i], part: i + 1, final: i === posts.length - 1 }),
         signal: AbortSignal.timeout(180_000),
       });
     } catch (e) {
-      throw new Error(`Sending the approved rows to the API failed${part}: ${e.name === "TimeoutError" ? "no answer after 3 min" : e.message}`);
+      throw new Error(`Sending the ${what} rows to the API failed${part}: ${e.name === "TimeoutError" ? "no answer after 3 min" : e.message}`);
     }
     const text = await res.text().catch(() => "");
     let json = null;
     try { json = JSON.parse(text); } catch { /* not JSON */ }
     if (res.status === 422) {
       const seen = Array.isArray(json?.columns) && json.columns.length ? json.columns : columns;
-      throw new Error(`${json?.error || "The API could not find a shipment id column in the Recently Approved export"} — columns in the export: ${seen.join(", ")}`.slice(0, 480));
+      throw Object.assign(new Error(`${json?.error || `The API could not find a shipment id column in the ${what} export`} — columns in the export: ${seen.join(", ")}`.slice(0, 480)), { status: 422 });
     }
     if (!res.ok) throw new Error(`POST ${path_} → ${res.status} ${(json?.error || text).slice(0, 200)}${part}`);
     resp = json;

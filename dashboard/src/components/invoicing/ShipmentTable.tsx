@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { GET_INVOICE_MAX } from "../../lib/erpPull";
+import { GET_INVOICE_MAX, approvalHover } from "../../lib/erpPull";
 import { fmtDateTime } from "../../lib/format";
 import { fmtMoney, fmtSigned, type BucketKey, type Row } from "./model";
 
@@ -12,13 +12,15 @@ const MONEY = TD + " text-right tabular-nums whitespace-nowrap text-slate-900";
 /** Who approved the invoice. Shaun is the name the team asks about, so he stands out. */
 function ApproverPill({ row }: { row: Row }) {
   const base = "inline-block text-xs rounded-full px-2.5 py-1 whitespace-nowrap ";
+  // "Approved by Shaun Zimmerman on Nov 13 · from Audit History"
+  const title = approvalHover(row.ap) || undefined;
   switch (row.approver) {
     case "shaun":
-      return <span className={base + "bg-violet-600 text-white font-medium"}>{row.approverName}</span>;
+      return <span title={title} className={base + "bg-violet-600 text-white font-medium"}>{row.approverName}</span>;
     case "person":
-      return <span className={base + "bg-violet-50 text-violet-800 ring-1 ring-violet-200"}>{row.approverName}</span>;
+      return <span title={title} className={base + "bg-violet-50 text-violet-800 ring-1 ring-violet-200"}>{row.approverName}</span>;
     case "edi":
-      return <span title="Approved automatically by EDI" className={base + "bg-sky-50 text-sky-800 ring-1 ring-sky-200"}>EDI</span>;
+      return <span title={title ?? "Approved automatically by EDI"} className={base + "bg-sky-50 text-sky-800 ring-1 ring-sky-200"}>EDI</span>;
     default:
       return (
         <span
@@ -87,7 +89,8 @@ export function ShipmentTable({ bucket, rows, empty, selected, atCap, allPicked,
             {bucket === "approved" ? (
               <>
                 <th className={TH}>Approved by</th>
-                <th className={TH + " pr-6"}>Approved on</th>
+                <th className={TH}>Approved on</th>
+                <th className={TH + " pr-6"}>Notes</th>
               </>
             ) : bucket === "not-approved" ? (
               <>
@@ -144,7 +147,10 @@ export function ShipmentTable({ bucket, rows, empty, selected, atCap, allPicked,
                 {bucket === "approved" ? (
                   <>
                     <td className={TD}><ApproverPill row={r} /></td>
-                    <td className={TD + " pr-6 whitespace-nowrap text-slate-500"}>{r.approvedOn || "—"}</td>
+                    <td className={TD + " whitespace-nowrap text-slate-500"}>{r.approvedOn || "—"}</td>
+                    <td className={TD + " pr-6 text-slate-600 max-w-[22rem]"}>
+                      {r.notes ? <span className="line-clamp-2" title={r.notes}>{r.notes}</span> : <span className="text-slate-300">—</span>}
+                    </td>
                   </>
                 ) : bucket === "not-approved" ? (
                   <>

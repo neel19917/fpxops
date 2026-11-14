@@ -1746,14 +1746,18 @@ function getNearbyLabelText(input) {
   return "";
 }
 
-function findDateInputs() {
-  const result = { from: null, to: null };
-  const candidates = [];
+// root: look only inside this element (default: the whole page).
+// skip(input): optional, true for an input that must not be considered.
+// → { from, to, all } — `all` is every date-like input found, in page order.
+function findDateInputs(root = document, skip = null) {
+  const result = { from: null, to: null, all: [] };
+  const candidates = result.all;
 
-  const allInputs = document.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='submit']):not([type='button'])");
+  const allInputs = root.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='submit']):not([type='button'])");
 
   for (const input of allInputs) {
     if (!isVisibleForClick(input)) continue;
+    if (skip && skip(input)) continue;
 
     const ph = (input.placeholder || "").toLowerCase();
     const name = (input.name || "").toLowerCase();
@@ -3603,6 +3607,8 @@ function fpxErpPoll() {
     // Get-invoices job only: finished shipments (emptied when read, like
     // `lines`) and a request to pause the job ({ id, text }).
     job: fpxErp.job || "erp_audit",
+    // Approval check only: "history" once Recently Approved is dealt with.
+    phase: fpxErp.phase || null,
     results: fpxErp.results ? fpxErp.results.splice(0) : [],
     pause: fpxErp.wantPause || null,
   };
@@ -4119,20 +4125,35 @@ async function erpAuditPull(months, runBy, shipmentType) {
 //
 // Audit page → "Recently Approved" → hand the grid's Excel export to the
 // browser service, which matches it against an ERP audit's shipments (who
-// approved each one: the EDI or a person).
+// approved each one: the EDI or a person). Then the same for the "History"
+// tab, over a date range the browser service gives (60 days before the
+// pull's start date … today), because Recently Approved only reaches back a
+// short while.
 //
-// Started by the browser service with erpApprovalCheck(runBy); it polls
-// fpxErpPoll() like the ERP audit pull. Pause / stop work the same way.
+// Started by the browser service with erpApprovalCheck(runBy, resumed, opts);
+// it polls fpxErpPoll() like the ERP audit pull. Pause / stop work the same way.
+//   opts: { historyFrom, historyTo } (MM/DD/YYYY), skipApproved (Recently
+//         Approved was already read before the page reloaded)
 //
-// HARD RULE — this job is read-only. On the Audit page it clicks exactly two
-// things: the AUDIT item in the top navigation and the "Recently Approved"
-// tab (plus, only when the browser service asks through fpxErpClickExport(),
-// an Excel export button). It never clicks approve / reject / dispute / pay /
-// edit controls, checkboxes or anything inside a grid row, and it never
-// changes a date range or page size: those are read and logged as shown.
+// HARD RULE — this job is read-only. On the Audit page it clicks exactly:
+// the AUDIT item in the top navigation, the "Recently Approved" tab, the
+// "History" tab, and on the History tab one control that applies the date
+// range (text exactly one of AP_APPLY_WORDS), after typing the range into
+// that tab's from / to date fields. (Plus, only when the browser service asks
+// through fpxErpClickExport() for Recently Approved, an Excel export button.)
+// It never clicks approve / reject / un-approve / dispute / pay / edit /
+// delete / reprocess controls, checkboxes or anything inside a grid row. On
+// Recently Approved the date range and page size are read and logged as shown.
+// A failure in the History part never fails the job: it ends as a warning.
 // =====================================================================
-const AP_GRID_MARK = "data-fpx-export-grid"; // on the Recently Approved grid, for the browser service
+const AP_GRID_MARK = "data-fpx-export-grid"; // on the grid being exported, for the browser service
 const AP_TAB_RE = /^recently\s+approved(\s*[(\[]?\s*[\d,]+\s*[)\]]?)?$/i;
+const AP_HISTORY_RE = /^history(\s*[(\[]?\s*[\d,]+\s*[)\]]?)?$/i;
+// The only controls the History tab may press to apply its date range, best first.
+const AP_APPLY_WORDS = ["search", "go", "apply", "filter", "submit", "generate", "view", "refresh", "load", "show", "get history"];
+// A control whose handler says it does one of these is never pressed, whatever its text.
+const AP_APPLY_NEVER_RE = /approv|reject|dispute|delete|remove|void|reprocess|process|save|update|edit|pay(?!load)|send|e-?mail|import|upload|erp|edi(?![a-z])|export/i;
+const AP_EXPIRED = "FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run";
 const AP_TABLIKE = "[role=tab], .nav-tabs li, .nav-tabs a, .nav-pills li, .nav-pills a, .k-tabstrip-items .k-item, .k-tabstrip-items .k-link, md-tab-item, .md-tab";
 const AP_DANGER_RE = /\b(approve|reject|dispute|pay|delete|void|cancel|send|e-?mail|import|upload|erp|edi|accounting|template|quickbooks|netsuite|pdf|print)\b/i;
 
@@ -4188,17 +4209,18 @@ function apTabIsActive(el) {
   return false;
 }
 
-// → { el, kind: "tab" | "heading", label } or null. A tab is clicked; a
-// section heading (the grid simply sits under it) is not.
-function apFindApprovedTab() {
+// Everything on the page whose text is the tab's name (`re`), best first:
+// [{ el, kind: "tab" | "heading", score, label }]. A tab is clicked; a section
+// heading (the grid simply sits under it) is not.
+function apTabHits(re) {
   const hits = [];
   for (const el of document.querySelectorAll(`${AP_TABLIKE}, a, button, h1, h2, h3, h4, h5, legend, .panel-heading, .panel-title, .card-header, span, div, li, label`)) {
     const text = apText(el);
-    if (text.length > 40 || !AP_TAB_RE.test(text) || !isVisibleForClick(el) || apInRow(el)) continue;
+    if (text.length > 40 || !re.test(text) || !isVisibleForClick(el) || apInRow(el)) continue;
     const tabby = el.matches(AP_TABLIKE) ? el : el.closest(AP_TABLIKE);
     let score, kind = "tab", target = el;
-    if (tabby && AP_TAB_RE.test(apText(tabby))) { score = 10; target = tabby; }
-    else if (el.matches("a, button") || (el.closest("a, button") && AP_TAB_RE.test(apText(el.closest("a, button"))))) { score = 5; target = el.closest("a, button") || el; }
+    if (tabby && re.test(apText(tabby))) { score = 10; target = tabby; }
+    else if (el.matches("a, button") || (el.closest("a, button") && re.test(apText(el.closest("a, button"))))) { score = 5; target = el.closest("a, button") || el; }
     else if (el.matches("h1, h2, h3, h4, h5, legend, .panel-heading, .panel-title, .card-header")) { score = 3; kind = "heading"; }
     else {
       const clickable = el.hasAttribute("ng-click") || el.hasAttribute("data-ng-click") || el.hasAttribute("onclick") || window.getComputedStyle(el).cursor === "pointer";
@@ -4207,9 +4229,43 @@ function apFindApprovedTab() {
     }
     hits.push({ el: target, kind, score, label: text, len: el.querySelectorAll("*").length });
   }
-  if (!hits.length) return null;
   hits.sort((a, b) => b.score - a.score || a.label.length - b.label.length || a.len - b.len);
-  return hits[0];
+  return hits;
+}
+
+// → { el, kind: "tab" | "heading", score, label } or null.
+function apFindTab(re) { return apTabHits(re)[0] || null; }
+
+// The History tab. Only a real tab is taken, and when Recently Approved is a
+// tab too, only one in the same strip (so a "History" link elsewhere on the
+// page is never clicked). → { tab, approved, others: labels not taken }
+function apFindHistoryTab() {
+  const approved = apFindTab(AP_TAB_RE);
+  const hits = apTabHits(AP_HISTORY_RE).filter((h) => h.kind === "tab" && h.score >= 5);
+  const sameStrip = (h) => {
+    let up = approved.el;
+    for (let i = 0; i <= 4 && up && up !== document.body; i++) {
+      if (up.contains(h.el)) return i;
+      up = up.parentElement;
+    }
+    return -1;
+  };
+  let ok;
+  if (approved && approved.kind === "tab") {
+    ok = hits.map((h) => ({ ...h, level: sameStrip(h) })).filter((h) => h.level >= 0).sort((a, b) => a.level - b.level || b.score - a.score);
+  } else {
+    ok = hits.filter((h) => h.score >= 10);
+  }
+  const others = hits.filter((h) => !ok.some((o) => o.el === h.el)).map((h) => `<${h.el.tagName.toLowerCase()}> "${h.label}"`);
+  return { tab: ok[0] || null, approved, others: apUniq(others, 5) };
+}
+
+// The pane a tab names (aria-controls / href="#id"), or null.
+function apTabPane(tab) {
+  if (!tab || tab.kind !== "tab") return null;
+  const link = tab.el.matches("a") ? tab.el : tab.el.querySelector("a");
+  const id = tab.el.getAttribute("aria-controls") || (link && (link.getAttribute("aria-controls") || (/^#[\w-]+$/.test(link.getAttribute("href") || "") ? link.getAttribute("href").slice(1) : "")));
+  return id ? document.getElementById(id) : null;
 }
 
 function apTabLabels() {
@@ -4226,15 +4282,13 @@ function apTabLabels() {
   return apUniq(seen);
 }
 
-// The Recently Approved grid: inside the tab's pane when the tab names one,
+// A tab's grid (Recently Approved, History): inside the tab's pane when the tab names one,
 // the first grid after a section heading, else the biggest visible grid.
 function apFindGrid(tab) {
   const grids = [...document.querySelectorAll(".k-grid")].filter(isVisibleForClick);
   if (!grids.length) return null;
   if (tab && tab.kind === "tab") {
-    const link = tab.el.matches("a") ? tab.el : tab.el.querySelector("a");
-    const id = tab.el.getAttribute("aria-controls") || (link && (link.getAttribute("aria-controls") || (/^#[\w-]+$/.test(link.getAttribute("href") || "") ? link.getAttribute("href").slice(1) : "")));
-    const pane = id ? document.getElementById(id) : null;
+    const pane = apTabPane(tab);
     const inPane = pane ? grids.filter((g) => pane.contains(g)) : [];
     if (inPane.length) return inPane[0];
   }
@@ -4311,6 +4365,7 @@ function apDescribeView(grid) {
 function apExportCandidates() {
   const grid = document.querySelector(`[${AP_GRID_MARK}]`);
   if (!grid) return []; // no Recently Approved grid in hand: click nothing
+  if (fpxErp && fpxErp.phase === "history") return []; // History: the grid's own export only, no button
   const scope = apGridScope(grid);
   const out = [];
   const seen = new Set();
@@ -4340,14 +4395,303 @@ function apExportCandidates() {
   return out.sort((a, b) => b.score - a.score);
 }
 
-async function erpApprovalCheck(runBy, resumed = false) {
+// A tab's grid, loaded and quiet. Counts steps (half a second each), so a
+// pause doesn't use the limit up. → { grid, settled, sawLoading }
+//   find()     the grid, or null while it isn't there
+//   changed(sig)  true when the grid no longer shows what it did before
+//   need({ rows, sawLoading, changed })  quiet steps wanted before it counts as loaded
+async function apWaitGrid({ find, label, steps, changed, need }) {
+  let grid = null, calm = 0, sawLoading = false, lastSig = null;
+  for (let i = 0; i < steps; i++) {
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error(AP_EXPIRED);
+    grid = find();
+    if (!grid) { calm = 0; }
+    else if (apLoading(grid)) { sawLoading = true; calm = 0; }
+    else {
+      const sig = apGridSig(grid);
+      calm = sig === lastSig ? calm + 1 : 0;
+      lastSig = sig;
+      if (calm >= need({ rows: apGridRows(grid), sawLoading, changed: changed(sig) })) return { grid, settled: true, sawLoading };
+    }
+    if (i > 0 && i % 30 === 0) erpLog(`Still loading ${label} · ${i / 2}s`);
+    await sleep(500);
+  }
+  return { grid, settled: false, sawLoading };
+}
+
+// ── History tab ──
+// Inside a grid (rows, header, filter row, pager) or a popup: never touched.
+function apInGrid(el) {
+  if (el.closest(".k-grid-toolbar")) return false;
+  return !!el.closest(".k-grid, .k-grid-content, .k-grid-header, .k-pager-wrap, .k-pager, .k-filter-row, .k-window, .modal, .k-animation-container");
+}
+
+function apDescribeEl(el) {
+  if (!el) return "?";
+  const cls = String(el.className || "").replace(/\s+/g, ".").slice(0, 60);
+  return `<${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${cls ? `.${cls}` : ""}>`;
+}
+
+// The part of the page that belongs to the open tab: the pane the tab names,
+// else the grid's surroundings, else the open tab pane, else the smallest
+// block around the tab strip that also holds fields or a grid.
+function apTabPanel(tab, grid) {
+  const pane = apTabPane(tab);
+  if (pane && isVisibleForClick(pane)) return pane;
+  if (grid) return apGridScope(grid);
+  const open = [...document.querySelectorAll(".tab-pane.active, [role=tabpanel], .k-tabstrip > .k-content, md-tab-content.md-active")].filter(isVisibleForClick);
+  if (open.length === 1) return open[0];
+  const strip = tab.el.closest("ul, [role=tablist], .nav-tabs, .k-tabstrip-items, md-tabs-wrapper") || tab.el.parentElement;
+  let up = strip ? strip.parentElement : null;
+  for (let i = 0; i < 4 && up && up !== document.body; i++) {
+    const holds = [...up.querySelectorAll("input:not([type=hidden]), select, .k-grid")].some((e) => isVisibleForClick(e) && !strip.contains(e));
+    if (holds) return up;
+    up = up.parentElement;
+  }
+  return null;
+}
+
+// "input[placeholder="…" ng-model=… name=…]=value" for every visible field of the tab.
+function apPanelFields(panel) {
+  return [...panel.querySelectorAll("input:not([type=hidden]), select, textarea")]
+    .filter((e) => isVisibleForClick(e) && !apInGrid(e))
+    .map((e) => {
+      const about = [
+        e.getAttribute("placeholder") ? `placeholder="${e.getAttribute("placeholder").slice(0, 30)}"` : "",
+        (e.getAttribute("ng-model") || e.getAttribute("data-ng-model") || e.getAttribute("k-ng-model")) ? `ng-model=${(e.getAttribute("ng-model") || e.getAttribute("data-ng-model") || e.getAttribute("k-ng-model")).slice(0, 40)}` : "",
+        e.name ? `name=${String(e.name).slice(0, 30)}` : "",
+        !e.getAttribute("placeholder") && !e.name && e.id ? `id=${String(e.id).slice(0, 30)}` : "",
+        e.tagName === "INPUT" && e.type && e.type !== "text" ? `type=${e.type}` : "",
+      ].filter(Boolean).join(" ");
+      const value = e.tagName === "SELECT" ? apText(e.options[e.selectedIndex]) : (e.type === "checkbox" || e.type === "radio") ? (e.checked ? "on" : "off") : e.value;
+      return `${e.tagName.toLowerCase()}[${about}]=${String(value || "").slice(0, 30)}`;
+    });
+}
+
+function apPanelButtons(panel) {
+  const out = [];
+  for (const e of panel.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button], .k-button")) {
+    if (!isVisibleForClick(e) || apInGrid(e)) continue;
+    const t = apText(e) || e.title || e.getAttribute("aria-label") || "";
+    if (t && t.length <= 30) out.push(t);
+  }
+  return apUniq(out, 40);
+}
+
+// The controls that may be pressed to apply the History date range: visible,
+// in the tab's panel, outside any grid, text exactly one of AP_APPLY_WORDS.
+// → { ok: [{ el, text }] best first, refused: [text (why)] }
+function apApplyControls(panel) {
+  const ok = [], refused = [];
+  const seen = new Set();
+  for (const e of panel.querySelectorAll("button, input[type=button], input[type=submit], a, [role=button], .k-button")) {
+    if (seen.has(e) || !isVisibleForClick(e) || apInGrid(e)) continue;
+    const text = apText(e);
+    const rank = AP_APPLY_WORDS.indexOf(text.toLowerCase());
+    if (rank < 0) continue;
+    seen.add(e);
+    const does = [e.getAttribute("ng-click"), e.getAttribute("data-ng-click"), e.getAttribute("onclick")].filter(Boolean).join(" | ");
+    if (e.disabled || e.getAttribute("aria-disabled") === "true") { refused.push(`"${text}" (disabled)`); continue; }
+    if (AP_APPLY_NEVER_RE.test(does)) { refused.push(`"${text}" (its handler is ${does.slice(0, 60)})`); continue; }
+    ok.push({ el: e, text, rank });
+  }
+  ok.sort((a, b) => a.rank - b.rank);
+  return { ok, refused };
+}
+
+// Does a date field show this MM/DD/YYYY day (in whatever format it uses)?
+function apShowsDay(input, mdy) {
+  const v = String((input && input.value) || "").trim();
+  const [mm, dd, yyyy] = mdy.split("/").map(Number);
+  let m = v.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})/);
+  if (m) return +m[1] === mm && +m[2] === dd && (+m[3] === yyyy || +m[3] === yyyy % 100);
+  m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return +m[1] === yyyy && +m[2] === mm && +m[3] === dd;
+  return false;
+}
+
+function apFieldName(input) {
+  return (input.getAttribute("ng-model") || input.getAttribute("k-ng-model") || input.name || input.id || input.getAttribute("placeholder") || input.type || "field").slice(0, 40);
+}
+
+// Open History, set its date range, wait for the grid and hand it over for
+// the Excel capture. → { rows, note }. Throws with the reason when History
+// could not be read; the caller turns that into a warning.
+//   mark(grid)  puts the export mark on the grid (and takes it off any other)
+async function apHistoryPhase(from, to, mark) {
+  const where = () => window.location.hash || window.location.pathname;
+  const controls = (panel) => `fields: ${panel ? apPanelFields(panel).slice(0, 12).join(" | ") || "none" : "?"} · buttons: ${panel ? apPanelButtons(panel).join(" | ") || "none" : "?"}`;
+
+  // a. The History tab, in the same strip as Recently Approved.
+  let found = null;
+  for (let i = 0; i < 20; i++) { // 10 s
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error(AP_EXPIRED);
+    found = apFindHistoryTab();
+    if (found.tab) break;
+    await sleep(500);
+  }
+  if (!found.tab) {
+    throw new Error(`"History" tab not found on the Audit page — tabs seen: ${apTabLabels().join(", ") || "none"}` +
+      `${found.others.length ? ` ("History" elsewhere on the page was not clicked: ${found.others.join(", ")})` : ""} (waited 10s; page is ${where()})`);
+  }
+  let tab = found.tab;
+
+  // b. Open it. It must be the open tab — and Recently Approved must not be —
+  // before anything is read or typed.
+  const isOpen = () => {
+    const f = apFindHistoryTab();
+    if (f.tab) tab = f.tab;
+    const other = f.approved && f.approved.kind === "tab" && f.approved.el !== tab.el && apTabIsActive(f.approved.el);
+    return apTabIsActive(tab.el) && !other;
+  };
+  if (isOpen()) {
+    erpLog(`"${tab.label}" tab is already open`);
+  } else {
+    erpLog(`Opening the "${tab.label}" tab`);
+    simulateClick(tab.el.matches("li") ? ([...tab.el.querySelectorAll("a, .k-link")].find(isVisibleForClick) || tab.el) : tab.el);
+    await humanDelay(800, 1400);
+    let open = false;
+    for (let i = 0; i < 30 && !open; i++) { // 15 s
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw new Error(AP_EXPIRED);
+      open = isOpen();
+      if (!open) await sleep(500);
+    }
+    if (!open) {
+      const li = tab.el.closest("li, .k-item, md-tab-item, [role=tab]") || tab.el;
+      const f = apFindHistoryTab();
+      throw new Error(`clicked the "${tab.label}" tab but it did not become the open tab within 15s — nothing was read or typed ` +
+        `(tab is <${tab.el.tagName.toLowerCase()} class="${String(li.className || "").slice(0, 80)}" aria-selected="${li.getAttribute("aria-selected") || ""}">` +
+        `${f.approved && f.approved.kind === "tab" && apTabIsActive(f.approved.el) ? "; Recently Approved still reads as the open tab" : ""})`);
+    }
+  }
+  await humanDelay(1200, 1800); // let the tab's content render
+
+  // c. Its part of the page. A grid counts only inside the pane the tab names.
+  const findGrid = () => {
+    const g = apFindGrid(tab);
+    const pane = apTabPane(tab);
+    return g && pane && isVisibleForClick(pane) && !pane.contains(g) ? null : g;
+  };
+  let grid = null, panel = null;
+  for (let i = 0; i < 20; i++) { // 10 s
+    await erpCheckpoint();
+    grid = findGrid();
+    panel = apTabPanel(tab, grid);
+    if (panel && (grid || apPanelFields(panel).length)) break;
+    await sleep(500);
+  }
+  if (!panel) throw new Error(`the History tab is open but nothing under it could be read after 10s (no grid, no fields; page is ${where()})`);
+  erpLog(`History tab open · reading ${apDescribeEl(panel)} · ${grid ? `grid on screen with ${erpNum(apGridRows(grid))} row(s)` : "no grid on screen yet"}`);
+  erpLog(`History tab fields: ${apPanelFields(panel).slice(0, 25).join(" | ") || "none"}`.slice(0, 900));
+  erpLog(`History tab buttons: ${apPanelButtons(panel).join(" | ") || "none"}`.slice(0, 900));
+
+  // d. The date range.
+  const found2 = findDateInputs(panel, apInGrid);
+  let fromInput = found2.from, toInput = found2.to;
+  if (found2.all.length >= 2 && (!fromInput || !toInput || fromInput === toInput)) { fromInput = found2.all[0]; toInput = found2.all[1]; }
+  const sigBefore = grid ? apGridSig(grid) : "";
+  let applied = false;
+  if (found2.all.length < 2 || !fromInput || !toInput || fromInput === toInput) {
+    const shown = grid ? apDescribeView(grid) : [];
+    erpLog(`History has ${found2.all.length === 1 ? "one date field, not a from / to pair" : "no date fields"} — left as it is` +
+      ` (wanted ${from} to ${to}) · ${shown.length ? shown.join(" · ") : "no date range or pager could be read"}`, "warn");
+  } else {
+    await erpCheckpoint();
+    erpLog(`History · setting the range ${from} to ${to} (from field ${apFieldName(fromInput)}, was "${String(fromInput.value).slice(0, 20)}" · to field ${apFieldName(toInput)}, was "${String(toInput.value).slice(0, 20)}")`);
+    setDateInput(fromInput, from);
+    await humanDelay(300, 600);
+    setDateInput(toInput, to);
+    await humanDelay(400, 800);
+    const fromOk = apShowsDay(fromInput, from), toOk = apShowsDay(toInput, to);
+    erpLog(`History dates · from shows "${String(fromInput.value).slice(0, 20)}"${fromOk ? "" : ` (wanted ${from})`} · to shows "${String(toInput.value).slice(0, 20)}"${toOk ? "" : ` (wanted ${to})`}`, fromOk && toOk ? "info" : "warn");
+
+    // e. Apply it: one of the allowed controls, else Enter on the To field.
+    await erpCheckpoint();
+    const apply = apApplyControls(panel);
+    if (apply.refused.length) erpLog(`History · not pressed: ${apply.refused.join(", ")}`, "warn");
+    if (apply.ok.length) {
+      erpLog(`History · applying the range · clicking "${apply.ok[0].text}"${apply.ok.length > 1 ? ` (also there: ${apply.ok.slice(1).map((c) => `"${c.text}"`).join(", ")})` : ""}`);
+      simulateClick(apply.ok[0].el);
+      applied = true;
+      await humanDelay(600, 1000);
+    } else {
+      erpLog(`History · no Search-type button on the tab (allowed: ${AP_APPLY_WORDS.join(", ")}) — pressing Enter in the To date field`);
+      toInput.focus();
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        toInput.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+      }
+      toInput.dispatchEvent(new Event("change", { bubbles: true }));
+      toInput.blur();
+      let reacted = false;
+      for (let i = 0; i < 20 && !reacted; i++) { // 10 s
+        await erpCheckpoint();
+        const g = findGrid();
+        reacted = !!g && (apLoading(g) || apGridSig(g) !== sigBefore);
+        if (!reacted) await sleep(500);
+      }
+      const g = findGrid();
+      if (reacted) {
+        erpLog("History · the grid reloaded after Enter in the To date field");
+        applied = true;
+      } else if (!g || apGridRows(g) === 0) {
+        // Nothing loads without a control that is not on the list: stop here.
+        throw new Error(`the dates were typed but nothing loads them: no button named ${AP_APPLY_WORDS.join(" / ")}, and Enter did nothing in 10s — on the tab: ${controls(panel)}`.slice(0, 900));
+      } else {
+        erpLog(`History · the grid did not reload after Enter (10s) — reading what it shows, which may not be ${from} to ${to} · on the tab: ${controls(panel)}`.slice(0, 900), "warn");
+      }
+    }
+  }
+
+  // f. The grid, loaded. A long range can take a while: up to 3 minutes.
+  // After the range was applied, rows that look the same as before must stay
+  // quiet for 20s (a slow search with no loading mask), an empty grid 30s.
+  const waited = await apWaitGrid({
+    find: findGrid, label: "History", steps: 360,
+    changed: (sig) => sig !== sigBefore,
+    need: ({ rows, sawLoading, changed }) => (rows > 0
+      ? ((sawLoading || changed) ? 4 : (applied ? 40 : 10))
+      : (sawLoading ? 16 : (applied ? 60 : 16))),
+  });
+  grid = waited.grid;
+  if (!grid) throw new Error(`the History grid never appeared (waited 3 min; page is ${where()}) — on the tab: ${controls(apTabPanel(tab, null) || panel)}`.slice(0, 900));
+  if (!waited.settled) throw new Error("the History grid was still loading after 3 min");
+
+  // g. What it shows.
+  const rowsOnScreen = apGridRows(grid);
+  const view = apDescribeView(grid);
+  erpLog(`History · ${view.length ? view.join(" · ") : "no date range or pager could be read"} · ${erpNum(rowsOnScreen)} row(s) on screen`);
+  if (rowsOnScreen === 0 || /no items to display/i.test(apText(grid.querySelector(".k-pager-info")))) {
+    return { rows: 0, note: `History is empty for ${from} to ${to}` };
+  }
+
+  // h. The browser service takes the grid's Excel export (all pages).
+  await erpCheckpoint();
+  mark(grid);
+  erpLog("Taking FreightPOP's Excel export · History");
+  const dl = await erpHandOffDownload("History");
+  await erpCheckpoint(); // a stop during the hand-off ends as "stopped"
+  if (!dl || !dl.ok) throw new Error(`export not captured: ${(dl && dl.error) || "no reply"}`);
+  return { rows: Number(dl.rows) || 0, note: `History export captured · ${erpNum(dl.rows)} rows (${from} to ${to})` };
+}
+
+async function erpApprovalCheck(runBy, resumed = false, opts = null) {
   if (fpxErp && !fpxErp.done) return; // already running in this page
   stopRequested = false;
-  const state = { job: "approval_check", lines: [], counts: { approvedRows: 0 }, done: null };
+  opts = opts && typeof opts === "object" ? opts : {};
+  const state = { job: "approval_check", lines: [], counts: { approvedRows: 0, historyRows: 0 }, done: null, phase: null };
   fpxErp = state;
   const where = () => window.location.hash || window.location.pathname;
-  const expired = "FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run";
+  const expired = AP_EXPIRED;
   let marked = null;
+  const mark = (grid) => {
+    for (const g of document.querySelectorAll(`[${AP_GRID_MARK}]`)) g.removeAttribute(AP_GRID_MARK);
+    grid.setAttribute(AP_GRID_MARK, "1");
+    marked = grid;
+  };
+  let approvedNote = null; // set once Recently Approved is dealt with
 
   try {
     await erpCheckpoint();
@@ -4380,7 +4724,7 @@ async function erpApprovalCheck(runBy, resumed = false) {
     for (let i = 0; i < 60; i++) { // 30 s
       await erpCheckpoint();
       if (erpLoginExpired()) throw new Error(expired);
-      tab = apFindApprovedTab();
+      tab = apFindTab(AP_TAB_RE);
       if (tab) break;
       await sleep(500);
     }
@@ -4392,84 +4736,94 @@ async function erpApprovalCheck(runBy, resumed = false) {
       throw new Error(`"Recently Approved" tab not found on the Audit page — tabs seen: ${tabs.join(", ") || "none"} (waited 30s; page is ${after})`);
     }
 
-    // 3. Show Recently Approved.
-    await erpCheckpoint();
-    const sigBefore = (() => { const g = apFindGrid(tab); return g ? apGridSig(g) : ""; })();
-    let clicked = false;
-    if (tab.kind === "heading") {
-      erpLog(`"${tab.label}" is a section on the page, not a tab — nothing to click`);
-    } else if (apTabIsActive(tab.el)) {
-      erpLog(`"${tab.label}" tab is already open`);
+    if (opts.skipApproved) {
+      // The page reloaded after Recently Approved was handed over.
+      erpLog("Recently Approved was already read — going on to History");
+      approvedNote = "Recently Approved export captured";
     } else {
-      erpLog(`Opening the "${tab.label}" tab`);
-      simulateClick(tab.el.matches("li") ? ([...tab.el.querySelectorAll("a, .k-link")].find(isVisibleForClick) || tab.el) : tab.el);
-      clicked = true;
-      await humanDelay(800, 1400);
-      // The tab must be the open one before any grid is read: otherwise the
-      // grid on screen is another tab's and its rows are not approvals.
-      let open = false, seenTab = tab;
-      for (let i = 0; i < 30 && !open; i++) { // 15 s
-        await erpCheckpoint();
-        seenTab = apFindApprovedTab() || seenTab;
-        open = seenTab.kind === "tab" && apTabIsActive(seenTab.el);
-        if (!open) await sleep(500);
-      }
-      if (!open) {
-        const li = seenTab.el.closest("li, .k-item, md-tab-item, [role=tab]") || seenTab.el;
-        throw new Error(`Clicked the "${tab.label}" tab but it did not become the open tab within 15s — nothing was read ` +
-          `(tab is <${seenTab.el.tagName.toLowerCase()} class="${String(li.className || "").slice(0, 80)}" aria-selected="${li.getAttribute("aria-selected") || ""}">)`);
-      }
-    }
-
-    // 4. Its grid, loaded. Counts steps, so a pause doesn't use the limit up.
-    let grid = null, calm = 0, sawLoading = false, lastSig = null, settled = false;
-    for (let i = 0; i < 180; i++) { // 90 s
+      // 3. Show Recently Approved.
       await erpCheckpoint();
-      if (erpLoginExpired()) throw new Error(expired);
-      grid = apFindGrid(apFindApprovedTab() || tab);
-      if (!grid) { calm = 0; }
-      else if (apLoading(grid)) { sawLoading = true; calm = 0; }
-      else {
-        const sig = apGridSig(grid);
-        calm = sig === lastSig ? calm + 1 : 0;
-        lastSig = sig;
-        const rows = apGridRows(grid);
-        // Rows on screen: 2 quiet seconds after a load or a change, else 5.
-        // No rows: 8 quiet seconds before calling it empty.
-        const need = rows > 0 ? ((sawLoading || (clicked && sig !== sigBefore)) ? 4 : 10) : 16;
-        if (calm >= need) { settled = true; break; }
+      const sigBefore = (() => { const g = apFindGrid(tab); return g ? apGridSig(g) : ""; })();
+      let clicked = false;
+      if (tab.kind === "heading") {
+        erpLog(`"${tab.label}" is a section on the page, not a tab — nothing to click`);
+      } else if (apTabIsActive(tab.el)) {
+        erpLog(`"${tab.label}" tab is already open`);
+      } else {
+        erpLog(`Opening the "${tab.label}" tab`);
+        simulateClick(tab.el.matches("li") ? ([...tab.el.querySelectorAll("a, .k-link")].find(isVisibleForClick) || tab.el) : tab.el);
+        clicked = true;
+        await humanDelay(800, 1400);
+        // The tab must be the open one before any grid is read: otherwise the
+        // grid on screen is another tab's and its rows are not approvals.
+        let open = false, seenTab = tab;
+        for (let i = 0; i < 30 && !open; i++) { // 15 s
+          await erpCheckpoint();
+          seenTab = apFindTab(AP_TAB_RE) || seenTab;
+          open = seenTab.kind === "tab" && apTabIsActive(seenTab.el);
+          if (!open) await sleep(500);
+        }
+        if (!open) {
+          const li = seenTab.el.closest("li, .k-item, md-tab-item, [role=tab]") || seenTab.el;
+          throw new Error(`Clicked the "${tab.label}" tab but it did not become the open tab within 15s — nothing was read ` +
+            `(tab is <${seenTab.el.tagName.toLowerCase()} class="${String(li.className || "").slice(0, 80)}" aria-selected="${li.getAttribute("aria-selected") || ""}">)`);
+        }
       }
-      if (i > 0 && i % 30 === 0) erpLog(`Still loading Recently Approved · ${i / 2}s`);
-      await sleep(500);
+
+      // 4. Its grid, loaded (90 s). Rows on screen: 2 quiet seconds after a
+      // load or a change, else 5. No rows: 8 quiet seconds before calling it empty.
+      const waited = await apWaitGrid({
+        find: () => apFindGrid(apFindTab(AP_TAB_RE) || tab), label: "Recently Approved", steps: 180,
+        changed: (sig) => clicked && sig !== sigBefore,
+        need: ({ rows, sawLoading, changed }) => (rows > 0 ? ((sawLoading || changed) ? 4 : 10) : 16),
+      });
+      const grid = waited.grid;
+      if (!grid) throw new Error(`The Recently Approved grid never appeared (waited 90s; page is ${where()}; tabs seen: ${apTabLabels().join(", ") || "none"})`);
+      if (!waited.settled) throw new Error("The Recently Approved grid was still loading after 90s");
+
+      mark(grid);
+
+      // 5. What it shows. Date range and page size are left exactly as they are.
+      const rowsOnScreen = apGridRows(grid);
+      const view = apDescribeView(grid);
+      erpLog(`Recently Approved · ${view.length ? view.join(" · ") : "no date range or pager could be read"} · ${erpNum(rowsOnScreen)} row(s) on screen`);
+      erpLog(`Audit page tabs: ${apTabLabels().join(" | ") || "none found"}`);
+      const pagerInfo = apText(grid.querySelector(".k-pager-info"));
+      if (rowsOnScreen === 0 || /no items to display/i.test(pagerInfo)) {
+        erpLog("Recently Approved is empty — going on to History");
+        approvedNote = "Recently Approved is empty";
+      } else {
+        // 6. The browser service takes the grid's Excel export.
+        await erpCheckpoint();
+        erpLog("Taking FreightPOP's Excel export · Recently Approved");
+        const dl = await erpHandOffDownload("Recently Approved");
+        await erpCheckpoint(); // a stop during the hand-off ends as "stopped"
+        if (!dl || !dl.ok) throw new Error(`Recently Approved export not captured: ${(dl && dl.error) || "no reply"}`);
+        state.counts.approvedRows = Number(dl.rows) || 0;
+        approvedNote = `Recently Approved export captured · ${erpNum(state.counts.approvedRows)} rows`;
+      }
     }
-    if (!grid) throw new Error(`The Recently Approved grid never appeared (waited 90s; page is ${where()}; tabs seen: ${apTabLabels().join(", ") || "none"})`);
-    if (!settled) throw new Error("The Recently Approved grid was still loading after 90s");
 
-    for (const g of document.querySelectorAll(`[${AP_GRID_MARK}]`)) g.removeAttribute(AP_GRID_MARK);
-    grid.setAttribute(AP_GRID_MARK, "1");
-    marked = grid;
-
-    // 5. What it shows. Date range and page size are left exactly as they are.
-    const rowsOnScreen = apGridRows(grid);
-    const view = apDescribeView(grid);
-    erpLog(`Recently Approved · ${view.length ? view.join(" · ") : "no date range or pager could be read"} · ${erpNum(rowsOnScreen)} row(s) on screen`);
-    const pagerInfo = apText(grid.querySelector(".k-pager-info"));
-    if (rowsOnScreen === 0 || /no items to display/i.test(pagerInfo)) {
-      state.done = { ok: true, note: "Recently Approved is empty — nothing to match" };
-      return;
+    // 7. History, for the range the browser service asked for. Nothing in
+    // here can fail the job: Recently Approved stands whatever happens.
+    state.phase = "history";
+    if (marked) { marked.removeAttribute(AP_GRID_MARK); marked = null; }
+    let historyNote;
+    try {
+      if (!opts.historyFrom || !opts.historyTo) throw new Error("the browser service sent no date range (it needs redeploying)");
+      const h = await apHistoryPhase(String(opts.historyFrom), String(opts.historyTo), mark);
+      state.counts.historyRows = h.rows;
+      historyNote = h.note;
+    } catch (e) {
+      if (e && e.fpxStop) throw e;
+      console.warn("[FPX-ERP] approval check, History:", e?.message || e);
+      historyNote = `History not read: ${String(e?.message || e)}`;
+      erpLog(historyNote.slice(0, 900), "warn");
     }
-
-    // 6. The browser service takes the grid's Excel export.
-    await erpCheckpoint();
-    erpLog("Taking FreightPOP's Excel export · Recently Approved");
-    const dl = await erpHandOffDownload("Recently Approved");
-    await erpCheckpoint(); // a stop during the hand-off ends as "stopped"
-    if (!dl || !dl.ok) throw new Error(`Recently Approved export not captured: ${(dl && dl.error) || "no reply"}`);
-    state.counts.approvedRows = Number(dl.rows) || 0;
-    state.done = { ok: true, note: `Recently Approved export captured · ${erpNum(state.counts.approvedRows)} rows` };
+    state.done = { ok: true, note: `${approvedNote} · ${historyNote}`.slice(0, 480) };
   } catch (e) {
     if (e && e.fpxStop) {
-      state.done = { ok: true, stopped: true, note: "Nothing was checked." };
+      state.done = { ok: true, stopped: true, note: approvedNote ? `${approvedNote}; History was not read.` : "Nothing was checked." };
     } else {
       console.warn("[FPX-ERP] approval check failed:", e?.message || e);
       state.done = { ok: false, note: String(e?.message || e) };

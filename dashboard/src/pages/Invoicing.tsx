@@ -6,7 +6,7 @@ import { hostedBrowser } from "../lib/hostedBrowser";
 import {
   APPROVAL_SCOPE, ERP_MONTH_CHOICES, ERP_TYPE_CHOICES, GET_INVOICE_MAX,
   asApprovalResult, asPullResult, downloadAuditExcel, erpWorker, isErpRequest,
-  requestApprovalCheck, requestErpPull,
+  requestApprovalCheck, requestErpPull, type AuditExcelWhich,
   type ErpMonths, type ErpShipmentType,
 } from "../lib/erpPull";
 import { fmtNum } from "../lib/format";
@@ -48,7 +48,8 @@ const AUDIT_STATUS: Record<string, { label: string; cls: string }> = {
 // ── The two-step refresh ──
 
 // What this page started in the hosted browser: step 1 is the list of
-// shipments not exported to ERP, step 2 the Recently Approved check.
+// shipments not exported to ERP, step 2 the approval check (the Audit page's
+// Recently Approved and History tabs).
 interface Chain {
   step: 1 | 2;
   state: "running" | "done" | "failed" | "stopped";
@@ -120,7 +121,7 @@ export function InvoicingPage() {
 
   const [months, setMonths] = useState<ErpMonths>(3);
   const [shipType, setShipType] = useState<ErpShipmentType>("non-parcel");
-  const [excel, setExcel] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
+  const [excel, setExcel] = useState<{ busy: AuditExcelWhich | null; error: string | null }>({ busy: null, error: null });
   const [starting, setStarting] = useState<"refresh" | "approvals" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -177,7 +178,7 @@ export function InvoicingPage() {
 
   const auditId = detail?.run.id ?? null;
 
-  /** Step 2: queue the Recently Approved check for one list. */
+  /** Step 2: queue the approval check (Recently Approved + History) for one list. */
   const startApprovals = useCallback(async (forAudit: string, full: boolean) => {
     try {
       const res = await requestApprovalCheck(forAudit);
@@ -300,14 +301,14 @@ export function InvoicingPage() {
   }
 
 
-  async function downloadExcel() {
+  async function downloadExcel(which: AuditExcelWhich) {
     if (!auditId || excel.busy) return;
-    setExcel({ busy: true, error: null });
+    setExcel({ busy: which, error: null });
     try {
-      await downloadAuditExcel(auditId, "not-exported");
-      setExcel({ busy: false, error: null });
+      await downloadAuditExcel(auditId, which);
+      setExcel({ busy: null, error: null });
     } catch (e) {
-      setExcel({ busy: false, error: (e as Error).message || "Could not download the file." });
+      setExcel({ busy: null, error: (e as Error).message || "Could not download the file." });
     }
   }
 
@@ -428,7 +429,7 @@ export function InvoicingPage() {
     : stripTone !== "working" ? (chain?.message ?? "")
     : invoiceRun ? "Pressing Get Invoice in FreightPOP on the shipments you picked, one at a time. It pauses after the first one for you to check."
     : step1 === "running" ? "Reading FreightPOP's History Report in the invoicing session…"
-    : step2 === "running" ? "Reading Recently Approved in the invoicing session…"
+    : step2 === "running" ? "Reading Recently Approved and History in the invoicing session…"
     : step1 === "queued" || step2 === "queued" ? "Waiting for the invoicing session…"
     : "Starting…";
 
@@ -437,8 +438,9 @@ export function InvoicingPage() {
   // ── Cards and the selected bucket's panel ──
 
   const n = fmtNum;
+  // Shaun is always named, even at zero: he is the one the team asks about.
   const approvedParts = [
-    approvedBy.shaun ? `${n(approvedBy.shaun)} by Shaun` : "",
+    `${n(approvedBy.shaun)} by Shaun`,
     approvedBy.edi ? `${n(approvedBy.edi)} by EDI` : "",
     approvedBy.person ? `${n(approvedBy.person)} by others` : "",
     approvedBy.none ? `${n(approvedBy.none)} approver not listed` : "",
@@ -520,8 +522,13 @@ export function InvoicingPage() {
           {run ? (
             <div className="mt-2 flex items-center gap-x-4 gap-y-1 flex-wrap">
               {files?.not_exported === true ? (
-                <button type="button" onClick={downloadExcel} disabled={excel.busy} className={quietLink}>
-                  {excel.busy ? "Downloading…" : "Download Excel (FreightPOP format)"}
+                <button type="button" onClick={() => downloadExcel("not-exported")} disabled={!!excel.busy} className={quietLink}>
+                  {excel.busy === "not-exported" ? "Downloading…" : "Download Excel (FreightPOP format)"}
+                </button>
+              ) : null}
+              {files?.audit_history === true ? (
+                <button type="button" onClick={() => downloadExcel("audit-history")} disabled={!!excel.busy} className={quietLink} title="FreightPOP's Audit History export from the last approval check (.xlsx)">
+                  {excel.busy === "audit-history" ? "Downloading…" : "Audit history (Excel)"}
                 </button>
               ) : null}
               <Link to={`/audits/invoice?run=${encodeURIComponent(run.id)}`} className={quietLink}>Open the full audit</Link>
@@ -539,7 +546,7 @@ export function InvoicingPage() {
             <div className="border-t border-slate-100 pt-3 space-y-1">
               {run ? (
                 <MenuAction
-                  title={starting === "approvals" ? "Starting…" : "Check approvals only"}
+                  title={starting === "approvals" ? "Starting…" : "Check approvals (Recently Approved + History)"}
                   hint={`Quicker: keeps this list and only re-reads who approved what. ${anyChecked && checkedAt ? `Last checked ${ago(checkedAt, now)}.` : "Not checked yet."}`}
                   onClick={approvalsOnly}
                   disabled={!!blocked}
@@ -567,7 +574,7 @@ export function InvoicingPage() {
 
       {stripShown ? (
         <ProgressStrip
-          steps={invoiceRun ? null : [{ title: "Shipment list", state: step1 }, { title: "Approvals", state: step2 }]}
+          steps={invoiceRun ? null : [{ title: "Shipment list", state: step1 }, { title: "Approvals (Recently Approved + History)", state: step2 }]}
           text={stripText}
           tone={stripTone}
           expanded={monitorOpen}

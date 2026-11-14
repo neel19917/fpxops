@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, FileText, X } from "lucide-react";
 import type { ScrapeRequest } from "../lib/api";
-import { GET_INVOICE_MAX, GET_INVOICE_SCOPE, approvalDate, approvalGroup, approvalLabel, getInvoiceLabel, requestGetInvoices, type ApprovalGroup } from "../lib/erpPull";
+import { GET_INVOICE_MAX, GET_INVOICE_SCOPE, approvalGroup, approvalHover, approvalLabel, approvalSourceLabel, getInvoiceLabel, requestGetInvoices, type ApprovalGroup } from "../lib/erpPull";
 import { fmtDateTime, fmtNum } from "../lib/format";
 import type { ApprovalState, GetInvoiceState } from "../lib/types";
 
@@ -68,22 +68,21 @@ const APPROVAL_CLS: Record<ApprovalGroup, string> = {
 /**
  * Small pill for who approved a shipment's invoice in FreightPOP: EDI, a
  * person's name, Unknown, or Not approved. Nothing when it was never checked.
- * Hover shows the approved date, amount and invoice number.
+ * Hover shows who approved it, when, where FPX found it (Recently Approved or
+ * Audit History), the amount and the invoice number.
  */
 export function ApprovalPill({ state }: { state: ApprovalState | null | undefined }) {
   const group = approvalGroup(state);
   if (!state || !group) return null;
   const approved = group !== "not_approved";
   const amount = typeof state.amount === "number" ? fmtMoney(state.amount) : state.amount ? String(state.amount) : "";
-  const date = approvalDate(state);
   const title = [
-    group === "edi" ? "Approved automatically by EDI" : null,
+    approved ? approvalHover(state) : null,
     group === "unknown" ? (state.approved_by_raw ? `FreightPOP says: "${state.approved_by_raw}"` : "FreightPOP doesn't say who approved it") : null,
     group === "not_approved" ? "Not in FreightPOP's Recently Approved list when last checked" : null,
-    approved && date ? `Approved ${date}` : null,
     approved && amount ? `Amount ${amount}` : null,
     approved && state.invoice ? `Invoice ${state.invoice}` : null,
-    approved && (state.matches ?? 0) > 1 ? `${fmtNum(state.matches)} lines in Recently Approved for this shipment` : null,
+    approved && (state.matches ?? 0) > 1 ? `${fmtNum(state.matches)} lines in ${approvalSourceLabel(state)} for this shipment` : null,
     state.checked_at ? `Checked ${fmtDateTime(state.checked_at)}${state.checked_by ? ` by ${state.checked_by}` : ""}` : null,
   ].filter(Boolean).join("\n");
   return (

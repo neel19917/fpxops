@@ -11,7 +11,7 @@ import { LoadingState } from "../components/LoadingState";
 import { ErpPullMonitor, type ErpMonitorStatus } from "../components/ErpPullMonitor";
 import { ApprovalPill, GetInvoiceModal, InvoicePill, type GetInvoiceItem } from "../components/GetInvoiceModal";
 import {
-  APPROVAL_SCOPE, GET_INVOICE_MAX, approvalDate, approvalGroup, approvalLabel, downloadAuditExcel, getInvoiceLabel, isShaun,
+  APPROVAL_SCOPE, GET_INVOICE_MAX, approvalDate, approvalGroup, approvalLabel, approvalSourceLabel, downloadAuditExcel, getInvoiceLabel, isShaun,
   requestApprovalCheck, toApprovalState, type ApprovalGroup, type AuditExcelWhich,
 } from "../lib/erpPull";
 
@@ -392,6 +392,7 @@ const ERP_CSV_COLS: Pick<ErpCol, "label" | "csvValue">[] = ERP_COLS.flatMap((c):
   c,
   { label: "Approved date", csvValue: (r) => approvalDate(approvedOnly(r)) },
   { label: "Approved amount", csvValue: (r) => { const a = approvedOnly(r)?.amount; return a == null || a === "" ? null : cents(toNum(a)) ?? String(a); } },
+  { label: "Audit notes", csvValue: (r) => approvedOnly(r)?.notes || null },
 ]);
 
 function downloadErpCsv(rows: ErpRow[], run: InvoiceAudit) {
@@ -418,6 +419,8 @@ const ERP_EXTRA_FIELDS: { label: string; value: (r: InvoiceAuditRow) => unknown 
   { label: "Account manager", value: (r) => r.raw?.account_manager },
   { label: "Shipment status", value: (r) => r.raw?.shipment_status },
   { label: "Transaction type", value: (r) => r.raw?.transaction_type },
+  { label: "Audit notes", value: (r) => r.raw?.approval?.notes || null },
+  { label: "Invoice uploaded by", value: (r) => r.raw?.approval?.uploaded_by || null },
   { label: "Not approved amount", value: (r) => { const n = toNum(r.raw?.not_approved_amount); return n == null ? null : fmtMoney(n); } },
   { label: "Variance", value: (r) => { const n = toNum(r.raw?.variance); return n == null ? null : fmtMoney(n); } },
   { label: "Customer invoice sent", value: (r) => { const v = r.raw?.customer_invoice_sent; return typeof v === "boolean" ? (v ? "Yes" : "No") : v; } },
@@ -438,6 +441,7 @@ function ErpRowDetail({ row }: { row: ErpRow }) {
         approvalDate(ap) ? `on ${approvalDate(ap)}` : null,
         apAmount != null ? `amount ${fmtMoney(apAmount)}` : ap.amount ? `amount ${ap.amount}` : null,
         ap.invoice ? `invoice ${ap.invoice}` : null,
+        `from ${approvalSourceLabel(ap)}`,
       ].filter(Boolean).join(" · ");
   return (
     <div className="space-y-2">
@@ -482,6 +486,7 @@ function ApprovalStrip({ summary, value, onPick }: { summary: ApprovalSummary; v
   const matched = count(summary.matched);
   const notFound = count(summary.not_found);
   const unknown = count(summary.by_unknown);
+  const bySource = summary.by_source ?? null;
   const figure = (filter: ApprovalFilter, n: number, hint: string, strong = false) => (
     <button
       onClick={() => onPick(value === filter ? "all" : filter)}
@@ -521,6 +526,9 @@ function ApprovalStrip({ summary, value, onPick }: { summary: ApprovalSummary; v
         {dot}
         <span>not approved yet {figure("not_approved", notFound, "Show the ones not in Recently Approved")}</span>
         {summary.checked_at ? <>{dot}<span title={fmtDateTime(summary.checked_at)}>checked {fmtRelative(summary.checked_at)}</span></> : null}
+        {bySource ? (
+          <>{dot}<span className="text-slate-400" title="Which of FreightPOP's Audit tabs each approved shipment was found on">{fmtNum(count(bySource.recently_approved))} from Recently Approved, {fmtNum(count(bySource.history))} from History</span></>
+        ) : null}
       </div>
       {namesOpen && others.length ? (
         <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -879,6 +887,11 @@ function ExcelDownloads({ auditId, files }: { auditId: string; files: InvoiceAud
       {files?.recently_approved ? (
         <button onClick={() => download("recently-approved")} disabled={!!busy} className={link} title="FreightPOP's Recently Approved export from the last approval check (.xlsx)">
           {busy === "recently-approved" ? "Downloading…" : "Recently approved"}
+        </button>
+      ) : null}
+      {files?.audit_history ? (
+        <button onClick={() => download("audit-history")} disabled={!!busy} className={link} title="FreightPOP's Audit History export from the last approval check (.xlsx)">
+          {busy === "audit-history" ? "Downloading…" : "Audit history (Excel)"}
         </button>
       ) : null}
       {!kept ? <span className="text-xs text-slate-500">No Excel file was kept for this pull — run a new pull</span> : null}

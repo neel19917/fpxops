@@ -1,5 +1,6 @@
 // Supabase Storage for the Excel files of an ERP pull / approval check:
-// private bucket "erp-pulls", objects at <audit_id>/<name>.xlsx. Written with
+// private bucket "erp-pulls", objects at <audit_id>/<name>.xlsx (approval
+// check: recently-approved.xlsx and audit-history.xlsx). Written with
 // the service-role key, like runs.js / settings.js write their tables.
 // No dependency: node's fetch.
 const SB_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");

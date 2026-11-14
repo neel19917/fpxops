@@ -417,7 +417,9 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
             <div className="font-medium inline-flex items-center gap-2">
               <CheckCircle2 className="h-4 w-4 shrink-0" />
               {acResult
-                ? `Matched ${fmtNum(acResult.matched)} of ${fmtNum(acResult.matched + acResult.not_found)} ${acResult.matched + acResult.not_found === 1 ? "shipment" : "shipments"} to Recently Approved`
+                ? acResult.history_rows != null
+                  ? `Matched ${fmtNum(acResult.matched)} of ${fmtNum(acResult.matched + acResult.not_found)} ${acResult.matched + acResult.not_found === 1 ? "shipment" : "shipments"} · checked Recently Approved (${fmtNum(acResult.approved_rows)} ${acResult.approved_rows === 1 ? "row" : "rows"}) and History (${fmtNum(acResult.history_rows)} ${acResult.history_rows === 1 ? "row" : "rows"})`
+                  : `Matched ${fmtNum(acResult.matched)} of ${fmtNum(acResult.matched + acResult.not_found)} ${acResult.matched + acResult.not_found === 1 ? "shipment" : "shipments"} to Recently Approved`
                 : "Approval check finished"}
             </div>
             {giAuditId && onFinished ? (
@@ -427,7 +429,7 @@ export function ErpPullMonitor({ onFinished, onSettled, started, onStatus }: Erp
             ) : null}
           </div>
           <div className="mt-1 text-xs opacity-80">
-            {acResult ? `${fmtNum(acResult.approved_rows)} ${acResult.approved_rows === 1 ? "row" : "rows"} in Recently Approved · ` : ""}finished {fmtRelative(last.finishedAt)} · took {fmtDuration(last.durationMs)}
+            {acResult && acResult.history_rows == null ? `${fmtNum(acResult.approved_rows)} ${acResult.approved_rows === 1 ? "row" : "rows"} in Recently Approved · ` : ""}finished {fmtRelative(last.finishedAt)} · took {fmtDuration(last.durationMs)}
           </div>
           {acResult ? <div className="mt-1 text-xs">Open the audit to see who approved each invoice: EDI or a person.</div> : null}
           {!acResult && last.note ? <div className="mt-1 break-words">{last.note}</div> : null}

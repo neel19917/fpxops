@@ -5,6 +5,7 @@ import { auditHistoryRows } from "../lib/historyAudit.js";
 import { MAX_GET_INVOICE_IDS, isUuid, normalizeResult, mergeResult, updateRowsRaw } from "../lib/getInvoice.js";
 import {
   approvalColumnNames, findApprovalColumns, matchApprovals, mergeApproval, summarizeApprovals,
+  normalizeApprovalSource,
 } from "../lib/approvalMatch.js";
 
 export const auditsRouter = Router();
@@ -103,12 +104,14 @@ const EXCEL_FILES = {
   "not-exported": { object: "not-exported.xlsx", key: "not_exported", label: "TransactionsData-not-exported" },
   full: { object: "full.xlsx", key: "full", label: "TransactionsData-full" },
   "recently-approved": { object: "recently-approved.xlsx", key: "recently_approved", label: "RecentlyApproved" },
+  "audit-history": { object: "audit-history.xlsx", key: "audit_history", label: "AuditHistory" },
 };
 
-// Which of a pull's Excel files exist: { not_exported, full, recently_approved }.
+// Which of a pull's Excel files exist:
+// { not_exported, full, recently_approved, audit_history }.
 // Never throws. `ok` is false when Storage could not be read (all false then).
 async function listPullFiles(auditId) {
-  const files = { not_exported: false, full: false, recently_approved: false };
+  const files = Object.fromEntries(Object.values(EXCEL_FILES).map((f) => [f.key, false]));
   try {
     const { data, error } = await supabase.storage.from(ERP_BUCKET).list(String(auditId), { limit: 100 });
     if (error) return { files, ok: false };
@@ -121,11 +124,12 @@ async function listPullFiles(auditId) {
 }
 
 // GET /audits/invoice/:id → { run, rows }. For an ERP pull also:
-//   files: { not_exported, full, recently_approved }  which Excel files can be
-//     downloaded from /audits/invoice/:id/excel (all false if Storage can't be read)
+//   files: { not_exported, full, recently_approved, audit_history }  which Excel
+//     files can be downloaded from /audits/invoice/:id/excel (all false if
+//     Storage can't be read)
 //   approval_summary: { checked_at, matched, not_found, by_edi, by_unknown,
-//     by_person: { name: count } } read from the rows' raw.approval, or null
-//     when no approval check has run.
+//     by_person: { name: count }, by_source: { recently_approved, history } }
+//     read from the rows' raw.approval, or null when no approval check has run.
 auditsRouter.get("/invoice/:id", async (req, res) => {
   const { data: run, error } = await supabase.from("fpx_invoice_audits").select("*").eq("id", req.params.id).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
@@ -153,14 +157,16 @@ auditsRouter.get("/invoice/:id", async (req, res) => {
   res.json({ run, rows });
 });
 
-// GET /audits/invoice/:id/excel?which=not-exported|full|recently-approved
+// GET /audits/invoice/:id/excel?which=not-exported|full|recently-approved|audit-history
 // Sends one of the pull's Excel files as a download (default not-exported).
+// audit-history is <audit_id>/audit-history.xlsx, sent as
+// AuditHistory-<from>_to_<to>.xlsx (the pull's own dates).
 // 400 for an unknown `which`; 404 { error: "No Excel file was saved for this
 // pull" } when it isn't in Storage; 502 when Storage can't be read.
 auditsRouter.get("/invoice/:id/excel", async (req, res) => {
   const which = req.query.which === undefined || req.query.which === "" ? "not-exported" : String(req.query.which);
   const file = Object.hasOwn(EXCEL_FILES, which) ? EXCEL_FILES[which] : null;
-  if (!file) return res.status(400).json({ error: "which must be not-exported, full or recently-approved" });
+  if (!file) return res.status(400).json({ error: "which must be not-exported, full, recently-approved or audit-history" });
   if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
   const { data: run, error } = await supabase
     .from("fpx_invoice_audits").select("id, shipment_type, date_from, date_to").eq("id", req.params.id).maybeSingle();
@@ -352,21 +358,33 @@ auditsRouter.post("/invoice/:id/get-invoice-results", async (req, res) => {
 });
 
 // POST /audits/invoice/:id/approval-results — the hosted browser posts the rows
-// of FreightPOP's Audit → "Recently Approved" Excel export, and they are
-// matched to the shipments of an ERP pull.
-// Body: { by, columns: string[], rows: object[] (keyed by column), part?, final? }
+// of an Excel export of FreightPOP's Audit page, and they are matched to the
+// shipments of an ERP pull.
+// Body: { by, columns: string[], rows: object[] (keyed by column), part?, final?,
+//         source?: "recently_approved" (default) | "history" }
 // A big export can be sent in parts: every part but the last sends
 // final: false, the last sends final: true. A call without `part` is taken as
 // the whole export unless it says final: false. `part` itself is not read.
 // Each row of the audit gets raw.approval (see lib/approvalMatch.js); no other
-// column, and no other key of raw, is written. Shipments not in the export are
-// marked not_found only on the last part, and an approval already stored is
-// never taken away.
-// 422 { error, columns } when the export has no shipment column.
-// Responds { matched, not_found, approved_rows, by_edi, by_unknown, by_person,
-// columns_used, failed, final }: matched … by_person describe the audit's rows
-// as they now stand (all parts so far), approved_rows is the rows in this
-// call, failed is rows whose save failed (send the call again).
+// column, and no other key of raw, is written.
+// source "recently_approved" (the "Recently Approved" tab): shipments not in
+// the export are marked not_found only on the last part, and an approval
+// already stored is never taken away.
+// source "history" (the "History" tab, sent after Recently Approved is done):
+// rows that are not approvals are left out first (see `dropped`); it only adds
+// approvals — never writes not_found, and for a shipment Recently Approved
+// already approved it only fills in blank fields. `final` changes nothing.
+// 400 for an unknown source. 422 { error, columns } when the export has
+// neither a shipment nor a tracking number column.
+// Responds { source, matched, not_found, approved_rows, by_edi, by_unknown,
+// by_person, by_source, newly_matched, dropped: { not_approved,
+// no_approval_info }, columns_used, failed, final }: matched … by_source
+// describe the audit's rows as they now stand (everything sent so far),
+// approved_rows is the rows in this call, newly_matched is the audit rows this
+// call took from no approval / not_found to approved, dropped is the rows of
+// this call left out (always 0 for recently_approved), columns_used.status is
+// the status column the filter used (else null), failed is rows whose save
+// failed (send the call again).
 auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
   const body = req.body || {};
   if (!Array.isArray(body.rows)) return res.status(400).json({ error: "body.rows must be a list" });
@@ -382,10 +400,13 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
     return res.status(400).json({ error: "That audit is not an ERP pull" });
   }
 
+  const source = normalizeApprovalSource(body.source);
+  if (!source) return res.status(400).json({ error: "body.source must be recently_approved or history" });
   const columns = approvalColumnNames(body.columns, body.rows);
-  const columnsUsed = findApprovalColumns(columns);
-  if (!columnsUsed.shipment && !columnsUsed.tracking) {
-    return res.status(422).json({ error: "Could not find a shipment or tracking number column in the Recently Approved export", columns });
+  const found = findApprovalColumns(columns, { source });
+  if (!found.shipment && !found.tracking) {
+    const tab = source === "history" ? "History" : "Recently Approved";
+    return res.status(422).json({ error: `Could not find a shipment or tracking number column in the ${tab} export`, columns });
   }
 
   const loaded = await loadAuditRows(run.id, "id, shipment_id, raw");
@@ -396,17 +417,20 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
   const final = hasPart ? body.final === true : body.final !== false;
   const checked_by = String(body.by || req.apiKey?.name || req.user?.email || "").trim() || null;
   const checked_at = new Date().toISOString();
-  const { results } = matchApprovals(auditRows, body.rows, columns);
+  const { results, dropped, columns_used: columnsUsed } = matchApprovals(auditRows, body.rows, columns, { source });
 
   // Rows as they stand after this call, for the numbers in the response. A row
   // whose save fails keeps what it had.
   const after = auditRows.slice();
   const changes = [];
   auditRows.forEach((row, i) => {
-    const next = mergeApproval(row.raw, results[i], { checked_at, checked_by, final });
-    if (next) changes.push({ i, id: row.id, raw: next });
+    const next = mergeApproval(row.raw, results[i], { checked_at, checked_by, final, source });
+    if (!next) return;
+    const isNew = row.raw?.approval?.status !== "approved" && next.approval?.status === "approved";
+    changes.push({ i, id: row.id, raw: next, isNew });
   });
   let failed = 0;
+  let newlyMatched = 0;
   const WRITE_CHUNK = 20;
   for (let i = 0; i < changes.length; i += WRITE_CHUNK) {
     await Promise.all(changes.slice(i, i + WRITE_CHUNK).map(async (c) => {
@@ -418,19 +442,27 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
         failedWrite = true;
       }
       if (failedWrite) failed += 1;
-      else after[c.i] = { ...auditRows[c.i], raw: c.raw };
+      else {
+        after[c.i] = { ...auditRows[c.i], raw: c.raw };
+        if (c.isNew) newlyMatched += 1;
+      }
     }));
   }
   if (failed) console.warn(`[FPX] approval results for ${run.id}: ${failed} row(s) not saved`);
 
-  const now = summarizeApprovals(after) || { matched: 0, not_found: 0, by_edi: 0, by_unknown: 0, by_person: {} };
+  const now = summarizeApprovals(after)
+    || { matched: 0, not_found: 0, by_edi: 0, by_unknown: 0, by_person: {}, by_source: { recently_approved: 0, history: 0 } };
   res.json({
+    source,
     matched: now.matched,
     not_found: now.not_found,
     approved_rows: body.rows.length,
     by_edi: now.by_edi,
     by_unknown: now.by_unknown,
     by_person: now.by_person,
+    by_source: now.by_source,
+    newly_matched: newlyMatched,
+    dropped,
     columns_used: columnsUsed,
     failed,
     final,

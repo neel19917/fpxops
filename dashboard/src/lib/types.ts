@@ -194,10 +194,13 @@ export interface InvoiceAuditFiles {
   not_exported?: boolean;
   full?: boolean;
   recently_approved?: boolean;
+  /** The Audit page's History tab export from the last approval check. */
+  audit_history?: boolean;
 }
 
 // Result of the last approval check on an ERP pull (matched against
-// FreightPOP's Audit → Recently Approved export). null = never checked.
+// FreightPOP's Audit → Recently Approved export and, on newer servers, its
+// History tab). null = never checked.
 export interface ApprovalSummary {
   checked_at: string | null;
   matched: number;
@@ -205,9 +208,13 @@ export interface ApprovalSummary {
   by_edi: number;
   by_unknown: number;
   by_person: Record<string, number>;
+  /** Where the approved rows were found. Absent on older servers. */
+  by_source?: { recently_approved?: number; history?: number } | null;
 }
 
 export type ApprovalByKind = "edi" | "person" | "unknown";
+// Which Audit tab an approved row was found on. Absent on older data = recently_approved.
+export type ApprovalSource = "recently_approved" | "history";
 // raw.approval on an ERP audit row. Absent = never checked.
 export interface ApprovalState {
   status: "approved" | "not_found" | (string & {});
@@ -215,9 +222,14 @@ export interface ApprovalState {
   approved_by_kind?: ApprovalByKind | (string & {}) | null;
   approved_by_raw?: string | null;
   approved_at?: string | null;
+  source?: ApprovalSource | (string & {}) | null;
   amount?: number | string | null;
   invoice?: string | number | null;
   matches?: number | null;
+  /** The Notes column of FreightPOP's Audit export for this invoice. */
+  notes?: string | null;
+  uploaded_by?: string | null;
+  variance?: number | string | null;
   checked_at?: string | null;
   checked_by?: string | null;
 }

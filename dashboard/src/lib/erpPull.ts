@@ -26,10 +26,12 @@ export interface GetInvoiceCounts { total: number; done: number; ok: number; fai
 export interface GetInvoiceResult { audit_id: string; total: number; ok: number; failed: number }
 
 // "Approval check": a third hosted-browser job. It opens FreightPOP's Audit
-// page, takes the Recently Approved Excel export, and the server matches it to
-// one ERP audit's shipments: was each invoice approved, and by EDI or a person.
+// page, takes the Recently Approved Excel export and the History tab's (60 days
+// before the pull's start date to today), and the server matches them to one
+// ERP audit's shipments: was each invoice approved, and by EDI or a person.
 export const APPROVAL_SCOPE = "approval_check";
-export interface ApprovalCheckResult { audit_id: string; approved_rows: number; matched: number; not_found: number }
+/** history_rows is absent when the hosted browser only read Recently Approved (older workers). */
+export interface ApprovalCheckResult { audit_id: string; approved_rows: number; history_rows?: number; matched: number; not_found: number }
 
 // The invoicing session's state: /stats → worker.invoicing. The top-level
 // worker fields describe the scrape session and are never read for these jobs.
@@ -120,7 +122,10 @@ export function asGetInvoiceResult(v: unknown): GetInvoiceResult | null {
 export function asApprovalResult(v: unknown): ApprovalCheckResult | null {
   const r = v as Partial<ApprovalCheckResult> | null | undefined;
   return r && typeof r === "object" && "matched" in r
-    ? { audit_id: String(r.audit_id ?? ""), approved_rows: num(r.approved_rows), matched: num(r.matched), not_found: num(r.not_found) }
+    ? {
+      audit_id: String(r.audit_id ?? ""), approved_rows: num(r.approved_rows), matched: num(r.matched), not_found: num(r.not_found),
+      ...(typeof r.history_rows === "number" && Number.isFinite(r.history_rows) ? { history_rows: r.history_rows } : {}),
+    }
     : null;
 }
 
@@ -221,9 +226,25 @@ export function approvalDate(state: ApprovalState | null | undefined): string {
   return isNaN(d.getTime()) ? s : fmtDate(d.toISOString());
 }
 
+/** The Audit tab an approved row was found on. Older data has no source: it came from Recently Approved. */
+export function approvalSourceLabel(state: ApprovalState | null | undefined): string {
+  return state?.source === "history" ? "Audit History" : "Recently Approved";
+}
+
+/** Hover text for an approver pill: "Approved by Shaun Zimmerman on Nov 13 · from Audit History". Empty unless approved. */
+export function approvalHover(state: ApprovalState | null | undefined): string {
+  const group = approvalGroup(state);
+  if (!state || !group || group === "not_approved") return "";
+  const who = group === "edi" ? "Approved automatically by EDI"
+    : group === "unknown" ? "Approved"
+    : `Approved by ${state.approved_by}`;
+  const date = approvalDate(state);
+  return `${who}${date ? ` on ${date}` : ""} · from ${approvalSourceLabel(state)}`;
+}
+
 // ── FreightPOP's own Excel files, kept with each pull ──
 
-export type AuditExcelWhich = "not-exported" | "full" | "recently-approved";
+export type AuditExcelWhich = "not-exported" | "full" | "recently-approved" | "audit-history";
 
 /** Fetch one of a pull's .xlsx files (signed in) and save it under the name the server gives. */
 export async function downloadAuditExcel(auditId: string, which: AuditExcelWhich): Promise<void> {
