@@ -4400,6 +4400,21 @@ function apExportCandidates() {
 //   find()     the grid, or null while it isn't there
 //   changed(sig)  true when the grid no longer shows what it did before
 //   need({ rows, sawLoading, changed })  quiet steps wanted before it counts as loaded
+// What the page is showing while a grid is awaited (for the log only).
+function apPageState() {
+  try {
+    const vis = (sel) => [...document.querySelectorAll(sel)].filter(isVisibleForClick);
+    const grids = vis(".k-grid").map((g) => `${g.id || g.className.split(" ").slice(0, 2).join(".")}(${g.querySelectorAll("tbody tr").length} rows, in ${(g.closest(".tab-pane") || {}).id || "no pane"})`);
+    const tables = vis("table").filter((t) => !t.closest(".k-grid")).map((t) => `${t.id || "table"}(${t.querySelectorAll("tbody tr").length} rows)`);
+    const loaders = vis(".k-loading-mask, .k-loading-image, .loading, .loader, .spinner, [class*=spinner], [class*=loading]").length;
+    const msgs = vis(".alert, .toast, .toast-message, .k-notification, .modal.in .modal-body, .swal2-popup, .sweet-alert, .validation-summary-errors, .text-danger, .error")
+      .map((e) => apText(e).slice(0, 100)).filter(Boolean);
+    const pane = document.querySelector(".tab-pane.active") ;
+    const paneText = pane ? apText(pane).replace(/Export To Excel|Search/g, "").slice(0, 160) : "";
+    return `grids: ${grids.slice(0, 4).join(", ") || "none"} · tables: ${tables.slice(0, 3).join(", ") || "none"} · loading indicators: ${loaders} · messages: ${apUniq(msgs).slice(0, 3).join(" / ") || "none"} · pane text: "${paneText}"`;
+  } catch (e) { return `state unreadable (${e.message})`; }
+}
+
 async function apWaitGrid({ find, label, steps, changed, need }) {
   let grid = null, calm = 0, sawLoading = false, lastSig = null;
   for (let i = 0; i < steps; i++) {
@@ -4414,7 +4429,7 @@ async function apWaitGrid({ find, label, steps, changed, need }) {
       lastSig = sig;
       if (calm >= need({ rows: apGridRows(grid), sawLoading, changed: changed(sig) })) return { grid, settled: true, sawLoading };
     }
-    if (i > 0 && i % 30 === 0) erpLog(`Still loading ${label} · ${i / 2}s`);
+    if (i > 0 && i % 30 === 0) erpLog(`Still loading ${label} · ${i / 2}s${grid ? "" : ` · ${apPageState()}`}`);
     await sleep(500);
   }
   return { grid, settled: false, sawLoading };
@@ -4649,14 +4664,14 @@ async function apHistoryPhase(from, to, mark) {
   // After the range was applied, rows that look the same as before must stay
   // quiet for 20s (a slow search with no loading mask), an empty grid 30s.
   const waited = await apWaitGrid({
-    find: findGrid, label: "History", steps: 360,
+    find: findGrid, label: "History", steps: 840, // 7 min: the search alone has taken 95 s to over 3 min
     changed: (sig) => sig !== sigBefore,
     need: ({ rows, sawLoading, changed }) => (rows > 0
       ? ((sawLoading || changed) ? 4 : (applied ? 40 : 10))
       : (sawLoading ? 16 : (applied ? 60 : 16))),
   });
   grid = waited.grid;
-  if (!grid) throw new Error(`the History grid never appeared (waited 3 min; page is ${where()}) — on the tab: ${controls(apTabPanel(tab, null) || panel)}`.slice(0, 900));
+  if (!grid) throw new Error(`the History grid never appeared (waited 7 min; page is ${where()}) — on the tab: ${controls(apTabPanel(tab, null) || panel)}`.slice(0, 900));
   if (!waited.settled) throw new Error("the History grid was still loading after 3 min");
 
   // g. What it shows.
