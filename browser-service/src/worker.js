@@ -513,6 +513,8 @@ async function claimAndRun(lane) {
     // Read now: completing the request overwrites its note.
     months: request.scope === "erp_audit" ? monthsFromNote(request.note) : null,
     shipmentType: request.scope === "erp_audit" ? typeFromNote(request.note) : null,
+    erpOpts: request.scope === "erp_audit" ? erpOptsFromNote(request.note) : null,
+    approvalHistory: request.scope === "approval_check" ? historyFromNote(request.note) : null,
     getInvoice: request.scope === "get_invoice" ? getInvoiceFromRequest(request) : null,
     approvalAuditId: request.scope === "approval_check" ? auditFromNote(request.note) : null,
     requestNote: String(request.note || "").slice(0, 200),
@@ -566,6 +568,25 @@ export function typeFromNote(note) {
   return m ? m[1].toLowerCase() : "non-parcel";
 }
 
+// "from=YYYY-MM-DD;to=YYYY-MM-DD;backfill=1" in an ERP audit request's note:
+// a fixed range instead of the last N months, and (backfill) every row copied
+// to Supabase with no audit made. → { from, to, backfill } or null.
+const noteParts = (note) => Object.fromEntries(String(note || "").split(";").map((p) => p.split("=").map((x) => x.trim())).filter((p) => p.length === 2).map(([k, v]) => [k.toLowerCase(), v]));
+const isoDay = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || "") ? v : null);
+export function erpOptsFromNote(note) {
+  const p = noteParts(note);
+  const from = isoDay(p.from), to = isoDay(p.to);
+  if (!(from && to) && p.backfill !== "1") return null;
+  return { ...(from && to ? { from, to } : {}), backfill: p.backfill === "1" };
+}
+// "hist_from=YYYY-MM-DD;hist_to=YYYY-MM-DD" in an approval-check request's
+// note: read only the Audit page's History tab, over that range (a backfill).
+export function historyFromNote(note) {
+  const p = noteParts(note);
+  const from = isoDay(p.hist_from), to = isoDay(p.hist_to);
+  return from && to ? { from, to } : null;
+}
+
 // "months=3" in an ERP audit request's note → 1-12 (3 when absent or unreadable).
 export function monthsFromNote(note) {
   const m = /months\s*=\s*(\d+)/i.exec(String(note || ""));
@@ -604,7 +625,7 @@ async function runJob(lane, job) {
   };
   if (kind === "erp_audit") {
     Object.assign(cur.counts, { reportRows: 0, notExported: 0, uploaded: 0 });
-    logLine(lane, `Claimed ERP audit pull · last ${cur.months} month(s) · ${cur.shipmentType} — running as ${email || "unknown user"}`);
+    logLine(lane, `Claimed ERP audit pull · ${job.erpOpts?.from ? `${job.erpOpts.from} to ${job.erpOpts.to}` : `last ${cur.months} month(s)`} · ${cur.shipmentType}${job.erpOpts?.backfill ? " · backfill (every row to Supabase, no audit)" : ""} — running as ${email || "unknown user"}`);
   } else if (kind === "approval_check") {
     cur.counts = { approvedRows: 0, historyRows: 0, matched: 0, notFound: 0 };
     cur.auditId = job.approvalAuditId || null;
@@ -628,14 +649,14 @@ async function runJob(lane, job) {
     if (!hasProfile(email)) throw new Error(`${email} hasn't logged in to FreightPOP in the hosted view yet`);
     let result;
     if (kind === "erp_audit") {
-      result = await runErpAudit(lane, email, cur.months, cur.shipmentType);
+      result = await runErpAudit(lane, email, cur.months, cur.shipmentType, job.erpOpts);
     } else if (kind === "get_invoice") {
       if (!gi.auditId || !gi.from || !gi.to) throw new Error(`The request's note could not be read ("${gi.note || ""}") — expected audit=<id>;from=YYYY-MM-DD;to=YYYY-MM-DD;pause_first=1|0`);
       if (!gi.shipmentIds.length) throw new Error("The request has no shipment ids (tracking_numbers is empty)");
       result = await runGetInvoices(lane, email, gi);
     } else if (kind === "approval_check") {
       if (!job.approvalAuditId) throw new Error(`The request's note could not be read ("${job.requestNote || ""}") — expected audit=<id>`);
-      result = await runApprovalCheck(lane, email, job.approvalAuditId);
+      result = await runApprovalCheck(lane, email, job.approvalAuditId, job.approvalHistory);
     } else {
       cur.tasksBefore = await taskSnapshot();
       result = await runRefreshAll(lane, email, job.modes || null);
@@ -910,10 +931,10 @@ async function runIn(lane, browser, url, who, modes = null) {
 // The page work is erpAuditPull() in the extension's content.js; this opens
 // the window (so the read-only live view shows it, like a scrape), relays its
 // log lines, and passes stop / pause on.
-async function runErpAudit(lane, email, months, shipmentType) {
+async function runErpAudit(lane, email, months, shipmentType, opts) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runErpIn(lane, lease.browser, dashboardUrlFor(email), email, months, shipmentType);
+    return await runErpIn(lane, lease.browser, dashboardUrlFor(email), email, months, shipmentType, opts);
   } finally {
     lease.release();
   }
@@ -1032,7 +1053,8 @@ async function runPageJob(lane, browser, url, who, job) {
   }
 }
 
-async function runErpIn(lane, browser, url, who, months, shipmentType) {
+async function runErpIn(lane, browser, url, who, months, shipmentType, opts) {
+  const backfillRows = []; // backfill: every screen row, all parts
   // Rows from FreightPOP's Excel export, all tabs together.
   const excelRows = [];
   const excelFiles = []; // the workbooks themselves, one per tab captured
@@ -1054,7 +1076,7 @@ async function runErpIn(lane, browser, url, who, months, shipmentType) {
     limitMs: ERP_LIMIT_MS,
     has: "typeof erpAuditPull === 'function' && typeof fpxErpPoll === 'function'",
     missing: "The extension in the hosted browser has no ERP audit pull (needs version 4.7 or later) — redeploy the browser service",
-    start: `erpAuditPull(${Number(months) || 3}, ${JSON.stringify(String(who))}, ${JSON.stringify(String(shipmentType || "non-parcel"))}); 'started'`,
+    start: `erpAuditPull(${Number(months) || 3}, ${JSON.stringify(String(who))}, ${JSON.stringify(String(shipmentType || "non-parcel"))}, ${JSON.stringify(opts || {})}); 'started'`,
     onPoll: async (r, { cdp, ext }) => {
       // The page wants FreightPOP's Excel export captured for the tab on screen.
       if (r.download && !r.done) {
@@ -1088,6 +1110,22 @@ async function runErpIn(lane, browser, url, who, months, shipmentType) {
           }
           if (rows.length !== meta.rowCount) throw new Error(`read ${rows.length} of ${meta.rowCount} rows from the page`);
           const { rowCount, ...body } = meta;
+          if (body.backfill) {
+            // Every row of the report → Supabase; no audit. The Excel export's
+            // rows when captured, their blanks filled from the screen rows.
+            backfillRows.push(...rows);
+            let answer = { ok: true, stored: 0 };
+            if (body.final !== false) {
+              const useExcel = !excelFailed && excelRows.length;
+              logLine(lane, `Backfill ${body.from} to ${body.to} · ${(useExcel ? excelRows.length : backfillRows.length).toLocaleString("en-US")} rows · source: ${useExcel ? "FreightPOP Excel export" : "report on screen"}`);
+              const out = await copyErpTransactions(lane, null, String(shipmentType || "non-parcel"),
+                useExcel ? { excel: excelRows, screen: backfillRows } : { screen: backfillRows, all: true });
+              answer = out?.error ? { ok: false, error: out.error } : { ok: true, stored: out?.stored || 0, failed: out?.failed || 0 };
+              if (cur) cur.result = { backfill: true, from: body.from, to: body.to, copied: out };
+            }
+            await ext.evaluate(`fpxErpDeliver(${JSON.stringify(answer)})`).catch(() => {});
+            return true;
+          }
           // Prefer the Excel export when every tab's file was captured.
           let send = rows;
           const fromExcel = !excelFailed && excelRows.length ? notExportedSorted(excelRows) : null;
@@ -1321,10 +1359,10 @@ const APPROVAL_POST_MAX_BYTES = 12 * 1024 * 1024; // per POST; the API's limit i
 const HISTORY_EXTRA_DAYS = 60;    // History starts this long before the pull's start date
 const HISTORY_FALLBACK_DAYS = 150; // … or this long before today when the pull's dates can't be read
 
-async function runApprovalCheck(lane, email, auditId) {
+async function runApprovalCheck(lane, email, auditId, hist) {
   const lease = await acquireUserBrowser(email, { busy: true });
   try {
-    return await runApprovalCheckIn(lane, lease.browser, dashboardUrlFor(email), email, auditId);
+    return await runApprovalCheckIn(lane, lease.browser, dashboardUrlFor(email), email, auditId, hist);
   } finally {
     lease.release();
   }
@@ -1372,13 +1410,16 @@ function approvalAnswer(resp) {
   return { who, cols, cu };
 }
 
-async function runApprovalCheckIn(lane, browser, url, who, auditId) {
-  const range = await historyRange(lane, auditId);
+async function runApprovalCheckIn(lane, browser, url, who, auditId, histOnly) {
+  // histOnly { from, to } (YYYY-MM-DD): a backfill — History tab only, that range.
+  const isoMdy = (v) => `${v.slice(5, 7)}/${v.slice(8, 10)}/${v.slice(0, 4)}`;
+  const range = histOnly ? { from: isoMdy(histOnly.from), to: isoMdy(histOnly.to) } : await historyRange(lane, auditId);
+  if (histOnly) logLine(lane, `History backfill · ${range.from} to ${range.to} · Recently Approved is skipped`);
   let got = null;  // the Recently Approved export: { rows, headers, buf, file }
   let hist = null; // the History export, same shape
-  let approvedDone = false; // the page is past Recently Approved
+  let approvedDone = !!histOnly; // the page is past Recently Approved
   let pageError = null;
-  const call = (resumed) => `erpApprovalCheck(${JSON.stringify(String(who))}, ${resumed}, ${JSON.stringify({ historyFrom: range.from, historyTo: range.to, skipApproved: resumed && approvedDone })}); 'started'`;
+  const call = (resumed) => `erpApprovalCheck(${JSON.stringify(String(who))}, ${resumed}, ${JSON.stringify({ historyFrom: range.from, historyTo: range.to, skipApproved: approvedDone && (resumed || !!histOnly) })}); 'started'`;
   let note;
   try {
     note = await runPageJob(lane, browser, url, who, {
@@ -1434,7 +1475,7 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId) {
   const short = String(auditId).slice(0, 8);
   await saveExcelFiles(lane, auditId, [
     ...(got?.buf ? [{ name: "recently-approved.xlsx", buf: got.buf, rows: got.rows.length }] : []),
-    ...(hist?.buf ? [{ name: "audit-history.xlsx", buf: hist.buf, rows: hist.rows.length }] : []),
+    ...(hist?.buf ? [{ name: histOnly ? `audit-history-${histOnly.from}_${histOnly.to}.xlsx` : "audit-history.xlsx", buf: hist.buf, rows: hist.rows.length }] : []),
   ]);
 
   let matched = 0, notFound = 0, unsaved = 0;
@@ -1455,7 +1496,7 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId) {
     logLine(lane, `Approvals matched · ${head} · ${a.who} · columns used: ${a.cols}`.slice(0, 500), !matched || !a.cu.approved_by ? "warn" : "done");
     parts.push(`${head} of audit ${short} are in Recently Approved (${num(got.rows.length)} approved rows) · ${a.who}`);
   } else {
-    parts.push("Recently Approved is empty");
+    parts.push(histOnly ? "History backfill" : "Recently Approved is empty");
   }
 
   // 2. History. Nothing here fails the job.
@@ -1713,7 +1754,7 @@ async function copyErpTransactions(lane, auditId, shipmentType, src) {
       if (key && key !== "Exported to ERP") rows = rows.map((r) => ({ ...r, "Exported to ERP": r[key] }));
     } else {
       rows = src.screen || [];
-      if (rows.length) logLine(lane, "FreightPOP's Excel export was not captured — only the shipments not exported to ERP are copied to Supabase; exported shipments were not copied this time", "warn");
+      if (rows.length && !src.all) logLine(lane, "FreightPOP's Excel export was not captured — only the shipments not exported to ERP are copied to Supabase; exported shipments were not copied this time", "warn");
     }
     total = rows.length;
     if (!total) return null;

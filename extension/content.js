@@ -3745,7 +3745,7 @@ function erpReportFailure(failNote) {
   const where = window.location.hash || window.location.pathname;
   if (/no date inputs/i.test(failNote || "")) return `Generate History Report dialog not found on the Transactions page (no date fields appeared; page is ${where})`;
   if (/CONTINUE/.test(failNote || "")) return "Generate History Report dialog: CONTINUE button not found";
-  if (/No grid data/i.test(failNote || "")) return "Report grid never loaded — no rows appeared within 3 min of pressing Continue (FreightPOP is still loading, or there are no transactions in this range)";
+  if (/No grid data/i.test(failNote || "")) return "Report grid never loaded — no rows appeared within 7 min of pressing Continue (FreightPOP is still loading, or there are no transactions in this range)";
   return failNote || "Generate History Report failed";
 }
 
@@ -3919,7 +3919,12 @@ function erpUploadChunk(payload, retry) {
 }
 
 // shipmentType: "non-parcel" (default) | "parcel" | "both"
-async function erpAuditPull(months, runBy, shipmentType) {
+// opts: { from, to } (YYYY-MM-DD) — a fixed range instead of the last N months;
+//       backfill: true — hand EVERY report row to the browser service for the
+//       Supabase copy and stop there (no audit is made).
+async function erpAuditPull(months, runBy, shipmentType, opts) {
+  const erpOpts = opts && typeof opts === "object" ? opts : {};
+  const erpIsoToMdy = (v) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || "")); return m ? `${m[2]}/${m[3]}/${m[1]}` : null; };
   const erpType = shipmentType === "parcel" || shipmentType === "both" ? shipmentType : "non-parcel";
   const erpTabs = [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"]].filter(([t]) => erpType === "both" || t === erpType);
   if (fpxErp && !fpxErp.done) return; // already running in this page
@@ -3931,8 +3936,9 @@ async function erpAuditPull(months, runBy, shipmentType) {
   try {
     const n = Math.min(12, Math.max(1, Math.round(Number(months)) || 3));
     const today = new Date();
-    const fromStr = erpDate(erpMonthsAgo(today, n));
-    const toStr = erpDate(today);
+    const fixed = erpIsoToMdy(erpOpts.from) && erpIsoToMdy(erpOpts.to);
+    const fromStr = fixed ? erpIsoToMdy(erpOpts.from) : erpDate(erpMonthsAgo(today, n));
+    const toStr = fixed ? erpIsoToMdy(erpOpts.to) : erpDate(today);
 
     await erpCheckpoint();
     if (erpLoginExpired()) throw new Error("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
@@ -3944,7 +3950,7 @@ async function erpAuditPull(months, runBy, shipmentType) {
       fail: (t) => { failNote = t; },
       openDialog: true,
       stoppable: true,
-      gridWaitSec: 180,
+      gridWaitSec: 420,
       beforeContinue: async (dateFields) => {
         await erpCheckpoint();
         const f = dateFields.from ? dateFields.from.value : "";
@@ -3961,7 +3967,7 @@ async function erpAuditPull(months, runBy, shipmentType) {
         return null;
       },
       onGridWait: (sec) => {
-        if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 3 min)");
+        if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 7 min)");
         else if (sec % 15 === 0) erpLog(`Still loading the report · ${sec}s`);
       },
     });
@@ -4009,6 +4015,32 @@ async function erpAuditPull(months, runBy, shipmentType) {
     erpLog(`Report loaded · ${erpNum(allRows.length)} rows (${got.map((p) => `${p.label} ${erpNum(p.rows.length)}`).join(", ")})`);
     if (!allRows.length) {
       state.done = { ok: true, note: `No transactions in the report for ${fromStr} to ${toStr} — nothing to audit`, result: null };
+      return;
+    }
+
+    // Backfill: every row goes to the Supabase copy; no audit is made.
+    if (erpOpts.backfill) {
+      const parts = [[]];
+      let bytes = 0;
+      for (const r of allRows) {
+        const b = JSON.stringify(r).length * 1.1 + 1;
+        if (bytes + b > ERP_UPLOAD_MAX_BYTES && parts[parts.length - 1].length) { parts.push([]); bytes = 0; }
+        parts[parts.length - 1].push(r);
+        bytes += b;
+      }
+      erpLog(`Backfill · handing ${erpNum(allRows.length)} rows over for Supabase` + (parts.length > 1 ? ` in ${parts.length} parts` : ""));
+      let last = null;
+      for (let c = 0; c < parts.length; c++) {
+        await erpCheckpoint();
+        last = await erpHandOff({ backfill: true, from: isoDateFromMmDdYyyy(fromStr), to: isoDateFromMmDdYyyy(toStr), final: c === parts.length - 1, rows: parts[c] });
+        if (!last || !last.ok) throw new Error(`Backfill copy failed${parts.length > 1 ? ` on part ${c + 1} of ${parts.length}` : ""}: ${(last && last.error) || "no reply"}`);
+        state.counts.uploaded += parts[c].length;
+      }
+      state.done = {
+        ok: true,
+        note: `Backfill ${fromStr} to ${toStr} · ${erpNum(allRows.length)} report rows · ${erpNum(last.stored)} shipments stored in Supabase` + (last.failed ? ` · ${erpNum(last.failed)} not stored` : ""),
+        result: null,
+      };
       return;
     }
 
@@ -5230,7 +5262,7 @@ async function erpGetInvoices(optsJson) {
         fail: (t) => { failNote = t; },
         openDialog: true,
         stoppable: true,
-        gridWaitSec: 180,
+        gridWaitSec: 420,
         beforeContinue: async (dateFields) => {
           await erpCheckpoint();
           const f = dateFields.from ? dateFields.from.value : "";
@@ -5247,7 +5279,7 @@ async function erpGetInvoices(optsJson) {
           return null;
         },
         onGridWait: (sec) => {
-          if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 3 min)");
+          if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 7 min)");
           else if (sec % 15 === 0) erpLog(`Still loading the report · ${sec}s`);
         },
       });
