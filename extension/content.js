@@ -4397,7 +4397,11 @@ function apDescribeView(grid) {
 function apExportCandidates() {
   const grid = document.querySelector(`[${AP_GRID_MARK}]`);
   if (!grid) return []; // no Recently Approved grid in hand: click nothing
-  if (fpxErp && fpxErp.phase === "history") return []; // History: the grid's own export only, no button
+  // History: FreightPOP's own "Export To Excel" button of that tab, by its id.
+  if (fpxErp && fpxErp.phase === "history") {
+    const btn = document.getElementById("ExportExcelHistory");
+    return btn && isVisibleForClick(btn) ? [{ el: btn, score: 20, desc: (btn.value || apText(btn) || "Export To Excel").slice(0, 60) }] : [];
+  }
   const scope = apGridScope(grid);
   const out = [];
   const seen = new Set();

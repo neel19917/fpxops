@@ -1455,7 +1455,8 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId, histOnly) {
         let answer;
         try {
           // History: the grid's own workbook only — no export button is clicked on that tab.
-          const cap = history ? await kendoExport(lane.page) : await captureExport(lane, browser, cdp, ext, lane.current?.requestId || "job");
+          // Both tabs: FreightPOP's Export To Excel button, the file taken from the download folder.
+          const cap = await captureExport(lane, browser, cdp, ext, lane.current?.requestId || "job", { buttonFirst: true });
           if (history) {
             // Several windows: their rows add up into one History export.
             if (hist) {
@@ -1467,7 +1468,7 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId, histOnly) {
             } else hist = cap;
           } else got = cap;
           if (lane.current) lane.current.counts[history ? "historyRows" : "approvedRows"] = (history ? hist : cap).rows.length;
-          logLine(lane, `Excel export · ${r.download.label} · ${cap.file} · ${num(cap.rows.length)} rows · ${cap.headers.length} columns · ${history ? "taken from the grid, no button clicked" : `button "${cap.clicked}"`}`);
+          logLine(lane, `Excel export · ${r.download.label} · ${cap.file} · ${num(cap.rows.length)} rows · ${cap.headers.length} columns · ${cap.via === "download" ? `downloaded with the "${cap.clicked}" button` : "taken from the grid"}`);
           // A grid that exports only the page on screen gives fewer rows than it holds.
           if (cap.gridTotal && cap.gridTotal > cap.rows.length) {
             logLine(lane, `The ${r.download.label} grid holds ${num(cap.gridTotal)} rows but its Excel export has ${num(cap.rows.length)} — only those are matched (FreightPOP exports the page on screen)`, "warn");
@@ -1652,8 +1653,24 @@ async function kendoExport(page) {
   return { rows, headers, buf, gridTotal: Number(out.rows) || null, file: `Excel export (${(buf.length / 1024 / 1024).toFixed(1)} MB, built in ${Math.round((Date.now() - t0) / 1000)}s)`, clicked: "Export to Excel" };
 }
 
-async function captureExport(lane, browser, cdp, ext, jobId) {
-  if (lane.page) {
+// opts.buttonFirst (the Audit page): press FreightPOP's own Export To Excel
+// button and take the downloaded file. The grid's workbook is built as well,
+// as a check: a button that exports only the page on screen gives fewer rows,
+// and then the grid's full workbook is used instead.
+async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
+  if (opts.buttonFirst) {
+    let file = null, fromGrid = null, why = "";
+    try { file = await captureExport(lane, browser, cdp, ext, jobId, { buttonOnly: true, waitMs: 180_000 }); }
+    catch (e) { why = e.message; }
+    try { if (lane.page) fromGrid = await kendoExport(lane.page); } catch { /* the file stands on its own */ }
+    if (file && (!fromGrid || file.rows.length >= fromGrid.rows.length)) return { ...file, gridTotal: fromGrid?.gridTotal || null, via: "download" };
+    if (!fromGrid) throw new Error(why || "the Excel export could not be captured");
+    logLine(lane, file
+      ? `The downloaded Excel file has ${num(file.rows.length)} rows but the grid holds ${num(fromGrid.rows.length)} — FreightPOP's button exported only part, so the grid's full export is used`
+      : `Export To Excel download not captured (${String(why).slice(0, 200)}) — using the grid's own Excel export`, "warn");
+    return { ...fromGrid, via: "grid" };
+  }
+  if (lane.page && !opts.buttonOnly) {
     try { return await kendoExport(lane.page); }
     catch (e) { logLine(lane, `Excel export from the grid failed (${e.message}) — trying the Export to Excel button`, "warn"); }
   }
@@ -1672,7 +1689,8 @@ async function captureExport(lane, browser, cdp, ext, jobId) {
   const click = JSON.parse((await ext.evaluate("fpxErpClickExport()")).value || "{}");
   if (click.error) throw new Error(`${click.error}${click.buttons?.length ? ` — buttons on the page: ${click.buttons.join(", ")}` : ""}`);
 
-  const until = Date.now() + 45_000;
+  const waitMs = opts.waitMs || 45_000;
+  const until = Date.now() + waitMs;
   let last = null;
   while (Date.now() < until) {
     await sleep(1000);
@@ -1695,7 +1713,7 @@ async function captureExport(lane, browser, cdp, ext, jobId) {
   }
   const partial = fs.readdirSync(dir);
   fs.rmSync(dir, { recursive: true, force: true });
-  throw new Error(`clicked "${click.clicked}" but no file arrived within 45s${partial.length ? ` (still downloading: ${partial.join(", ")})` : ""}${click.others?.length ? ` — other candidates: ${click.others.join(", ")}` : ""}`);
+  throw new Error(`clicked "${click.clicked}" but no file arrived within ${Math.round(waitMs / 1000)}s${partial.length ? ` (still downloading: ${partial.join(", ")})` : ""}${click.others?.length ? ` — other candidates: ${click.others.join(", ")}` : ""}`);
 }
 
 // The "not exported to ERP, highest charge first" rule, shared by the rows
