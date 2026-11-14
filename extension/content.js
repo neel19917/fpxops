@@ -4340,7 +4340,7 @@ function apExportCandidates() {
   return out.sort((a, b) => b.score - a.score);
 }
 
-async function erpApprovalCheck(runBy) {
+async function erpApprovalCheck(runBy, resumed = false) {
   if (fpxErp && !fpxErp.done) return; // already running in this page
   stopRequested = false;
   const state = { job: "approval_check", lines: [], counts: { approvedRows: 0 }, done: null };
@@ -4352,21 +4352,28 @@ async function erpApprovalCheck(runBy) {
   try {
     await erpCheckpoint();
     if (erpLoginExpired()) throw new Error(expired);
-    erpLog(`Approval check${runBy ? ` for ${runBy}` : ""} · read-only: nothing on the Audit page is approved, rejected or edited`);
+    if (!resumed) erpLog(`Approval check${runBy ? ` for ${runBy}` : ""} · read-only: nothing on the Audit page is approved, rejected or edited`);
 
     // 1. The AUDIT item in the top navigation (it can take a moment to render).
-    let nav = null;
-    for (let i = 0; i < 40; i++) { // 20 s
-      nav = apFindAuditNav();
-      if (nav.el) break;
-      await erpCheckpoint();
-      await sleep(500);
-    }
-    if (!nav.el) throw new Error(`AUDIT was not found in FreightPOP's top navigation after 20s (page is ${where()}) — navigation shows: ${nav.labels.join(", ") || "nothing readable"}`);
+    // AUDIT can be a separate page: the click then reloads everything and the
+    // browser service starts this again on the new page with resumed = true,
+    // which goes straight to waiting for the page instead of clicking again.
     const before = where();
-    erpLog(`Opening Audit · clicking "${apText(nav.el) || "AUDIT"}" in the ${nav.inNav ? "top navigation" : "page header"} (page is ${before})`);
-    simulateClick(nav.el);
-    await humanDelay(800, 1400);
+    if (resumed) {
+      erpLog(`On the Audit page (${before})`);
+    } else {
+      let nav = null;
+      for (let i = 0; i < 40; i++) { // 20 s
+        nav = apFindAuditNav();
+        if (nav.el) break;
+        await erpCheckpoint();
+        await sleep(500);
+      }
+      if (!nav.el) throw new Error(`AUDIT was not found in FreightPOP's top navigation after 20s (page is ${where()}) — navigation shows: ${nav.labels.join(", ") || "nothing readable"}`);
+      erpLog(`Opening Audit · clicking "${apText(nav.el) || "AUDIT"}" in the ${nav.inNav ? "top navigation" : "page header"} (page is ${before})`);
+      simulateClick(nav.el);
+      await humanDelay(800, 1400);
+    }
 
     // 2. The Audit page is up once its "Recently Approved" tab is there.
     let tab = null;

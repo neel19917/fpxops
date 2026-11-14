@@ -300,6 +300,8 @@ export function lanePageFor(laneName, email) {
 }
 export function scrapePageFor(email) { return lanePageFor("scrape", email); }
 
+const INVOICING_POLL_MS = 3000;
+
 export function startScrapeWorker() {
   if (!config.apiKey) {
     console.warn("[worker] SCRAPE_WORKER set but FPX_API_KEY missing — worker disabled");
@@ -318,7 +320,9 @@ export function startScrapeWorker() {
   Object.values(lanes).forEach((lane, i) => {
     const loop = async () => {
       await poll(lane).catch((e) => console.error(`[worker] ${lane.name} poll error:`, e.message));
-      setTimeout(loop, config.scrapePollMs);
+      // Invoicing jobs are started by a person waiting at the screen: look
+      // for one every 3 s. Scrapes keep the admin-set interval.
+      setTimeout(loop, lane.name === "invoicing" ? INVOICING_POLL_MS : config.scrapePollMs);
     };
     // Offset the lanes so their claim requests don't always land together.
     setTimeout(loop, i * Math.min(2000, config.scrapePollMs / 2));
@@ -967,7 +971,7 @@ async function runPageJob(lane, browser, url, who, job) {
     await ext.evaluate(job.start, { awaitPromise: false });
 
     const startedAt = Date.now();
-    let lost = 0;
+    let lost = 0, restarts = 0;
     // Paused time doesn't count towards the limit.
     while (Date.now() < startedAt + job.limitMs + pausedTotal(lane)) {
       await sleep(1500);
@@ -979,7 +983,20 @@ async function runPageJob(lane, browser, url, who, job) {
         // The page (and the job running in it) went away.
         if (onLogin()) throw new Error("Redirected to FreightPOP login mid-run — sign in again, then re-run");
         if (authGone(lane, who)) throw new Error(EXPIRED);
-        if (++lost >= 10) throw new Error(`The FreightPOP page reloaded mid-run and the ${job.noun} was lost — re-run it`);
+        // A job that moves to another FreightPOP page (Audit is a separate
+        // page, so its content script starts afresh) is started again there
+        // and carries on from where the page now is.
+        if (job.resumeOnReload && ++lost >= 2 && restarts < 4 && ext.ready) {
+          const again = await ext.evaluate(job.has).catch(() => null);
+          if (again?.value === true) {
+            restarts++; lost = 0;
+            logLine(lane, `FreightPOP moved to another page (${page.url().replace(/^https?:\/\/[^/]+/, "")}) — carrying on there`);
+            if (lane.pauseFlag) pushPause(lane);
+            await ext.evaluate(job.restart || job.start, { awaitPromise: false }).catch(() => {});
+            continue;
+          }
+        }
+        if (++lost >= 20) throw new Error(`The FreightPOP page reloaded mid-run and the ${job.noun} was lost — re-run it (page is ${page.url()})`);
         continue;
       }
       lost = 0;
@@ -1287,10 +1304,12 @@ async function runApprovalCheckIn(lane, browser, url, who, auditId) {
   let got = null; // the Recently Approved export: { rows, headers, buf, file }
   const note = await runPageJob(lane, browser, url, who, {
     noun: "approval check",
+    resumeOnReload: true,
     limitMs: APPROVAL_LIMIT_MS,
     has: "typeof erpApprovalCheck === 'function' && typeof fpxErpPoll === 'function'",
     missing: "The extension in the hosted browser has no approval check (needs version 4.12 or later) — redeploy the browser service",
     start: `erpApprovalCheck(${JSON.stringify(String(who))}); 'started'`,
+    restart: `erpApprovalCheck(${JSON.stringify(String(who))}, true); 'started'`,
     onPoll: async (r, { cdp, ext }) => {
       // The page has Recently Approved on screen and wants its Excel captured.
       if (!r.download || r.done) return false;
