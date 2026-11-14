@@ -3,12 +3,14 @@ import { useSearchParams } from "react-router-dom";
 import { ArrowDown, ArrowUp, Download, Sparkles, X } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDate, fmtDateTime, fmtNum, fmtPct } from "../lib/format";
-import type { GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditRow } from "../lib/types";
+import type { GetInvoiceState, GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditRow } from "../lib/types";
 import { Drawer, Field, Section } from "../components/Drawer";
 import { ShareButton } from "../components/ShareButton";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { LoadingState } from "../components/LoadingState";
-import { ErpPullMonitor } from "../components/ErpPullMonitor";
+import { ErpPullMonitor, type ErpMonitorStatus } from "../components/ErpPullMonitor";
+import { GetInvoiceModal, InvoicePill, type GetInvoiceItem } from "../components/GetInvoiceModal";
+import { GET_INVOICE_MAX, getInvoiceLabel } from "../lib/erpPull";
 
 interface ReanalyzeButtonProps {
   busy: boolean;
@@ -226,10 +228,23 @@ interface ErpRow {
   diff: number | null;
   status: string;
   flags: string[];
+  // Get Invoice state (raw.get_invoice); null = never requested.
+  gi: GetInvoiceState | null;
   notes: string | null;
   search: string;
   source: InvoiceAuditRow;
 }
+
+function toInvoiceState(v: unknown): GetInvoiceState | null {
+  if (!v || typeof v !== "object") return null;
+  const state = v as GetInvoiceState;
+  return typeof state.status === "string" && getInvoiceLabel(state.status) ? state : null;
+}
+
+// "Not yet requested" also covers a shipment a stopped run never reached.
+const notRequested = (r: ErpRow) => !r.gi || r.gi.status === "not_started";
+// Failed first, Done last, so a sort brings what needs attention to the top.
+const GI_SORT: Record<string, number> = { failed: 0, requested: 1, not_started: 2, done: 3 };
 
 function toErpRow(row: InvoiceAuditRow): ErpRow {
   const raw = row.raw ?? {};
@@ -252,13 +267,14 @@ function toErpRow(row: InvoiceAuditRow): ErpRow {
     diff: toNum(row.difference),
     status: row.status ?? "",
     flags: Array.isArray(raw.flags) ? raw.flags.map(String) : [],
+    gi: toInvoiceState(raw.get_invoice),
     notes: row.ai_notes,
     search: `${shipment} ${customer} ${carrier}`.toLowerCase(),
     source: row,
   };
 }
 
-type ErpColKey = "rank" | "shipment" | "customer" | "carrier" | "shipped" | "charge" | "cost" | "gp" | "invoice" | "diff" | "status" | "flags";
+type ErpColKey = "rank" | "shipment" | "customer" | "carrier" | "shipped" | "charge" | "cost" | "gp" | "invoice" | "diff" | "status" | "getInvoice" | "flags";
 
 interface ErpCol {
   key: ErpColKey;
@@ -294,6 +310,12 @@ const ERP_COLS: ErpCol[] = [
     key: "status", label: "Status", firstDir: "asc",
     sortValue: (r) => statusLabel(r.status), csvValue: (r) => statusLabel(r.status),
     cell: (r) => <span className={"text-xs rounded-full px-2 py-0.5 whitespace-nowrap " + (STATUS_META[r.status]?.cls ?? "bg-slate-100 text-slate-700")}>{statusLabel(r.status)}</span>,
+  },
+  {
+    key: "getInvoice", label: "Invoice", firstDir: "asc",
+    sortValue: (r) => (r.gi ? GI_SORT[r.gi.status] ?? null : null),
+    csvValue: (r) => (r.gi ? [getInvoiceLabel(r.gi.status), r.gi.status === "failed" ? r.gi.note : null].filter(Boolean).join(": ") : ""),
+    cell: (r) => <InvoicePill state={r.gi} />,
   },
   {
     key: "flags", label: "Flags", firstDir: "desc",
@@ -382,7 +404,16 @@ function ErpRowDetail({ row }: { row: ErpRow }) {
   );
 }
 
-function ErpRowsTable({ run, rows }: { run: InvoiceAudit; rows: InvoiceAuditRow[] }) {
+interface ErpRowsTableProps {
+  run: InvoiceAudit;
+  rows: InvoiceAuditRow[];
+  /** Why a Get Invoice run can't be started right now; null = it can. */
+  getInvoiceBlocked?: string | null;
+  /** A Get Invoice run was queued for this audit (request id). */
+  onInvoicesStarted?: (requestId: string) => void;
+}
+
+function ErpRowsTable({ run, rows, getInvoiceBlocked, onInvoicesStarted }: ErpRowsTableProps) {
   const all = useMemo(() => rows.map(toErpRow), [rows]);
   const [sortKey, setSortKey] = useState<ErpColKey>("charge");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
@@ -391,6 +422,12 @@ function ErpRowsTable({ run, rows }: { run: InvoiceAudit; rows: InvoiceAuditRow[
   const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [limit, setLimit] = useState(ERP_PAGE_SIZE);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [notRequestedOnly, setNotRequestedOnly] = useState(false);
+  // Shipments ticked for Get Invoice (audit row ids). Survives filter changes.
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [anchorId, setAnchorId] = useState<string | null>(null); // last row ticked, for shift-click
+  const [capNote, setCapNote] = useState<string | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
 
   const statusCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -402,19 +439,65 @@ function ErpRowsTable({ run, rows }: { run: InvoiceAudit; rows: InvoiceAuditRow[
     });
   }, [all]);
   const flaggedCount = useMemo(() => all.filter((r) => r.flags.length > 0).length, [all]);
+  const notRequestedCount = useMemo(() => all.filter(notRequested).length, [all]);
 
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
     const col = ERP_COLS.find((c) => c.key === sortKey) ?? ERP_COLS[0];
     return all
-      .filter((r) => (status === "all" || r.status === status) && (!flaggedOnly || r.flags.length > 0) && (!q || r.search.includes(q)))
+      .filter((r) => (status === "all" || r.status === status) && (!flaggedOnly || r.flags.length > 0) && (!notRequestedOnly || notRequested(r)) && (!q || r.search.includes(q)))
       .sort((a, b) => compareErp(a, b, col, sortDir));
-  }, [all, query, status, flaggedOnly, sortKey, sortDir]);
+  }, [all, query, status, flaggedOnly, notRequestedOnly, sortKey, sortDir]);
 
   const totals = useMemo(() => shown.reduce((t, r) => ({ charge: t.charge + (r.charge ?? 0), cost: t.cost + (r.cost ?? 0) }), { charge: 0, cost: 0 }), [shown]);
 
   // Any change to what is shown starts again from the first page.
-  useEffect(() => { setLimit(ERP_PAGE_SIZE); }, [query, status, flaggedOnly, sortKey, sortDir]);
+  useEffect(() => { setLimit(ERP_PAGE_SIZE); }, [query, status, flaggedOnly, notRequestedOnly, sortKey, sortDir]);
+
+  // ── Selection for Get Invoice ──
+  const selectedRows = useMemo(() => all.filter((r) => selected.has(r.id)), [all, selected]);
+  const selCount = selectedRows.length;
+  const selCharge = useMemo(() => selectedRows.reduce((t, r) => t + (r.charge ?? 0), 0), [selectedRows]);
+  // The header checkbox covers the filtered rows, except ones already Done.
+  const headerRows = useMemo(() => shown.filter((r) => r.shipment && r.gi?.status !== "done"), [shown]);
+  const headerOn = headerRows.filter((r) => selected.has(r.id)).length;
+  const headerAll = headerRows.length > 0 && (headerOn === headerRows.length || (headerOn > 0 && selCount >= GET_INVOICE_MAX));
+
+  function applySelection(ids: string[], on: boolean) {
+    // Start from the rows still in the run, so the cap counts what is really ticked.
+    const next = new Set(selectedRows.map((r) => r.id));
+    let left = 0;
+    for (const id of ids) {
+      if (!on) next.delete(id);
+      else if (next.has(id)) continue;
+      else if (next.size >= GET_INVOICE_MAX) left++;
+      else next.add(id);
+    }
+    setSelected(next);
+    setCapNote(left ? `One run takes up to ${GET_INVOICE_MAX} shipments, so ${fmtNum(left)} more ${left === 1 ? "was" : "were"} left unticked. Run these first, then pick the next batch.` : null);
+  }
+  function toggleRow(r: ErpRow, shift: boolean) {
+    const on = !selected.has(r.id);
+    let ids = [r.id];
+    if (shift && anchorId) {
+      const a = shown.findIndex((x) => x.id === anchorId);
+      const b = shown.findIndex((x) => x.id === r.id);
+      if (a >= 0 && b >= 0) ids = shown.slice(Math.min(a, b), Math.max(a, b) + 1).filter((x) => x.shipment).map((x) => x.id);
+    }
+    applySelection(ids, on);
+    setAnchorId(r.id);
+  }
+  function toggleHeader() {
+    if (headerAll) applySelection(shown.map((r) => r.id), false);
+    else applySelection(headerRows.map((r) => r.id), true);
+  }
+  const modalItems = useMemo<GetInvoiceItem[]>(() => selectedRows.map((r) => ({
+    id: r.id, shipment: r.shipment, customer: r.customer, carrier: r.carrier, charge: r.charge, invoice: r.invoice,
+    status: r.status, statusLabel: statusLabel(r.status), statusCls: STATUS_META[r.status]?.cls ?? "bg-slate-100 text-slate-700",
+    flags: r.flags, invoiceState: r.gi,
+  })), [selectedRows]);
+  const getDisabledReason = selCount === 0 ? "Tick the shipments you want invoices for first" : getInvoiceBlocked || null;
+  const colCount = ERP_COLS.length + 1;
 
   function sortBy(col: ErpCol) {
     if (col.key === sortKey) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -446,6 +529,10 @@ function ErpRowsTable({ run, rows }: { run: InvoiceAudit; rows: InvoiceAuditRow[
           <input type="checkbox" checked={flaggedOnly} onChange={(e) => setFlaggedOnly(e.target.checked)} className="rounded border-slate-300 text-sky-600" />
           Flagged only ({fmtNum(flaggedCount)})
         </label>
+        <label className="text-xs text-slate-600 inline-flex items-center gap-1.5 ml-1 cursor-pointer" title="Shipments nobody has asked FPX to get an invoice for yet">
+          <input type="checkbox" checked={notRequestedOnly} onChange={(e) => setNotRequestedOnly(e.target.checked)} className="rounded border-slate-300 text-sky-600" />
+          Not yet requested ({fmtNum(notRequestedCount)})
+        </label>
         <button
           onClick={() => downloadErpCsv(shown, run)}
           disabled={shown.length === 0}
@@ -456,16 +543,56 @@ function ErpRowsTable({ run, rows }: { run: InvoiceAudit; rows: InvoiceAuditRow[
           Download Excel (CSV)
         </button>
       </div>
-      <div className="shrink-0 text-xs text-slate-500 mb-2">
-        {filtered ? `${fmtNum(shown.length)} of ${fmtNum(all.length)} shipments` : `${fmtNum(all.length)} shipments`}
-        {" · "}Total charges <span className="font-medium text-slate-700">{fmtMoney(totals.charge)}</span>
-        {" · "}Total cost <span className="font-medium text-slate-700">{fmtMoney(totals.cost)}</span>
+      <div className="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-slate-500 mb-2">
+        <span>
+          {filtered ? `${fmtNum(shown.length)} of ${fmtNum(all.length)} shipments` : `${fmtNum(all.length)} shipments`}
+          {" · "}Total charges <span className="font-medium text-slate-700">{fmtMoney(totals.charge)}</span>
+          {" · "}Total cost <span className="font-medium text-slate-700">{fmtMoney(totals.cost)}</span>
+        </span>
+        <span className="ml-auto inline-flex flex-wrap items-center gap-2">
+          {selCount > 0 ? (
+            <>
+              <span className="text-slate-700" aria-live="polite">
+                <span className="font-semibold">{fmtNum(selCount)}</span> selected · <span className="font-semibold">{fmtMoney(selCharge)}</span> in charges
+              </span>
+              <button onClick={() => { setSelected(new Set()); setCapNote(null); setAnchorId(null); }} className="underline hover:text-slate-900">Clear</button>
+            </>
+          ) : (
+            <span>Tick shipments to get their invoices (up to {GET_INVOICE_MAX} at a time)</span>
+          )}
+          <button
+            onClick={() => setModalOpen(true)}
+            disabled={!!getDisabledReason}
+            title={getDisabledReason || "Review the ticked shipments, then start"}
+            className="px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700 text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Get invoices…
+          </button>
+        </span>
       </div>
+      {capNote ? (
+        <div className="shrink-0 mb-2 text-xs text-amber-800 bg-amber-50 ring-1 ring-amber-200 rounded-lg px-3 py-2">{capNote}</div>
+      ) : null}
+      {selCount > 0 && getInvoiceBlocked ? (
+        <div className="shrink-0 mb-2 text-xs text-slate-600 bg-slate-50 ring-1 ring-slate-200 rounded-lg px-3 py-2">Can't start yet: {getInvoiceBlocked}.</div>
+      ) : null}
 
       <div className="flex-1 min-h-[320px] overflow-auto rounded-xl ring-1 ring-slate-200">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 sticky top-0 z-10 shadow-[0_1px_0_0_rgb(226_232_240)]">
             <tr className="text-[11px] uppercase tracking-wide text-slate-500">
+              <th className="pl-3 pr-1 py-2 w-8 text-left">
+                <input
+                  type="checkbox"
+                  ref={(el) => { if (el) el.indeterminate = headerOn > 0 && !headerAll; }}
+                  checked={headerAll}
+                  onChange={toggleHeader}
+                  disabled={headerRows.length === 0}
+                  aria-label="Select the shipments shown"
+                  title={`Select the shipments shown (up to ${GET_INVOICE_MAX}). Ones already Done are skipped.`}
+                  className="rounded border-slate-300 text-violet-600"
+                />
+              </th>
               {ERP_COLS.map((c) => {
                 const active = c.key === sortKey;
                 return (
@@ -481,16 +608,27 @@ function ErpRowsTable({ run, rows }: { run: InvoiceAudit; rows: InvoiceAuditRow[
           </thead>
           <tbody className="divide-y divide-slate-100">
             {visible.length === 0 ? (
-              <tr><td colSpan={ERP_COLS.length} className="p-8 text-center text-slate-500">{all.length === 0 ? "This run has no shipments." : "No shipments match these filters."}</td></tr>
+              <tr><td colSpan={colCount} className="p-8 text-center text-slate-500">{all.length === 0 ? "This run has no shipments." : "No shipments match these filters."}</td></tr>
             ) : visible.map((r) => (
               <Fragment key={r.id}>
-                <tr className={"cursor-pointer " + (expandedId === r.id ? "bg-sky-50/60" : "hover:bg-sky-50/50")} onClick={() => setExpandedId(expandedId === r.id ? null : r.id)}>
+                <tr className={"cursor-pointer " + (expandedId === r.id ? "bg-sky-50/60" : selected.has(r.id) ? "bg-violet-50/60 hover:bg-violet-50" : "hover:bg-sky-50/50")} onClick={() => setExpandedId(expandedId === r.id ? null : r.id)}>
+                  <td className="pl-3 pr-1 py-2 align-top select-none" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="checkbox"
+                      checked={selected.has(r.id)}
+                      disabled={!r.shipment}
+                      onChange={(e) => toggleRow(r, (e.nativeEvent as MouseEvent).shiftKey === true)}
+                      aria-label={`Select shipment ${r.shipment}`}
+                      title={r.shipment ? "Shift-click to select a range" : "No shipment number on this row"}
+                      className="rounded border-slate-300 text-violet-600"
+                    />
+                  </td>
                   {ERP_COLS.map((c) => (
                     <td key={c.key} className={"px-3 py-2 align-top " + (c.numeric ? "text-right tabular-nums whitespace-nowrap" : "")}>{c.cell(r)}</td>
                   ))}
                 </tr>
                 {expandedId === r.id ? (
-                  <tr className="bg-slate-50/60"><td colSpan={ERP_COLS.length} className="px-3 py-3"><ErpRowDetail row={r} /></td></tr>
+                  <tr className="bg-slate-50/60"><td colSpan={colCount} className="px-3 py-3"><ErpRowDetail row={r} /></td></tr>
                 ) : null}
               </Fragment>
             ))}
@@ -505,6 +643,19 @@ function ErpRowsTable({ run, rows }: { run: InvoiceAudit; rows: InvoiceAuditRow[
           </div>
         ) : null}
       </div>
+      {modalOpen && selCount > 0 ? (
+        <GetInvoiceModal
+          auditId={run.id}
+          items={modalItems}
+          onClose={() => setModalOpen(false)}
+          onStarted={(request) => {
+            setModalOpen(false);
+            setSelected(new Set());
+            setCapNote(null);
+            onInvoicesStarted?.(request.id);
+          }}
+        />
+      ) : null}
     </>
   );
 }
@@ -552,6 +703,9 @@ export function InvoiceAuditsPage() {
   const [detailNonce, setDetailNonce] = useState(0);
   // A run we know is an ERP pull before the list or the run itself has loaded.
   const [erpHintId, setErpHintId] = useState<string | null>(null);
+  // What the monitor card is doing, and the Get Invoice run this page last queued.
+  const [monitor, setMonitor] = useState<ErpMonitorStatus | null>(null);
+  const [invoiceRun, setInvoiceRun] = useState<{ requestId: string; auditId: string } | null>(null);
 
   // The open run lives in the URL (?run=<id>) so it can be linked to.
   const [params, setParams] = useSearchParams();
@@ -597,6 +751,31 @@ export function InvoiceAuditsPage() {
     }
   }
 
+  // Re-read the open run without blanking it (pills move from Requested to Done).
+  const refreshOpenRun = useCallback(() => {
+    if (!openId) return;
+    api.audits.invoice.get(openId)
+      .then((d) => setDetail((cur) => (cur && cur.run.id === d.run.id ? d : cur)))
+      .catch(() => { /* keep what is shown; the next refresh tries again */ });
+  }, [openId]);
+  const onSettled = useCallback(() => { void loadList(); refreshOpenRun(); }, [loadList, refreshOpenRun]);
+  const invoicesRunning = monitor?.active === "get_invoice";
+  useEffect(() => {
+    if (!invoicesRunning || !openId) return;
+    const id = setInterval(() => { if (document.visibilityState === "visible") refreshOpenRun(); }, 10_000);
+    return () => clearInterval(id);
+  }, [invoicesRunning, openId, refreshOpenRun]);
+
+  // The person confirmed the modal: step out of the run so the monitor card,
+  // which sits behind the panel, is what they see.
+  function onInvoicesStarted(requestId: string) {
+    if (openId) setInvoiceRun({ requestId, auditId: openId });
+    setOpenId(null);
+  }
+  const getInvoiceBlocked = monitor?.active === "get_invoice" ? "An invoice run is already queued or running"
+    : monitor?.active === "erp_audit" ? "A pull from FreightPOP is queued or running. Wait for it to finish"
+    : monitor?.blocked ?? null;
+
   function onPullFinished(auditId: string) {
     setErpHintId(auditId);
     void loadList();
@@ -616,7 +795,7 @@ export function InvoiceAuditsPage() {
         Open a run to see its shipments.
       </p>
       {/* The monitor is its own card, with its own heading and controls. */}
-      <ErpPullMonitor onFinished={onPullFinished} onSettled={() => { void loadList(); }} />
+      <ErpPullMonitor onFinished={onPullFinished} onSettled={onSettled} started={invoiceRun} onStatus={setMonitor} />
       <div className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-slate-50">
@@ -743,7 +922,7 @@ export function InvoiceAuditsPage() {
                 </div>
               ) : null}
             </div>
-            <ErpRowsTable key={erpDetail.run.id} run={erpDetail.run} rows={erpDetail.rows} />
+            <ErpRowsTable key={erpDetail.run.id} run={erpDetail.run} rows={erpDetail.rows} getInvoiceBlocked={getInvoiceBlocked} onInvoicesStarted={onInvoicesStarted} />
           </>
         ) : detailError && erpOpen ? <ErrorBlock compact>{detailError}</ErrorBlock> : <LoadingState variant="inline" />}
       </WidePanel>

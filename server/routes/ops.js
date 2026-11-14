@@ -1,6 +1,10 @@
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
+import {
+  GET_INVOICE_SCOPE, isUuid, normalizeShipmentIds, missingShipmentIds,
+  buildGetInvoiceNote, parseGetInvoiceNote, markRequested, resetRequested, updateRowsRaw,
+} from "../lib/getInvoice.js";
 
 export const opsRouter = Router();
 
@@ -18,13 +22,111 @@ export const opsRouter = Router();
 // pull the Transactions History Report for the last `months` months (default
 // 3) and post it to /audits/invoice/from-history. The window travels in
 // note as "months=N" (the complete route later replaces note with the result).
-const SCOPES = ["all", "selected", "erp_audit"];
-// Only the hosted browser knows how to run an ERP audit pull. Any other
-// claimer would treat the row as a full rescrape, so it is never handed one.
+//
+// scope "get_invoice" is not a scrape either: { audit_id, shipment_ids,
+// pause_after_first? } asks the hosted browser to click FreightPOP's GET
+// INVOICE button for shipments a person ticked in an ERP pull. The ids travel
+// in tracking_numbers and the rest in note as
+// "audit=<uuid>;from=<date_from>;to=<date_to>;pause_first=<1|0>". Only one
+// such run may be queued or running at a time (409 otherwise).
+const SCOPES = ["all", "selected", "erp_audit", GET_INVOICE_SCOPE];
+// Only the hosted browser knows how to run an ERP audit pull or a get-invoice
+// run. Any other claimer would treat the row as a full rescrape, so it is
+// never handed one.
 const HOSTED_WORKER = "fpx-browser";
+const HOSTED_ONLY_SCOPES = ["erp_audit", GET_INVOICE_SCOPE];
+
+// Puts the rows of a get-invoice request that are still waiting ("requested")
+// back to "not_started". Rows that already have a result are left alone.
+// `request` must carry the original note (it names the audit). Never throws.
+async function resetGetInvoiceRows(request, note) {
+  try {
+    const job = parseGetInvoiceNote(request?.note);
+    const ids = Array.isArray(request?.tracking_numbers) ? request.tracking_numbers.map(String) : [];
+    if (!job || !ids.length) return;
+    const out = await updateRowsRaw(supabase, job.audit_id, ids,
+      (raw) => resetRequested(raw, { request_id: request.id, note }));
+    if (out.error || out.failed) {
+      console.warn(`[FPX] get_invoice ${request.id}: could not reset rows (${out.error || `${out.failed} failed`})`);
+    }
+  } catch (e) {
+    console.warn(`[FPX] get_invoice ${request?.id}: could not reset rows (${e.message})`);
+  }
+}
+
+async function requestGetInvoice(req, res) {
+  const auditId = String(req.body?.audit_id || "").trim();
+  if (!auditId) return res.status(400).json({ error: "audit_id required" });
+  const picked = normalizeShipmentIds(req.body?.shipment_ids);
+  if (picked.error) return res.status(400).json({ error: picked.error });
+  const ids = picked.ids;
+  const pauseFirst = req.body?.pause_after_first !== false; // on unless switched off
+
+  if (!isUuid(auditId)) return res.status(404).json({ error: "Invoice audit not found" });
+  const { data: audit, error: aErr } = await supabase
+    .from("fpx_invoice_audits").select("id, shipment_type, date_from, date_to").eq("id", auditId).maybeSingle();
+  if (aErr) return res.status(500).json({ error: aErr.message });
+  if (!audit) return res.status(404).json({ error: "Invoice audit not found" });
+  if (audit.shipment_type !== "erp_pending") {
+    return res.status(400).json({ error: "That audit is not an ERP pull" });
+  }
+  if (!audit.date_from || !audit.date_to) {
+    return res.status(400).json({ error: "That ERP pull has no date range, so its shipments can't be looked up. Run a new pull." });
+  }
+
+  const found = await updateRowsRaw(supabase, audit.id, ids, null);
+  if (found.error) return res.status(500).json({ error: found.error });
+  const missing = missingShipmentIds(ids, found.rows);
+  if (missing.length) {
+    const shown = missing.slice(0, 5).join(", ");
+    const more = missing.length > 5 ? ` and ${missing.length - 5} more` : "";
+    return res.status(400).json({
+      error: `${missing.length} shipment${missing.length === 1 ? " is" : "s are"} not in this ERP pull: ${shown}${more}`,
+    });
+  }
+
+  const { data: busy, error: bErr } = await supabase
+    .from("fpx_scrape_requests").select("id")
+    .eq("scope", GET_INVOICE_SCOPE).in("status", ["pending", "claimed"]).limit(1);
+  if (bErr) return res.status(500).json({ error: bErr.message });
+  if (busy?.[0]) return res.status(409).json({ error: "An invoice run is already queued or running" });
+
+  const requestedBy = req.user?.email || req.apiKey?.name || null;
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .insert({
+      scope: GET_INVOICE_SCOPE,
+      tracking_numbers: ids,
+      note: buildGetInvoiceNote({ auditId: audit.id, from: audit.date_from, to: audit.date_to, pauseFirst }),
+      requested_by: requestedBy,
+    })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "rescrape_request",
+    entity_type: "scrape_request",
+    entity_id: data.id,
+    summary: `Requested Get Invoice for ${ids.length} shipment(s)`,
+    metadata: { scope: GET_INVOICE_SCOPE, audit_id: audit.id, count: ids.length, shipment_ids: ids, pause_after_first: pauseFirst },
+  });
+
+  // Show the chosen rows as requested. The request is already queued, so a
+  // failure here is only logged.
+  try {
+    const stamp = { requested_at: data.requested_at || new Date().toISOString(), requested_by: requestedBy, request_id: data.id };
+    const marked = await updateRowsRaw(supabase, audit.id, ids, (raw) => markRequested(raw, stamp));
+    if (marked.error || marked.failed) {
+      console.warn(`[FPX] get_invoice ${data.id}: could not mark rows requested (${marked.error || `${marked.failed} failed`})`);
+    }
+  } catch (e) {
+    console.warn(`[FPX] get_invoice ${data.id}: could not mark rows requested (${e.message})`);
+  }
+  return res.json({ request: data });
+}
 
 opsRouter.post("/rescrape", async (req, res) => {
   const scope = SCOPES.includes(req.body?.scope) ? req.body.scope : "all";
+  if (scope === GET_INVOICE_SCOPE) return requestGetInvoice(req, res);
   if (scope === "erp_audit") {
     const rawMonths = req.body?.months;
     const months = rawMonths === undefined || rawMonths === null || rawMonths === "" ? 3 : Number(rawMonths);
@@ -112,14 +214,35 @@ async function expireStaleErpRequests() {
     .eq("status", "pending").eq("scope", "erp_audit").lt("requested_at", cutoff);
 }
 
-// GET /ops/rescrape/pending?claim=1&by=<name> — extension poll. With claim=1 it
+// Same close-out for get-invoice runs, and their rows go back to
+// "not_started" so the person can pick them again.
+async function expireStaleGetInvoiceRequests() {
+  const cutoff = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const note = "Not picked up — the hosted browser needs an update before it can get invoices.";
+  const { data: stale } = await supabase.from("fpx_scrape_requests")
+    .select("id, note, tracking_numbers")
+    .eq("status", "pending").eq("scope", GET_INVOICE_SCOPE).lt("requested_at", cutoff);
+  for (const request of stale || []) {
+    // Guarded on pending so a request claimed in the meantime is left alone.
+    const { data: closed } = await supabase.from("fpx_scrape_requests")
+      .update({ status: "error", completed_at: new Date().toISOString(), note })
+      .eq("id", request.id).eq("status", "pending")
+      .select("id").maybeSingle();
+    if (closed) await resetGetInvoiceRows(request, note);
+  }
+}
+
+// GET /ops/rescrape/pending?claim=1&by=<name>&caps=<a,b> — extension poll. With claim=1 it
 // atomically flips the oldest pending request to 'claimed' (guarded on
 // status='pending' so two pollers can't grab the same one).
 //
 // Rows come back whole, so the caller sees scope ("all" | "selected" |
-// "erp_audit") and, for erp_audit, note "months=N". erp_audit rows are only
-// handed to a claimer named "fpx-browser" (the hosted worker): anyone else
-// claiming skips past them to the next shipment rescrape.
+// "erp_audit" | "get_invoice") and, for erp_audit, note "months=N". erp_audit
+// and get_invoice rows are only handed to a claimer named "fpx-browser" (the
+// hosted worker) whose caps list names that scope, e.g.
+// caps=erp_audit,get_invoice: anyone else claiming skips past them to the
+// next shipment rescrape. A get_invoice row carries the shipment ids in
+// tracking_numbers and note "audit=<uuid>;from=…;to=…;pause_first=<1|0>".
 opsRouter.get("/rescrape/pending", async (req, res) => {
   const claim = req.query.claim === "1" || req.query.claim === "true";
   const by = req.query.by ? String(req.query.by) : (req.apiKey?.name || null);
@@ -128,11 +251,16 @@ opsRouter.get("/rescrape/pending", async (req, res) => {
     .select("*").eq("status", "pending");
   // …and only when it says it knows how (caps=erp_audit). A hosted worker
   // build from before this job existed would run the row as a full rescrape.
-  const caps = String(req.query.caps || "").split(",");
+  const caps = String(req.query.caps || "").split(",").map((c) => c.trim()).filter(Boolean);
   // A worker polling without the cap can't run ERP pulls: close out any that
-  // have waited, so they don't sit "queued" forever.
+  // have waited, so they don't sit "queued" forever. Same for get-invoice runs.
   if (claim && by === HOSTED_WORKER && !caps.includes("erp_audit")) await expireStaleErpRequests();
-  if (claim && (by !== HOSTED_WORKER || !caps.includes("erp_audit"))) query = query.neq("scope", "erp_audit");
+  if (claim && by === HOSTED_WORKER && !caps.includes(GET_INVOICE_SCOPE)) await expireStaleGetInvoiceRequests();
+  if (claim) {
+    for (const hostedScope of HOSTED_ONLY_SCOPES) {
+      if (by !== HOSTED_WORKER || !caps.includes(hostedScope)) query = query.neq("scope", hostedScope);
+    }
+  }
   const { data: rows, error } = await query
     .order("requested_at", { ascending: true }).limit(1);
   if (error) return res.status(500).json({ error: error.message });
@@ -155,12 +283,23 @@ opsRouter.get("/rescrape/pending", async (req, res) => {
 opsRouter.post("/rescrape/release-orphans", async (req, res) => {
   const by = String(req.body?.by || req.apiKey?.name || "").trim();
   if (!by) return res.status(400).json({ error: "by required" });
+  // Read get-invoice runs first: the update below replaces note, which is
+  // what names their audit.
+  const { data: invoiceRuns } = await supabase
+    .from("fpx_scrape_requests").select("id, note, tracking_numbers")
+    .eq("status", "claimed").eq("claimed_by", by).eq("scope", GET_INVOICE_SCOPE);
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
     .update({ status: "error", completed_at: new Date().toISOString(), note: "Interrupted — the hosted browser restarted mid-run. Re-run if needed." })
     .eq("status", "claimed").eq("claimed_by", by)
     .select("id");
   if (error) return res.status(500).json({ error: error.message });
+  const released = new Set((data || []).map((r) => r.id));
+  for (const request of invoiceRuns || []) {
+    if (released.has(request.id)) {
+      await resetGetInvoiceRows(request, "Not run — the hosted browser restarted mid-run. Pick it again to retry.");
+    }
+  }
   res.json({ released: (data || []).map((r) => r.id) });
 });
 
@@ -170,12 +309,25 @@ opsRouter.post("/rescrape/:id/complete", async (req, res) => {
   const result_count = Number.isFinite(Number(req.body?.result_count)) ? Number(req.body.result_count) : null;
   const note = req.body?.note ? String(req.body.note).slice(0, 500) : null;
   const status = req.body?.error ? "error" : "done";
+  // The update replaces note, which for a get-invoice run names its audit, so
+  // read that first.
+  const { data: before } = await supabase
+    .from("fpx_scrape_requests").select("id, scope, note, tracking_numbers")
+    .eq("id", req.params.id).maybeSingle();
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
     .update({ status, completed_at: new Date().toISOString(), result_count, note })
     .eq("id", req.params.id).select().maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: "request not found" });
+  // A get-invoice run that ends with shipments it never reported on (it
+  // paused after the first, or stopped early) frees those rows to be picked
+  // again. Rows with a result are left alone.
+  if (before?.scope === GET_INVOICE_SCOPE) {
+    await resetGetInvoiceRows(before, status === "error"
+      ? "Not run — the invoice run stopped early. Pick it again to retry."
+      : "Not run in this pass. Pick it again to continue.");
+  }
   res.json({ request: data });
 });
 

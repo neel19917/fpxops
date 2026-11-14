@@ -2,6 +2,7 @@ import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { analyzeGpAuditRun, analyzeInvoiceAuditRun } from "./analyze.js";
 import { auditHistoryRows } from "../lib/historyAudit.js";
+import { MAX_GET_INVOICE_IDS, isUuid, normalizeResult, mergeResult, updateRowsRaw } from "../lib/getInvoice.js";
 
 export const auditsRouter = Router();
 
@@ -90,6 +91,8 @@ auditsRouter.get("/invoice/:id", async (req, res) => {
     rows.push(...(data || []));
     if (!data || data.length < PAGE) break;
   }
+  // Rows go out whole (select *), so raw.get_invoice — the state of a "get
+  // invoices" run for that shipment — reaches the dashboard as stored.
   // ERP-pending rows are ranked by charge (biggest first) when they are stored;
   // the charge lives in jsonb, so put them back in that order here.
   if (run.shipment_type === "erp_pending") {
@@ -205,6 +208,60 @@ auditsRouter.post("/invoice/from-history", async (req, res) => {
     invoice: audited.filter((r) => r.bill_amount != null).length,
   };
   res.json({ audit_id: run.id, total: stored, pending: stored, fields });
+});
+
+// POST /audits/invoice/:id/get-invoice-results — the hosted browser reports
+// what happened when it clicked GET INVOICE for shipments of an ERP pull.
+// Body: { by, results: [{ shipment_id, ok, note, at }] }, up to 200 results.
+// Each result is folded into raw.get_invoice of the matching row(s):
+//   { status: ok ? "done" : "failed", note, at, by } plus the requested_at /
+//   requested_by / request_id written when the run was queued.
+// No other column, and no other key of raw, is written. Shipment ids that are
+// not in the audit are counted, not refused.
+// Responds { updated, unknown, failed }: shipments saved, shipments not in
+// this audit, shipments whose save failed (send those again).
+auditsRouter.post("/invoice/:id/get-invoice-results", async (req, res) => {
+  const results = req.body?.results;
+  if (!Array.isArray(results) || !results.length) {
+    return res.status(400).json({ error: "body.results must be a list with at least one result" });
+  }
+  if (results.length > MAX_GET_INVOICE_IDS) {
+    return res.status(400).json({ error: `Send up to ${MAX_GET_INVOICE_IDS} results at a time` });
+  }
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
+  const { data: run, error } = await supabase
+    .from("fpx_invoice_audits").select("id, shipment_type").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!run) return res.status(404).json({ error: "Invoice audit not found" });
+  if (run.shipment_type !== "erp_pending") {
+    return res.status(400).json({ error: "That audit is not an ERP pull" });
+  }
+
+  const by = String(req.body?.by || req.apiKey?.name || req.user?.email || "").trim() || null;
+  const now = new Date().toISOString();
+  // One result per shipment; if a shipment is sent twice the later one wins.
+  const byShipment = new Map();
+  let unknown = 0;
+  for (const entry of results) {
+    const r = normalizeResult(entry, { by, now });
+    if (!r) { unknown += 1; continue; } // no shipment id to match
+    byShipment.set(r.shipment_id, r);
+  }
+
+  const failedShipments = new Set();
+  const out = await updateRowsRaw(supabase, run.id, [...byShipment.keys()], (raw, row) => {
+    const r = byShipment.get(String(row.shipment_id ?? "").trim());
+    return r ? mergeResult(raw, r) : null;
+  }, (row) => failedShipments.add(String(row.shipment_id ?? "").trim()));
+  if (out.error) return res.status(500).json({ error: out.error });
+
+  let updated = 0;
+  for (const id of byShipment.keys()) {
+    if (!out.matched.has(id)) unknown += 1;
+    else if (!failedShipments.has(id)) updated += 1;
+  }
+  if (failedShipments.size) console.warn(`[FPX] get-invoice results for ${run.id}: ${failedShipments.size} shipment(s) not saved`);
+  res.json({ updated, unknown, failed: failedShipments.size });
 });
 
 auditsRouter.post("/invoice", async (req, res) => {

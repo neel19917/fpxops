@@ -3600,6 +3600,11 @@ function fpxErpPoll() {
     started: true, lines: fpxErp.lines.splice(0), counts: fpxErp.counts, done: fpxErp.done,
     upload: fpxErp.outbox ? { rows: fpxErp.outbox.rows.length } : null,
     download: fpxErp.wantDownload || null,
+    // Get-invoices job only: finished shipments (emptied when read, like
+    // `lines`) and a request to pause the job ({ id, text }).
+    job: fpxErp.job || "erp_audit",
+    results: fpxErp.results ? fpxErp.results.splice(0) : [],
+    pause: fpxErp.wantPause || null,
   };
 }
 
@@ -3725,6 +3730,15 @@ async function erpCheckpoint() {
 
 function erpLoginExpired() {
   return /[#/]login\b/i.test(window.location.pathname + window.location.hash);
+}
+
+// Why invoiceGenerateReport() gave up, as a sentence that names the step.
+function erpReportFailure(failNote) {
+  const where = window.location.hash || window.location.pathname;
+  if (/no date inputs/i.test(failNote || "")) return `Generate History Report dialog not found on the Transactions page (no date fields appeared; page is ${where})`;
+  if (/CONTINUE/.test(failNote || "")) return "Generate History Report dialog: CONTINUE button not found";
+  if (/No grid data/i.test(failNote || "")) return "Report grid never loaded — no rows appeared within 3 min of pressing Continue (FreightPOP is still loading, or there are no transactions in this range)";
+  return failNote || "Generate History Report failed";
 }
 
 // "Exported to ERP" false / 0 / No / blank → not exported. Anything else
@@ -3947,11 +3961,7 @@ async function erpAuditPull(months, runBy, shipmentType) {
     if (!generated) {
       await erpCheckpoint(); // a stop ends here as "stopped", not as a failure
       if (erpLoginExpired()) throw new Error("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
-      const where = window.location.hash || window.location.pathname;
-      if (/no date inputs/i.test(failNote || "")) throw new Error(`Generate History Report dialog not found on the Transactions page (no date fields appeared; page is ${where})`);
-      if (/CONTINUE/.test(failNote || "")) throw new Error("Generate History Report dialog: CONTINUE button not found");
-      if (/No grid data/i.test(failNote || "")) throw new Error("Report grid never loaded — no rows appeared within 3 min of pressing Continue (FreightPOP is still loading, or there are no transactions in this range)");
-      throw new Error(failNote || "Generate History Report failed");
+      throw new Error(erpReportFailure(failNote));
     }
 
     // One result tab per shipment type asked for.
@@ -4098,6 +4108,550 @@ async function erpAuditPull(months, runBy, shipmentType) {
     } else {
       console.warn("[FPX-ERP] failed:", e?.message || e);
       state.done = { ok: false, note: String(e?.message || e), result: lastResult };
+    }
+  }
+}
+
+// =====================================================================
+// GET INVOICES (hosted browser job)
+//
+// After a person has reviewed an ERP audit and picked shipments: generate the
+// same History Report, then for each picked shipment find its row and click
+// that row's GET INVOICE button. One shipment at a time, one click each.
+//
+// Started by the browser service with erpGetInvoices(optsJson); it polls
+// fpxErpPoll() for log lines, finished shipments (`results`) and pause
+// requests (`pause`), and tells this page about things only it can see
+// (a new window, a file download, a browser prompt) with fpxErpNote().
+//
+// What FreightPOP does after the click is not known, so the job watches for
+// ~15 s, writes down what it saw in plain words, and only ever puts a dialog
+// away with a passive control (GI_PASSIVE, a close icon, or a lone OK on a
+// message). It never clicks anything else. A dialog that wants an answer is
+// left open and the job pauses for a person.
+// Pause / stop: as for the ERP audit pull (erpCheckpoint / humanDelay).
+// =====================================================================
+const GI_OBSERVE_STEPS = 50; // × 300 ms ≈ 15 s. Steps, not wall time: a browser prompt freezes the page.
+const GI_DIALOG_SELECTOR = ".modal.in, .modal.show, .k-window, [role='dialog'], [role='alertdialog'], .bootbox, .sweet-alert, .swal2-popup, .swal-modal, .ui-dialog, md-dialog";
+const GI_MESSAGE_SELECTOR = "#toast-container > *, .toast, .k-notification, .noty_bar, .ui-pnotify, .growl, .snackbar, .alert, [role='alert']";
+// The only button texts that are ever clicked inside a dialog.
+const GI_PASSIVE = /^(close|x|×|✕|✖|cancel|done|dismiss)$/i;
+// Clicked only when it is the one button of a plain message (no Cancel beside
+// it, no fields, no question mark).
+const GI_OK = /^(ok|okay|got it)$/i;
+const GI_ERROR_TEXT = /\b(error|failed|failure|unable to|could not|couldn't|cannot|can't|not found|invalid|denied|not authorized|unauthorized|exception|went wrong|try again)\b/i;
+const GI_BUSY_TEXT = /please wait|loading|generating|processing|in progress/i;
+// Field names the report grid may use for the shipment id. Not "Id": that is
+// an internal key and would match some other row.
+const GI_SHIPMENT_ID_FIELDS = ["ShipmentID", "ShipmentId", "shipmentId", "Shipment_ID", "Shipment_Id", "shipment_id", "ShipmentNumber", "ShipmentNo", "ShipId"];
+
+// The browser service reports what the page can't see for itself:
+// { kind: "window" } · { kind: "download", file } · { kind: "alert", text } · { kind: "confirm", text }
+function fpxErpNote(note) {
+  if (!fpxErp || fpxErp.done || !fpxErp.notes || !note) return "no job";
+  fpxErp.notes.push(note);
+  return "ok";
+}
+
+function giFatal(message) {
+  return Object.assign(new Error(message), { fpxFatal: true });
+}
+
+function giText(el) {
+  return String((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim();
+}
+
+// Visible matches, outermost only.
+function giVisible(selector) {
+  const all = [...document.querySelectorAll(selector)].filter(isVisibleForClick);
+  return all.filter((el) => !all.some((o) => o !== el && o.contains(el)));
+}
+
+function giStillOpen(el) {
+  return !!(el && el.isConnected && isVisibleForClick(el));
+}
+
+async function giWaitGone(el, ms) {
+  for (let i = 0; i < ms / 250; i++) {
+    if (!giStillOpen(el)) return true;
+    await sleep(250);
+  }
+  return !giStillOpen(el);
+}
+
+// Asks the browser service to pause the job exactly as if Pause had been
+// pressed (it logs `text`), then holds here until Resume. Throws on a stop.
+// If the pause never arrives the job stops: carrying on unattended is the
+// wrong default for this job.
+async function erpAskPause(text) {
+  const state = fpxErp;
+  state.pauseSeq = (state.pauseSeq || 0) + 1;
+  state.wantPause = { id: state.pauseSeq, text: String(text) };
+  const until = Date.now() + 30000;
+  while (!fpxIsPaused()) {
+    if (stopRequested) { state.wantPause = null; throw Object.assign(new Error("Stopped by user"), { fpxStop: true }); }
+    if (Date.now() > until) {
+      state.wantPause = null;
+      throw giFatal("Asked the browser service to pause the job and it did not within 30s — stopped here rather than carry on unattended");
+    }
+    await sleep(300);
+  }
+  state.wantPause = null;
+  await erpCheckpoint();
+}
+
+// The report grid on screen: rows as { buttonRow, dataRow } (locked ↔
+// scrollable by index, as in the invoice audit), and where the Shipment ID
+// column sits in each half (-1 when its header can't be found).
+function giGrid() {
+  const grids = [...document.querySelectorAll(".k-grid")].filter(isVisibleForClick);
+  const grid = grids.find((g) => g.querySelector(".k-grid-content")) || grids[0];
+  if (!grid) return null;
+  const real = (r) => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row") && !r.classList.contains("k-detail-row");
+  const locked = [...grid.querySelectorAll(".k-grid-content-locked tbody tr")].filter(real);
+  const scroll = [...grid.querySelectorAll(grid.querySelector(".k-grid-content") ? ".k-grid-content tbody tr" : "tbody tr")].filter(real);
+  const pairs = locked.length
+    ? scroll.slice(0, Math.min(locked.length, scroll.length)).map((r, i) => ({ buttonRow: locked[i], dataRow: r }))
+    : scroll.map((r) => ({ buttonRow: r, dataRow: r }));
+  const colOf = (sel) => {
+    const ths = [...grid.querySelectorAll(sel)];
+    return ths.findIndex((th) => /^shipment\s*(id|#|no\.?|number)$/i.test(giText(th.querySelector("a.k-link") || th)));
+  };
+  return {
+    pairs,
+    col: colOf(grid.querySelector(".k-grid-header-wrap") ? ".k-grid-header-wrap thead tr:last-child th" : "thead tr:last-child th"),
+    lockedCol: colOf(".k-grid-header-locked thead tr:last-child th"),
+  };
+}
+
+function giReportOnScreen() {
+  return /Transactions/i.test(window.location.href) && !!giGrid();
+}
+
+// Rows on screen that are this shipment. The Shipment ID cell must read
+// exactly `id`. A match in some other cell only counts when the grid's own
+// filter has already narrowed it to this shipment (`filtered`), or when the
+// Shipment ID column could not be located and exactly one row has it.
+function giRowsFor(id, filtered) {
+  const g = giGrid();
+  if (!g) return { rows: [], onScreen: 0 };
+  const want = String(id).replace(/\s+/g, "");
+  const cellIs = (td) => !!td && td.textContent.replace(/\s+/g, "") === want;
+  const byCol = g.pairs.filter((p) =>
+    (g.col >= 0 && cellIs(p.dataRow.children[g.col])) ||
+    (g.lockedCol >= 0 && p.buttonRow !== p.dataRow && cellIs(p.buttonRow.children[g.lockedCol])));
+  if (byCol.length) return { rows: byCol, onScreen: g.pairs.length };
+  const any = g.pairs.filter((p) => [...p.dataRow.children, ...(p.buttonRow !== p.dataRow ? p.buttonRow.children : [])].some(cellIs));
+  if (filtered || (g.col < 0 && g.lockedCol < 0 && any.length === 1)) return { rows: any, onScreen: g.pairs.length };
+  return { rows: [], onScreen: g.pairs.length };
+}
+
+async function giClearFilter(st) {
+  try { await fpxFilterViaKendoApi("", [], { mode: "clear" }); } catch { /* the next lookup starts with another clear */ }
+  if (st.uiFilter) {
+    st.uiFilter = false;
+    try { await clearShipmentIdFilter(); } catch { /* same */ }
+  }
+}
+
+// Narrow the grid on screen to one shipment and return its rows.
+// → { rows, why } (rows empty when it isn't in this tab; `why` says what was tried)
+async function giFilterTo(id, st) {
+  await giClearFilter(st); // start clean: a miss must not leave the previous shipment's row
+  fpxLastInjectDetail = "";
+  let confirmed = false; // the grid itself said it now holds only this shipment
+  let filtered = false;
+  let why = "";
+  if (await fpxFilterViaKendoApi(id, GI_SHIPMENT_ID_FIELDS, { titleRe: FPX_SHIPMENT_ID_TITLE_RE })) {
+    confirmed = true;
+    filtered = true;
+  } else {
+    why = fpxLastInjectDetail || "the grid's data did not answer";
+    // "→ 0 row(s)" = the grid answered and has no such shipment. Anything
+    // else = the grid's data could not be reached: use the column's own
+    // filter box instead.
+    if (!/→ 0 row/.test(why)) {
+      await erpCheckpoint();
+      st.uiFilter = true;
+      try { filtered = (await filterGridByShipmentId(id)) === true; } catch (e) { why += ` | column filter: ${e?.message || e}`; }
+    }
+  }
+  let got = { rows: [], onScreen: 0 };
+  for (let k = 0; k < (filtered ? 12 : 3); k++) {
+    got = giRowsFor(id, confirmed);
+    if (got.rows.length) return { rows: got.rows };
+    await sleep(500);
+  }
+  if (filtered) why = `the filter ran but none of the ${got.onScreen} row(s) on screen shows this shipment id`;
+  return { rows: [], why: String(why).slice(0, 200) };
+}
+
+// The row for one shipment: the tab on screen first, then the other one.
+// → { rows } or { error }
+async function giFindRow(id, st) {
+  const tabs = [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"]];
+  const order = [...tabs.filter((t) => t[0] === st.tab), ...tabs.filter((t) => t[0] !== st.tab)];
+  const tried = [];
+  for (const [type, label] of order) {
+    await erpCheckpoint();
+    if (type !== st.tab) {
+      await giClearFilter(st);
+      const before = erpGridSig();
+      if (!clickShipmentTypeTab(type)) { tried.push(`${label}: tab not found`); continue; }
+      st.tab = type;
+      await humanDelay(800, 1400);
+      if (!(await erpWaitGridSettled(before, 60))) { tried.push(`${label}: still loading after 60s`); continue; }
+    }
+    const r = await giFilterTo(id, st);
+    if (r.rows.length) return { rows: r.rows };
+    tried.push(`${label}: ${r.why}`);
+  }
+  return { error: `Not found in the report (${tried.join("; ")})` };
+}
+
+// The GET INVOICE control of a row. → { el } or { error }
+function giFindButton(pair) {
+  const rows = pair.buttonRow === pair.dataRow ? [pair.dataRow] : [pair.buttonRow, pair.dataRow];
+  const label = (b) => String(b.textContent || b.value || b.title || b.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+  const all = [];
+  for (const row of rows) for (const b of row.querySelectorAll("a, button, input[type='button'], input[type='submit'], [role='button']")) all.push(b);
+  const hit = all.find((b) => /^getinvoices?$/.test(label(b).toLowerCase().replace(/[^a-z]/g, "")));
+  if (!hit) {
+    const texts = [...new Set(all.map(label).filter(Boolean))].slice(0, 8);
+    return { error: `No Get Invoice button on this row (buttons: ${texts.join(", ") || "none"})` };
+  }
+  if (hit.disabled || hit.hasAttribute("disabled") || hit.getAttribute("aria-disabled") === "true" || /(^|\s)(disabled|k-state-disabled)(\s|$)/.test(String(hit.className || ""))) {
+    return { error: "The Get Invoice button is disabled on this row" };
+  }
+  if (!isVisibleForClick(hit)) return { error: "The Get Invoice button is hidden on this row" };
+  return { el: hit, text: label(hit) };
+}
+
+// What a dialog says and which of its buttons may be clicked.
+function giDescribeDialog(d) {
+  const full = giText(d);
+  const controls = [];
+  for (const el of d.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn, a.k-button, .btn, .k-button, [role='button'], a.k-window-action, .close, [data-dismiss]")) {
+    if (!isVisibleForClick(el) || controls.some((c) => c.el.contains(el))) continue;
+    const text = String(el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").replace(/\s+/g, " ").trim();
+    const windowAction = el.matches(".k-window-action");
+    const closeIcon = windowAction
+      ? !!el.querySelector(".k-i-close, .k-i-x, .k-svg-i-x") || /^close$/i.test(el.getAttribute("aria-label") || "")
+      : el.matches(".close, [data-dismiss]") && (text.length <= 1 || GI_PASSIVE.test(text));
+    if (windowAction && !closeIcon) continue; // minimise / maximise
+    const kind = closeIcon || GI_PASSIVE.test(text) ? "passive" : GI_OK.test(text) ? "ok" : "other";
+    controls.push({ el, kind, icon: closeIcon && !GI_PASSIVE.test(text), label: closeIcon && text.length <= 1 ? "X" : text || "(unlabelled button)" });
+  }
+  const passives = controls.filter((c) => c.kind === "passive");
+  const oks = controls.filter((c) => c.kind === "ok");
+  const others = controls.filter((c) => c.kind === "other");
+  const fields = [...d.querySelectorAll("input, select, textarea")].filter((el) =>
+    isVisibleForClick(el) && !el.disabled && !el.readOnly && !/^(hidden|button|submit|image|reset)$/i.test(el.type || ""));
+  const hasCancel = passives.some((c) => /^cancel$/i.test(c.label));
+  // A button that isn't purely "put this away" means a person has to choose.
+  const decision = others.length > 0 || oks.length > 1 || (oks.length === 1 && (hasCancel || fields.length > 0 || full.includes("?")));
+  const rank = (c) => (/^(close|done|dismiss)$/i.test(c.label) ? 0 : c.icon || /^(x|×|✕|✖)$/i.test(c.label) ? 1 : 2); // Cancel last
+  const passive = passives.slice().sort((a, b) => rank(a) - rank(b))[0] || null;
+  const errorMark = [...d.querySelectorAll(".text-danger, .alert-danger, .k-i-error, .swal2-error, .sa-error, .fa-exclamation-triangle, .fa-times-circle")].some(isVisibleForClick);
+  return {
+    text: full.slice(0, 120),
+    buttons: controls.map((c) => c.label),
+    decision,
+    passive,                                   // Close / X / Cancel / Done — never OK
+    closer: decision ? null : passive || oks[0] || null,
+    busy: !decision && !oks.length && (GI_BUSY_TEXT.test(full) || !!d.querySelector(".progress, .k-progressbar, .spinner, .fa-spinner, .k-loading-image")),
+    error: /(^|[\s-])(error|danger)($|[\s-])/i.test(String(d.className || "")) || errorMark || GI_ERROR_TEXT.test(full.slice(0, 300)),
+  };
+}
+
+function giSnapshot() {
+  return {
+    href: window.location.href,
+    dialogs: new Set(giVisible(GI_DIALOG_SELECTOR)),
+    messages: new Map(giVisible(GI_MESSAGE_SELECTOR).map((el) => [el, giText(el)])),
+  };
+}
+
+// Watch the page after the click. Ends ~3 s after the first thing seen, or
+// after the whole ~15 s when nothing shows.
+// → { messages: Map(el → { text, error }), dialogs: Map(el → text), loading, href }
+async function giObserve(before, state) {
+  const seen = { messages: new Map(), dialogs: new Map(), loading: false, href: null };
+  let firstAt = -1;
+  for (let step = 0; step < GI_OBSERVE_STEPS; step++) {
+    if (stopRequested) break;
+    const dialogs = giVisible(GI_DIALOG_SELECTOR).filter((d) => !before.dialogs.has(d));
+    for (const d of dialogs) seen.dialogs.set(d, giText(d).slice(0, 120) || seen.dialogs.get(d) || "");
+    for (const el of giVisible(GI_MESSAGE_SELECTOR)) {
+      if (dialogs.some((d) => d.contains(el))) continue;
+      const text = giText(el);
+      if (!text || before.messages.get(el) === text) continue; // was already there, unchanged
+      const had = seen.messages.get(el);
+      if (!had || text.length > had.text.length) {
+        seen.messages.set(el, { text, error: /error|danger|fail/i.test(String(el.className || "")) || GI_ERROR_TEXT.test(text) });
+      }
+    }
+    const loading = !!document.querySelector(".k-loading-mask, .k-loading-image");
+    if (loading) seen.loading = true;
+    if (window.location.href !== before.href) seen.href = window.location.href;
+    const something = seen.dialogs.size > 0 || seen.messages.size > 0 || seen.href || state.notes.length > 0;
+    if (something && firstAt < 0) firstAt = step;
+    if (firstAt >= 0 && step - firstAt >= 10 && !loading) break;
+    await sleep(300);
+  }
+  return seen;
+}
+
+// Put away every dialog the click opened. `out`: { parts, fail(text), emit(), paused }.
+// A dialog that wants an answer, or that has no passive control, is left
+// open: the shipment is recorded as failed, the job pauses, and after Resume
+// it is closed with Close / X / Cancel if it has one — otherwise the job stops.
+async function giSettleDialogs(id, before, out) {
+  for (let round = 0; round < 4; round++) {
+    const open = giVisible(GI_DIALOG_SELECTOR).filter((d) => !before.dialogs.has(d));
+    if (!open.length) return;
+    const d = open[open.length - 1]; // the one on top
+    let info = giDescribeDialog(d);
+    if (info.busy) {
+      // A progress message: let it finish by itself (up to 45 s more).
+      for (let i = 0; i < 90 && !stopRequested && giStillOpen(d) && giDescribeDialog(d).busy; i++) await sleep(500);
+      if (!giStillOpen(d)) { out.parts.push(`"${info.text}" was shown, then went away`); continue; }
+      info = giDescribeDialog(d);
+      if (info.busy) out.fail(`Still showing "${info.text}" after a minute`);
+    }
+    if (info.error) out.fail(`Error shown: "${info.text}"`);
+
+    let closedWith = null;
+    if (info.closer) {
+      await erpCheckpoint();
+      simulateClick(info.closer.el);
+      if (await giWaitGone(d, 5000)) closedWith = info.closer.label;
+    }
+    if (closedWith) { out.parts.push(info.error ? `closed with ${closedWith}` : `Dialog opened: "${info.text}" · closed with ${closedWith}`); continue; }
+
+    const buttons = info.buttons.join(", ") || "none";
+    out.fail(info.decision
+      ? `Needs a decision: ${info.text} — buttons: ${buttons}`
+      : `A dialog could not be closed: ${info.text} — buttons: ${buttons}`);
+    out.emit();
+    await erpAskPause(`Get Invoice · ${id} · FreightPOP is showing "${info.text}" — buttons: ${buttons}. Nothing was chosen. Press Resume to carry on: it is closed with Close or Cancel if it has one, otherwise the job stops`);
+    out.paused = true;
+    if (!giStillOpen(d)) continue; // someone dealt with it during the pause
+    const again = giDescribeDialog(d);
+    if (again.passive) {
+      simulateClick(again.passive.el);
+      if (await giWaitGone(d, 5000)) continue;
+    }
+    throw giFatal(`Stopped: FreightPOP is still showing "${again.text}" for shipment ${id} and it has no Close or Cancel button that works (buttons: ${again.buttons.join(", ") || "none"}). Close it in FreightPOP, then run the remaining shipments again`);
+  }
+  if (giVisible(GI_DIALOG_SELECTOR).some((d) => !before.dialogs.has(d))) {
+    throw giFatal(`Stopped: dialogs kept opening for shipment ${id} — look at FreightPOP, then run the remaining shipments again`);
+  }
+}
+
+// optsJson: { from, to, shipmentIds, pauseFirst, runBy } — from / to are YYYY-MM-DD.
+async function erpGetInvoices(optsJson) {
+  if (fpxErp && !fpxErp.done) return; // already running in this page
+  let opts = {};
+  try { opts = (typeof optsJson === "string" ? JSON.parse(optsJson) : optsJson) || {}; } catch { opts = {}; }
+  stopRequested = false;
+  const ids = [...new Set((Array.isArray(opts.shipmentIds) ? opts.shipmentIds : []).map((v) => String(v ?? "").trim()).filter(Boolean))];
+  const state = {
+    job: "get_invoice", lines: [], results: [], notes: [], wantPause: null, pauseSeq: 0,
+    counts: { total: ids.length, done: 0, ok: 0, failed: 0 }, done: null,
+  };
+  fpxErp = state;
+  const st = { tab: "non-parcel", uiFilter: false };
+  const summary = () => `${erpNum(state.counts.ok)} of ${erpNum(state.counts.total)} invoice(s) clicked` +
+    (state.counts.failed ? ` · ${erpNum(state.counts.failed)} failed` : "") +
+    (state.counts.done < state.counts.total ? ` · ${erpNum(state.counts.total - state.counts.done)} not reached` : "");
+
+  const record = (id, ok, note) => {
+    state.results.push({ shipment_id: id, ok: !!ok, note: String(note).slice(0, 480), at: new Date().toISOString() });
+    state.counts.done++;
+    if (ok) state.counts.ok++; else state.counts.failed++;
+    erpLog(`Get Invoice · ${id} · ${note}`, ok ? "info" : "warn");
+  };
+
+  try {
+    const mmddyyyy = (iso) => {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || "").trim());
+      return m ? `${m[2]}/${m[3]}/${m[1]}` : null;
+    };
+    const fromStr = mmddyyyy(opts.from);
+    const toStr = mmddyyyy(opts.to);
+    if (!ids.length) throw new Error("No shipments were given to get invoices for");
+    if (!fromStr || !toStr) throw new Error(`The report dates could not be read (from "${opts.from}", to "${opts.to}") — expected YYYY-MM-DD`);
+
+    const loginGone = () => giFatal("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
+    const openReport = async () => {
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw loginGone();
+      erpLog("Opening Transactions");
+      let failNote = null;
+      const generated = await invoiceGenerateReport(fromStr, toStr, "non-parcel", "", {
+        status: (t) => dlog("[FPX-ERP]", t),
+        fail: (t) => { failNote = t; },
+        openDialog: true,
+        stoppable: true,
+        gridWaitSec: 180,
+        beforeContinue: async (dateFields) => {
+          await erpCheckpoint();
+          const f = dateFields.from ? dateFields.from.value : "";
+          const t = dateFields.to ? dateFields.to.value : "";
+          if (!f || !t) return `Could not fill the report dates (From "${f}", To "${t}")`;
+          const cust = erpCheckCustomer();
+          if (cust.error) return cust.error;
+          // The carrier filter is left exactly as FreightPOP shows it.
+          const carrier = erpFindDialogSelect("carrier", cust.select);
+          const shown = carrier ? [...carrier.selectedOptions].map((o) => o.text.replace(/\s+/g, " ").trim()).filter(Boolean).join(", ") : "";
+          erpLog(`Generate History Report · ${fromStr} to ${toStr} · ${cust.label} · carrier filter untouched${shown ? ` ("${shown}")` : ""}`);
+          if (cust.note) erpLog(cust.note, "warn");
+          await humanDelay(300, 600);
+          return null;
+        },
+        onGridWait: (sec) => {
+          if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 3 min)");
+          else if (sec % 15 === 0) erpLog(`Still loading the report · ${sec}s`);
+        },
+      });
+      if (!generated) {
+        await erpCheckpoint(); // a stop ends here as "stopped", not as a failure
+        if (erpLoginExpired()) throw loginGone();
+        throw giFatal(erpReportFailure(failNote));
+      }
+      st.tab = "non-parcel";
+      st.uiFilter = false;
+    };
+
+    // One shipment. → true when the job paused for a person along the way.
+    const one = async (id) => {
+      let clicked = false;
+      let emitted = false;
+      const out = {
+        parts: [], failure: null, paused: false,
+        fail(text) { if (!this.failure) this.failure = text; },
+        emit() {
+          if (emitted) return;
+          emitted = true;
+          // A failure after the click says so: running it again would click twice.
+          const tail = this.failure && clicked ? "the button was clicked" : null;
+          record(id, !this.failure, [this.failure, ...this.parts, tail].filter(Boolean).join(" · ") || "Nothing visible changed");
+        },
+      };
+      try {
+        let found = await giFindRow(id, st);
+        if (found.error) { out.fail(found.error); return false; }
+        let btn = giFindButton(found.rows[0]);
+        if (btn.error) { out.fail(btn.error); return false; }
+        await erpCheckpoint();
+        if (!btn.el.isConnected) {
+          // The grid redrew (a long pause): look the row up again.
+          found = await giFindRow(id, st);
+          if (found.error) { out.fail(found.error); return false; }
+          btn = giFindButton(found.rows[0]);
+          if (btn.error) { out.fail(btn.error); return false; }
+          await erpCheckpoint();
+        }
+        if (found.rows.length > 1) out.parts.push(`${found.rows.length} rows for this shipment — clicked the first`);
+
+        const before = giSnapshot();
+        state.notes.length = 0;
+        try { btn.el.scrollIntoView({ block: "center", inline: "nearest" }); } catch { /* not needed for the click */ }
+        // The one click of this shipment. Never repeated.
+        simulateClick(btn.el);
+        clicked = true;
+        const seen = await giObserve(before, state);
+
+        // What the browser service saw.
+        for (const n of state.notes.splice(0)) {
+          if (n.kind === "window") out.parts.push("A new window opened");
+          else if (n.kind === "download") out.parts.push(`A file downloaded${n.file ? `: ${n.file}` : ""}`);
+          else if (n.kind === "alert") {
+            out.parts.push(`Message: "${String(n.text || "").slice(0, 120)}"`);
+            if (GI_ERROR_TEXT.test(String(n.text || ""))) out.fail(`Error shown: "${String(n.text || "").slice(0, 120)}"`);
+          } else if (n.kind === "confirm") {
+            out.fail(`Needs a decision: ${String(n.text || "").slice(0, 120)} — buttons: OK, Cancel (a browser prompt; cancelled after Resume)`);
+            out.paused = true;
+          }
+        }
+        for (const m of seen.messages.values()) {
+          if (m.error) out.fail(`Error shown: "${m.text.slice(0, 120)}"`);
+          else out.parts.push(`Message: "${m.text.slice(0, 120)}"`);
+        }
+
+        for (const [d, text] of seen.dialogs) if (!giStillOpen(d)) out.parts.push(`"${text}" was shown, then went away`);
+        await giSettleDialogs(id, before, out);
+
+        if (seen.href) {
+          out.parts.push(`The page went to ${(window.location.hash || window.location.pathname).slice(0, 80)}`);
+          if (erpLoginExpired()) throw loginGone();
+          if (!giReportOnScreen()) {
+            history.back();
+            for (let i = 0; i < 20 && !giReportOnScreen(); i++) await sleep(500);
+          }
+        }
+        if (!giReportOnScreen()) {
+          // Back at the grid is part of "ok". Getting the report again is the
+          // only way back; if that fails the job ends (report not loading).
+          out.fail("The page did not come back to the report by itself");
+          out.emit();
+          erpLog("The report is no longer on screen — generating it again", "warn");
+          await openReport();
+        } else if (!out.parts.length && !out.failure) {
+          // Nothing appeared: say whether the row itself changed.
+          const now = giRowsFor(id, true).rows[0];
+          const nowBtn = now ? giFindButton(now) : null;
+          if (!now) out.parts.push(seen.loading ? "The list reloaded and the row is no longer in it" : "The row is no longer in the list");
+          else if (nowBtn.error) out.parts.push("The row no longer has a Get Invoice button");
+          else if (nowBtn.text !== btn.text) out.parts.push(`The button now reads "${nowBtn.text}"`);
+          else if (seen.loading) out.parts.push("The list reloaded");
+        }
+        return out.paused;
+      } catch (e) {
+        if (e && (e.fpxStop || e.fpxFatal)) {
+          if (clicked) out.fail(e.fpxStop ? "Stopped before the result could be checked" : String(e.message));
+          throw e;
+        }
+        // Anything else is this shipment's failure, not the job's.
+        out.fail(`${clicked ? "Clicked, then: " : ""}${e?.message || e}`);
+        return out.paused;
+      } finally {
+        // A shipment that was clicked always gets its line, stop or not.
+        if (clicked || out.failure) out.emit();
+      }
+    };
+
+    await openReport();
+    erpLog(`Report on screen · ${erpNum(ids.length)} shipment(s) to do, one at a time`);
+
+    for (let i = 0; i < ids.length; i++) {
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw loginGone();
+      if (!giReportOnScreen()) {
+        erpLog("The report is no longer on screen — generating it again", "warn");
+        await openReport();
+      }
+      const failedBefore = state.counts.failed;
+      const paused = await one(ids[i]);
+      const left = ids.length - i - 1;
+      if (i === 0 && opts.pauseFirst && left > 0 && !paused) {
+        await erpAskPause(state.counts.failed > failedBefore
+          ? `First shipment could not be done — check it in FreightPOP, then press Resume to continue with the other ${left}`
+          : `First invoice done — check it in FreightPOP, then press Resume to continue with the other ${left}`);
+      }
+      if (left > 0) await humanDelay(1500, 3000);
+    }
+
+    await giClearFilter(st);
+    erpLog(summary(), "done");
+    state.done = { ok: true, note: summary(), result: null };
+  } catch (e) {
+    if (e && e.fpxStop) {
+      state.done = { ok: true, stopped: true, result: null, note: summary() };
+    } else {
+      console.warn("[FPX-ERP] get invoices failed:", e?.message || e);
+      state.done = { ok: false, note: `${String(e?.message || e)}${state.counts.done ? ` — ${summary()}` : ""}`, result: null };
     }
   }
 }

@@ -161,7 +161,7 @@ async function handleApi(req, res, url, who) {
     if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can stop this scrape" });
     return json(res, 200, { stopping: requestStop(who.email) });
   }
-  // Pause / resume the running job (scrape or ERP audit pull). Same rule as stop.
+  // Pause / resume the running job (scrape, ERP audit pull or get invoices). Same rule as stop.
   if ((p === "/scrape/pause" || p === "/scrape/resume") && m === "POST") {
     const cur = workerState().current;
     if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can pause this run" });

@@ -205,7 +205,20 @@ export interface InvoiceAuditRowRaw {
   user?: string | null;
   rank?: number | null;
   flags?: string[] | null;
+  // Set once someone asks FPX to press FreightPOP's GET INVOICE button for
+  // this shipment. Absent = never requested.
+  get_invoice?: GetInvoiceState | null;
   [key: string]: unknown;
+}
+
+export type GetInvoiceStatus = "requested" | "done" | "failed" | "not_started";
+export interface GetInvoiceState {
+  status: GetInvoiceStatus | (string & {});
+  note?: string | null;
+  at?: string | null;
+  by?: string | null;
+  requested_at?: string | null;
+  request_id?: string | null;
 }
 
 export interface InvoiceAuditRow {

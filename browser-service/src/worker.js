@@ -280,10 +280,11 @@ export function workerState() {
     enabled,
     reason: enabled ? null : (!config.scrapeWorker ? "SCRAPE_WORKER is off" : "FPX_API_KEY not set"),
     pollSeconds: config.scrapePollMs / 1000,
-    // "scrape" | "erp_audit" — the running job, else the last finished one.
+    // "scrape" | "erp_audit" | "get_invoice" — the running job, else the last finished one.
     kind: (current || lastResult)?.kind || null,
     paused: !!current && pauseFlag,
-    // { audit_id, total, pending } once an ERP audit pull has finished.
+    // Once the job has finished: { audit_id, total, pending } for an ERP audit
+    // pull, { audit_id, total, ok, failed } for a get-invoices job.
     result: lastResult?.result || null,
     current: withTail(current),
     lastResult: withTail(lastResult),
@@ -301,36 +302,65 @@ export function fullLog() {
 export function requestStop(byEmail) {
   if (!current) return false;
   console.log(`[worker] stop requested by ${byEmail} for ${current.requestId}`);
-  stopFlag = true;
-  // A stop gets through a pause; drop the pause so the job can wind down.
-  if (pauseFlag) { pausedMs += Date.now() - pausedAt; pauseFlag = false; current.paused = false; pushPause(); }
-  logLine(current.kind === "erp_audit"
+  stopJob(current.kind === "erp_audit"
     ? `Stop requested by ${byEmail} — stopping at the next step…`
-    : `Stop requested by ${byEmail} — finishing the current row…`, "warn");
+    : current.kind === "get_invoice"
+      ? `Stop requested by ${byEmail} — stopping after the shipment it is on…`
+      : `Stop requested by ${byEmail} — finishing the current row…`);
   return true;
 }
 
-// Pause / resume the running job (scrape or ERP audit pull). Returns whether
-// it is paused now. The job holds at its next step, not mid-click.
+function stopJob(line) {
+  stopFlag = true;
+  // A stop gets through a pause; drop the pause so the job can wind down.
+  clearTimeout(pauseTimer);
+  if (pauseFlag) { pausedMs += Date.now() - pausedAt; pauseFlag = false; current.paused = false; pushPause(); }
+  logLine(line, "warn");
+}
+
+// How a stopped job's note starts: "Stopped by user", or why it stopped itself.
+const stoppedBecause = () => current?.stopReason || "Stopped by user";
+
+// Pause / resume the running job (scrape, ERP audit pull or get invoices).
+// Returns whether it is paused now. The job holds at its next step, not
+// mid-click.
 const PAUSE_LIMIT_MS = 30 * 60 * 1000;
 let pauseTimer = null;
 export function requestPause(byEmail) { return setPaused(true, byEmail); }
 export function requestResume(byEmail) { return setPaused(false, byEmail); }
 
-function setPaused(on, byEmail) {
+// `line`: the job pausing itself (get invoices) — logged in place of
+// "Paused by …". Everything else is the same pause as the button.
+function setPaused(on, byEmail, line = null) {
   if (!current || stopFlag) return false;
-  if (pauseFlag === on) return pauseFlag;
+  if (pauseFlag === on) {
+    if (on && line) logLine(line, "warn"); // already paused by someone: still say why
+    return pauseFlag;
+  }
   if (on) pausedAt = Date.now(); else pausedMs += Date.now() - pausedAt;
-  // A pause holds the one-job-at-a-time lock, so it can't be open-ended:
-  // after 30 minutes the job carries on by itself.
+  // A pause holds the one-job-at-a-time lock, so it can't be open-ended.
   clearTimeout(pauseTimer);
-  if (on) pauseTimer = setTimeout(() => { if (pauseFlag) setPaused(false, "the 30-minute pause limit"); }, PAUSE_LIMIT_MS);
+  if (on) pauseTimer = setTimeout(pauseLimitReached, PAUSE_LIMIT_MS);
   pauseFlag = on;
   current.paused = on;
-  console.log(`[worker] ${on ? "pause" : "resume"} requested by ${byEmail} for ${current.requestId}`);
-  logLine(on ? `Paused by ${byEmail}` : `Resumed by ${byEmail}`, on ? "warn" : "info");
+  console.log(`[worker] ${on ? "pause" : "resume"} requested by ${byEmail || "the job"} for ${current.requestId}`);
+  logLine(line || (on ? `Paused by ${byEmail}` : `Resumed by ${byEmail}`), on ? "warn" : "info");
   pushPause();
   return pauseFlag;
+}
+
+// 30 minutes paused. A scrape or an ERP audit pull carries on by itself. A
+// get-invoices job stops instead: it pauses because a person has to look, and
+// clicking on unattended is the wrong default.
+function pauseLimitReached() {
+  if (!pauseFlag || !current) return;
+  if (current.kind === "get_invoice") {
+    current.stopReason = "Stopped: nobody resumed within 30 minutes";
+    console.log(`[worker] pause limit reached for ${current.requestId} — stopping`);
+    stopJob(current.stopReason);
+  } else {
+    setPaused(false, "the 30-minute pause limit");
+  }
 }
 
 // Tell the job's content script. Also re-sent on every poll tick while
@@ -384,12 +414,13 @@ async function poll() {
 }
 
 async function claimAndRun() {
-  // caps=erp_audit: the API only hands scope "erp_audit" rows to a worker that
-  // says it can run them (an older build would run one as a full rescrape).
+  // caps: the API only hands scope "erp_audit" / "get_invoice" rows to a
+  // worker that says it can run them (an older build would run one as a full
+  // rescrape).
   let request;
   claiming = true;
   try {
-    ({ request } = await api(`/api/ops/rescrape/pending?claim=1&by=${encodeURIComponent("fpx-browser")}&caps=erp_audit`));
+    ({ request } = await api(`/api/ops/rescrape/pending?claim=1&by=${encodeURIComponent("fpx-browser")}&caps=erp_audit,get_invoice`));
   } finally { claiming = false; }
   if (!request) return;
   const job = {
@@ -398,11 +429,33 @@ async function claimAndRun() {
     // Read now: completing the request overwrites its note.
     months: request.scope === "erp_audit" ? monthsFromNote(request.note) : null,
     shipmentType: request.scope === "erp_audit" ? typeFromNote(request.note) : null,
+    getInvoice: request.scope === "get_invoice" ? getInvoiceFromRequest(request) : null,
   };
   // A scheduled job may have started while the claim was in flight: this one
   // is already claimed, so it waits its turn instead of running beside it.
   if (busy) { localQueue.push(job); return; }
   return runJob(job);
+}
+
+// A get-invoices request: the shipment ids are in tracking_numbers and the
+// rest in its note, "audit=<uuid>;from=YYYY-MM-DD;to=YYYY-MM-DD;pause_first=1|0".
+// Pause-first is on unless the note switches it off.
+export function getInvoiceFromRequest(request) {
+  const parts = {};
+  for (const piece of String(request?.note || "").split(";")) {
+    const eq = piece.indexOf("=");
+    if (eq > 0) parts[piece.slice(0, eq).trim().toLowerCase()] = piece.slice(eq + 1).trim();
+  }
+  const date = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || "") ? v : null);
+  const list = Array.isArray(request?.tracking_numbers) ? request.tracking_numbers : [];
+  return {
+    auditId: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(parts.audit || "") ? parts.audit : null,
+    from: date(parts.from),
+    to: date(parts.to),
+    pauseFirst: parts.pause_first !== "0",
+    shipmentIds: [...new Set(list.map((v) => String(v ?? "").trim()).filter(Boolean))],
+    note: String(request?.note || "").slice(0, 200),
+  };
 }
 
 // "type=parcel|both|non-parcel" in an ERP audit request's note (non-parcel when absent).
@@ -426,8 +479,10 @@ async function runJob(job) {
   pauseFlag = false; pausedAt = 0; pausedMs = 0;
   const email = job.email;
   const startedAt = Date.now();
-  // One lock, two kinds of job: a Refresh All scrape, or an ERP audit pull.
-  const kind = job.scope === "erp_audit" ? "erp_audit" : "scrape";
+  // One lock, three kinds of job: a Refresh All scrape, an ERP audit pull, or
+  // get invoices (click GET INVOICE on the shipments picked from an audit).
+  const kind = job.scope === "erp_audit" ? "erp_audit" : job.scope === "get_invoice" ? "get_invoice" : "scrape";
+  const gi = kind === "get_invoice" ? job.getInvoice || { shipmentIds: [] } : null;
   current = {
     kind, paused: false, result: null, months: kind === "erp_audit" ? job.months || 3 : null, shipmentType: kind === "erp_audit" ? job.shipmentType || "non-parcel" : null,
     requestId: job.id, user: email, scope: job.scope || "all", source: job.source, modes: job.modes || null,
@@ -443,6 +498,11 @@ async function runJob(job) {
   if (kind === "erp_audit") {
     Object.assign(current.counts, { reportRows: 0, notExported: 0, uploaded: 0 });
     logLine(`Claimed ERP audit pull · last ${current.months} month(s) · ${current.shipmentType} — running as ${email || "unknown user"}`);
+  } else if (kind === "get_invoice") {
+    current.counts = { total: gi.shipmentIds.length, done: 0, ok: 0, failed: 0 };
+    current.auditId = gi.auditId || null;
+    logLine(`Claimed get invoices · ${gi.shipmentIds.length} shipment(s) · report ${gi.from || "?"} to ${gi.to || "?"} · audit ${String(gi.auditId || "?").slice(0, 8)}` +
+      `${gi.pauseFirst ? " · pauses after the first" : ""} — running as ${email || "unknown user"}`);
   } else {
     if (job.modes) logLine(`Limited to ${job.modes.join(" + ")} shipments`);
     logLine(job.source === "schedule"
@@ -458,6 +518,10 @@ async function runJob(job) {
     let result;
     if (kind === "erp_audit") {
       result = await runErpAudit(email, current.months, current.shipmentType);
+    } else if (kind === "get_invoice") {
+      if (!gi.auditId || !gi.from || !gi.to) throw new Error(`The request's note could not be read ("${gi.note || ""}") — expected audit=<id>;from=YYYY-MM-DD;to=YYYY-MM-DD;pause_first=1|0`);
+      if (!gi.shipmentIds.length) throw new Error("The request has no shipment ids (tracking_numbers is empty)");
+      result = await runGetInvoices(email, gi);
     } else {
       if (current) current.tasksBefore = await taskSnapshot();
       result = await runRefreshAll(email, job.modes || null);
@@ -472,22 +536,28 @@ async function runJob(job) {
       await api(`/api/ops/rescrape/${job.apiRequestId}/complete`, {
         method: "POST",
         body: JSON.stringify(ok
-          ? { note: note.slice(0, 500), result_count: kind === "erp_audit" ? current?.counts?.uploaded ?? 0 : current?.counts?.saved ?? null }
+          ? { note: note.slice(0, 500), result_count: kind === "erp_audit" ? current?.counts?.uploaded ?? 0 : kind === "get_invoice" ? current?.counts?.ok ?? 0 : current?.counts?.saved ?? null }
           : { error: true, note: String(note).slice(0, 500) }),
       }).catch((e) => console.warn("[worker] complete failed:", e.message));
     }
     if (email.includes("@")) recordScrape(email, Date.now() - startedAt, ok);
     const tasksAfter = current?.tasksBefore ? await taskSnapshot() : null;
     logLine(ok ? `Finished: ${note}` : `Failed: ${note}`, ok ? "done" : "error");
+    // Get invoices: what was done, whether it finished, stopped or failed.
+    if (kind === "get_invoice" && current) {
+      const c = current.counts || {};
+      current.result = { audit_id: gi.auditId || null, total: c.total ?? gi.shipmentIds.length, ok: c.ok || 0, failed: c.failed || 0 };
+    }
     const finishedAt = new Date().toISOString();
     const summary = {
       id: job.id, source: job.source, user: email, kind,
       // ERP audit pull: the audit it made ({ audit_id, total, pending }).
+      // Get invoices: { audit_id, total, ok, failed }.
       result: current?.result || null,
       scheduleId: job.scheduleId || null, scheduleName: job.scheduleName || null,
       startedAt: new Date(startedAt).toISOString(), finishedAt, durationMs: Date.now() - startedAt,
       ok, note: String(note).slice(0, 500), modes: job.modes || null,
-      counts: current?.counts ? { ...current.counts, total: current.total ?? null } : null,
+      counts: current?.counts ? { ...current.counts, total: current.total ?? current.counts.total ?? null } : null,
       // FreightPOP dashboard totals at the start and end of the run (trends).
       fpBefore: current?.fpBefore || null,
       fpAfter: current?.fpAfter || (current?.fpCounts ? { ...current.fpCounts, at: current.fpCountsAt } : null),
@@ -505,6 +575,7 @@ async function runJob(job) {
     }
     lastResult = { ...summary, requestId: job.id, log: current?.log || [] };
     current = null;
+    clearTimeout(pauseTimer);
     pauseFlag = false; pausedAt = 0; pausedMs = 0;
     busy = false;
     // Something may have been queued while we ran.
@@ -726,12 +797,25 @@ async function runErpAudit(email, months, shipmentType) {
 
 const ERP_LIMIT_MS = 45 * 60_000; // whole pull, not counting paused time
 
-async function runErpIn(browser, url, who, months, shipmentType) {
+// The part the ERP audit pull and the get-invoices job share: open FreightPOP
+// in a window, wait for the extension, start the page work and poll
+// fpxErpPoll() every 1.5 s until the page reports the outcome. `job`:
+//   noun           "pull" | "get-invoices job" — for messages
+//   limitMs        whole job, not counting paused time
+//   has / missing  expression that is true when the extension can do it / the error when it can't
+//   start          expression that starts the page work
+//   setup(ctx)     optional, before the start; returns a cleanup function (awaited at the end)
+//   blocked()      optional; true while the page can't answer (a browser prompt is open)
+//   onPoll(r, ctx) optional, after the log lines and counts of one poll;
+//                  true = it answered a hand-off, skip the rest of this tick
+// ctx: { browser, page, cdp, ext, who }
+async function runPageJob(browser, url, who, job) {
   clearAuthExpired(who);
   const page = await openWindowPage(browser, url);
   currentPage = page;
   const offAuth = watchAuth(page, who);
   const onLogin = () => /#\/login|\/login\b/i.test(page.url());
+  let cleanup = null;
   try {
     if (onLogin()) throw new Error("Your FreightPOP session expired — log in again through the dashboard's hosted view");
     const cdp = await page.createCDPSession();
@@ -754,33 +838,75 @@ async function runErpIn(browser, url, who, months, shipmentType) {
     }
     if (!appUp && isAuthExpired(who)) throw new Error(EXPIRED);
     if (!appUp) logLine("FreightPOP's start page did not finish loading — going to Transactions anyway", "warn");
-    const has = (await ext.evaluate("typeof erpAuditPull === 'function' && typeof fpxErpPoll === 'function'").catch(() => ({ value: false }))).value === true;
-    if (!has) throw new Error("The extension in the hosted browser has no ERP audit pull (needs version 4.7 or later) — redeploy the browser service");
+    const has = (await ext.evaluate(job.has).catch(() => ({ value: false }))).value === true;
+    if (!has) throw new Error(job.missing);
 
+    const ctx = { browser, page, cdp, ext, who };
+    if (job.setup) cleanup = await job.setup(ctx);
     if (pauseFlag) pushPause(); // paused while it was starting up
-    await ext.evaluate(`erpAuditPull(${Number(months) || 3}, ${JSON.stringify(String(who))}, ${JSON.stringify(String(shipmentType || "non-parcel"))}); 'started'`, { awaitPromise: false });
+    await ext.evaluate(job.start, { awaitPromise: false });
 
     const startedAt = Date.now();
     let lost = 0;
-    // Rows from FreightPOP's Excel export, all tabs together.
-    const excelRows = [];
-    let excelHeaders = [];
-    let excelFailed = false;
     // Paused time doesn't count towards the limit.
-    while (Date.now() < startedAt + ERP_LIMIT_MS + pausedTotal()) {
+    while (Date.now() < startedAt + job.limitMs + pausedTotal()) {
       await sleep(1500);
+      if (job.blocked?.()) continue;
       if (pauseFlag) pushPause();
       const r = (await ext.evaluate("fpxErpPoll()").catch(() => null))?.value;
       if (!r || !r.started) {
-        // The page (and the pull running in it) went away.
+        if (job.blocked?.()) continue; // the prompt opened while this poll was on its way
+        // The page (and the job running in it) went away.
         if (onLogin()) throw new Error("Redirected to FreightPOP login mid-run — sign in again, then re-run");
         if (isAuthExpired(who)) throw new Error(EXPIRED);
-        if (++lost >= 10) throw new Error("The FreightPOP page reloaded mid-run and the pull was lost — re-run it");
+        if (++lost >= 10) throw new Error(`The FreightPOP page reloaded mid-run and the ${job.noun} was lost — re-run it`);
         continue;
       }
       lost = 0;
       for (const l of r.lines || []) logLine(l.text, l.level || "info");
       if (current && r.counts) Object.assign(current.counts, r.counts);
+      if (job.onPoll && (await job.onPoll(r, ctx))) continue;
+      if (r.done) {
+        if (current && r.done.result) current.result = r.done.result;
+        if (!r.done.ok) {
+          if (onLogin() || isAuthExpired(who)) throw new Error(`${EXPIRED} (${r.done.note})`);
+          throw new Error(r.done.note || `The ${job.noun} failed`);
+        }
+        return r.done.stopped ? `${stoppedBecause()}. ${r.done.note}` : r.done.note;
+      }
+      if (stopFlag && !page.__fpxStopSentAt) {
+        page.__fpxStopSentAt = Date.now();
+        await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
+      }
+      // If the extension never acknowledges the stop, give up after 2 min.
+      if (page.__fpxStopSentAt && Date.now() - page.__fpxStopSentAt > 120_000) {
+        return `${stoppedBecause()} (last step: ${current?.status || "none"})`;
+      }
+      if (onLogin()) throw new Error("Redirected to FreightPOP login mid-run — sign in again, then re-run");
+    }
+    await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
+    throw new Error(`Timed out after ${job.limitMs / 60000} min (last step: ${current?.status || "none"})`);
+  } finally {
+    if (cleanup) await Promise.resolve().then(cleanup).catch(() => {});
+    offAuth();
+    currentPage = null;
+    currentExt = null;
+    await page.close().catch(() => {});
+  }
+}
+
+function runErpIn(browser, url, who, months, shipmentType) {
+  // Rows from FreightPOP's Excel export, all tabs together.
+  const excelRows = [];
+  let excelHeaders = [];
+  let excelFailed = false;
+  return runPageJob(browser, url, who, {
+    noun: "pull",
+    limitMs: ERP_LIMIT_MS,
+    has: "typeof erpAuditPull === 'function' && typeof fpxErpPoll === 'function'",
+    missing: "The extension in the hosted browser has no ERP audit pull (needs version 4.7 or later) — redeploy the browser service",
+    start: `erpAuditPull(${Number(months) || 3}, ${JSON.stringify(String(who))}, ${JSON.stringify(String(shipmentType || "non-parcel"))}); 'started'`,
+    onPoll: async (r, { cdp, ext }) => {
       // The page wants FreightPOP's Excel export captured for the tab on screen.
       if (r.download && !r.done) {
         let answer;
@@ -798,7 +924,7 @@ async function runErpIn(browser, url, who, months, shipmentType) {
           answer = { ok: false, error: e.message };
         }
         await ext.evaluate(`fpxErpDownloadDone(${JSON.stringify(answer)})`).catch(() => {});
-        continue;
+        return true;
       }
       // The page has rows ready: fetch them in slices and post them from here.
       if (r.upload && !r.done) {
@@ -829,41 +955,216 @@ async function runErpIn(browser, url, who, months, shipmentType) {
           answer = { ok: false, error: e.message };
         }
         await ext.evaluate(`fpxErpDeliver(${JSON.stringify(answer)})`).catch(() => {});
-        continue;
+        return true;
       }
-      if (r.done) {
-        if (current && r.done.result) current.result = r.done.result;
-        if (!r.done.ok) {
-          if (onLogin() || isAuthExpired(who)) throw new Error(`${EXPIRED} (${r.done.note})`);
-          throw new Error(r.done.note || "ERP audit pull failed");
-        }
-        return r.done.stopped ? `Stopped by user. ${r.done.note}` : r.done.note;
-      }
-      if (stopFlag && !page.__fpxStopSentAt) {
-        page.__fpxStopSentAt = Date.now();
-        await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
-      }
-      // If the extension never acknowledges the stop, give up after 2 min.
-      if (page.__fpxStopSentAt && Date.now() - page.__fpxStopSentAt > 120_000) {
-        return `Stopped by user (last step: ${current?.status || "none"})`;
-      }
-      if (onLogin()) throw new Error("Redirected to FreightPOP login mid-run — sign in again, then re-run");
-    }
-    await ext.evaluate("stopRequested = true; 'stopping'", { awaitPromise: false }).catch(() => {});
-    throw new Error(`Timed out after ${ERP_LIMIT_MS / 60000} min (last step: ${current?.status || "none"})`);
+      return false;
+    },
+  });
+}
+
+// ── Get invoices ────────────────────────────────────────────────────────────
+// After a person has reviewed an ERP audit and picked shipments: in the
+// requester's own hosted browser, generate the same History Report and click
+// GET INVOICE on each picked shipment, one at a time. The page work is
+// erpGetInvoices() in the extension's content.js. This side relays its log,
+// saves each shipment's result to the audit as it finishes, pauses the job
+// when the page asks (after the first invoice; when FreightPOP asks
+// something), and tells the page what only the browser can see: a new
+// window, a file download, a browser prompt.
+const GET_INVOICE_LIMIT_MS = 90 * 60_000; // whole job, not counting paused time
+
+async function runGetInvoices(email, gi) {
+  const lease = await acquireUserBrowser(email, { busy: true });
+  try {
+    return await runGetInvoicesIn(lease.browser, dashboardUrlFor(email), email, gi);
   } finally {
-    offAuth();
-    currentPage = null;
-    currentExt = null;
-    await page.close().catch(() => {});
+    lease.release();
   }
+}
+
+async function runGetInvoicesIn(browser, url, who, gi) {
+  // Results not yet saved to the audit. A failed save never fails the job:
+  // it is logged and sent again with the next batch.
+  const unsaved = [];
+  const save = async (again = false) => {
+    if (!unsaved.length) return true;
+    const batch = unsaved.slice();
+    try {
+      const resp = await api(`/api/audits/invoice/${encodeURIComponent(gi.auditId)}/get-invoice-results`, {
+        method: "POST", body: JSON.stringify({ by: who, results: batch }), signal: AbortSignal.timeout(20_000),
+      });
+      // The API counts the rows it could not write but does not name them:
+      // the whole batch goes again (saving a result twice is harmless).
+      if (resp?.failed) throw new Error(`the API could not write ${resp.failed} of them`);
+      if (resp?.unknown) logLine(`${resp.unknown} of ${batch.length} result(s) are for shipments that are not in audit ${String(gi.auditId).slice(0, 8)}`, "warn");
+      unsaved.splice(0, batch.length);
+      return true;
+    } catch (e) {
+      logLine(`Could not save ${batch.length} result(s) to the audit (${String(e.message).slice(0, 200)}) — ${again ? "trying again" : "they go with the next batch"}`, "warn");
+      return false;
+    }
+  };
+  // Every result saved, or three tries 3 s apart. → how many were left unsaved.
+  const saveAll = async () => {
+    for (let i = 0; i < 3 && unsaved.length; i++) {
+      if (i) await sleep(3000);
+      await save(i < 2);
+    }
+    if (unsaved.length) logLine(`${unsaved.length} result(s) could not be saved to the audit: ${unsaved.map((r) => `${r.shipment_id} ${r.ok ? "OK" : "failed"}`).join(", ")}`.slice(0, 500), "error");
+    return unsaved.length;
+  };
+
+  let promptOpen = false; // a browser confirm / prompt is on screen: the page is frozen
+  let lastPauseId = 0;
+  let note;
+  try {
+    note = await runPageJob(browser, url, who, {
+      noun: "get-invoices job",
+      limitMs: GET_INVOICE_LIMIT_MS,
+      has: "typeof erpGetInvoices === 'function' && typeof fpxErpNote === 'function' && typeof fpxErpPoll === 'function'",
+      missing: "The extension in the hosted browser cannot get invoices (needs version 4.11 or later) — redeploy the browser service",
+      start: `erpGetInvoices(${JSON.stringify(JSON.stringify({ from: gi.from, to: gi.to, shipmentIds: gi.shipmentIds, pauseFirst: !!gi.pauseFirst, runBy: who }))}); 'started'`,
+      blocked: () => promptOpen,
+      setup: async ({ page, cdp, ext }) => {
+        let ended = false;
+        const tell = (n) => ext.evaluate(`fpxErpNote(${JSON.stringify(n)})`, { awaitPromise: false }).catch(() => {});
+
+        // Browser prompts freeze the page until answered. An alert only has
+        // OK. A confirm / prompt is a question: it is not answered — the job
+        // pauses, and Resume (or a stop) cancels it.
+        const onDialog = async (d) => {
+          const text = String(d.message() || "").replace(/\s+/g, " ").trim().slice(0, 200);
+          try {
+            if (d.type() === "alert") { await d.accept(); tell({ kind: "alert", text }); return; }
+            if (d.type() === "beforeunload") {
+              await d.dismiss(); // stay on the page
+              logLine("FreightPOP tried to leave the page — stayed on it", "warn");
+              return;
+            }
+            promptOpen = true;
+            setPaused(true, null, `Get Invoice · FreightPOP is asking in a browser prompt: "${text}" — buttons: OK, Cancel. Nothing was chosen. Press Resume to cancel it and carry on with the next shipment`);
+            while (!ended && pauseFlag && !stopFlag) await sleep(500);
+            await d.dismiss();
+            tell({ kind: "confirm", text });
+          } catch (e) {
+            logLine(`A browser prompt could not be closed (${e.message})`, "warn");
+          } finally {
+            promptOpen = false;
+          }
+        };
+        page.on("dialog", onDialog);
+
+        // A window opened by the click: say so, then close it (closing is
+        // passive; left open they would pile up, one per shipment).
+        const onTarget = async (t) => {
+          try {
+            if (t.type() !== "page" || t.opener() !== page.target()) return;
+            tell({ kind: "window" });
+            await sleep(8000);
+            let where = "";
+            try { const u = new URL(t.url()); where = u.protocol.startsWith("http") ? u.host + u.pathname : u.protocol; } catch { /* blank */ }
+            const p = await t.page().catch(() => null);
+            if (p && !p.isClosed()) await p.close().catch(() => {});
+            logLine(`Get Invoice · the new window${where ? ` (${where.slice(0, 120)})` : ""} was closed`);
+          } catch { /* the window went away by itself */ }
+        };
+        browser.on("targetcreated", onTarget);
+
+        // File downloads: let them land in a folder of this job so they can be
+        // seen starting; the folder is removed when the job ends.
+        const dir = path.join(path.dirname(config.profileRoot), "erp-downloads", `gi-${String(current?.requestId || "job").replace(/[^a-zA-Z0-9_-]/g, "")}`);
+        fs.mkdirSync(dir, { recursive: true });
+        await cdp.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir }).catch(() => {});
+        await cdp.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: dir, eventsEnabled: true }).catch(() => {});
+        const downloads = new Set();
+        const onDownload = (e) => {
+          if (downloads.has(e.guid)) return;
+          downloads.add(e.guid);
+          tell({ kind: "download", file: String(e.suggestedFilename || "").slice(0, 80) });
+        };
+        cdp.on("Page.downloadWillBegin", onDownload);
+        cdp.on("Browser.downloadWillBegin", onDownload);
+
+        return async () => {
+          ended = true;
+          page.off("dialog", onDialog);
+          browser.off("targetcreated", onTarget);
+          await cdp.send("Browser.setDownloadBehavior", { behavior: "default" }).catch(() => {});
+          fs.rmSync(dir, { recursive: true, force: true });
+        };
+      },
+      onPoll: async (r) => {
+        if (r.results?.length) {
+          unsaved.push(...r.results.map((x) => ({
+            shipment_id: String(x.shipment_id), ok: x.ok === true, note: String(x.note || "").slice(0, 500), at: x.at || new Date().toISOString(),
+          })));
+          await save();
+        }
+        // The page asks for a pause: the same pause as the button, with its line.
+        if (r.pause && r.pause.id > lastPauseId && !r.done) {
+          lastPauseId = r.pause.id;
+          setPaused(true, null, String(r.pause.text || "Paused by the job — press Resume to continue"));
+        }
+        return false;
+      },
+    });
+  } catch (e) {
+    await saveAll();
+    throw e;
+  }
+  const left = await saveAll();
+  return left ? `${note} · ${left} result(s) not saved to the audit` : note;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Click the report's Excel export and read the file Chromium saves.
 // → { rows, headers, file, clicked }
+// The same file "Export to Excel" would save, taken straight from the grid:
+// ask the report's Kendo grid to build its Excel workbook, keep the bytes and
+// skip the browser's download step (which never delivered a file here).
+// FreightPOP's own export handlers run first, so the workbook is theirs.
+async function kendoExport(page) {
+  const t0 = Date.now();
+  const out = await page.evaluate(() => new Promise((resolve) => {
+    try {
+      const $ = window.jQuery, kendo = window.kendo;
+      if (!$ || !kendo) return resolve({ error: "the page has no Kendo grid library" });
+      if (!kendo.ooxml || !kendo.ooxml.Workbook) return resolve({ error: "the page's Kendo build has no Excel export" });
+      const grids = $(".k-grid").filter(":visible").toArray().map((el) => $(el).data("kendoGrid")).filter(Boolean);
+      if (!grids.length) return resolve({ error: "no report grid on the page" });
+      const grid = grids.sort((a, b) => (b.dataSource.total() || 0) - (a.dataSource.total() || 0))[0];
+      if (typeof grid.saveAsExcel !== "function") return resolve({ error: "the report grid has no Excel export" });
+      const timer = setTimeout(() => { grid.unbind("excelExport", onExport); resolve({ error: "the grid took over 3 minutes to build the Excel file" }); }, 180000);
+      function onExport(e) {
+        e.preventDefault(); // we take the bytes; nothing is saved to disk
+        grid.unbind("excelExport", onExport);
+        try {
+          const wb = new kendo.ooxml.Workbook(e.workbook);
+          const done = (url) => { clearTimeout(timer); resolve({ dataUrl: String(url), rows: grid.dataSource.total() }); };
+          const fail = (err) => { clearTimeout(timer); resolve({ error: "building the Excel file failed: " + (err && err.message || err) }); };
+          if (typeof wb.toDataURLAsync === "function") wb.toDataURLAsync().then(done, fail);
+          else done(wb.toDataURL());
+        } catch (err) { clearTimeout(timer); resolve({ error: "building the Excel file failed: " + (err && err.message || err) }); }
+      }
+      grid.bind("excelExport", onExport);
+      grid.saveAsExcel();
+    } catch (err) { resolve({ error: String(err && err.message || err) }); }
+  }));
+  if (out.error) throw new Error(out.error);
+  const b64 = String(out.dataUrl).split(",")[1] || "";
+  const buf = Buffer.from(b64, "base64");
+  if (buf.length < 100) throw new Error("the grid returned an empty Excel file");
+  const { headers, rows } = readXlsx(buf);
+  if (!rows.length) throw new Error("the Excel file has no rows");
+  return { rows, headers, file: `Excel export (${(buf.length / 1024 / 1024).toFixed(1)} MB, built in ${Math.round((Date.now() - t0) / 1000)}s)`, clicked: "Export to Excel" };
+}
+
 async function captureExport(browser, cdp, ext, jobId) {
+  if (currentPage) {
+    try { return await kendoExport(currentPage); }
+    catch (e) { logLine(`Excel export from the grid failed (${e.message}) — trying the Export to Excel button`, "warn"); }
+  }
   const dir = path.join(path.dirname(config.profileRoot), "erp-downloads", String(jobId).replace(/[^a-zA-Z0-9_-]/g, ""));
   fs.mkdirSync(dir, { recursive: true });
   for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f), { force: true });
@@ -879,7 +1180,7 @@ async function captureExport(browser, cdp, ext, jobId) {
   const click = JSON.parse((await ext.evaluate("fpxErpClickExport()")).value || "{}");
   if (click.error) throw new Error(`${click.error}${click.buttons?.length ? ` — buttons on the page: ${click.buttons.join(", ")}` : ""}`);
 
-  const until = Date.now() + 120_000;
+  const until = Date.now() + 45_000;
   let last = null;
   while (Date.now() < until) {
     await sleep(1000);
@@ -901,7 +1202,7 @@ async function captureExport(browser, cdp, ext, jobId) {
   }
   const partial = fs.readdirSync(dir);
   fs.rmSync(dir, { recursive: true, force: true });
-  throw new Error(`clicked "${click.clicked}" but no file arrived within 2 min${partial.length ? ` (still downloading: ${partial.join(", ")})` : ""}${click.others?.length ? ` — other candidates: ${click.others.join(", ")}` : ""}`);
+  throw new Error(`clicked "${click.clicked}" but no file arrived within 45s${partial.length ? ` (still downloading: ${partial.join(", ")})` : ""}${click.others?.length ? ` — other candidates: ${click.others.join(", ")}` : ""}`);
 }
 
 // Rows of the export that are not exported to ERP, highest charge first.
