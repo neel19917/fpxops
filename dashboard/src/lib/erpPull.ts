@@ -266,6 +266,8 @@ export interface ApprovalCheck {
   missing: string[];
   issues: string[];
   cautions: string[];
+  /** FreightPOP's quote id for the shipment: what its Shipment Details page opens by. */
+  quote_id?: string | null;
 }
 export interface ApprovalChecks { threshold: number; checks: Record<string, ApprovalCheck> }
 

@@ -661,7 +661,7 @@ auditsRouter.post("/erp/click-log", async (req, res) => {
 // right (0–100), and what is missing or does not match. Rules only (see
 // lib/approvalCheck.js); nothing is stored.
 // Responds { threshold, checks: { [shipment_id]: { confidence, pass, missing,
-// issues, cautions } } }.
+// issues, cautions, quote_id } } } — quote_id is FreightPOP's QuoteID, or null.
 auditsRouter.get("/invoice/:id/approval-checks", async (req, res) => {
   if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
   const { data: run, error } = await supabase
@@ -689,10 +689,13 @@ auditsRouter.get("/invoice/:id/approval-checks", async (req, res) => {
   try {
     const ids = [...new Set(rows.map((r) => String(r.shipment_id)))];
     const tracking = [...new Set(rows.map((r) => String(r.raw?.tracking ?? "").trim()).filter(Boolean))];
-    const [views, approvals] = await Promise.all([
+    const [views, approvals, quotes] = await Promise.all([
       inChunks("fpx_shipment_records", "shipment_id", ids, "shipment_id, kind, data, text, files").then((l) => l.filter((v) => v.kind === "view_shipment")),
       inChunks("fpx_audit_approvals", "tracking_number", tracking, "tracking_number, approved_by, invoice_amount, quote_amount, invoice_number, approved_date, data"),
+      // FreightPOP's quote id: what its shipment page is opened by.
+      inChunks("fpx_erp_transactions", "shipment_id", ids, "shipment_id, quote_id:data->>QuoteID").catch(() => []),
     ]);
+    const quoteOf = new Map(quotes.map((q) => [String(q.shipment_id), String(q.quote_id ?? "").trim()]));
     const viewOf = new Map(views.map((v) => [String(v.shipment_id), v]));
     // The newest approval of a tracking number is the one that stands.
     const approvalOf = new Map();
@@ -702,7 +705,10 @@ auditsRouter.get("/invoice/:id/approval-checks", async (req, res) => {
     }
     const checks = {};
     for (const r of rows) {
-      checks[String(r.shipment_id)] = checkApproval(r, viewOf.get(String(r.shipment_id)) || null, approvalOf.get(String(r.raw?.tracking ?? "").trim()) || null);
+      checks[String(r.shipment_id)] = {
+        ...checkApproval(r, viewOf.get(String(r.shipment_id)) || null, approvalOf.get(String(r.raw?.tracking ?? "").trim()) || null),
+        quote_id: /^\d+$/.test(quoteOf.get(String(r.shipment_id)) || "") ? quoteOf.get(String(r.shipment_id)) : null,
+      };
     }
     res.json({ threshold: APPROVAL_CONFIDENCE_MIN, checks });
   } catch (e) {

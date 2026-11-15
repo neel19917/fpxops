@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
-import { FileImage } from "lucide-react";
+import { ExternalLink, FileImage } from "lucide-react";
+import { openInFreightPop } from "../../lib/freightpopFrame";
 import { GET_INVOICE_MAX, approvalHover } from "../../lib/erpPull";
 import { fmtDateTime } from "../../lib/format";
 import { InvoiceRecordModal } from "./InvoiceRecordModal";
@@ -52,6 +53,21 @@ function RecordButton({ row, onOpen }: { row: Row; onOpen: (row: Row) => void })
       </button>
     </div>
   );
+}
+
+/** FreightPOP's own Shipment Details page for a shipment, by its quote id. */
+function shipmentUrl(row: Row): string | null {
+  const q = row.check?.quote_id;
+  if (!q) return null;
+  const p = new URLSearchParams({ FromHistory: "true", QuoteID: q, FromEmailLink: "false", IsFromIframe: "false", bh: "true" });
+  if (row.charge != null) p.set("Amount", String(row.charge));
+  if (row.cost != null) p.set("co", String(row.cost));
+  if (row.charge != null && row.cost != null) p.set("pr", (Math.round((row.charge - row.cost) * 100) / 100).toString());
+  return `https://app.freightpop.com/ShipmentDetail.html?${p.toString()}`;
+}
+function openShipment(row: Row) {
+  const url = shipmentUrl(row);
+  if (url) openInFreightPop({ url, label: `Shipment ${row.shipment}`, customerName: row.customer });
 }
 
 /** The approval check of one shipment: its score, then what is missing, wrong or worth a look. */
@@ -175,8 +191,9 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
             return (
               <tr
                 key={r.id}
-                onClick={pick && !full ? () => onToggle(r.id) : undefined}
-                className={(pick ? "cursor-pointer " : "") + (on ? "bg-violet-50/70" : "hover:bg-slate-50/70")}
+                onClick={pick && !full ? () => onToggle(r.id) : review && shipmentUrl(r) ? () => openShipment(r) : undefined}
+                title={review ? (shipmentUrl(r) ? "Open this shipment in FreightPOP (your hosted browser)" : "FreightPOP's quote id for this shipment is not known yet, so it can't be opened from here") : undefined}
+                className={(pick || (review && shipmentUrl(r)) ? "cursor-pointer " : "") + (on ? "bg-violet-50/70" : "hover:bg-slate-50/70")}
               >
                 {pick ? (
                   <td className="pl-6 pr-2 py-3.5 align-top">
@@ -200,6 +217,15 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
                     </div>
                   ) : null}
                   {bucket === "approved" || review ? <RecordButton row={r} onOpen={setRecord} /> : null}
+                  {review && shipmentUrl(r) ? (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); openShipment(r); }}
+                      className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-violet-700 hover:text-violet-900 whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-500"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5 shrink-0" /> Open in FreightPOP
+                    </button>
+                  ) : null}
                   {review ? <div className="text-xs text-slate-500 mt-1 whitespace-nowrap">{r.bucket === "sent" ? "Invoice sent" : "Ready to invoice"}{r.approverName ? ` · ${r.approverName}` : ""}</div> : null}
                 </td>
                 <td className={TD + " text-slate-700"}>{r.customer || "—"}</td>

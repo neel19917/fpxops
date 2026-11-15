@@ -18,6 +18,7 @@ import { GetInvoiceModal, type GetInvoiceItem } from "../components/GetInvoiceMo
 import { BucketCards, BucketCardsSkeleton, type BucketCard } from "../components/invoicing/BucketCards";
 import { Counted, MenuAction, MoreMenu, ProgressStrip, Segmented, SelectionBar, type StepState, type StripControls } from "../components/invoicing/Controls";
 import { ShipmentTable } from "../components/invoicing/ShipmentTable";
+import { hideFrame } from "../lib/freightpopFrame";
 import { ago, byCharge, dayLabel, plural, sumCharge, toRow, type BucketKey, type Row } from "../components/invoicing/model";
 
 // Invoicing: one simple page for the person who sends invoices. It shows the
@@ -341,6 +342,8 @@ export function InvoicingPage() {
     return () => { gone = true; };
   }, [auditId, checksKey]);
   const threshold = checks?.threshold ?? 90;
+  // A shipment opened in FreightPOP from this page closes when the page is left.
+  useEffect(() => () => { hideFrame(); }, []);
 
   const rows = useMemo(() => (detail?.rows ?? []).map((r) => toRow(r, checks?.checks[r.shipment_id ?? ""] ?? null)), [detail, checks]);
   const lists = useMemo(() => {
