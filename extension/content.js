@@ -3733,6 +3733,12 @@ function fpxRemovesSomething(el) {
     const link = el.closest("a[href]");
     if (!link || /delete|remove/i.test(link.className + " " + (link.getAttribute("title") || "") + " " + (link.textContent || ""))) return true;
   }
+  // An "X" beside a row or a list entry removes that entry (FreightPOP's
+  // document list asks "Are you sure you want to delete this document?").
+  // Only an X in a window's own title bar or header closes something.
+  const btn = el.closest("button, a, [role='button'], span, i") || el;
+  const text = String(btn.tagName === "INPUT" ? btn.value : btn.textContent || "").replace(/\s+/g, "").toLowerCase();
+  if (/^(x|×|✕|✖)$/.test(text) && btn.closest("tr, li, td, .k-file, .list-group-item") && !btn.closest(".modal-header, .k-window-titlebar, .ui-dialog-titlebar, .popover-title, .panel-heading")) return true;
   for (let n = el, i = 0; n && n.getAttribute && i < 4; n = n.parentElement, i++) {
     const says = `${n.getAttribute("title") || ""} ${n.getAttribute("aria-label") || ""} ${n.getAttribute("ng-click") || ""} ${n.getAttribute("onclick") || ""} ${typeof n.className === "string" ? n.className : ""}`;
     if (/\b(remove|delete|trash)/i.test(says) || /k-i-delete|k-i-trash|fa-trash|glyphicon-trash|glyphicon-remove/i.test(says)) return true;
@@ -5198,7 +5204,7 @@ async function vbRun(id, d, state, shots) {
       // Never an icon inside a list of files: there the same "x" removes the file.
       const closer = [...box.querySelectorAll("button, a, [role='button'], .close, .k-window-action")].filter(vbSeen)
         .filter((x) => !fpxRemovesSomething(x))
-        .find((x) => GI_PASSIVE.test(vbLabel(x)) || (!filePanel && (/(^|\s)close(\s|$)|k-window-action/i.test(String(x.className || "")) || /^close$/i.test(x.getAttribute("aria-label") || ""))));
+        .find((x) => (filePanel ? /^(close|cancel|done|dismiss)$/i.test(vbLabel(x)) : GI_PASSIVE.test(vbLabel(x))) || (!filePanel && (/(^|\s)close(\s|$)|k-window-action/i.test(String(x.className || "")) || /^close$/i.test(x.getAttribute("aria-label") || ""))));
       const gone = async () => { for (let i = 0; i < 8 && vbSeen(box); i++) await sleep(300); return !vbSeen(box); };
       let shut = false;
       if (closer) { simulateClick(closer); shut = await gone(); }
