@@ -71,9 +71,9 @@ export function parseGetInvoiceNote(note) {
 
 // A screenshot path as the worker sends it: one file name under invoices/.
 // Nothing else is accepted, so a path can never leave the audit's folder.
-export const MAX_SHOTS = 6;
+export const MAX_SHOTS = 40;
 // A screenshot (.png) or the invoice file itself (.pdf).
-const SHOT_RE = /^invoices\/[A-Za-z0-9_.-]+\.(png|pdf)$/;
+const SHOT_RE = /^invoices\/[A-Za-z0-9_.-]+\.(png|pdf|jpe?g|gif|txt|csv|xlsx?|zpl|html?|docx?|zip)$/;
 export const isShotPath = (v) => typeof v === "string" && SHOT_RE.test(v);
 
 // The valid screenshot paths of a list, repeats dropped, at most MAX_SHOTS.

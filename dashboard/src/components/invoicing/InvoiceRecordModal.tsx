@@ -69,8 +69,10 @@ function Shot({ auditId, file, name, label }: { auditId: string; file: string; n
           </button>
         </div>
       ) : (
-        file.endsWith(".pdf") ? (
-          <iframe src={state.url} title={`${label}: the invoice PDF from FreightPOP`} className="block w-full h-[70vh] bg-slate-100" />
+        !["pdf", "png", "jpg", "jpeg", "gif"].includes(shotExt(file)) ? (
+          <div className="px-4 py-6 text-sm text-slate-600 bg-slate-50">This file is kept as FreightPOP gave it. Use Download to open it.</div>
+        ) : file.endsWith(".pdf") ? (
+          <iframe src={state.url} title={`${label}: the PDF from FreightPOP`} className="block w-full h-[70vh] bg-slate-100" />
         ) : <a href={state.url} target="_blank" rel="noopener noreferrer" title="Open full size in a new tab" className="block bg-slate-100 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-violet-500">
           <img src={state.url} alt={`${label} for this shipment's invoice`} className="block w-full h-auto cursor-zoom-in" />
         </a>
@@ -78,6 +80,16 @@ function Shot({ auditId, file, name, label }: { auditId: string; file: string; n
     </figure>
   );
 }
+
+/** What one saved file is, from its name: <shipment>[-view[-<button>]]-<n>.png | -invoice.pdf | -file.pdf | -download-<n>.<ext>. */
+function shotLabel(file: string): string {
+  const ext = (file.split(".").pop() || "").toLowerCase();
+  const m = /-view(?:-([a-z0-9-]+?))?-(?:\d+|file(?:-\d+)?|invoice(?:-\d+)?|download-\d+)\.[a-z0-9]+$/.exec(file);
+  const what = ext === "pdf" ? "PDF" : ext === "png" ? (/-1\.png$/.test(file) ? "FreightPOP page" : "window it opened") : `downloaded file (.${ext})`;
+  if (!m) return ext === "pdf" ? "Invoice PDF from FreightPOP (Get Invoice)" : `Get Invoice · ${what}`;
+  return m[1] ? `View Shipment · ${m[1].replace(/-/g, " ")} · ${what}` : `View Shipment · ${what}`;
+}
+const shotExt = (file: string) => (file.split(".").pop() || "").toLowerCase();
 
 function Fact({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -203,7 +215,7 @@ export function InvoiceRecordModal({ auditId, row, onClose }: {
 
           {row.shots.length === 0 ? (
             <div className="rounded-xl ring-1 ring-slate-200 px-6 py-10 text-center text-sm text-slate-500">
-              No screenshot was saved for this shipment.
+              No file was saved for this shipment.
             </div>
           ) : (
             <div className="space-y-4">
@@ -212,8 +224,8 @@ export function InvoiceRecordModal({ auditId, row, onClose }: {
                   key={file}
                   auditId={auditId}
                   file={file}
-                  name={file.endsWith(".pdf") ? `invoice-${fileId}.pdf` : `invoice-${fileId}-${i + 1}.png`}
-                  label={file.endsWith(".pdf") ? "Invoice PDF from FreightPOP (Get Invoice)" : `${/-view-\d+\.png$/.test(file) ? "View Shipment" : "Get Invoice"} · ${/-1\.png$/.test(file) ? "FreightPOP page" : "window it opened"}`}
+                  name={`${fileId}-${i + 1}-${file.slice("invoices/".length)}`}
+                  label={shotLabel(file)}
                 />
               ))}
             </div>

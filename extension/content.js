@@ -5030,6 +5030,114 @@ function giReadDialog(dIn) {
   const tabs = [...new Set(d.querySelectorAll("[role='tab'], .nav-tabs a, .k-tabstrip-items .k-item, .k-tabstrip-items li").map((x) => clean(x.textContent)).filter(Boolean))].slice(0, 30);
   return { url: window.location.href.slice(0, 300), frames, text: clean(d.innerText).slice(0, 300000), fields, tables, tabs };
 }
+// ── Every button inside View Shipment that only shows something ──
+// Each is opened, read, photographed and closed again, for the audit record.
+// A button that sends, creates or changes anything is never clicked: it is
+// listed in the record as left alone.
+const VB_NEVER = /e-?mail|send|generate|request|edit|save|delete|remove|cancel|void|\badd\b|submit|update|create|approve|reject|upload|\bbook\b|duplicate|\bcopy\b|return|non-?conformance|dispute|pay\b|re-?rate|reship|\bship\b(?! ?date)/i;
+const VB_SHOW = /^(print\b.*|view\b.*|download\b.*|show\b.*|see\b.*|change log|details|documents?|notes?|history|track(ing)?\b.*|pod|bol|labels?|invoice|attachments?)$/i;
+const VB_BUTTONS = "button, a, input[type='button'], [role='button'], [role='tab'], .btn, [ng-click], [onclick], .nav-tabs li, .k-tabstrip-items li";
+const VB_DIALOGS = ".modal.in, .modal.show, .k-window, [role='dialog'], [role='alertdialog'], .bootbox, .ui-dialog, .popover, .k-animation-container";
+const vbClean = (t) => String(t || "").replace(/\s+/g, " ").trim();
+const vbSeen = (el) => {
+  try {
+    if (!el.getClientRects().length) return false;
+    const st = (el.ownerDocument.defaultView || window).getComputedStyle(el);
+    return st.display !== "none" && st.visibility !== "hidden";
+  } catch { return false; }
+};
+const vbLabel = (el) => vbClean(el.tagName === "INPUT" ? el.value : (el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label"))).slice(0, 60);
+const vbSlug = (label) => label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 28) || "button";
+// The view's own buttons, innermost element per label, in page order.
+function vbFind(d) {
+  const out = [];
+  for (const root of giDialogRoots(d)) {
+    for (const el of root.querySelectorAll(VB_BUTTONS)) {
+      if (!vbSeen(el)) continue;
+      const label = vbLabel(el);
+      if (!label || label.length > 45) continue;
+      if ([...el.querySelectorAll(VB_BUTTONS)].some((k) => vbSeen(k) && vbLabel(k) === label)) continue; // its child is the button
+      if (out.some((b) => b.label.toLowerCase() === label.toLowerCase())) continue;
+      out.push({ el, label });
+    }
+  }
+  return out;
+}
+const vbOpenDialogs = (d) => giDialogRoots(d).flatMap((r) => [...r.querySelectorAll(VB_DIALOGS)]).filter(vbSeen);
+function vbReadEl(el) {
+  const clean = (t) => String(t || "").replace(/[ \t ]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+  const tables = [];
+  for (const t of [...el.querySelectorAll("table")].slice(0, 20)) {
+    const rows = [...t.rows].slice(0, 300).map((r) => [...r.cells].map((c) => clean(c.innerText).slice(0, 500))).filter((r) => r.some(Boolean));
+    if (rows.length) tables.push(rows);
+  }
+  const links = [...el.querySelectorAll("a[href]")].map((a) => ({ text: clean(a.textContent).slice(0, 80), href: String(a.href || "").slice(0, 400) })).filter((l) => /^https?:/i.test(l.href)).slice(0, 40);
+  return { text: clean(el.innerText).slice(0, 100000), tables, links };
+}
+// → [{ label, did, opened?, text?, tables?, links?, files? }] — one entry per button found.
+async function vbRun(id, d, state, shots) {
+  const list = [];
+  const found = vbFind(d);
+  for (const b of found) {
+    if (/^(close|x|×)$/i.test(b.label)) continue;
+    if (VB_NEVER.test(b.label)) list.push({ label: b.label, did: "left alone: it sends or changes something" });
+    else if (!VB_SHOW.test(b.label)) list.push({ label: b.label, did: "left alone: not known to be view-only" });
+    else list.push({ label: b.label, did: "todo" });
+  }
+  let n = 0;
+  for (const item of list) {
+    if (item.did !== "todo") continue;
+    if (stopRequested || n >= 14) { item.did = "not reached"; continue; }
+    // Found again each time: an earlier button may have redrawn the view.
+    const now = vbFind(d).find((x) => x.label === item.label);
+    if (!now) { item.did = "no longer on screen"; continue; }
+    n++;
+    await erpCheckpoint();
+    const had = new Set(vbOpenDialogs(d));
+    const textBefore = giDialogRoots(d).map((r) => r.innerText || "").join("\n");
+    state.notes.length = 0;
+    try { now.el.scrollIntoView({ block: "center", inline: "nearest" }); } catch { /* not needed for the click */ }
+    simulateClick(now.el);
+    let box = null, win = false, dl = false, changed = false;
+    for (let i = 0; i < 24 && !stopRequested; i++) {
+      await sleep(400);
+      for (const note of state.notes.splice(0)) { if (note.kind === "window") win = true; if (note.kind === "download") dl = true; }
+      box = vbOpenDialogs(d).filter((x) => !had.has(x)).pop() || null;
+      changed = giDialogRoots(d).map((r) => r.innerText || "").join("\n") !== textBefore;
+      if ((box || win || dl || changed) && i >= 4) break;
+    }
+    if (box) {
+      // Let it fill in before it is read.
+      let last = -1;
+      for (let i = 0; i < 12 && !stopRequested; i++) { const len = (box.innerText || "").length; if (len === last && len > 0) break; last = len; await sleep(500); }
+      Object.assign(item, vbReadEl(box));
+    } else if (changed && !win) {
+      const after = giDialogRoots(d).map((r) => r.innerText || "").join("\n");
+      const was = new Set(textBefore.split("\n").map((l) => l.trim()));
+      item.text = after.split("\n").map((l) => l.trim()).filter((l) => l && !was.has(l)).join("\n").slice(0, 100000);
+    }
+    item.opened = [win && "a new window", dl && "a file download", box && "a panel", !box && changed && "the view changed"].filter(Boolean).join(" + ") || "nothing visible";
+    item.did = "opened";
+    if (win || dl || box || changed) {
+      const r = await erpHandOffShot(id, `view-${vbSlug(item.label)}`);
+      if (r && r.ok && Array.isArray(r.shots)) { item.files = r.shots.map(String); shots.push(...item.files); }
+    }
+    erpLog(`View Shipment · ${id} · ${item.label} → ${item.opened}${item.files ? ` · ${item.files.length} file(s) saved` : ""}`);
+    if (box && vbSeen(box)) {
+      const closer = [...box.querySelectorAll("button, a, [role='button'], .close, .k-window-action")].filter(vbSeen)
+        .find((x) => GI_PASSIVE.test(vbLabel(x)) || /\bclose\b|k-i-close|k-window-action/i.test(String(x.className || "") + " " + (x.getAttribute("aria-label") || "")));
+      if (closer) { simulateClick(closer); for (let i = 0; i < 10 && vbSeen(box); i++) await sleep(300); }
+      if (vbSeen(box)) {
+        // Still open and nothing passive closes it: stop here, the view itself is closed next.
+        item.did = "opened (its panel could not be closed, so the remaining buttons were not opened)";
+        for (const rest of list) if (rest.did === "todo") rest.did = "not reached";
+        break;
+      }
+    }
+  }
+  return list;
+}
+
 function fpxErpTakeView() {
   const v = fpxErp && fpxErp.viewDetail;
   if (fpxErp) fpxErp.viewDetail = null;
@@ -5436,11 +5544,21 @@ async function erpGetInvoices(optsJson) {
                   last = n;
                   await sleep(500);
                 }
-                state.viewDetail = giReadDialog(d);
+                const detail = giReadDialog(d);
+                // Then every view-only button inside it, each kept with what it showed.
+                try {
+                  const extra = [];
+                  detail.buttons = await vbRun(id, d, state, extra);
+                  if (extra.length) out.shots = [...out.shots, ...extra].slice(0, 40);
+                } catch (e) {
+                  if (e && (e.fpxStop || e.fpxFatal)) throw e;
+                  erpLog(`View Shipment · ${id} · its buttons could not all be opened (${String(e?.message || e).slice(0, 120)})`, "warn");
+                }
+                state.viewDetail = detail;
               }
-            } catch (e) { erpLog(`View Shipment · ${id} · could not read the view (${String(e?.message || e).slice(0, 120)})`, "warn"); }
+            } catch (e) { if (e && (e.fpxStop || e.fpxFatal)) throw e; erpLog(`View Shipment · ${id} · could not read the view (${String(e?.message || e).slice(0, 120)})`, "warn"); }
             const r = await erpHandOffShot(id, "view");
-            if (r && r.ok && Array.isArray(r.shots) && r.shots.length) out.shots = [...out.shots, ...r.shots.map(String)].slice(0, 6);
+            if (r && r.ok && Array.isArray(r.shots) && r.shots.length) out.shots = [...out.shots, ...r.shots.map(String)].slice(0, 40);
             else erpLog(`View Shipment · ${id} · no screenshot (${String((r && r.error) || "nothing was captured").slice(0, 200)})`, "warn");
           },
         };
@@ -5484,7 +5602,7 @@ async function erpGetInvoices(optsJson) {
           try {
             const r = await erpHandOffShot(id);
             if (r && r.ok && Array.isArray(r.shots) && r.shots.length) {
-              this.shots = r.shots.map(String).slice(0, 6);
+              this.shots = r.shots.map(String).slice(0, 40);
             } else if (r && r.noAnswer) {
               // A browser service from before screenshots: wait for it once only.
               shotsOn = false;

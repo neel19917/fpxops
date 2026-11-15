@@ -245,7 +245,9 @@ auditsRouter.get("/invoice/:id/invoice-shot", async (req, res) => {
   }
   const bytes = Buffer.from(await blob.arrayBuffer());
   res.set({
-    "Content-Type": file.endsWith(".pdf") ? "application/pdf" : "image/png",
+    // Only a picture or a PDF is ever shown in the page; anything else is a download.
+    "Content-Type": file.endsWith(".pdf") ? "application/pdf" : file.endsWith(".png") ? "image/png" : /\.jpe?g$/.test(file) ? "image/jpeg" : file.endsWith(".gif") ? "image/gif" : "application/octet-stream",
+    "X-Content-Type-Options": "nosniff",
     "Content-Length": String(bytes.length),
     "Cache-Control": "private, max-age=3600",
   });
@@ -614,7 +616,7 @@ auditsRouter.post("/erp/shipment-records", async (req, res) => {
       audit_id: isUuid(r.audit_id) ? r.audit_id : null,
       data,
       text: typeof data.text === "string" ? data.text.slice(0, 500_000) : null,
-      files: (Array.isArray(r.files) ? r.files : []).map(String).filter((f) => f.length < 300).slice(0, 12),
+      files: (Array.isArray(r.files) ? r.files : []).map(String).filter((f) => f.length < 300).slice(0, 60),
       captured_by: by, captured_at: now,
     });
   }

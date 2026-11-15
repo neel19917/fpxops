@@ -206,7 +206,7 @@ describe("normalizeResult", () => {
       ok: true,
       shots: [
         "invoices/a_b-1.v2.png", "invoices/a_b-1.v2.png", "invoices/../secret.png", "invoices/sub/a.png",
-        "/invoices/a.png", "other/a.png", "invoices/a.jpg", "invoices/a.png?x=1", "invoices/a b.png",
+        "/invoices/a.png", "other/a.png", "invoices/a.exe", "invoices/a.png?x=1", "invoices/a b.png",
         "invoices/.png", "invoices/a.png\n", "full.xlsx", 5, null, { path: "invoices/a.png" }, ["invoices/a.png"],
       ],
     }, { now });
@@ -214,9 +214,9 @@ describe("normalizeResult", () => {
   });
 
   it("keeps at most 6 screenshots, counted after dropping bad ones and repeats", () => {
-    const many = Array.from({ length: 9 }, (_, i) => `invoices/1-${i + 1}.png`);
+    const many = Array.from({ length: 45 }, (_, i) => `invoices/1-${i + 1}.png`);
     const r = normalizeResult({ shipment_id: "1", ok: true, shots: ["bad", many[0], ...many] }, { now });
-    assert.deepEqual(r.shots, many.slice(0, 6));
+    assert.deepEqual(r.shots, many.slice(0, 40));
   });
 
   it("has no shots key when there are none", () => {

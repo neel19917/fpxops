@@ -1330,6 +1330,11 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
   const children = [];
   let shooting = false;   // a screenshot is being taken: child windows stay open for it
   let pageShoots = false; // the extension asks for screenshots (4.24 or later)
+  let dlDir = null;       // where this job's file downloads land (set in setup)
+  const dlTaken = new Set();
+  const viewExtra = new Map(); // shipment id → files saved from the buttons inside View Shipment
+  const KEEP_EXT = /^(png|pdf|jpe?g|gif|txt|csv|xlsx?|zpl|html?|docx?|zip)$/;
+  const EXT_TYPE = { png: "image/png", pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", txt: "text/plain", csv: "text/csv", zpl: "text/plain", html: "text/html", htm: "text/html", zip: "application/zip" };
 
   // A PNG of one page as it is on screen. Bounded: a window Chrome isn't
   // drawing, or one frozen by a browser prompt, can take very long.
@@ -1348,8 +1353,10 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
   // <audit id>/invoices/<shipment>-<n>.png. → the answer for fpxErpShotDone().
   // tag "view": the record of VIEW SHIPMENT, kept beside the Get Invoice one.
   const takeShots = async (page, shipmentId, tag) => {
-    const kind = tag === "view" ? "view-" : "";
-    const what = tag === "view" ? "View Shipment" : "Get Invoice";
+    // tag "view": the View Shipment window; "view-<button>": what one of its buttons showed.
+    const slug = String(tag || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 40);
+    const kind = slug ? `${slug}-` : "";
+    const what = slug ? "View Shipment" : "Get Invoice";
     if (!storageEnabled) return { ok: false, error: "storage is not configured" };
     const safe = String(shipmentId ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "shipment";
     shooting = true;
@@ -1360,7 +1367,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
       // page is in front again for its own picture.
       const files = []; // { buf, name, type }
       for (const c of children.filter((x) => !x.shot)) {
-        if (files.length >= 2) break;
+        if (files.length >= 4) break;
         c.shot = true;
         const p = await c.t.page().catch(() => null);
         let url = "";
@@ -1371,9 +1378,24 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
             const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
             const b = res.ok ? Buffer.from(await res.arrayBuffer()) : null;
             if (b && b.length > 200 && b.subarray(0, 5).toString("latin1") === "%PDF-") {
-              got = { buf: b, name: `${safe}-${kind}invoice${files.some((f) => f.type === "application/pdf") ? "-2" : ""}.pdf`, type: "application/pdf" };
+              got = { buf: b, name: `${safe}-${kind}${slug ? "file" : "invoice"}${files.some((f) => f.type === "application/pdf") ? `-${files.length + 1}` : ""}.pdf`, type: "application/pdf" };
             }
-          } catch { /* a picture of the window instead */ }
+          } catch { /* next: the same address, signed in */ }
+          // A file behind the FreightPOP login: fetched by the signed-in page instead.
+          if (!got && !page.isClosed()) {
+            try {
+              const b64 = await page.evaluate(async (u) => {
+                const res = await fetch(u, { credentials: "include" });
+                if (!res.ok) return "";
+                const bytes = new Uint8Array(await res.arrayBuffer());
+                if (bytes.length < 200 || bytes.length > 30e6 || String.fromCharCode(...bytes.subarray(0, 5)) !== "%PDF-") return "";
+                let bin = "";
+                for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+                return btoa(bin);
+              }, url);
+              if (b64) got = { buf: Buffer.from(b64, "base64"), name: `${safe}-${kind}${slug ? "file" : "invoice"}${files.some((f) => f.type === "application/pdf") ? `-${files.length + 1}` : ""}.pdf`, type: "application/pdf" };
+            } catch { /* a picture of the window instead */ }
+          }
         }
         if (!got && p && !p.isClosed()) {
           const b = await png(p);
@@ -1381,6 +1403,20 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         }
         if (got) files.push(got);
         if (p && !p.isClosed()) await p.close().catch(() => {});
+      }
+      // Files the click downloaded: kept as they are.
+      if (dlDir) {
+        for (let i = 0; i < 20 && fs.readdirSync(dlDir).some((f) => f.endsWith(".crdownload")); i++) await sleep(500);
+        for (const f of fs.readdirSync(dlDir)) {
+          if (dlTaken.has(f) || f.endsWith(".crdownload")) continue;
+          dlTaken.add(f);
+          const ext = (f.split(".").pop() || "").toLowerCase();
+          if (!KEEP_EXT.test(ext)) { logLine(lane, `${what} · ${shipmentId} · a downloaded file was not kept (${f.slice(0, 80)})`, "warn"); continue; }
+          try {
+            const b = fs.readFileSync(path.join(dlDir, f));
+            if (b.length && b.length < 30e6) files.push({ buf: b, name: `${safe}-${kind}download-${dlTaken.size}.${ext}`, type: EXT_TYPE[ext] || "application/octet-stream" });
+          } catch { /* gone */ }
+        }
       }
       if (files.length) await sleep(700);
       const main = page.isClosed() ? null : await png(page);
@@ -1398,7 +1434,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
       }
       const bufs = files;
       if (!shots.length) return { ok: false, error: String(failed || "the screenshot could not be saved").slice(0, 300) };
-      logLine(lane, `${what} · ${shipmentId} · record saved (${shots.map((x) => (x.endsWith(".pdf") ? "invoice PDF" : "screenshot")).join(" + ")}, ${(bytes / 1048576).toFixed(1)} MB)${failed ? ` · ${bufs.length - shots.length} more could not be saved (${String(failed).slice(0, 160)})` : ""}`, failed ? "warn" : "info");
+      logLine(lane, `${what} · ${shipmentId} · record saved (${shots.map((x) => (x.endsWith(".pdf") ? "PDF" : x.endsWith(".png") ? "screenshot" : "file")).join(" + ")}, ${(bytes / 1048576).toFixed(1)} MB)${failed ? ` · ${bufs.length - shots.length} more could not be saved (${String(failed).slice(0, 160)})` : ""}`, failed ? "warn" : "info");
       return { ok: true, shots };
     } catch (e) {
       return { ok: false, error: String(e?.message || e).slice(0, 300) };
@@ -1479,6 +1515,9 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         // seen starting; the folder is removed when the job ends.
         const dir = path.join(path.dirname(config.profileRoot), "erp-downloads", `gi-${String(lane.current?.requestId || "job").replace(/[^a-zA-Z0-9_-]/g, "")}`);
         fs.mkdirSync(dir, { recursive: true });
+        dlDir = dir;
+        // Print buttons must not open the browser's print window (it freezes the page).
+        await page.evaluateOnNewDocument(() => { try { window.print = () => {}; } catch { /* left as it is */ } }).catch(() => {});
         await cdp.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir }).catch(() => {});
         await cdp.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: dir, eventsEnabled: true }).catch(() => {});
         const downloads = new Set();
@@ -1492,6 +1531,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
 
         return async () => {
           ended = true;
+          dlDir = null;
           page.off("dialog", onDialog);
           browser.off("targetcreated", onTarget);
           await cdp.send("Browser.setDownloadBehavior", { behavior: "default" }).catch(() => {});
@@ -1502,7 +1542,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         if (r.results?.length) {
           unsaved.push(...r.results.map((x) => ({
             shipment_id: String(x.shipment_id), ok: x.ok === true, note: String(x.note || "").slice(0, 500), at: x.at || new Date().toISOString(),
-            shots: (Array.isArray(x.shots) ? x.shots : []).map(String).filter((p) => /^invoices\/[A-Za-z0-9_.-]+\.(png|pdf)$/.test(p)).slice(0, 6),
+            shots: (Array.isArray(x.shots) ? x.shots : []).map(String).filter((p) => /^invoices\/[A-Za-z0-9_.-]+\.[a-z]{2,5}$/.test(p)).slice(0, 40),
           })));
           await save();
         }
@@ -1515,15 +1555,24 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
             try { detail = JSON.parse((await ext.evaluate("typeof fpxErpTakeView === 'function' ? fpxErpTakeView() : 'null'")).value || "null"); } catch { /* picture only */ }
           }
           const answer = await takeShots(page, r.shot.shipment_id, r.shot.tag);
+          const sid = String(r.shot.shipment_id);
+          // What a button inside View Shipment showed: kept until the view's own record is stored.
+          if (!view && String(r.shot.tag || "").startsWith("view-")) {
+            if (answer.ok) viewExtra.set(sid, [...(viewExtra.get(sid) || []), ...answer.shots]);
+            await ext.evaluate(`fpxErpShotDone(${JSON.stringify(answer)})`).catch(() => {});
+            return true;
+          }
+          const extraFiles = view ? viewExtra.get(sid) || [] : [];
+          viewExtra.delete(sid);
           // The same capture as a row of fpx_shipment_records: readable and
           // searchable, not only a picture. Never this shipment's failure.
           if (answer.ok || detail) {
             try {
               const out = await api("/api/audits/erp/shipment-records", {
                 method: "POST", signal: AbortSignal.timeout(30_000),
-                body: JSON.stringify({ by: who, records: [{ shipment_id: String(r.shot.shipment_id), kind: view ? "view_shipment" : "invoice", audit_id: gi.auditId, data: detail || {}, files: answer.shots || [] }] }),
+                body: JSON.stringify({ by: who, records: [{ shipment_id: String(r.shot.shipment_id), kind: view ? "view_shipment" : "invoice", audit_id: gi.auditId, data: detail || {}, files: [...(answer.shots || []), ...extraFiles] }] }),
               });
-              if (view && detail) logLine(lane, `View Shipment · ${r.shot.shipment_id} · stored · ${num(String(detail.text || "").length)} characters, ${Object.keys(detail.fields || {}).length} fields, ${(detail.tables || []).length} tables${out?.failed ? " · NOT saved" : ""}`, out?.failed ? "warn" : "info");
+              if (view && detail) logLine(lane, `View Shipment · ${r.shot.shipment_id} · stored · ${num(String(detail.text || "").length)} characters, ${Object.keys(detail.fields || {}).length} fields, ${(detail.tables || []).length} tables${Array.isArray(detail.buttons) ? `, ${detail.buttons.filter((b) => String(b.did).startsWith("opened")).length} of ${detail.buttons.length} buttons opened` : ""}${out?.failed ? " · NOT saved" : ""}`, out?.failed ? "warn" : "info");
             } catch (e) { logLine(lane, `Shipment record not stored (${String(e.message).slice(0, 200)})`, "warn"); }
           }
           await ext.evaluate(`fpxErpShotDone(${JSON.stringify(answer)})`).catch(() => {});
