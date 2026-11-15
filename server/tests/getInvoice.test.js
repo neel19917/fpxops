@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   MAX_GET_INVOICE_IDS, isUuid, normalizeShipmentIds, missingShipmentIds,
   buildGetInvoiceNote, parseGetInvoiceNote, markRequested, mergeResult,
-  resetRequested, normalizeResult, updateRowsRaw,
+  resetRequested, normalizeResult, updateRowsRaw, isShotPath, normalizeShots,
 } from "../lib/getInvoice.js";
 
 const AUDIT = "3f2b6c1e-8a4d-4e0b-9c57-1d2e3f4a5b6c";
@@ -123,6 +123,39 @@ describe("raw.get_invoice state", () => {
     assert.equal(mergeResult(["x"], { ok: true, at: "t" }).get_invoice.status, "done");
   });
 
+  it("mergeResult stores screenshots at get_invoice.shots", () => {
+    const next = mergeResult(markRequested(raw, stamp), { ok: true, at: "t", shots: ["invoices/1-1.png", "invoices/1-2.png"] });
+    assert.deepEqual(next.get_invoice, { ...stamp, status: "done", note: null, at: "t", by: null, shots: ["invoices/1-1.png", "invoices/1-2.png"] });
+  });
+
+  it("mergeResult leaves out shots when there are none", () => {
+    for (const shots of [undefined, null, [], "invoices/1-1.png", ["../1.png"]]) {
+      assert.equal("shots" in mergeResult(raw, { ok: true, at: "t", shots }).get_invoice, false);
+    }
+  });
+
+  it("a later result without screenshots keeps the stored ones", () => {
+    const first = mergeResult(markRequested(raw, stamp), { ok: true, note: "Invoice shown", at: "t1", shots: ["invoices/1-1.png"] });
+    for (const shots of [undefined, [], ["nope"]]) {
+      const retry = mergeResult(first, { ok: false, note: "Page did not load", at: "t2", by: "fpx-browser", shots });
+      assert.deepEqual(retry.get_invoice, {
+        ...stamp, status: "failed", note: "Page did not load", at: "t2", by: "fpx-browser", shots: ["invoices/1-1.png"],
+      });
+    }
+    assert.deepEqual(first.get_invoice.shots, ["invoices/1-1.png"]); // input untouched
+  });
+
+  it("a later result with screenshots replaces the list", () => {
+    const first = mergeResult(raw, { ok: true, at: "t1", shots: ["invoices/1-1.png", "invoices/1-2.png"] });
+    const next = mergeResult(first, { ok: true, at: "t2", shots: ["invoices/1-3.png"] });
+    assert.deepEqual(next.get_invoice.shots, ["invoices/1-3.png"]);
+  });
+
+  it("mergeResult cleans the screenshot list itself", () => {
+    const next = mergeResult(raw, { ok: true, at: "t", shots: ["invoices/a.png", "invoices/../b.png", "invoices/a.png"] });
+    assert.deepEqual(next.get_invoice.shots, ["invoices/a.png"]);
+  });
+
   it("resetRequested puts a waiting row back, keeping the requested fields", () => {
     const next = resetRequested(markRequested(raw, stamp), { request_id: REQ, note: "Not picked up" });
     assert.deepEqual(next, { ...raw, get_invoice: { ...stamp, status: "not_started", note: "Not picked up" } });
@@ -160,6 +193,51 @@ describe("normalizeResult", () => {
     for (const bad of [null, "1", {}, { shipment_id: "  " }, { shipment_id: null, ok: true }]) {
       assert.equal(normalizeResult(bad, { now }), null);
     }
+  });
+
+  it("keeps screenshot paths", () => {
+    const r = normalizeResult({ shipment_id: "12970098", ok: true, shots: ["invoices/12970098-1.png", "invoices/12970098-2.png"] }, { now });
+    assert.deepEqual(r.shots, ["invoices/12970098-1.png", "invoices/12970098-2.png"]);
+  });
+
+  it("drops screenshot paths that are not invoices/<name>.png, and repeats", () => {
+    const r = normalizeResult({
+      shipment_id: "1",
+      ok: true,
+      shots: [
+        "invoices/a_b-1.v2.png", "invoices/a_b-1.v2.png", "invoices/../secret.png", "invoices/sub/a.png",
+        "/invoices/a.png", "other/a.png", "invoices/a.jpg", "invoices/a.png?x=1", "invoices/a b.png",
+        "invoices/.png", "invoices/a.png\n", "full.xlsx", 5, null, { path: "invoices/a.png" }, ["invoices/a.png"],
+      ],
+    }, { now });
+    assert.deepEqual(r.shots, ["invoices/a_b-1.v2.png"]);
+  });
+
+  it("keeps at most 6 screenshots, counted after dropping bad ones and repeats", () => {
+    const many = Array.from({ length: 9 }, (_, i) => `invoices/1-${i + 1}.png`);
+    const r = normalizeResult({ shipment_id: "1", ok: true, shots: ["bad", many[0], ...many] }, { now });
+    assert.deepEqual(r.shots, many.slice(0, 6));
+  });
+
+  it("has no shots key when there are none", () => {
+    for (const shots of [undefined, null, [], "invoices/a.png", { 0: "invoices/a.png" }, ["bad", 7]]) {
+      assert.equal("shots" in normalizeResult({ shipment_id: "1", ok: true, shots }, { now }), false);
+    }
+  });
+});
+
+describe("screenshot paths", () => {
+  it("isShotPath accepts one png under invoices/ and nothing else", () => {
+    for (const ok of ["invoices/12970098-1.png", "invoices/a.b_c-d.png"]) assert.equal(isShotPath(ok), true);
+    for (const bad of [
+      "", "invoices/", "invoices/.png", "invoices/a.PNG", "invoices/a/b.png", "invoices\\a.png",
+      "invoices/%2e%2e/a.png", "../invoices/a.png", "invoices/a.png/", " invoices/a.png", "invoices/a.png\n",
+      undefined, null, 5, ["invoices/a.png"],
+    ]) assert.equal(isShotPath(bad), false);
+  });
+
+  it("normalizeShots returns [] for anything that is not a list", () => {
+    for (const bad of [undefined, null, "invoices/a.png", 3, {}]) assert.deepEqual(normalizeShots(bad), []);
   });
 });
 

@@ -1,6 +1,8 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
+import { FileImage } from "lucide-react";
 import { GET_INVOICE_MAX, approvalHover } from "../../lib/erpPull";
 import { fmtDateTime } from "../../lib/format";
+import { InvoiceRecordModal } from "./InvoiceRecordModal";
 import { fmtMoney, fmtSigned, type BucketKey, type Row } from "./model";
 
 // One table, three shapes: the columns follow the selected bucket.
@@ -33,7 +35,26 @@ function ApproverPill({ row }: { row: Row }) {
   }
 }
 
-function Result({ row }: { row: Row }) {
+/** Opens the saved screenshots of the invoice. Only for rows that have some. */
+function RecordButton({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) {
+  if (row.shots.length === 0) return null;
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onOpen(row); }}
+        aria-label={`View invoice record for shipment ${row.shipment}`}
+        title="The screenshot FPX saved of the invoice FreightPOP showed"
+        className="inline-flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1 whitespace-nowrap bg-white text-violet-700 ring-1 ring-violet-200 hover:bg-violet-50 hover:text-violet-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-500"
+      >
+        <FileImage className="h-3.5 w-3.5 shrink-0" />
+        View invoice record
+      </button>
+    </div>
+  );
+}
+
+function Result({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) {
   const inProgress = row.gi?.status === "requested";
   return (
     <>
@@ -42,12 +63,15 @@ function Result({ row }: { row: Row }) {
         {inProgress ? "In progress" : "Sent"}
       </span>
       {row.gi?.note ? <div className="text-xs text-slate-500 mt-1 break-words max-w-sm">{row.gi.note}</div> : null}
+      <RecordButton row={row} onOpen={onOpen} />
     </>
   );
 }
 
-export function ShipmentTable({ bucket, rows, empty, selected, atCap, allPicked, canPickAll, capped, onToggle, onToggleAll, footer }: {
+export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, allPicked, canPickAll, capped, onToggle, onToggleAll, footer }: {
   bucket: BucketKey;
+  /** The pull these rows belong to: the saved invoice screenshots are fetched from it. */
+  auditId: string | null;
   rows: Row[];
   /** Shown in place of the rows when there are none. */
   empty: ReactNode;
@@ -63,6 +87,8 @@ export function ShipmentTable({ bucket, rows, empty, selected, atCap, allPicked,
   footer?: ReactNode;
 }) {
   const pick = bucket === "approved";
+  // The shipment whose saved invoice record is open, if any.
+  const [record, setRecord] = useState<Row | null>(null);
   const colCount = bucket === "approved" ? 7 : bucket === "not-approved" ? 7 : 6;
   return (
     <div className="max-h-[72vh] overflow-auto">
@@ -140,6 +166,7 @@ export function ShipmentTable({ bucket, rows, empty, selected, atCap, allPicked,
                       Last try failed{r.gi?.note ? `: ${r.gi.note}` : ""}
                     </div>
                   ) : null}
+                  {bucket === "approved" ? <RecordButton row={r} onOpen={setRecord} /> : null}
                 </td>
                 <td className={TD + " text-slate-700"}>{r.customer || "—"}</td>
                 <td className={TD + " text-slate-500"}>{r.carrier || "—"}</td>
@@ -169,7 +196,7 @@ export function ShipmentTable({ bucket, rows, empty, selected, atCap, allPicked,
                   </>
                 ) : (
                   <>
-                    <td className={TD}><Result row={r} /></td>
+                    <td className={TD}><Result row={r} onOpen={setRecord} /></td>
                     <td className={TD + " pr-6 whitespace-nowrap text-slate-500"}>{when ? fmtDateTime(when) : "—"}</td>
                   </>
                 )}
@@ -179,6 +206,7 @@ export function ShipmentTable({ bucket, rows, empty, selected, atCap, allPicked,
         </tbody>
       </table>
       {footer}
+      {record && auditId ? <InvoiceRecordModal auditId={auditId} row={record} onClose={() => setRecord(null)} /> : null}
     </div>
   );
 }

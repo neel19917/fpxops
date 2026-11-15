@@ -45,6 +45,8 @@ export interface Row {
   waiting: WaitingGroup | null;
   /** The last Get Invoice try on this shipment failed. */
   failed: boolean;
+  /** Saved screenshots of the invoice FreightPOP showed when Get Invoice was pressed. */
+  shots: string[];
   search: string;
 }
 
@@ -125,6 +127,7 @@ export function toRow(row: InvoiceAuditRow): Row {
     notes: approvedByCheck ? String(ap?.notes ?? "").trim() : "",
     waiting: bucket !== "not-approved" ? null : flagged ? "received" : "none",
     failed: sent === "failed",
+    shots: Array.isArray(gi?.shots) ? gi.shots.filter((f): f is string => typeof f === "string" && f.trim() !== "") : [],
     search: `${shipment} ${customer} ${carrier} ${approvedByCheck ? String(ap?.notes ?? "") : ""}`.toLowerCase(),
   };
 }

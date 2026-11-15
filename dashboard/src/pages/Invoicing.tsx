@@ -712,6 +712,7 @@ export function InvoicingPage() {
             <div className="border-t border-slate-200">
               <ShipmentTable
                 bucket={tab}
+                auditId={auditId}
                 rows={shown}
                 empty={empty}
                 selected={selected}

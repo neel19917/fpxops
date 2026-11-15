@@ -8,7 +8,10 @@
 // Row state, in fpx_invoice_audit_rows.raw.get_invoice:
 //   { status: "requested" | "done" | "failed" | "not_started",
 //     requested_at, requested_by, request_id,   // set when the job is queued
-//     note, at, by }                            // set when a result comes back
+//     note, at, by,                             // set when a result comes back
+//     shots }                                   // only when screenshots were saved
+// shots lists the invoice screenshots the worker saved for the shipment, as
+// paths inside the audit's Storage folder: ["invoices/12970098-1.png", ...].
 
 export const GET_INVOICE_SCOPE = "get_invoice";
 export const MAX_GET_INVOICE_IDS = 200;
@@ -66,25 +69,49 @@ export function parseGetInvoiceNote(note) {
   };
 }
 
+// A screenshot path as the worker sends it: one file name under invoices/.
+// Nothing else is accepted, so a path can never leave the audit's folder.
+export const MAX_SHOTS = 6;
+const SHOT_RE = /^invoices\/[A-Za-z0-9_.-]+\.png$/;
+export const isShotPath = (v) => typeof v === "string" && SHOT_RE.test(v);
+
+// The valid screenshot paths of a list, repeats dropped, at most MAX_SHOTS.
+export function normalizeShots(input) {
+  if (!Array.isArray(input)) return [];
+  const shots = [];
+  for (const v of input) {
+    if (!isShotPath(v) || shots.includes(v)) continue;
+    shots.push(v);
+    if (shots.length === MAX_SHOTS) break;
+  }
+  return shots;
+}
+
 const asObject = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
 
 // A new request starts the row's state over: an older result's note/at/by
 // would otherwise sit next to "requested".
 export function markRequested(raw, { requested_at, requested_by = null, request_id }) {
+  // Screenshots already saved for the shipment are a record: a new try keeps them.
+  const base = asObject(raw);
+  const kept = asObject(base.get_invoice).shots;
   return {
-    ...asObject(raw),
-    get_invoice: { status: "requested", requested_at, requested_by, request_id },
+    ...base,
+    get_invoice: { status: "requested", requested_at, requested_by, request_id, ...(Array.isArray(kept) && kept.length ? { shots: kept } : {}) },
   };
 }
 
 // Folds one result into raw. Every other key of raw is kept, and so are the
 // requested_at / requested_by / request_id written when the job was queued.
-export function mergeResult(raw, { ok, note = null, at, by = null }) {
+// A result with screenshots replaces the stored list; one without leaves the
+// stored list alone, so a retry that failed before the screenshot does not
+// lose the earlier ones.
+export function mergeResult(raw, { ok, note = null, at, by = null, shots }) {
   const base = asObject(raw);
-  return {
-    ...base,
-    get_invoice: { ...asObject(base.get_invoice), status: ok ? "done" : "failed", note, at, by },
-  };
+  const get_invoice = { ...asObject(base.get_invoice), status: ok ? "done" : "failed", note, at, by };
+  const clean = normalizeShots(shots);
+  if (clean.length) get_invoice.shots = clean;
+  return { ...base, get_invoice };
 }
 
 // Puts a row that was waiting on a request back to "not_started". Returns null
@@ -99,19 +126,22 @@ export function resetRequested(raw, { request_id, note }) {
 }
 
 // Cleans one entry of the worker's results. Returns null when it has no
-// shipment id.
+// shipment id. `shots` is only present when the entry has at least one valid
+// screenshot path.
 export function normalizeResult(entry, { by = null, now = new Date().toISOString() } = {}) {
   const e = asObject(entry);
   const shipment_id = typeof e.shipment_id === "string" || typeof e.shipment_id === "number"
     ? String(e.shipment_id).trim() : "";
   if (!shipment_id) return null;
   const t = e.at ? new Date(e.at) : null;
+  const shots = normalizeShots(e.shots);
   return {
     shipment_id,
     ok: e.ok === true,
     note: e.note === undefined || e.note === null || e.note === "" ? null : String(e.note).slice(0, 500),
     at: t && !Number.isNaN(t.getTime()) ? t.toISOString() : now,
     by,
+    ...(shots.length ? { shots } : {}),
   };
 }
 

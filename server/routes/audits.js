@@ -2,7 +2,7 @@ import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
 import { analyzeGpAuditRun, analyzeInvoiceAuditRun } from "./analyze.js";
 import { auditHistoryRows } from "../lib/historyAudit.js";
-import { MAX_GET_INVOICE_IDS, isUuid, normalizeResult, mergeResult, updateRowsRaw } from "../lib/getInvoice.js";
+import { MAX_GET_INVOICE_IDS, isUuid, isShotPath, normalizeResult, mergeResult, updateRowsRaw } from "../lib/getInvoice.js";
 import {
   approvalColumnNames, findApprovalColumns, matchApprovals, mergeApproval, summarizeApprovals,
   normalizeApprovalSource,
@@ -202,6 +202,56 @@ auditsRouter.get("/invoice/:id/excel", async (req, res) => {
   res.send(bytes);
 });
 
+// GET /audits/invoice/:id/invoice-shot?file=invoices/<name>.png
+// Sends one screenshot of the invoice FreightPOP showed when the hosted
+// browser clicked GET INVOICE, from <audit_id>/invoices/<name>.png in the
+// same bucket. `file` is a path from a row's raw.get_invoice.shots.
+// 400 unless `file` is invoices/<letters, digits, _ . ->.png (so it can only
+// name a file in this audit's invoices folder); 404 { error: "No screenshot
+// was saved for this shipment" } when it isn't in Storage; 502 when Storage
+// can't be read.
+auditsRouter.get("/invoice/:id/invoice-shot", async (req, res) => {
+  const file = req.query.file;
+  if (!isShotPath(file)) return res.status(400).json({ error: "file must be invoices/<name>.png" });
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
+  const { data: run, error } = await supabase
+    .from("fpx_invoice_audits").select("id, shipment_type").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!run) return res.status(404).json({ error: "Invoice audit not found" });
+  const missing = () => res.status(404).json({ error: "No screenshot was saved for this shipment" });
+  if (run.shipment_type !== "erp_pending") return missing();
+
+  let blob = null;
+  try {
+    const { data, error: dlErr } = await supabase.storage.from(ERP_BUCKET).download(`${run.id}/${file}`);
+    if (!dlErr) blob = data;
+  } catch { /* handled below */ }
+  if (!blob) {
+    // A missing object and a Storage outage both come back as an error, so
+    // look in the folder to tell them apart.
+    const name = file.slice("invoices/".length);
+    let known = false; // the folder was read
+    let there = false;
+    try {
+      const { data, error: listErr } = await supabase.storage
+        .from(ERP_BUCKET).list(`${run.id}/invoices`, { limit: 100, search: name });
+      if (!listErr) {
+        known = true;
+        there = (data || []).some((o) => o?.name === name);
+      }
+    } catch { /* handled below */ }
+    if (known && !there) return missing();
+    return res.status(502).json({ error: "Could not read the screenshot from storage. Try again." });
+  }
+  const bytes = Buffer.from(await blob.arrayBuffer());
+  res.set({
+    "Content-Type": "image/png",
+    "Content-Length": String(bytes.length),
+    "Cache-Control": "private, max-age=3600",
+  });
+  res.send(bytes);
+});
+
 // POST /audits/invoice/from-history — ERP-pending audit fed by FreightPOP's
 // Transactions "History Report" (pulled by the hosted browser), not a carrier
 // bill. Body:
@@ -308,10 +358,19 @@ auditsRouter.post("/invoice/from-history", async (req, res) => {
 
 // POST /audits/invoice/:id/get-invoice-results — the hosted browser reports
 // what happened when it clicked GET INVOICE for shipments of an ERP pull.
-// Body: { by, results: [{ shipment_id, ok, note, at }] }, up to 200 results.
+// Body: { by, results: [{ shipment_id, ok, note, at, shots? }] }, up to 200
+// results. `shots` lists the screenshots of the invoice the browser saved in
+// Storage for that shipment, as paths inside the audit's folder:
+//   ["invoices/12970098-1.png", ...]
+// Only invoices/<letters, digits, _ . ->.png entries are kept, repeats are
+// dropped, and at most 6 are stored.
 // Each result is folded into raw.get_invoice of the matching row(s):
-//   { status: ok ? "done" : "failed", note, at, by } plus the requested_at /
-//   requested_by / request_id written when the run was queued.
+//   { status: ok ? "done" : "failed", note, at, by, shots } plus the
+//   requested_at / requested_by / request_id written when the run was queued.
+// A result with shots replaces the stored list; a result without any leaves
+// the stored list as it is (a retry that failed before the screenshot keeps
+// the earlier ones). Rows that never had a screenshot have no `shots` key.
+// Each one can be fetched from GET /audits/invoice/:id/invoice-shot.
 // No other column, and no other key of raw, is written. Shipment ids that are
 // not in the audit are counted, not refused.
 // Responds { updated, unknown, failed }: shipments saved, shipments not in

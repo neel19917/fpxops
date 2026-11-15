@@ -3611,6 +3611,8 @@ function fpxErpPoll() {
     phase: fpxErp.phase || null,
     results: fpxErp.results ? fpxErp.results.splice(0) : [],
     pause: fpxErp.wantPause || null,
+    // Get-invoices job only: a screenshot is wanted now ({ shipment_id }).
+    shot: fpxErp.wantShot || null,
   };
 }
 
@@ -4909,9 +4911,10 @@ async function erpApprovalCheck(runBy, resumed = false, opts = null) {
 // that row's GET INVOICE button. One shipment at a time, one click each.
 //
 // Started by the browser service with erpGetInvoices(optsJson); it polls
-// fpxErpPoll() for log lines, finished shipments (`results`) and pause
-// requests (`pause`), and tells this page about things only it can see
-// (a new window, a file download, a browser prompt) with fpxErpNote().
+// fpxErpPoll() for log lines, finished shipments (`results`), pause
+// requests (`pause`) and screenshot requests (`shot`), and tells this page
+// about things only it can see (a new window, a file download, a browser
+// prompt) with fpxErpNote().
 //
 // What FreightPOP does after the click is not known, so the job watches for
 // ~15 s, writes down what it saw in plain words, and only ever puts a dialog
@@ -4966,6 +4969,31 @@ async function giWaitGone(el, ms) {
     await sleep(250);
   }
   return !giStillOpen(el);
+}
+
+// ── Screenshot of what FreightPOP shows after the click ──
+// Only the browser service can take one: it sees `shot` in the poll, saves
+// the picture(s) and answers with fpxErpShotDone({ ok, shots: [...], error? }).
+function fpxErpShotDone(resp) {
+  if (!fpxErp) return "no job";
+  fpxErp.wantShot = null;
+  fpxErp.shotResult = resp || { ok: false, error: "empty answer" };
+  return "ok";
+}
+// ~45 s, counted in steps like GI_OBSERVE_STEPS: a browser prompt freezes the
+// page (and the browser service's polling), which must not look like "no answer".
+const GI_SHOT_STEPS = 150;
+async function erpHandOffShot(shipmentId) {
+  const state = fpxErp;
+  state.shotResult = null;
+  state.wantShot = { shipment_id: String(shipmentId) };
+  for (let step = 0; step < GI_SHOT_STEPS; step++) {
+    if (state.shotResult) { const r = state.shotResult; state.shotResult = null; return r; }
+    if (stopRequested) { state.wantShot = null; return { ok: false, error: "stopped" }; }
+    await sleep(300);
+  }
+  state.wantShot = null;
+  return { ok: false, noAnswer: true, error: "no answer from the browser service after 45s" };
 }
 
 // Asks the browser service to pause the job exactly as if Pause had been
@@ -5191,7 +5219,7 @@ async function giObserve(before, state) {
   return seen;
 }
 
-// Put away every dialog the click opened. `out`: { parts, fail(text), emit(), paused }.
+// Put away every dialog the click opened. `out`: { parts, fail(text), emit(), paused, shoot() }.
 // A dialog that wants an answer, or that has no passive control, is left
 // open: the shipment is recorded as failed, the job pauses, and after Resume
 // it is closed with Close / X / Cancel if it has one — otherwise the job stops.
@@ -5209,6 +5237,8 @@ async function giSettleDialogs(id, before, out) {
       if (info.busy) out.fail(`Still showing "${info.text}" after a minute`);
     }
     if (info.error) out.fail(`Error shown: "${info.text}"`);
+    // The dialog has its final content and nothing has been closed yet.
+    if (out.shoot) await out.shoot();
 
     let closedWith = null;
     if (info.closer) {
@@ -5251,12 +5281,13 @@ async function erpGetInvoices(optsJson) {
   };
   fpxErp = state;
   const st = { tab: "non-parcel", uiFilter: false };
+  let shotsOn = true; // off after the browser service did not answer one screenshot request
   const summary = () => `${erpNum(state.counts.ok)} of ${erpNum(state.counts.total)} invoice(s) clicked` +
     (state.counts.failed ? ` · ${erpNum(state.counts.failed)} failed` : "") +
     (state.counts.done < state.counts.total ? ` · ${erpNum(state.counts.total - state.counts.done)} not reached` : "");
 
-  const record = (id, ok, note) => {
-    state.results.push({ shipment_id: id, ok: !!ok, note: String(note).slice(0, 480), at: new Date().toISOString() });
+  const record = (id, ok, note, shots) => {
+    state.results.push({ shipment_id: id, ok: !!ok, note: String(note).slice(0, 480), at: new Date().toISOString(), shots: shots || [] });
     state.counts.done++;
     if (ok) state.counts.ok++; else state.counts.failed++;
     erpLog(`Get Invoice · ${id} · ${note}`, ok ? "info" : "warn");
@@ -5317,15 +5348,36 @@ async function erpGetInvoices(optsJson) {
     const one = async (id) => {
       let clicked = false;
       let emitted = false;
+      let shot = false;
       const out = {
-        parts: [], failure: null, paused: false,
+        parts: [], failure: null, paused: false, shots: [],
         fail(text) { if (!this.failure) this.failure = text; },
+        // One screenshot per shipment, kept with its result. Never this
+        // shipment's failure: no picture is a warning line, nothing more.
+        async shoot() {
+          if (shot || !shotsOn || stopRequested) return;
+          shot = true;
+          try {
+            const r = await erpHandOffShot(id);
+            if (r && r.ok && Array.isArray(r.shots) && r.shots.length) {
+              this.shots = r.shots.map(String).slice(0, 6);
+            } else if (r && r.noAnswer) {
+              // A browser service from before screenshots: wait for it once only.
+              shotsOn = false;
+              erpLog(`Get Invoice · ${id} · no screenshot (${r.error}) — carrying on without screenshots for the rest of this job`, "warn");
+            } else if (!r || r.error !== "stopped") {
+              erpLog(`Get Invoice · ${id} · no screenshot (${String((r && r.error) || "nothing was captured").slice(0, 200)})`, "warn");
+            }
+          } catch (e) {
+            erpLog(`Get Invoice · ${id} · no screenshot (${String(e?.message || e).slice(0, 200)})`, "warn");
+          }
+        },
         emit() {
           if (emitted) return;
           emitted = true;
           // A failure after the click says so: running it again would click twice.
           const tail = this.failure && clicked ? "the button was clicked" : null;
-          record(id, !this.failure, [this.failure, ...this.parts, tail].filter(Boolean).join(" · ") || "Nothing visible changed");
+          record(id, !this.failure, [this.failure, ...this.parts, tail].filter(Boolean).join(" · ") || "Nothing visible changed", this.shots);
         },
       };
       try {
@@ -5352,6 +5404,11 @@ async function erpGetInvoices(optsJson) {
         clicked = true;
         const seen = await giObserve(before, state);
 
+        // The record of what FreightPOP showed. With a dialog open it is taken
+        // in giSettleDialogs, once a progress message has become the result and
+        // before anything is closed; with none, now, while a message is still up.
+        if (!giVisible(GI_DIALOG_SELECTOR).some((d) => !before.dialogs.has(d))) await out.shoot();
+
         // What the browser service saw.
         for (const n of state.notes.splice(0)) {
           if (n.kind === "window") out.parts.push("A new window opened");
@@ -5371,6 +5428,8 @@ async function erpGetInvoices(optsJson) {
 
         for (const [d, text] of seen.dialogs) if (!giStillOpen(d)) out.parts.push(`"${text}" was shown, then went away`);
         await giSettleDialogs(id, before, out);
+        // Only progress messages that went away by themselves: the page as it is now.
+        await out.shoot();
 
         if (seen.href) {
           out.parts.push(`The page went to ${(window.location.hash || window.location.pathname).slice(0, 80)}`);

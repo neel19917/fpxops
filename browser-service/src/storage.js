@@ -1,6 +1,7 @@
 // Supabase Storage for the Excel files of an ERP pull / approval check:
 // private bucket "erp-pulls", objects at <audit_id>/<name>.xlsx (approval
-// check: recently-approved.xlsx and audit-history.xlsx). Written with
+// check: recently-approved.xlsx and audit-history.xlsx). Get-invoices
+// screenshots go beside them: <audit_id>/invoices/<shipment>-<n>.png. Written with
 // the service-role key, like runs.js / settings.js write their tables.
 // No dependency: node's fetch.
 const SB_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
@@ -47,7 +48,12 @@ async function createBucket() {
 
 // Store one .xlsx at `objectPath` in the bucket (replaces a file already there).
 // → { path, bytes }. Throws a short readable Error on any failure.
-export async function saveExcel(objectPath, buf) {
+export function saveExcel(objectPath, buf) {
+  return saveFile(objectPath, buf, XLSX_TYPE);
+}
+
+// The same for any file: `contentType` is what it is served back as.
+export async function saveFile(objectPath, buf, contentType) {
   if (!storageEnabled) throw new Error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set");
   const clean = String(objectPath || "").split("/").filter(Boolean);
   if (!clean.length) throw new Error("Supabase Storage: no object path given");
@@ -59,7 +65,7 @@ export async function saveExcel(objectPath, buf) {
   try {
     res = await fetch(`${SB_URL}/storage/v1/object/${ERP_BUCKET}/${clean.map(encodeURIComponent).join("/")}`, {
       method: "POST",
-      headers: { ...auth(), "x-upsert": "true", "content-type": XLSX_TYPE },
+      headers: { ...auth(), "x-upsert": "true", "content-type": contentType || "application/octet-stream" },
       body: buf,
       signal: AbortSignal.timeout(120_000),
     });

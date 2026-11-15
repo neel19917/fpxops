@@ -258,6 +258,20 @@ export function downloadAuditExcel(auditId: string, which: AuditExcelWhich): Pro
   return downloadExcel(`/api/audits/invoice/${encodeURIComponent(auditId)}/excel?which=${which}`, `freightpop-${which}.xlsx`, "No Excel file was kept for this pull.");
 }
 
+/** One saved screenshot of the invoice FreightPOP showed when Get Invoice was pressed (signed in). */
+export async function fetchInvoiceShot(auditId: string, file: string): Promise<Blob> {
+  const token = await getAccessTokenOrWait();
+  const res = await fetch(`${apiUrl}/api/audits/invoice/${encodeURIComponent(auditId)}/invoice-shot?file=${encodeURIComponent(file)}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    if (body?.error) throw new Error(String(body.error));
+    throw new Error(res.status === 404 ? "This screenshot was not kept." : `The server returned ${res.status}`);
+  }
+  return res.blob();
+}
+
 async function downloadExcel(path: string, fallbackName: string, missing: string): Promise<void> {
   const token = await getAccessTokenOrWait();
   const res = await fetch(`${apiUrl}${path}`, {

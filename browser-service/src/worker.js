@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { readXlsx } from "./xlsxRead.js";
 import { filterSortXlsx, writeXlsx } from "./xlsxWrite.js";
-import { saveExcel, storageEnabled } from "./storage.js";
+import { saveExcel, saveFile, storageEnabled } from "./storage.js";
 import { recordScrape } from "./usage.js";
 import { recordRun } from "./runs.js";
 import { reindexAssistant } from "./assistant.js";
@@ -1325,6 +1325,62 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
 
   let promptOpen = false; // a browser confirm / prompt is on screen: the page is frozen
   let lastPauseId = 0;
+  // Windows the click opened that are still open: { t, shot } — `shot` once a
+  // screenshot has taken them in. Filled and emptied by onTarget in setup.
+  const children = [];
+  let shooting = false;   // a screenshot is being taken: child windows stay open for it
+  let pageShoots = false; // the extension asks for screenshots (4.24 or later)
+
+  // A PNG of one page as it is on screen. Bounded: a window Chrome isn't
+  // drawing, or one frozen by a browser prompt, can take very long.
+  const png = async (p) => {
+    let timer;
+    const buf = await Promise.race([
+      p.screenshot({ type: "png" }).catch(() => null),
+      new Promise((r) => { timer = setTimeout(r, 15_000, null); }),
+    ]);
+    clearTimeout(timer);
+    return buf && buf.length ? Buffer.from(buf) : null;
+  };
+  // The record of what FreightPOP showed for one shipment: the page itself,
+  // then any window the click opened — 3 pictures at most. Kept in storage at
+  // <audit id>/invoices/<shipment>-<n>.png. → the answer for fpxErpShotDone().
+  const takeShots = async (page, shipmentId) => {
+    if (!storageEnabled) return { ok: false, error: "storage is not configured" };
+    const safe = String(shipmentId ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "shipment";
+    shooting = true;
+    try {
+      const bufs = [];
+      const main = page.isClosed() ? null : await png(page);
+      if (main) bufs.push(main);
+      for (const c of children.filter((x) => !x.shot)) {
+        if (bufs.length >= 3) break;
+        c.shot = true;
+        const p = await c.t.page().catch(() => null);
+        const buf = p && !p.isClosed() ? await png(p) : null;
+        if (buf) bufs.push(buf);
+      }
+      if (!bufs.length) return { ok: false, error: "the screenshot could not be taken" };
+      const shots = [];
+      let bytes = 0, failed = null;
+      for (let i = 0; i < bufs.length; i++) {
+        const rel = `invoices/${safe}-${i + 1}.png`;
+        try {
+          await saveFile(`${gi.auditId}/${rel}`, bufs[i], "image/png");
+          shots.push(rel);
+          bytes += bufs[i].length;
+        } catch (e) { failed = e.message; }
+      }
+      if (!shots.length) return { ok: false, error: String(failed || "the screenshot could not be saved").slice(0, 300) };
+      logLine(lane, `Get Invoice · ${shipmentId} · screenshot saved (${shots.length} image${shots.length === 1 ? "" : "s"}, ${(bytes / 1048576).toFixed(1)} MB)${failed ? ` · ${bufs.length - shots.length} more could not be saved (${String(failed).slice(0, 160)})` : ""}`, failed ? "warn" : "info");
+      return { ok: true, shots };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e).slice(0, 300) };
+    } finally {
+      shooting = false;
+    }
+  };
+
   let note;
   try {
     note = await runPageJob(lane, browser, url, who, {
@@ -1336,6 +1392,9 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
       blocked: () => promptOpen,
       setup: async ({ page, cdp, ext }) => {
         let ended = false;
+        // An extension from before screenshots never asks for one: its
+        // windows are closed after 8 s, as they always were.
+        pageShoots = (await ext.evaluate("typeof fpxErpShotDone === 'function'").catch(() => ({ value: false }))).value === true;
         const tell = (n) => ext.evaluate(`fpxErpNote(${JSON.stringify(n)})`, { awaitPromise: false }).catch(() => {});
 
         // Browser prompts freeze the page until answered. An alert only has
@@ -1364,18 +1423,29 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         page.on("dialog", onDialog);
 
         // A window opened by the click: say so, then close it (closing is
-        // passive; left open they would pile up, one per shipment).
+        // passive; left open they would pile up, one per shipment). It stays
+        // open for 8 s, and after that only until this shipment's screenshot
+        // has taken it in — 30 s in all at most.
         const onTarget = async (t) => {
+          let child = null;
           try {
             if (t.type() !== "page" || t.opener() !== page.target()) return;
+            child = { t, shot: false };
+            children.push(child);
             tell({ kind: "window" });
             await sleep(8000);
+            for (let i = 0; i < 44 && !ended && (shooting || (pageShoots && !child.shot)); i++) await sleep(500);
+            while (shooting && !ended) await sleep(250); // never closed in the middle of its picture
             let where = "";
             try { const u = new URL(t.url()); where = u.protocol.startsWith("http") ? u.host + u.pathname : u.protocol; } catch { /* blank */ }
             const p = await t.page().catch(() => null);
             if (p && !p.isClosed()) await p.close().catch(() => {});
             logLine(lane, `Get Invoice · the new window${where ? ` (${where.slice(0, 120)})` : ""} was closed`);
           } catch { /* the window went away by itself */ }
+          finally {
+            const at = child ? children.indexOf(child) : -1;
+            if (at >= 0) children.splice(at, 1);
+          }
         };
         browser.on("targetcreated", onTarget);
 
@@ -1402,12 +1472,20 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
           fs.rmSync(dir, { recursive: true, force: true });
         };
       },
-      onPoll: async (r) => {
+      onPoll: async (r, { page, ext }) => {
         if (r.results?.length) {
           unsaved.push(...r.results.map((x) => ({
             shipment_id: String(x.shipment_id), ok: x.ok === true, note: String(x.note || "").slice(0, 500), at: x.at || new Date().toISOString(),
+            shots: (Array.isArray(x.shots) ? x.shots : []).map(String).filter((p) => /^invoices\/[A-Za-z0-9_.-]+\.png$/.test(p)).slice(0, 6),
           })));
           await save();
+        }
+        // The page wants a screenshot of what FreightPOP is showing for this
+        // shipment, before it closes anything. A failure is logged by the page.
+        if (r.shot && !r.done) {
+          const answer = await takeShots(page, r.shot.shipment_id);
+          await ext.evaluate(`fpxErpShotDone(${JSON.stringify(answer)})`).catch(() => {});
+          return true;
         }
         // The page asks for a pause: the same pause as the button, with its line.
         if (r.pause && r.pause.id > lastPauseId && !r.done) {

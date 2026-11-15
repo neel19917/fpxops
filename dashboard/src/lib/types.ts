@@ -278,6 +278,8 @@ export interface GetInvoiceState {
   by?: string | null;
   requested_at?: string | null;
   request_id?: string | null;
+  /** Screenshots of the invoice FreightPOP showed when Get Invoice was pressed, e.g. "invoices/12970098-1.png". */
+  shots?: string[] | null;
 }
 
 export interface InvoiceAuditRow {
