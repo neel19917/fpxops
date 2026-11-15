@@ -5034,8 +5034,8 @@ function giReadDialog(dIn) {
 // Each is opened, read, photographed and closed again, for the audit record.
 // A button that sends, creates or changes anything is never clicked: it is
 // listed in the record as left alone.
-const VB_NEVER = /e-?mail|send|generate|request|edit|save|delete|remove|cancel|void|\badd\b|submit|update|create|approve|reject|upload|\bbook\b|duplicate|\bcopy\b|return|non-?conformance|dispute|pay\b|re-?rate|reship|\bship\b(?! ?date)/i;
-const VB_SHOW = /^(print\b.*|view\b.*|download\b.*|show\b.*|see\b.*|change log|details|documents?|notes?|history|track(ing)?\b.*|pod|bol|labels?|invoice|attachments?)$/i;
+const VB_NEVER = /e-?mail|send|generate|request|edit|save|delete|remove|cancel|void|\badd\b|submit|update|create|approve|reject|upload|\bbook\b|duplicate|\bcopy\b|return|non-?conformance|claim|dispute|pay\b|re-?rate|reship|\bship\b(?! ?date)/i;
+const VB_SHOW = /^(print\b.*|view\b.*|download\b.*|show\b.*|see\b.*|change log|(.+ )?details|documents?|(.+ )?notes?|history|track(ing)?\b.*|pod|bol|labels?|invoice|attachments?)$/i;
 const VB_BUTTONS = "button, a, input[type='button'], [role='button'], [role='tab'], .btn, [ng-click], [onclick], .nav-tabs li, .k-tabstrip-items li";
 const VB_DIALOGS = ".modal.in, .modal.show, .k-window, [role='dialog'], [role='alertdialog'], .bootbox, .ui-dialog, .popover, .k-animation-container";
 const vbClean = (t) => String(t || "").replace(/\s+/g, " ").trim();
@@ -5084,7 +5084,7 @@ async function vbRun(id, d, state, shots) {
     else if (!VB_SHOW.test(b.label)) list.push({ label: b.label, did: "left alone: not known to be view-only" });
     else list.push({ label: b.label, did: "todo" });
   }
-  let n = 0;
+  let n = 0, stuck = 0;
   for (const item of list) {
     if (item.did !== "todo") continue;
     if (stopRequested || n >= 14) { item.did = "not reached"; continue; }
@@ -5109,7 +5109,8 @@ async function vbRun(id, d, state, shots) {
     if (box) {
       // Let it fill in before it is read.
       let last = -1;
-      for (let i = 0; i < 12 && !stopRequested; i++) { const len = (box.innerText || "").length; if (len === last && len > 0) break; last = len; await sleep(500); }
+      let calm = 0;
+      for (let i = 0; i < 16 && calm < 3 && !stopRequested; i++) { const len = (box.innerText || "").length; calm = len === last && len > 0 ? calm + 1 : 0; last = len; await sleep(500); }
       Object.assign(item, vbReadEl(box));
     } else if (changed && !win) {
       const after = giDialogRoots(d).map((r) => r.innerText || "").join("\n");
@@ -5126,12 +5127,32 @@ async function vbRun(id, d, state, shots) {
     if (box && vbSeen(box)) {
       const closer = [...box.querySelectorAll("button, a, [role='button'], .close, .k-window-action")].filter(vbSeen)
         .find((x) => GI_PASSIVE.test(vbLabel(x)) || /\bclose\b|k-i-close|k-window-action/i.test(String(x.className || "") + " " + (x.getAttribute("aria-label") || "")));
-      if (closer) { simulateClick(closer); for (let i = 0; i < 10 && vbSeen(box); i++) await sleep(300); }
-      if (vbSeen(box)) {
-        // Still open and nothing passive closes it: stop here, the view itself is closed next.
-        item.did = "opened (its panel could not be closed, so the remaining buttons were not opened)";
-        for (const rest of list) if (rest.did === "todo") rest.did = "not reached";
-        break;
+      const gone = async () => { for (let i = 0; i < 8 && vbSeen(box); i++) await sleep(300); return !vbSeen(box); };
+      let shut = false;
+      if (closer) { simulateClick(closer); shut = await gone(); }
+      // No Close of its own: its dismiss control, then Escape, then the button that opened it.
+      if (!shut) {
+        const x = [...box.querySelectorAll("[data-dismiss], [data-bs-dismiss], .close, .k-i-close, .k-i-x, [aria-label='Close']")].filter(vbSeen)[0];
+        if (x) { simulateClick(x); shut = await gone(); }
+      }
+      if (!shut) {
+        for (const type of ["keydown", "keyup"]) {
+          const ev = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
+          try { box.dispatchEvent(new KeyboardEvent(type, ev)); box.ownerDocument.dispatchEvent(new KeyboardEvent(type, ev)); } catch { /* next way */ }
+        }
+        shut = await gone();
+      }
+      if (!shut) {
+        const again = vbFind(d).find((x) => x.label === item.label);
+        if (again && !box.contains(again.el)) { simulateClick(again.el); shut = await gone(); }
+      }
+      if (!shut) {
+        stuck++;
+        item.did = "opened (its panel stayed open until the view was closed)";
+        if (stuck >= 3) {
+          for (const rest of list) if (rest.did === "todo") rest.did = "not reached";
+          break;
+        }
       }
     }
   }
