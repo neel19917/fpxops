@@ -4985,14 +4985,34 @@ function fpxErpShotDone(resp) {
 const GI_SHOT_STEPS = 150;
 // What a dialog says, in a form that can be stored and searched: its text,
 // its fields (label → value), its tables and its tab names. Read only.
-function giReadDialog(d) {
+// The whole window a dialog element belongs to, and the documents of any
+// frames inside it that can be read (the content is often in one).
+function giDialogRoots(d) {
+  const root = d.closest(".modal, .k-window, [role='dialog'], .modal-dialog, .ui-dialog") || d;
+  const roots = [root];
+  for (const f of root.querySelectorAll("iframe")) {
+    try { if (f.contentDocument && f.contentDocument.body) roots.push(f.contentDocument.body); } catch { /* another site: not readable */ }
+  }
+  return roots;
+}
+const giDialogChars = (d) => giDialogRoots(d).reduce((n, r) => n + String(r.innerText || "").length, 0);
+
+function giReadDialog(dIn) {
+  const roots = giDialogRoots(dIn);
+  const frames = [...roots[0].querySelectorAll("iframe")].map((f) => String(f.src || "").slice(0, 300)).filter(Boolean);
+  // One reader over the window and its frames.
+  const d = {
+    querySelectorAll: (sel) => roots.flatMap((r) => [...r.querySelectorAll(sel)]),
+    querySelector: (sel) => { for (const r of roots) { const hit = r.querySelector(sel); if (hit) return hit; } return null; },
+    get innerText() { return roots.map((r) => r.innerText || "").join("\n"); },
+  };
   const clean = (t) => String(t || "").replace(/[ \t\u00a0]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
   const fields = {};
   for (const el of d.querySelectorAll("input, select, textarea")) {
     if (["hidden", "button", "submit", "password", "file"].includes(el.type)) continue;
     let label = "";
     if (el.id) { const l = d.querySelector(`label[for="${CSS.escape(el.id)}"]`); if (l) label = clean(l.textContent); }
-    if (!label) { const l = el.closest("label") || (el.closest(".form-group, .control-group, td, .row") || d).querySelector("label"); if (l) label = clean(l.textContent); }
+    if (!label) { const box = el.closest(".form-group, .control-group, td, .row"); const l = el.closest("label") || (box ? box.querySelector("label") : null); if (l) label = clean(l.textContent); }
     if (!label) label = el.getAttribute("placeholder") || el.getAttribute("ng-model") || el.name || el.id || "";
     label = clean(label).slice(0, 80);
     if (!label) continue;
@@ -5003,12 +5023,12 @@ function giReadDialog(d) {
     fields[key] = value.slice(0, 2000);
   }
   const tables = [];
-  for (const t of [...d.querySelectorAll("table")].slice(0, 30)) {
+  for (const t of d.querySelectorAll("table").slice(0, 40)) {
     const rows = [...t.rows].slice(0, 300).map((r) => [...r.cells].map((c) => clean(c.innerText).slice(0, 500))).filter((r) => r.some(Boolean));
     if (rows.length) tables.push(rows);
   }
-  const tabs = [...new Set([...d.querySelectorAll("[role='tab'], .nav-tabs a, .k-tabstrip-items .k-item, .k-tabstrip-items li")].map((x) => clean(x.textContent)).filter(Boolean))].slice(0, 30);
-  return { url: window.location.href.slice(0, 300), text: clean(d.innerText).slice(0, 300000), fields, tables, tabs };
+  const tabs = [...new Set(d.querySelectorAll("[role='tab'], .nav-tabs a, .k-tabstrip-items .k-item, .k-tabstrip-items li").map((x) => clean(x.textContent)).filter(Boolean))].slice(0, 30);
+  return { url: window.location.href.slice(0, 300), frames, text: clean(d.innerText).slice(0, 300000), fields, tables, tabs };
 }
 function fpxErpTakeView() {
   const v = fpxErp && fpxErp.viewDetail;
@@ -5407,7 +5427,17 @@ async function erpGetInvoices(optsJson) {
             // What the shipment view says, for the browser service to store.
             try {
               const d = giVisible(GI_DIALOG_SELECTOR).filter((x) => !before.dialogs.has(x)).pop();
-              if (d) state.viewDetail = giReadDialog(d);
+              if (d) {
+                // The view fills in after it opens: wait until its text has stopped growing (12 s at most).
+                let last = -1, calm = 0;
+                for (let i = 0; i < 24 && calm < 3 && !stopRequested; i++) {
+                  const n = giDialogChars(d);
+                  calm = n === last && n > 40 ? calm + 1 : 0;
+                  last = n;
+                  await sleep(500);
+                }
+                state.viewDetail = giReadDialog(d);
+              }
             } catch (e) { erpLog(`View Shipment · ${id} · could not read the view (${String(e?.message || e).slice(0, 120)})`, "warn"); }
             const r = await erpHandOffShot(id, "view");
             if (r && r.ok && Array.isArray(r.shots) && r.shots.length) out.shots = [...out.shots, ...r.shots.map(String)].slice(0, 6);
