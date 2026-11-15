@@ -4983,6 +4983,39 @@ function fpxErpShotDone(resp) {
 // ~45 s, counted in steps like GI_OBSERVE_STEPS: a browser prompt freezes the
 // page (and the browser service's polling), which must not look like "no answer".
 const GI_SHOT_STEPS = 150;
+// What a dialog says, in a form that can be stored and searched: its text,
+// its fields (label → value), its tables and its tab names. Read only.
+function giReadDialog(d) {
+  const clean = (t) => String(t || "").replace(/[ \t\u00a0]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+  const fields = {};
+  for (const el of d.querySelectorAll("input, select, textarea")) {
+    if (["hidden", "button", "submit", "password", "file"].includes(el.type)) continue;
+    let label = "";
+    if (el.id) { const l = d.querySelector(`label[for="${CSS.escape(el.id)}"]`); if (l) label = clean(l.textContent); }
+    if (!label) { const l = el.closest("label") || (el.closest(".form-group, .control-group, td, .row") || d).querySelector("label"); if (l) label = clean(l.textContent); }
+    if (!label) label = el.getAttribute("placeholder") || el.getAttribute("ng-model") || el.name || el.id || "";
+    label = clean(label).slice(0, 80);
+    if (!label) continue;
+    let value = el.tagName === "SELECT" ? clean((el.options[el.selectedIndex] || {}).text) : el.type === "checkbox" || el.type === "radio" ? (el.checked ? "yes" : "no") : clean(el.value);
+    if (value === "" || (el.type === "radio" && !el.checked)) continue;
+    let key = label;
+    for (let n = 2; key in fields; n++) key = `${label} (${n})`;
+    fields[key] = value.slice(0, 2000);
+  }
+  const tables = [];
+  for (const t of [...d.querySelectorAll("table")].slice(0, 30)) {
+    const rows = [...t.rows].slice(0, 300).map((r) => [...r.cells].map((c) => clean(c.innerText).slice(0, 500))).filter((r) => r.some(Boolean));
+    if (rows.length) tables.push(rows);
+  }
+  const tabs = [...new Set([...d.querySelectorAll("[role='tab'], .nav-tabs a, .k-tabstrip-items .k-item, .k-tabstrip-items li")].map((x) => clean(x.textContent)).filter(Boolean))].slice(0, 30);
+  return { url: window.location.href.slice(0, 300), text: clean(d.innerText).slice(0, 300000), fields, tables, tabs };
+}
+function fpxErpTakeView() {
+  const v = fpxErp && fpxErp.viewDetail;
+  if (fpxErp) fpxErp.viewDetail = null;
+  return JSON.stringify(v || null);
+}
+
 async function erpHandOffShot(shipmentId, tag) {
   const state = fpxErp;
   state.shotResult = null;
@@ -5371,6 +5404,11 @@ async function erpGetInvoices(optsJson) {
           async shoot() {
             if (shot || stopRequested) return;
             shot = true;
+            // What the shipment view says, for the browser service to store.
+            try {
+              const d = giVisible(GI_DIALOG_SELECTOR).filter((x) => !before.dialogs.has(x)).pop();
+              if (d) state.viewDetail = giReadDialog(d);
+            } catch (e) { erpLog(`View Shipment · ${id} · could not read the view (${String(e?.message || e).slice(0, 120)})`, "warn"); }
             const r = await erpHandOffShot(id, "view");
             if (r && r.ok && Array.isArray(r.shots) && r.shots.length) out.shots = [...out.shots, ...r.shots.map(String)].slice(0, 6);
             else erpLog(`View Shipment · ${id} · no screenshot (${String((r && r.error) || "nothing was captured").slice(0, 200)})`, "warn");

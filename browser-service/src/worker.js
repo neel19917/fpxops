@@ -1509,7 +1509,23 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         // The page wants a screenshot of what FreightPOP is showing for this
         // shipment, before it closes anything. A failure is logged by the page.
         if (r.shot && !r.done) {
+          const view = r.shot.tag === "view";
+          let detail = null;
+          if (view) {
+            try { detail = JSON.parse((await ext.evaluate("typeof fpxErpTakeView === 'function' ? fpxErpTakeView() : 'null'")).value || "null"); } catch { /* picture only */ }
+          }
           const answer = await takeShots(page, r.shot.shipment_id, r.shot.tag);
+          // The same capture as a row of fpx_shipment_records: readable and
+          // searchable, not only a picture. Never this shipment's failure.
+          if (answer.ok || detail) {
+            try {
+              const out = await api("/api/audits/erp/shipment-records", {
+                method: "POST", signal: AbortSignal.timeout(30_000),
+                body: JSON.stringify({ by: who, records: [{ shipment_id: String(r.shot.shipment_id), kind: view ? "view_shipment" : "invoice", audit_id: gi.auditId, data: detail || {}, files: answer.shots || [] }] }),
+              });
+              if (view && detail) logLine(lane, `View Shipment · ${r.shot.shipment_id} · stored · ${num(String(detail.text || "").length)} characters, ${Object.keys(detail.fields || {}).length} fields, ${(detail.tables || []).length} tables${out?.failed ? " · NOT saved" : ""}`, out?.failed ? "warn" : "info");
+            } catch (e) { logLine(lane, `Shipment record not stored (${String(e.message).slice(0, 200)})`, "warn"); }
+          }
           await ext.evaluate(`fpxErpShotDone(${JSON.stringify(answer)})`).catch(() => {});
           return true;
         }

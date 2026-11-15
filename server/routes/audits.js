@@ -591,6 +591,39 @@ auditsRouter.post("/erp/transactions", async (req, res) => {
   });
 });
 
+// POST /audits/erp/shipment-records — what the hosted browser captured for
+// shipments in FreightPOP (kept in fpx_shipment_records, one row per shipment
+// and kind; a new capture replaces the last).
+// Body: { by?, records: [{ shipment_id, kind: "view_shipment" | "invoice",
+//         audit_id?, data?: object, files?: string[] }] } (at most 50).
+// data.text, when present, is also kept in the `text` column for searching.
+// Responds { stored, failed }.
+auditsRouter.post("/erp/shipment-records", async (req, res) => {
+  const list = Array.isArray(req.body?.records) ? req.body.records.slice(0, 50) : null;
+  if (!list) return res.status(400).json({ error: "body.records must be a list" });
+  const by = String(req.body?.by || req.apiKey?.name || req.user?.email || "").trim() || null;
+  const now = new Date().toISOString();
+  const rows = [];
+  for (const r of list) {
+    const shipment_id = String(r?.shipment_id ?? "").trim();
+    const kind = String(r?.kind ?? "").trim();
+    if (!shipment_id || !["view_shipment", "invoice"].includes(kind)) continue;
+    const data = r.data && typeof r.data === "object" && !Array.isArray(r.data) ? r.data : {};
+    rows.push({
+      shipment_id, kind,
+      audit_id: isUuid(r.audit_id) ? r.audit_id : null,
+      data,
+      text: typeof data.text === "string" ? data.text.slice(0, 500_000) : null,
+      files: (Array.isArray(r.files) ? r.files : []).map(String).filter((f) => f.length < 300).slice(0, 12),
+      captured_by: by, captured_at: now,
+    });
+  }
+  if (!rows.length) return res.json({ stored: 0, failed: 0 });
+  const { error } = await supabase.from("fpx_shipment_records").upsert(rows, { onConflict: "shipment_id,kind" });
+  if (error) console.warn(`[FPX] shipment records not stored: ${error.message}`);
+  res.json({ stored: error ? 0 : rows.length, failed: error ? rows.length : 0, ...(error ? { error: error.message } : {}) });
+});
+
 // GET /audits/erp/master?which=transactions|approvals[&format=json]
 // A master Excel workbook of everything kept from FreightPOP, in FreightPOP's
 // own export columns and column order: every shipment (transactions) or every
