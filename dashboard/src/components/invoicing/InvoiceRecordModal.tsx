@@ -212,7 +212,7 @@ export function InvoiceRecordModal({ auditId, row, onClose }: {
                   auditId={auditId}
                   file={file}
                   name={`invoice-${fileId}-${i + 1}.png`}
-                  label={many ? `Screenshot ${i + 1} of ${row.shots.length}` : "Screenshot"}
+                  label={`${/-view-\d+\.png$/.test(file) ? "View Shipment" : "Get Invoice"} · ${/-1\.png$/.test(file) ? "FreightPOP page" : "window it opened"}${many ? ` · ${i + 1} of ${row.shots.length}` : ""}`}
                 />
               ))}
             </div>

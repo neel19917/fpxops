@@ -1333,10 +1333,11 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
 
   // A PNG of one page as it is on screen. Bounded: a window Chrome isn't
   // drawing, or one frozen by a browser prompt, can take very long.
-  const png = async (p) => {
+  const png = async (p, fullPage = false) => {
     let timer;
     const buf = await Promise.race([
-      p.screenshot({ type: "png" }).catch(() => null),
+      // A window the click opened is captured whole (the invoice can be longer than the screen).
+      p.screenshot({ type: "png", fullPage }).catch(() => null),
       new Promise((r) => { timer = setTimeout(r, 15_000, null); }),
     ]);
     clearTimeout(timer);
@@ -1345,7 +1346,10 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
   // The record of what FreightPOP showed for one shipment: the page itself,
   // then any window the click opened — 3 pictures at most. Kept in storage at
   // <audit id>/invoices/<shipment>-<n>.png. → the answer for fpxErpShotDone().
-  const takeShots = async (page, shipmentId) => {
+  // tag "view": the record of VIEW SHIPMENT, kept beside the Get Invoice one.
+  const takeShots = async (page, shipmentId, tag) => {
+    const kind = tag === "view" ? "view-" : "";
+    const what = tag === "view" ? "View Shipment" : "Get Invoice";
     if (!storageEnabled) return { ok: false, error: "storage is not configured" };
     const safe = String(shipmentId ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "shipment";
     shooting = true;
@@ -1357,14 +1361,14 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         if (bufs.length >= 3) break;
         c.shot = true;
         const p = await c.t.page().catch(() => null);
-        const buf = p && !p.isClosed() ? await png(p) : null;
+        const buf = p && !p.isClosed() ? await png(p, true) : null;
         if (buf) bufs.push(buf);
       }
       if (!bufs.length) return { ok: false, error: "the screenshot could not be taken" };
       const shots = [];
       let bytes = 0, failed = null;
       for (let i = 0; i < bufs.length; i++) {
-        const rel = `invoices/${safe}-${i + 1}.png`;
+        const rel = `invoices/${safe}-${kind}${i + 1}.png`;
         try {
           await saveFile(`${gi.auditId}/${rel}`, bufs[i], "image/png");
           shots.push(rel);
@@ -1372,7 +1376,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         } catch (e) { failed = e.message; }
       }
       if (!shots.length) return { ok: false, error: String(failed || "the screenshot could not be saved").slice(0, 300) };
-      logLine(lane, `Get Invoice · ${shipmentId} · screenshot saved (${shots.length} image${shots.length === 1 ? "" : "s"}, ${(bytes / 1048576).toFixed(1)} MB)${failed ? ` · ${bufs.length - shots.length} more could not be saved (${String(failed).slice(0, 160)})` : ""}`, failed ? "warn" : "info");
+      logLine(lane, `${what} · ${shipmentId} · screenshot saved (${shots.length} image${shots.length === 1 ? "" : "s"}, ${(bytes / 1048576).toFixed(1)} MB)${failed ? ` · ${bufs.length - shots.length} more could not be saved (${String(failed).slice(0, 160)})` : ""}`, failed ? "warn" : "info");
       return { ok: true, shots };
     } catch (e) {
       return { ok: false, error: String(e?.message || e).slice(0, 300) };
@@ -1483,7 +1487,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         // The page wants a screenshot of what FreightPOP is showing for this
         // shipment, before it closes anything. A failure is logged by the page.
         if (r.shot && !r.done) {
-          const answer = await takeShots(page, r.shot.shipment_id);
+          const answer = await takeShots(page, r.shot.shipment_id, r.shot.tag);
           await ext.evaluate(`fpxErpShotDone(${JSON.stringify(answer)})`).catch(() => {});
           return true;
         }

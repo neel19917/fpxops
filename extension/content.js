@@ -4983,10 +4983,10 @@ function fpxErpShotDone(resp) {
 // ~45 s, counted in steps like GI_OBSERVE_STEPS: a browser prompt freezes the
 // page (and the browser service's polling), which must not look like "no answer".
 const GI_SHOT_STEPS = 150;
-async function erpHandOffShot(shipmentId) {
+async function erpHandOffShot(shipmentId, tag) {
   const state = fpxErp;
   state.shotResult = null;
-  state.wantShot = { shipment_id: String(shipmentId) };
+  state.wantShot = { shipment_id: String(shipmentId), ...(tag ? { tag } : {}) };
   for (let step = 0; step < GI_SHOT_STEPS; step++) {
     if (state.shotResult) { const r = state.shotResult; state.shotResult = null; return r; }
     if (stopRequested) { state.wantShot = null; return { ok: false, error: "stopped" }; }
@@ -5127,20 +5127,21 @@ async function giFindRow(id, st) {
 }
 
 // The GET INVOICE control of a row. → { el } or { error }
-function giFindButton(pair) {
+// `want` / `name`: which button (GET INVOICE unless told otherwise).
+function giFindButton(pair, want = /^getinvoices?$/, name = "Get Invoice") {
   const rows = pair.buttonRow === pair.dataRow ? [pair.dataRow] : [pair.buttonRow, pair.dataRow];
   const label = (b) => String(b.textContent || b.value || b.title || b.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
   const all = [];
   for (const row of rows) for (const b of row.querySelectorAll("a, button, input[type='button'], input[type='submit'], [role='button']")) all.push(b);
-  const hit = all.find((b) => /^getinvoices?$/.test(label(b).toLowerCase().replace(/[^a-z]/g, "")));
+  const hit = all.find((b) => want.test(label(b).toLowerCase().replace(/[^a-z]/g, "")));
   if (!hit) {
     const texts = [...new Set(all.map(label).filter(Boolean))].slice(0, 8);
-    return { error: `No Get Invoice button on this row (buttons: ${texts.join(", ") || "none"})` };
+    return { error: `No ${name} button on this row (buttons: ${texts.join(", ") || "none"})` };
   }
   if (hit.disabled || hit.hasAttribute("disabled") || hit.getAttribute("aria-disabled") === "true" || /(^|\s)(disabled|k-state-disabled)(\s|$)/.test(String(hit.className || ""))) {
-    return { error: "The Get Invoice button is disabled on this row" };
+    return { error: `The ${name} button is disabled on this row` };
   }
-  if (!isVisibleForClick(hit)) return { error: "The Get Invoice button is hidden on this row" };
+  if (!isVisibleForClick(hit)) return { error: `The ${name} button is hidden on this row` };
   return { el: hit, text: label(hit) };
 }
 
@@ -5345,6 +5346,61 @@ async function erpGetInvoices(optsJson) {
     };
 
     // One shipment. → true when the job paused for a person along the way.
+    // A second record for the shipment: the same row's VIEW SHIPMENT, opened,
+    // photographed, and closed again. Nothing here is the shipment's failure;
+    // what happened is added to its note.
+    const viewShipment = async (id, out) => {
+      if (!shotsOn || stopRequested) return;
+      const said = [];
+      try {
+        const row = giReportOnScreen() ? giRowsFor(id, true).rows[0] : null;
+        if (!row) { out.parts.push("View Shipment: the row is no longer in the list"); return; }
+        const vb = giFindButton(row, /^viewshipments?$/, "View Shipment");
+        if (vb.error) { out.parts.push(`View Shipment: ${vb.error}`); return; }
+        await erpCheckpoint();
+        const before = giSnapshot();
+        state.notes.length = 0;
+        try { vb.el.scrollIntoView({ block: "center", inline: "nearest" }); } catch { /* not needed for the click */ }
+        simulateClick(vb.el);
+        const seen = await giObserve(before, state);
+        let shot = false;
+        const sub = {
+          parts: said, paused: false,
+          fail(text) { said.push(text); },
+          emit() {},
+          async shoot() {
+            if (shot || stopRequested) return;
+            shot = true;
+            const r = await erpHandOffShot(id, "view");
+            if (r && r.ok && Array.isArray(r.shots) && r.shots.length) out.shots = [...out.shots, ...r.shots.map(String)].slice(0, 6);
+            else erpLog(`View Shipment · ${id} · no screenshot (${String((r && r.error) || "nothing was captured").slice(0, 200)})`, "warn");
+          },
+        };
+        // A window or a new page gets a moment to draw before the picture.
+        if (!giVisible(GI_DIALOG_SELECTOR).some((d) => !before.dialogs.has(d))) { await sleep(2500); await sub.shoot(); }
+        for (const n of state.notes.splice(0)) if (n.kind === "window") said.push("a new window opened");
+        await giSettleDialogs(id, before, sub);
+        await sub.shoot();
+        if (seen.href) {
+          said.push(`the page went to ${(window.location.hash || window.location.pathname).slice(0, 80)}`);
+          if (erpLoginExpired()) throw loginGone();
+          if (!giReportOnScreen()) {
+            history.back();
+            for (let i = 0; i < 20 && !giReportOnScreen(); i++) await sleep(500);
+          }
+        }
+        if (!giReportOnScreen()) {
+          erpLog("View Shipment left the report — generating it again", "warn");
+          await openReport();
+        }
+        if (sub.paused) out.paused = true;
+        out.parts.push(`View Shipment: ${said.join(" · ") || "captured"}`);
+      } catch (e) {
+        if (e && (e.fpxStop || e.fpxFatal)) throw e;
+        out.parts.push(`View Shipment: ${String(e?.message || e).slice(0, 160)}`);
+      }
+    };
+
     const one = async (id) => {
       let clicked = false;
       let emitted = false;
@@ -5455,6 +5511,7 @@ async function erpGetInvoices(optsJson) {
           else if (nowBtn.text !== btn.text) out.parts.push(`The button now reads "${nowBtn.text}"`);
           else if (seen.loading) out.parts.push("The list reloaded");
         }
+        if (!out.failure) await viewShipment(id, out);
         return out.paused;
       } catch (e) {
         if (e && (e.fpxStop || e.fpxFatal)) {
