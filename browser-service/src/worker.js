@@ -480,6 +480,69 @@ export function enqueueScheduled(schedule) {
   return { queued: true, job };
 }
 
+// ── Daily mirror ────────────────────────────────────────────────────────────
+// Keeps the Supabase copy of FreightPOP's invoicing data current without
+// anyone pressing a button: the regular 3-month pull (non-parcel, makes the
+// audit the Invoicing page reads), the same range for parcel (rows only),
+// then the approval check against that new audit, then the master files.
+// Runs as the person who last ran a pull by hand (their hosted FreightPOP
+// login); remembered in a file beside the schedules.
+const MIRROR_FILE = path.join(path.dirname(config.profileRoot), "invoicing-mirror.json");
+let mirror = {};
+try { mirror = JSON.parse(fs.readFileSync(MIRROR_FILE, "utf8")) || {}; } catch { mirror = {}; }
+function saveMirror() {
+  try { fs.mkdirSync(path.dirname(MIRROR_FILE), { recursive: true }); fs.writeFileSync(MIRROR_FILE, JSON.stringify(mirror, null, 2)); }
+  catch (e) { console.warn("[mirror] save failed:", e.message); }
+}
+export function mirrorState() { return { owner: mirror.owner || null, lastQueuedAt: mirror.lastQueuedAt || null }; }
+
+export function enqueueInvoicingMirror(why = "daily") {
+  const owner = mirror.owner;
+  if (!owner) return { queued: false, reason: "nobody has run a pull by hand yet, so there is no FreightPOP login to run as" };
+  const lane = lanes.invoicing;
+  if (lane.current?.mirror || lane.localQueue.some((j) => j.mirror)) return { queued: false, reason: "already queued or running" };
+  const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const today = new Date();
+  const from = new Date(today.getFullYear(), today.getMonth() - 3, today.getDate());
+  const base = () => ({
+    id: `mir_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+    email: owner, source: "schedule", scheduleName: "Daily invoicing mirror", mirror: true, queuedAt: new Date().toISOString(),
+  });
+  lane.localQueue.push(
+    { ...base(), scope: "erp_audit", months: 3, shipmentType: "non-parcel", erpOpts: null },
+    { ...base(), scope: "erp_audit", months: 3, shipmentType: "parcel", erpOpts: { from: iso(from), to: iso(today), backfill: true } },
+    { ...base(), scope: "approval_check", approvalAuditId: "last-pull", refreshMasters: true },
+  );
+  mirror.lastQueuedAt = new Date().toISOString();
+  saveMirror();
+  console.log(`[mirror] queued (${why}) for ${owner}`);
+  setImmediate(() => poll(lane).catch((e) => console.error("[worker] invoicing poll error:", e.message)));
+  return { queued: true };
+}
+
+// Mon-Fri at MIRROR_TIME (default 06:00) in MIRROR_TZ (default America/Chicago).
+export function startInvoicingMirror() {
+  const at = /^\d{2}:\d{2}$/.test(process.env.MIRROR_TIME || "") ? process.env.MIRROR_TIME : "06:00";
+  const tz = process.env.MIRROR_TZ || "America/Chicago";
+  if (process.env.MIRROR_ENABLED === "0") { console.log("[mirror] disabled"); return; }
+  let fired = "";
+  const tick = () => {
+    let p;
+    try {
+      p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+        .formatToParts(new Date()).map((x) => [x.type, x.value]));
+    } catch { return; }
+    if (["Sat", "Sun"].includes(p.weekday) || `${p.hour}:${p.minute}` !== at) return;
+    const key = `${p.year}-${p.month}-${p.day}`;
+    if (fired === key) return;
+    fired = key;
+    const r = enqueueInvoicingMirror("daily");
+    console.log(`[mirror] ${key} ${at} ${tz}: ${r.queued ? "queued" : r.reason}`);
+  };
+  console.log(`[mirror] every business day at ${at} ${tz} · runs as ${mirror.owner || "(nobody yet: run one pull by hand)"}`);
+  setInterval(tick, 20_000).unref();
+}
+
 export function queuedJobs(laneName = "scrape") {
   return laneNamed(laneName).localQueue.map(({ id, email, source, scheduleId, scheduleName, queuedAt }) => ({ id, user: email, source, scheduleId, scheduleName, queuedAt }));
 }
@@ -655,14 +718,33 @@ async function runJob(lane, job) {
       if (!gi.shipmentIds.length) throw new Error("The request has no shipment ids (tracking_numbers is empty)");
       result = await runGetInvoices(lane, email, gi);
     } else if (kind === "approval_check") {
+      // The daily mirror checks the pull it has just made.
+      if (job.approvalAuditId === "last-pull") {
+        job.approvalAuditId = lane.lastAuditId || null;
+        cur.auditId = job.approvalAuditId;
+        if (!job.approvalAuditId) throw new Error("The pull before this check made no audit, so there is nothing to check approvals against");
+      }
       if (!job.approvalAuditId) throw new Error(`The request's note could not be read ("${job.requestNote || ""}") — expected audit=<id>`);
       result = await runApprovalCheck(lane, email, job.approvalAuditId, job.approvalHistory);
+      if (job.refreshMasters) {
+        for (const which of ["transactions", "approvals"]) {
+          try {
+            const m = await api(`/api/audits/erp/master?which=${which}&format=json`, { signal: AbortSignal.timeout(300_000) });
+            logLine(lane, `Master Excel refreshed · ${which} · ${num(m.rows)} rows · ${m.columns?.length || 0} columns${m.stored ? "" : " · not saved to storage"}`, m.stored ? "info" : "warn");
+          } catch (e) { logLine(lane, `Master Excel not refreshed · ${which} (${String(e.message).slice(0, 200)})`, "warn"); }
+        }
+      }
     } else {
       cur.tasksBefore = await taskSnapshot();
       result = await runRefreshAll(lane, email, job.modes || null);
     }
     ok = true; note = result;
     console.log(`[worker] ${job.id} done: ${result}`);
+    // A pull run by hand: the daily mirror runs as that person from now on.
+    if (kind === "erp_audit" && job.source === "manual" && !job.erpOpts?.backfill && email.includes("@") && mirror.owner !== email) {
+      mirror.owner = email; saveMirror();
+      console.log(`[mirror] will run as ${email}`);
+    }
   } catch (e) {
     note = e.message;
     console.error(`[worker] ${job.id} failed:`, e.message);
@@ -1168,6 +1250,7 @@ async function runErpIn(lane, browser, url, who, months, shipmentType, opts) {
         // part (the Excel export goes up whole with the first part). The page
         // already has its answer and the save is not waited for here, so a slow
         // one holds nothing up.
+        if (answer.ok && answer.audit_id) lane.lastAuditId = answer.audit_id;
         if (answer.ok && answer.audit_id && !filesSaved && lastPart) {
           filesSaved = true;
           saving = saveErpExcel(lane, answer.audit_id, usedExcel ? { files: excelFiles, total: excelRows.length } : { rows: screenRows });

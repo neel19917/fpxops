@@ -6,7 +6,7 @@ import { poolStats, closeAll, userStatus, selfTest, resetUserProfile } from "./b
 import { summary as usageSummary, flush as flushUsage } from "./usage.js";
 import { ViewerSession, egressStats, dropAllParked } from "./session.js";
 import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
-import { startScrapeWorker, workerBusy, workerState, requestStop, requestPause, requestResume, fullLog, LANES } from "./worker.js";
+import { startScrapeWorker, workerBusy, workerState, requestStop, requestPause, requestResume, fullLog, LANES, startInvoicingMirror } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
 import { chat, assistantEnabled, startAssistantIndexer, assistantIndexStatus, saveChatTurn, listChats, getChat, deleteChat } from "./assistant.js";
 
@@ -482,7 +482,7 @@ server.listen(config.port, async () => {
   console.log(`[fpx-browser] listening on :${config.port}${config.devNoAuth ? " (DEV: auth disabled)" : ""}`);
   startSettings();
   initRuns().catch((e) => console.warn("[runs] init failed:", e.message));
-  if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); }
+  if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); startInvoicingMirror(); }
   startLoginKeepAlive();
   startAssistantIndexer();
   selfTest().then((r) => {
