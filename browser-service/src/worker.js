@@ -1684,7 +1684,11 @@ export function readLooseTable(buf) {
   const at = grid.findIndex((r) => r.filter((v) => String(v).trim()).length >= 3);
   if (at < 0) return { headers: [], rows: [] };
   const headers = grid[at].map((h, i) => String(h).trim() || `Column ${i + 1}`);
-  const rows = grid.slice(at + 1).map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""]).filter(([, v]) => v !== "")));
+  // Money columns become numbers, as Excel shows them; ids, tracking and zip
+  // codes stay text so nothing is rounded or loses a leading zero.
+  const money = (h) => /amount|variance|\brate\b|charge|cost/i.test(h);
+  const cell = (h, v) => (money(h) && /^-?\d+(\.\d+)?$/.test(String(v).trim()) ? Math.round(Number(v) * 100) / 100 : v);
+  const rows = grid.slice(at + 1).map((r) => Object.fromEntries(headers.map((h, i) => [h, cell(h, r[i] ?? "")]).filter(([, v]) => v !== "")));
   return { headers, rows: rows.filter((r) => Object.keys(r).length) };
 }
 
@@ -1892,13 +1896,18 @@ const isBlank = (v) => v === undefined || v === null || String(v).trim() === "";
 function fillBlanksFromScreen(excel, screen) {
   if (!screen?.length) return { rows: excel, filled: 0 };
   const onScreen = new Map(screen.map((r) => [erpRowKey(r), r]));
+  // Only the export's own columns are filled: the screen rows also carry the
+  // grid's internal fields (rate, speed, readyTime…), which are not part of
+  // FreightPOP's Excel format and must not be added to it.
+  const columns = new Set();
+  for (const r of excel.slice(0, 200)) for (const k of Object.keys(r)) columns.add(k);
   let filled = 0;
   const rows = excel.map((r) => {
     const scr = onScreen.get(erpRowKey(r));
     if (!scr) return r;
     let out = r;
     for (const [k, v] of Object.entries(scr)) {
-      if (isBlank(out[k]) && !isBlank(v)) {
+      if (columns.has(k) && isBlank(out[k]) && !isBlank(v)) {
         if (out === r) out = { ...r };
         out[k] = v;
       }
