@@ -3724,6 +3724,21 @@ function erpLog(text, level = "info") {
 // fpx_click_log. A click on a control that sends, cancels or deletes is
 // stopped before FreightPOP sees it, whatever part of FPX made it.
 const CLICK_NEVER = /cancel shipment|request pickup|generate return|e-?mail|\bresend\b|file a claim|non-?conformance|\bdelete\b|\bvoid\b|\bdispute\b/i;
+// A control that removes a file or a row: an "x" in an upload or attachment
+// list, or anything titled Remove / Delete. Never pressed.
+function fpxRemovesSomething(el) {
+  if (!el || !el.closest) return false;
+  if (el.closest(".k-upload, .k-upload-files, .k-file, .k-upload-action, .k-delete, .k-grid-delete")) {
+    // Inside a file list only plain links (to open the file) are safe.
+    const link = el.closest("a[href]");
+    if (!link || /delete|remove/i.test(link.className + " " + (link.getAttribute("title") || "") + " " + (link.textContent || ""))) return true;
+  }
+  for (let n = el, i = 0; n && n.getAttribute && i < 4; n = n.parentElement, i++) {
+    const says = `${n.getAttribute("title") || ""} ${n.getAttribute("aria-label") || ""} ${n.getAttribute("ng-click") || ""} ${n.getAttribute("onclick") || ""} ${typeof n.className === "string" ? n.className : ""}`;
+    if (/\b(remove|delete|trash)/i.test(says) || /k-i-delete|k-i-trash|fa-trash|glyphicon-trash|glyphicon-remove/i.test(says)) return true;
+  }
+  return false;
+}
 function fpxClickTarget(e) {
   const t = e.target && e.target.closest ? e.target : null;
   if (!t) return null;
@@ -3731,7 +3746,7 @@ function fpxClickTarget(e) {
   let label = el.tagName === "INPUT" ? (el.type === "checkbox" || el.type === "radio" ? `${el.type} ${el.name || el.id || ""}` : el.value || el.placeholder || el.name || el.id) : (el.innerText || el.textContent || "");
   label = String(label || "").replace(/\s+/g, " ").trim() || el.getAttribute("title") || el.getAttribute("aria-label") || "";
   if (!label) label = `<${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${typeof el.className === "string" && el.className ? `.${el.className.trim().split(/\s+/).slice(0, 2).join(".")}` : ""}>`;
-  return { el, label: label.slice(0, 80) };
+  return { el, raw: t, label: label.slice(0, 80) };
 }
 // Kept here, not on the document: a frame's own copy of this script shares the
 // frame's document with this one, and its copy has no job to report to.
@@ -3740,7 +3755,7 @@ function fpxWatchClicks(doc) {
   if (!doc || fpxWatchedDocs.has(doc)) return;
   fpxWatchedDocs.add(doc);
   const running = () => fpxErp && !fpxErp.done;
-  const never = (hit) => hit.label.length <= 60 && CLICK_NEVER.test(hit.label);
+  const never = (hit) => (hit.label.length <= 60 && CLICK_NEVER.test(hit.label)) || fpxRemovesSomething(hit.raw);
   for (const type of ["mousedown", "mouseup", "pointerdown", "pointerup"]) {
     doc.addEventListener(type, (e) => {
       if (!running()) return;
@@ -5177,14 +5192,19 @@ async function vbRun(id, d, state, shots) {
     }
     erpLog(`View Shipment · ${id} · ${item.label} → ${item.opened}${item.files ? ` · ${item.files.length} file(s) saved` : ""}`);
     if (box && vbSeen(box)) {
+      // A panel that lists files is closed only by a button that says Close or Cancel.
+      const filePanel = /document|attach|file|upload/i.test(item.label) || !!box.querySelector(".k-upload, .k-file, input[type='file']");
+      // Only a control that says Close / Cancel, or the window's own corner button.
+      // Never an icon inside a list of files: there the same "x" removes the file.
       const closer = [...box.querySelectorAll("button, a, [role='button'], .close, .k-window-action")].filter(vbSeen)
-        .find((x) => GI_PASSIVE.test(vbLabel(x)) || /\bclose\b|k-i-close|k-window-action/i.test(String(x.className || "") + " " + (x.getAttribute("aria-label") || "")));
+        .filter((x) => !fpxRemovesSomething(x))
+        .find((x) => GI_PASSIVE.test(vbLabel(x)) || (!filePanel && (/(^|\s)close(\s|$)|k-window-action/i.test(String(x.className || "")) || /^close$/i.test(x.getAttribute("aria-label") || ""))));
       const gone = async () => { for (let i = 0; i < 8 && vbSeen(box); i++) await sleep(300); return !vbSeen(box); };
       let shut = false;
       if (closer) { simulateClick(closer); shut = await gone(); }
       // No Close of its own: its dismiss control, then Escape, then the button that opened it.
-      if (!shut) {
-        const x = [...box.querySelectorAll("[data-dismiss], [data-bs-dismiss], .close, .k-i-close, .k-i-x, [aria-label='Close']")].filter(vbSeen)[0];
+      if (!shut && !filePanel) {
+        const x = [...box.querySelectorAll("[data-dismiss], [data-bs-dismiss], [aria-label='Close']")].filter(vbSeen).filter((el) => !fpxRemovesSomething(el))[0];
         if (x) { simulateClick(x); shut = await gone(); }
       }
       if (!shut) {
