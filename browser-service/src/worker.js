@@ -1653,6 +1653,41 @@ async function kendoExport(page) {
   return { rows, headers, buf, gridTotal: Number(out.rows) || null, file: `Excel export (${(buf.length / 1024 / 1024).toFixed(1)} MB, built in ${Math.round((Date.now() - t0) / 1000)}s)`, clicked: "Export to Excel" };
 }
 
+// An "Excel" file that is really an HTML table or delimited text → { headers, rows }.
+export function readLooseTable(buf) {
+  let text = buf[0] === 0xff && buf[1] === 0xfe ? buf.toString("utf16le") : buf.toString("utf8");
+  text = text.replace(/^\uFEFF/, "");
+  let grid = [];
+  if (/<t[rdh][\s>]/i.test(text)) {
+    const un = (v) => v.replace(/<br\s*\/?>/gi, " ").replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/\s+/g, " ").trim();
+    for (const tr of text.match(/<tr[\s\S]*?<\/tr>/gi) || []) {
+      const cells = (tr.match(/<t[dh][\s\S]*?<\/t[dh]>/gi) || []).map(un);
+      if (cells.length) grid.push(cells);
+    }
+  } else {
+    const first = text.slice(0, text.indexOf("\n") + 1 || text.length);
+    const sep = (first.match(/\t/g) || []).length > (first.match(/,/g) || []).length ? "\t" : ",";
+    let row = [], cell = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+      else if (c === '"') q = true;
+      else if (c === sep) { row.push(cell); cell = ""; }
+      else if (c === "\n") { row.push(cell.replace(/\r$/, "")); grid.push(row); row = []; cell = ""; }
+      else cell += c;
+    }
+    if (cell || row.length) { row.push(cell); grid.push(row); }
+    grid = grid.filter((r) => r.some((v) => String(v).trim() !== ""));
+  }
+  // The header is the first row with several filled cells (a title line may sit above it).
+  const at = grid.findIndex((r) => r.filter((v) => String(v).trim()).length >= 3);
+  if (at < 0) return { headers: [], rows: [] };
+  const headers = grid[at].map((h, i) => String(h).trim() || `Column ${i + 1}`);
+  const rows = grid.slice(at + 1).map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""]).filter(([, v]) => v !== "")));
+  return { headers, rows: rows.filter((r) => Object.keys(r).length) };
+}
+
 // opts.buttonFirst (the Audit page): press FreightPOP's own Export To Excel
 // button and take the downloaded file. The grid's workbook is built as well,
 // as a check: a button that exports only the page on screen gives fewer rows,
@@ -1777,9 +1812,24 @@ async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
     if (saved) {
       await unhook();
       fs.rmSync(dir, { recursive: true, force: true });
-      const { headers, rows } = readXlsx(saved.buf);
+      let parsed, buf = saved.buf, file = saved.name;
+      try { parsed = readXlsx(saved.buf); }
+      catch (e) {
+        // Not an .xlsx: FreightPOP's ExportToExcel writes an HTML table or
+        // delimited text under an Excel name. Read that, and keep it as .xlsx.
+        const head = saved.buf.subarray(0, 160).toString("utf8").replace(/\s+/g, " ");
+        if (lane.current && !lane.current.exportHeadLogged) {
+          lane.current.exportHeadLogged = true;
+          logLine(lane, `FreightPOP's export "${saved.name}" is not .xlsx (${(saved.buf.length / 1024).toFixed(0)} KB) · starts: ${head}`.slice(0, 400));
+        }
+        parsed = readLooseTable(saved.buf);
+        if (!parsed.rows.length) throw new Error(`"${saved.name}" could not be read (${e.message}; starts: ${head.slice(0, 80)})`);
+        buf = writeXlsx(parsed.headers, parsed.rows);
+        file = `${saved.name} (saved as .xlsx)`;
+      }
+      const { headers, rows } = parsed;
       if (!rows.length) throw new Error(`"${saved.name}" has no rows`);
-      return { rows, headers, buf: saved.buf, file: saved.name, clicked: click.clicked };
+      return { rows, headers, buf, file, clicked: click.clicked };
     }
     const done = fs.readdirSync(dir).filter((f) => !/\.(crdownload|tmp|part)$/i.test(f));
     if (!done.length) continue;
