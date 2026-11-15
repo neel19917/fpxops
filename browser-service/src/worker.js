@@ -1354,29 +1354,51 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
     const safe = String(shipmentId ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "shipment";
     shooting = true;
     try {
-      const bufs = [];
-      const main = page.isClosed() ? null : await png(page);
-      if (main) bufs.push(main);
+      // Windows the click opened come first. A window showing a file (Get
+      // Invoice opens the invoice PDF) is kept as that file, not as a picture
+      // of it; anything else as a picture. Each is then closed, so the main
+      // page is in front again for its own picture.
+      const files = []; // { buf, name, type }
       for (const c of children.filter((x) => !x.shot)) {
-        if (bufs.length >= 3) break;
+        if (files.length >= 2) break;
         c.shot = true;
         const p = await c.t.page().catch(() => null);
-        const buf = p && !p.isClosed() ? await png(p, true) : null;
-        if (buf) bufs.push(buf);
+        let url = "";
+        try { url = c.t.url(); } catch { /* gone */ }
+        let got = null;
+        if (/^https?:/i.test(url)) {
+          try {
+            const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+            const b = res.ok ? Buffer.from(await res.arrayBuffer()) : null;
+            if (b && b.length > 200 && b.subarray(0, 5).toString("latin1") === "%PDF-") {
+              got = { buf: b, name: `${safe}-${kind}invoice${files.some((f) => f.type === "application/pdf") ? "-2" : ""}.pdf`, type: "application/pdf" };
+            }
+          } catch { /* a picture of the window instead */ }
+        }
+        if (!got && p && !p.isClosed()) {
+          const b = await png(p);
+          if (b) got = { buf: b, name: `${safe}-${kind}${files.length + 2}.png`, type: "image/png" };
+        }
+        if (got) files.push(got);
+        if (p && !p.isClosed()) await p.close().catch(() => {});
       }
-      if (!bufs.length) return { ok: false, error: "the screenshot could not be taken" };
+      if (files.length) await sleep(700);
+      const main = page.isClosed() ? null : await png(page);
+      if (main) files.unshift({ buf: main, name: `${safe}-${kind}1.png`, type: "image/png" });
+      if (!files.length) return { ok: false, error: "nothing could be captured" };
       const shots = [];
       let bytes = 0, failed = null;
-      for (let i = 0; i < bufs.length; i++) {
-        const rel = `invoices/${safe}-${kind}${i + 1}.png`;
+      for (const f of files) {
+        const rel = `invoices/${f.name}`;
         try {
-          await saveFile(`${gi.auditId}/${rel}`, bufs[i], "image/png");
+          await saveFile(`${gi.auditId}/${rel}`, f.buf, f.type);
           shots.push(rel);
-          bytes += bufs[i].length;
+          bytes += f.buf.length;
         } catch (e) { failed = e.message; }
       }
+      const bufs = files;
       if (!shots.length) return { ok: false, error: String(failed || "the screenshot could not be saved").slice(0, 300) };
-      logLine(lane, `${what} · ${shipmentId} · screenshot saved (${shots.length} image${shots.length === 1 ? "" : "s"}, ${(bytes / 1048576).toFixed(1)} MB)${failed ? ` · ${bufs.length - shots.length} more could not be saved (${String(failed).slice(0, 160)})` : ""}`, failed ? "warn" : "info");
+      logLine(lane, `${what} · ${shipmentId} · record saved (${shots.map((x) => (x.endsWith(".pdf") ? "invoice PDF" : "screenshot")).join(" + ")}, ${(bytes / 1048576).toFixed(1)} MB)${failed ? ` · ${bufs.length - shots.length} more could not be saved (${String(failed).slice(0, 160)})` : ""}`, failed ? "warn" : "info");
       return { ok: true, shots };
     } catch (e) {
       return { ok: false, error: String(e?.message || e).slice(0, 300) };
@@ -1480,7 +1502,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
         if (r.results?.length) {
           unsaved.push(...r.results.map((x) => ({
             shipment_id: String(x.shipment_id), ok: x.ok === true, note: String(x.note || "").slice(0, 500), at: x.at || new Date().toISOString(),
-            shots: (Array.isArray(x.shots) ? x.shots : []).map(String).filter((p) => /^invoices\/[A-Za-z0-9_.-]+\.png$/.test(p)).slice(0, 6),
+            shots: (Array.isArray(x.shots) ? x.shots : []).map(String).filter((p) => /^invoices\/[A-Za-z0-9_.-]+\.(png|pdf)$/.test(p)).slice(0, 6),
           })));
           await save();
         }

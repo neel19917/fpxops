@@ -69,7 +69,9 @@ function Shot({ auditId, file, name, label }: { auditId: string; file: string; n
           </button>
         </div>
       ) : (
-        <a href={state.url} target="_blank" rel="noopener noreferrer" title="Open full size in a new tab" className="block bg-slate-100 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-violet-500">
+        file.endsWith(".pdf") ? (
+          <iframe src={state.url} title={`${label}: the invoice PDF from FreightPOP`} className="block w-full h-[70vh] bg-slate-100" />
+        ) : <a href={state.url} target="_blank" rel="noopener noreferrer" title="Open full size in a new tab" className="block bg-slate-100 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-violet-500">
           <img src={state.url} alt={`${label} for this shipment's invoice`} className="block w-full h-auto cursor-zoom-in" />
         </a>
       )}
@@ -138,7 +140,6 @@ export function InvoiceRecordModal({ auditId, row, onClose }: {
   const group = approvalGroup(row.ap);
   const approved = !!group && group !== "not_approved";
   const approvedOn = approved ? approvalDate(row.ap) : "";
-  const many = row.shots.length > 1;
   const fileId = (row.shipment || "shipment").replace(/[^\w.-]+/g, "_");
 
   return createPortal(
@@ -211,8 +212,8 @@ export function InvoiceRecordModal({ auditId, row, onClose }: {
                   key={file}
                   auditId={auditId}
                   file={file}
-                  name={`invoice-${fileId}-${i + 1}.png`}
-                  label={`${/-view-\d+\.png$/.test(file) ? "View Shipment" : "Get Invoice"} · ${/-1\.png$/.test(file) ? "FreightPOP page" : "window it opened"}${many ? ` · ${i + 1} of ${row.shots.length}` : ""}`}
+                  name={file.endsWith(".pdf") ? `invoice-${fileId}.pdf` : `invoice-${fileId}-${i + 1}.png`}
+                  label={file.endsWith(".pdf") ? "Invoice PDF from FreightPOP (Get Invoice)" : `${/-view-\d+\.png$/.test(file) ? "View Shipment" : "Get Invoice"} · ${/-1\.png$/.test(file) ? "FreightPOP page" : "window it opened"}`}
                 />
               ))}
             </div>

@@ -212,7 +212,7 @@ auditsRouter.get("/invoice/:id/excel", async (req, res) => {
 // can't be read.
 auditsRouter.get("/invoice/:id/invoice-shot", async (req, res) => {
   const file = req.query.file;
-  if (!isShotPath(file)) return res.status(400).json({ error: "file must be invoices/<name>.png" });
+  if (!isShotPath(file)) return res.status(400).json({ error: "file must be invoices/<name>.png or .pdf" });
   if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
   const { data: run, error } = await supabase
     .from("fpx_invoice_audits").select("id, shipment_type").eq("id", req.params.id).maybeSingle();
@@ -245,7 +245,7 @@ auditsRouter.get("/invoice/:id/invoice-shot", async (req, res) => {
   }
   const bytes = Buffer.from(await blob.arrayBuffer());
   res.set({
-    "Content-Type": "image/png",
+    "Content-Type": file.endsWith(".pdf") ? "application/pdf" : "image/png",
     "Content-Length": String(bytes.length),
     "Cache-Control": "private, max-age=3600",
   });
