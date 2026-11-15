@@ -8,6 +8,8 @@ import {
   normalizeApprovalSource,
 } from "../lib/approvalMatch.js";
 import { transactionRows, upsertTransactions, approvalRows, upsertApprovals } from "../lib/erpStore.js";
+import { ERP_MASTERS, buildErpMaster, transactionPieceRows, upsertPieceRows } from "../lib/erpMaster.js";
+import { transactionRow } from "../lib/erpStore.js";
 
 export const auditsRouter = Router();
 
@@ -518,13 +520,55 @@ auditsRouter.post("/erp/transactions", async (req, res) => {
   } catch (e) {
     out.error = e?.message || String(e);
   }
+  // Every report row as it came (a parcel shipment has one per package).
+  const pieces = await upsertPieceRows(supabase, transactionPieceRows(body.rows, (r) => transactionRow(r), { shipmentType: shipmentType || undefined }));
   res.json({
     received: mapped.received,
+    rows_stored: pieces.upserted,
     stored: out.upserted,
     skipped_no_id: mapped.skipped_no_id,
     failed: out.failed,
     ...(out.error ? { error: out.error } : {}),
   });
+});
+
+// GET /audits/erp/master?which=transactions|approvals[&format=json]
+// A master Excel workbook of everything kept from FreightPOP, in FreightPOP's
+// own export columns and column order: every shipment (transactions) or every
+// approved invoice (approvals). Built fresh from the tables on each call, kept
+// in Storage at erp-pulls/masters/, and sent as a download. The same columns
+// are also the views fpx_freightpop_transactions_export and
+// fpx_freightpop_audit_export, rebuilt here to match.
+// format=json: no file, just { which, rows, columns, stored, views }.
+auditsRouter.get("/erp/master", async (req, res) => {
+  const which = String(req.query.which || "transactions");
+  if (!Object.hasOwn(ERP_MASTERS, which)) return res.status(400).json({ error: "which must be transactions or approvals" });
+  let built;
+  try {
+    built = await buildErpMaster(supabase, ERP_BUCKET, which);
+  } catch (e) {
+    return res.status(500).json({ error: `Could not build the master file: ${e?.message || e}` });
+  }
+  // Postgres column names hold 63 bytes; longer titles stay in the file only.
+  let views = false;
+  try {
+    const cols = built.columns.filter((c) => Buffer.byteLength(c) <= 63);
+    const { error } = await supabase.rpc("fpx_erp_rebuild_export_views", which === "transactions" ? { tx_cols: cols, ap_cols: null } : { tx_cols: null, ap_cols: cols });
+    views = !error;
+    if (error) console.warn(`[FPX] export view for ${which} not rebuilt: ${error.message}`);
+  } catch (e) {
+    console.warn(`[FPX] export view for ${which} not rebuilt: ${e?.message || e}`);
+  }
+  if (req.query.format === "json") {
+    return res.json({ which, rows: built.rows, columns: built.columns, stored: built.stored, views, bytes: built.buf.length });
+  }
+  res.set({
+    "Content-Type": XLSX_TYPE,
+    "Content-Disposition": `attachment; filename="${ERP_MASTERS[which].label}-${new Date().toISOString().slice(0, 10)}.xlsx"`,
+    "Content-Length": String(built.buf.length),
+    "Cache-Control": "private, no-store",
+  });
+  res.send(built.buf);
 });
 
 const ERP_BUCKETS = ["exported", "approved_ready", "invoice_not_approved", "no_invoice"];

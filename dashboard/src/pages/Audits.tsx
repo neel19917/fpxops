@@ -11,7 +11,7 @@ import { LoadingState } from "../components/LoadingState";
 import { ErpPullMonitor, type ErpMonitorStatus } from "../components/ErpPullMonitor";
 import { ApprovalPill, GetInvoiceModal, InvoicePill, type GetInvoiceItem } from "../components/GetInvoiceModal";
 import {
-  APPROVAL_SCOPE, GET_INVOICE_MAX, approvalDate, approvalGroup, approvalLabel, approvalSourceLabel, downloadAuditExcel, getInvoiceLabel, isShaun,
+  APPROVAL_SCOPE, GET_INVOICE_MAX, approvalDate, approvalGroup, approvalLabel, approvalSourceLabel, downloadAuditExcel, downloadErpMaster, getInvoiceLabel, isShaun,
   requestApprovalCheck, toApprovalState, type ApprovalGroup, type AuditExcelWhich,
 } from "../lib/erpPull";
 
@@ -854,6 +854,35 @@ function WidePanel({ open, onClose, title, subtitle, children }: { open: boolean
 
 // FreightPOP's own .xlsx files, kept with each pull: same columns as FreightPOP's
 // export, so they drop straight into the team's macros and workbooks.
+/** The two master workbooks: everything kept from FreightPOP, in FreightPOP's own columns. */
+function MasterDownloads() {
+  const [busy, setBusy] = useState<"transactions" | "approvals" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  async function download(which: "transactions" | "approvals") {
+    if (busy) return;
+    setBusy(which); setError(null);
+    try { await downloadErpMaster(which); }
+    catch (e) { setError((e as Error).message || "Could not download the file."); }
+    finally { setBusy(null); }
+  }
+  const btn = "px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-50";
+  return (
+    <div className="mt-4 pt-4 border-t border-slate-100 flex flex-wrap items-center gap-2">
+      <span className="text-xs text-slate-500 mr-1">Master Excel files (everything pulled so far, FreightPOP's columns):</span>
+      <button onClick={() => download("transactions")} disabled={!!busy} className={btn} title="Every shipment row pulled from Transactions > History Report, all dates, one workbook">
+        <Download className="h-3.5 w-3.5" />
+        {busy === "transactions" ? "Building…" : "All shipments"}
+      </button>
+      <button onClick={() => download("approvals")} disabled={!!busy} className={btn} title="Every approved invoice pulled from the Audit page (Recently Approved and History), one workbook">
+        <Download className="h-3.5 w-3.5" />
+        {busy === "approvals" ? "Building…" : "All approved invoices"}
+      </button>
+      {busy ? <span className="text-xs text-slate-500">This can take up to a minute.</span> : null}
+      {error ? <span role="alert" className="text-xs text-rose-700 break-words">{error}</span> : null}
+    </div>
+  );
+}
+
 function ExcelDownloads({ auditId, files }: { auditId: string; files: InvoiceAuditFiles | null }) {
   const [busy, setBusy] = useState<AuditExcelWhich | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1035,6 +1064,7 @@ export function InvoiceAuditsPage() {
       </p>
       {/* The monitor is its own card, with its own heading and controls. */}
       <ErpPullMonitor onFinished={onPullFinished} onSettled={onSettled} started={invoiceRun} onStatus={setMonitor} />
+      <MasterDownloads />
       <div className="bg-white rounded-2xl ring-1 ring-slate-200 shadow-sm overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-slate-50">

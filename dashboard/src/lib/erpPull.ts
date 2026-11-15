@@ -247,15 +247,26 @@ export function approvalHover(state: ApprovalState | null | undefined): string {
 export type AuditExcelWhich = "not-exported" | "full" | "recently-approved" | "audit-history";
 
 /** Fetch one of a pull's .xlsx files (signed in) and save it under the name the server gives. */
-export async function downloadAuditExcel(auditId: string, which: AuditExcelWhich): Promise<void> {
+export type ErpMasterWhich = "transactions" | "approvals";
+
+/** The master workbook of everything kept from FreightPOP (every shipment, or every approved invoice). Built fresh on each call. */
+export function downloadErpMaster(which: ErpMasterWhich): Promise<void> {
+  return downloadExcel(`/api/audits/erp/master?which=${which}`, `freightpop-${which}-master.xlsx`, "The master file could not be built.");
+}
+
+export function downloadAuditExcel(auditId: string, which: AuditExcelWhich): Promise<void> {
+  return downloadExcel(`/api/audits/invoice/${encodeURIComponent(auditId)}/excel?which=${which}`, `freightpop-${which}.xlsx`, "No Excel file was kept for this pull.");
+}
+
+async function downloadExcel(path: string, fallbackName: string, missing: string): Promise<void> {
   const token = await getAccessTokenOrWait();
-  const res = await fetch(`${apiUrl}/api/audits/invoice/${encodeURIComponent(auditId)}/excel?which=${which}`, {
+  const res = await fetch(`${apiUrl}${path}`, {
     headers: { authorization: `Bearer ${token}` },
   });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     if (body?.error) throw new Error(String(body.error));
-    throw new Error(res.status === 404 ? "No Excel file was kept for this pull." : `The server returned ${res.status}`);
+    throw new Error(res.status === 404 ? missing : `The server returned ${res.status}`);
   }
   const blob = await res.blob();
   const cd = res.headers.get("content-disposition") || "";
@@ -264,7 +275,7 @@ export async function downloadAuditExcel(auditId: string, which: AuditExcelWhich
   if (star) { try { name = decodeURIComponent(star.trim().replace(/^"|"$/g, "")); } catch { /* keep the plain name */ } }
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = name || `freightpop-${which}.xlsx`;
+  a.download = name || fallbackName;
   document.body.appendChild(a);
   a.click();
   a.remove();
