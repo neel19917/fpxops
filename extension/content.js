@@ -3733,9 +3733,12 @@ function fpxClickTarget(e) {
   if (!label) label = `<${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${typeof el.className === "string" && el.className ? `.${el.className.trim().split(/\s+/).slice(0, 2).join(".")}` : ""}>`;
   return { el, label: label.slice(0, 80) };
 }
+// Kept here, not on the document: a frame's own copy of this script shares the
+// frame's document with this one, and its copy has no job to report to.
+const fpxWatchedDocs = new WeakSet();
 function fpxWatchClicks(doc) {
-  if (!doc || doc.__fpxClicksWatched) return;
-  doc.__fpxClicksWatched = true;
+  if (!doc || fpxWatchedDocs.has(doc)) return;
+  fpxWatchedDocs.add(doc);
   const running = () => fpxErp && !fpxErp.done;
   const never = (hit) => hit.label.length <= 60 && CLICK_NEVER.test(hit.label);
   for (const type of ["mousedown", "mouseup", "pointerdown", "pointerup"]) {
