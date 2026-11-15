@@ -1715,7 +1715,28 @@ async function captureExport(lane, browser, cdp, ext, jobId, opts = {}) {
   const hooked = opts.buttonOnly && lane.page ? await lane.page.evaluate(() => {
     const k = window.kendo;
     window.__fpxSaved = null;
-    if (!k || typeof k.saveAs !== "function") return false;
+    // FreightPOP's Audit buttons build the file in the page (ExportToExcel)
+    // and hand it over as a blob or data link: catch it there too.
+    if (!window.__fpxUrlHook) {
+      window.__fpxUrlHook = true;
+      const make = URL.createObjectURL.bind(URL);
+      URL.createObjectURL = (b) => {
+        try { if (window.__fpxCatch && b instanceof Blob && b.size > 200) window.__fpxSaved = { data: b, name: "export.xlsx" }; } catch { /* leave the page alone */ }
+        return make(b);
+      };
+      const click = HTMLAnchorElement.prototype.click;
+      HTMLAnchorElement.prototype.click = function () {
+        try {
+          if (window.__fpxCatch && this.download) {
+            if (/^data:/.test(this.href)) window.__fpxSaved = { data: this.href, name: this.download };
+            else if (window.__fpxSaved) window.__fpxSaved.name = this.download;
+          }
+        } catch { /* leave the page alone */ }
+        return click.apply(this, arguments);
+      };
+    }
+    window.__fpxCatch = true;
+    if (!k || typeof k.saveAs !== "function") return true;
     if (!k.__fpxSaveAs) {
       k.__fpxSaveAs = k.saveAs;
       k.saveAs = (o) => { if (window.__fpxCatch) window.__fpxSaved = { data: o && o.dataURI, name: o && o.fileName }; else k.__fpxSaveAs(o); };
