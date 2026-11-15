@@ -8,6 +8,7 @@ import {
   asApprovalResult, asPullResult, downloadAuditExcel, erpWorker, isErpRequest,
   requestApprovalCheck, requestErpPull, type AuditExcelWhich,
   type ErpMonths, type ErpShipmentType,
+  fetchApprovalChecks, type ApprovalChecks,
 } from "../lib/erpPull";
 import { fmtNum } from "../lib/format";
 import type { InvoiceAudit, InvoiceAuditDetail } from "../lib/types";
@@ -30,7 +31,7 @@ const REFRESH_MS = 10_000;
 const CHAIN_KEY = "fpx.invoicing.refresh";
 const CHAIN_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 
-const BUCKETS: readonly BucketKey[] = ["approved", "not-approved", "sent"];
+const BUCKETS: readonly BucketKey[] = ["approved", "not-approved", "sent", "review"];
 // Links made before the buckets were renamed still open the right one.
 const OLD_TABS: Record<string, BucketKey> = { ready: "approved", waiting: "not-approved" };
 type ApprovedFilter = "all" | "shaun" | "edi" | "person" | "none" | "failed";
@@ -318,7 +319,30 @@ export function InvoicingPage() {
 
   // ── Buckets ──
 
-  const rows = useMemo(() => (detail?.rows ?? []).map(toRow), [detail]);
+  // The approval checks of this pull: loaded with it, and again whenever its rows change.
+  const [checks, setChecks] = useState<ApprovalChecks | null>(null);
+  const [checksError, setChecksError] = useState<string | null>(null);
+  // Asked again only when something a check depends on changed, not on every 10 s reload.
+  const checksKey = useMemo(() => {
+    let sent = 0, approved = 0;
+    for (const r of detail?.rows ?? []) {
+      if (r.raw?.get_invoice?.status === "done") sent++;
+      if (r.raw?.approval?.status === "approved") approved++;
+    }
+    return `${detail?.rows.length ?? 0}|${sent}|${approved}`;
+  }, [detail]);
+  useEffect(() => {
+    if (!auditId) { setChecks(null); return; }
+    let gone = false;
+    fetchApprovalChecks(auditId).then(
+      (c) => { if (!gone) { setChecks(c); setChecksError(null); } },
+      (e: unknown) => { if (!gone) setChecksError((e as Error)?.message || "The approval checks could not be loaded."); },
+    );
+    return () => { gone = true; };
+  }, [auditId, checksKey]);
+  const threshold = checks?.threshold ?? 90;
+
+  const rows = useMemo(() => (detail?.rows ?? []).map((r) => toRow(r, checks?.checks[r.shipment_id ?? ""] ?? null)), [detail, checks]);
   const lists = useMemo(() => {
     const inBucket = (b: BucketKey) => rows.filter((r) => r.bucket === b).sort(byCharge);
     const approved = inBucket("approved");
@@ -331,6 +355,8 @@ export function InvoicingPage() {
       noInvoice: notApproved.filter((r) => r.waiting === "none"),
       sent: inSent.filter((r) => r.gi?.status === "done"),
       requested: inSent.filter((r) => r.gi?.status === "requested"),
+      // Approved or sent, and the approval check scored under the threshold: lowest first.
+      review: rows.filter((r) => r.check && !r.check.pass).sort((a, b) => (a.check?.confidence ?? 0) - (b.check?.confidence ?? 0) || byCharge(a, b)),
     };
   }, [rows]);
   const approvedBy = useMemo(() => {
@@ -358,7 +384,8 @@ export function InvoicingPage() {
 
   const q = query.trim().toLowerCase();
   const visible = useMemo(() => {
-    const base = tab === "approved"
+    const base = tab === "review" ? lists.review
+      : tab === "approved"
       ? (approvedView === "all" ? lists.approved
         : approvedView === "failed" ? lists.approved.filter((r) => r.failed)
         : lists.approved.filter((r) => r.approver === approvedView))
@@ -491,15 +518,26 @@ export function InvoicingPage() {
         : lists.sent.length ? "Get Invoice was pressed in FreightPOP"
         : "None sent from this list yet",
     },
+    {
+      key: "review", label: `Needs review · under ${threshold}% confidence`, count: lists.review.length, total: sumCharge(lists.review),
+      breakdown: checksError ? "The checks could not be loaded"
+        : !checks ? "Checking…"
+        : lists.review.length ? `${n(lists.review.filter((r) => r.check?.issues.length).length)} do not match · ${n(lists.review.filter((r) => r.check?.missing.length).length)} missing something`
+        : "Every approval checks out",
+    },
   ];
 
-  const count = tab === "approved" ? lists.approved.length : tab === "not-approved" ? lists.notApproved.length : lists.sent.length;
-  const heading = tab === "approved"
+  const count = tab === "review" ? lists.review.length : tab === "approved" ? lists.approved.length : tab === "not-approved" ? lists.notApproved.length : lists.sent.length;
+  const heading = tab === "review"
+    ? (checksError ? "The approval checks could not be loaded." : count ? `${n(count)} approved ${plural(count, "shipment scores", "shipments score")} under ${threshold}% confidence.` : `Every approved shipment scores ${threshold}% or higher.`)
+    : tab === "approved"
     ? (count ? `${n(count)} ${plural(count, "shipment is", "shipments are")} approved and ready. Select the ones to invoice.` : "Nothing is approved and ready right now.")
     : tab === "not-approved"
       ? (count ? `${n(count)} ${plural(count, "shipment is", "shipments are")} not approved yet.` : "Nothing is waiting on approval.")
       : (count ? `${n(count)} ${plural(count, "invoice was", "invoices were")} sent from this list.` : "No invoices have been sent from this list yet.");
-  const subheading = tab === "approved"
+  const subheading = tab === "review"
+    ? (checksError || "Each approved or invoiced shipment starts at 100%. Points come off for anything FPX does not hold (shipment details, invoice PDF, bill of lading, rate confirmation, quote breakdown, proof of delivery), anything that does not match, and approvals that were forced or made on a corrected invoice. Lowest score first.")
+    : tab === "approved"
     ? (!count ? "Shipments appear here once their carrier invoice is approved in FreightPOP."
       : !anyChecked ? "FreightPOP's report shows an approved carrier invoice for each. Approver names appear after the next refresh."
       : "FreightPOP shows an approved carrier invoice for each. Nothing is sent until you review the list.")
@@ -512,6 +550,7 @@ export function InvoicingPage() {
 
   const shown = visible.slice(0, limit);
   const empty = q ? "Nothing matches that search."
+    : tab === "review" ? (checks ? "Nothing needs review." : "Checking…")
     : tab === "approved" ? (
       approvedView === "all" ? "Nothing is approved and ready right now."
       : approvedView === "shaun" ? "None of the approved shipments were approved by Shaun."
@@ -660,7 +699,7 @@ export function InvoicingPage() {
                 <p className="text-sm text-slate-500 mt-1 max-w-3xl">{subheading}</p>
               </div>
               <div className="flex items-center justify-between gap-3 flex-wrap">
-                {tab === "approved" ? (
+                {tab === "review" ? <span /> : tab === "approved" ? (
                   <Segmented<ApprovedFilter>
                     label="Approved by"
                     value={approvedView}

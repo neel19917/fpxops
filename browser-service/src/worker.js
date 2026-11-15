@@ -1105,6 +1105,12 @@ async function runPageJob(lane, browser, url, who, job) {
       }
       lost = 0;
       for (const l of r.lines || []) logLine(lane, l.text, l.level || "info");
+      // The click audit log: every click the job made, kept in fpx_click_log.
+      if (Array.isArray(r.clicks) && r.clicks.length) {
+        const clicks = r.clicks.slice(0, 500).map((c) => ({ ...c, request_id: lane.current?.requestId || null, job: r.job || job.noun, run_by: who }));
+        api("/api/audits/erp/click-log", { method: "POST", signal: AbortSignal.timeout(20_000), body: JSON.stringify({ clicks }) })
+          .catch((e) => logLine(lane, `${clicks.length} click(s) were not written to the click log (${String(e.message).slice(0, 160)})`, "warn"));
+      }
       if (lane.current && r.counts) Object.assign(lane.current.counts, r.counts);
       if (job.onPoll && (await job.onPoll(r, ctx))) continue;
       if (r.done) {

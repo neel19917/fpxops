@@ -5,7 +5,7 @@ import { fmtDateTime } from "../../lib/format";
 import { InvoiceRecordModal } from "./InvoiceRecordModal";
 import { fmtMoney, fmtSigned, type BucketKey, type Row } from "./model";
 
-// One table, three shapes: the columns follow the selected bucket.
+// One table, four shapes: the columns follow the selected bucket.
 
 const TH = "px-4 py-3 font-medium whitespace-nowrap";
 const TD = "px-4 py-3.5 align-top";
@@ -54,6 +54,33 @@ function RecordButton({ row, onOpen }: { row: Row; onOpen: (row: Row) => void })
   );
 }
 
+/** The approval check of one shipment: its score, then what is missing, wrong or worth a look. */
+function CheckCells({ row }: { row: Row }) {
+  const c = row.check;
+  if (!c) return <><td className={TD + " text-slate-300"}>—</td><td className={TD + " pr-6 text-slate-300"}>—</td></>;
+  const tone = c.confidence >= 90 ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : c.confidence >= 70 ? "bg-amber-50 text-amber-800 ring-amber-200" : "bg-rose-50 text-rose-800 ring-rose-200";
+  const groups: [string, string[], string][] = [
+    ["Does not match", c.issues, "text-rose-700"],
+    ["Missing", c.missing, "text-slate-700"],
+    ["Check", c.cautions, "text-amber-800"],
+  ];
+  return (
+    <>
+      <td className={TD + " whitespace-nowrap"}>
+        <span className={"inline-block text-xs font-medium rounded-full px-2.5 py-1 tabular-nums ring-1 " + tone}>{c.confidence}%</span>
+      </td>
+      <td className={TD + " pr-6 max-w-[34rem]"}>
+        {groups.filter(([, list]) => list.length).map(([label, list, cls]) => (
+          <div key={label} className="text-xs leading-5 break-words">
+            <span className="text-slate-500">{label}: </span>
+            <span className={cls}>{list.join(" · ")}</span>
+          </div>
+        ))}
+      </td>
+    </>
+  );
+}
+
 function Result({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) {
   const inProgress = row.gi?.status === "requested";
   return (
@@ -90,6 +117,7 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
   // The shipment whose saved invoice record is open, if any.
   const [record, setRecord] = useState<Row | null>(null);
   const colCount = bucket === "approved" ? 7 : bucket === "not-approved" ? 7 : 6;
+  const review = bucket === "review";
   return (
     <div className="max-h-[72vh] overflow-auto">
       <table className="w-full text-sm">
@@ -112,7 +140,12 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
             <th className={TH}>Customer</th>
             <th className={TH}>Carrier</th>
             <th className={TH + " text-right"}>Charge</th>
-            {bucket === "approved" ? (
+            {review ? (
+              <>
+                <th className={TH}>Confidence</th>
+                <th className={TH + " pr-6"}>What is missing or needs a look</th>
+              </>
+            ) : bucket === "approved" ? (
               <>
                 <th className={TH}>Approved by</th>
                 <th className={TH}>Approved on</th>
@@ -166,12 +199,13 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
                       Last try failed{r.gi?.note ? `: ${r.gi.note}` : ""}
                     </div>
                   ) : null}
-                  {bucket === "approved" ? <RecordButton row={r} onOpen={setRecord} /> : null}
+                  {bucket === "approved" || review ? <RecordButton row={r} onOpen={setRecord} /> : null}
+                  {review ? <div className="text-xs text-slate-500 mt-1 whitespace-nowrap">{r.bucket === "sent" ? "Invoice sent" : "Ready to invoice"}{r.approverName ? ` · ${r.approverName}` : ""}</div> : null}
                 </td>
                 <td className={TD + " text-slate-700"}>{r.customer || "—"}</td>
                 <td className={TD + " text-slate-500"}>{r.carrier || "—"}</td>
                 <td className={MONEY}>{fmtMoney(r.charge)}</td>
-                {bucket === "approved" ? (
+                {review ? <CheckCells row={r} /> : bucket === "approved" ? (
                   <>
                     <td className={TD}><ApproverPill row={r} /></td>
                     <td className={TD + " whitespace-nowrap text-slate-500"}>{r.approvedOn || "—"}</td>

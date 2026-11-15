@@ -1,4 +1,4 @@
-import { approvalDate, approvalGroup, getInvoiceLabel, toApprovalState } from "../../lib/erpPull";
+import { approvalDate, approvalGroup, getInvoiceLabel, toApprovalState, type ApprovalCheck } from "../../lib/erpPull";
 import type { ApprovalState, GetInvoiceState, InvoiceAuditRow } from "../../lib/types";
 
 // What the Invoicing page knows about one shipment, and which of the three
@@ -11,7 +11,9 @@ import type { ApprovalState, GetInvoiceState, InvoiceAuditRow } from "../../lib/
 //   not-approved  Everything else: a carrier invoice that is not approved yet,
 //                 or no carrier invoice at all.
 
-export type BucketKey = "approved" | "not-approved" | "sent";
+// "review" is a fourth view, not a fourth bucket: the approved and sent
+// shipments whose approval check scored under the confidence threshold.
+export type BucketKey = "approved" | "not-approved" | "sent" | "review";
 /** Who approved it. "none" = approved per the report, but the approver isn't listed. */
 export type ApproverGroup = "shaun" | "edi" | "person" | "none";
 /** Why it isn't approved: an invoice arrived but isn't approved, or no invoice yet. */
@@ -47,6 +49,8 @@ export interface Row {
   failed: boolean;
   /** Saved screenshots of the invoice FreightPOP showed when Get Invoice was pressed. */
   shots: string[];
+  /** The approval check, once loaded. Only approved and sent shipments have one. */
+  check: ApprovalCheck | null;
   search: string;
 }
 
@@ -82,7 +86,7 @@ function toInvoiceState(v: unknown): GetInvoiceState | null {
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-export function toRow(row: InvoiceAuditRow): Row {
+export function toRow(row: InvoiceAuditRow, check: ApprovalCheck | null = null): Row {
   const raw = row.raw ?? {};
   const shipment = row.shipment_id ?? "";
   const customer = row.customer_name ?? "";
@@ -127,6 +131,7 @@ export function toRow(row: InvoiceAuditRow): Row {
     notes: approvedByCheck ? String(ap?.notes ?? "").trim() : "",
     waiting: bucket !== "not-approved" ? null : flagged ? "received" : "none",
     failed: sent === "failed",
+    check: bucket === "not-approved" ? null : check,
     shots: Array.isArray(gi?.shots) ? gi.shots.filter((f): f is string => typeof f === "string" && f.trim() !== "") : [],
     search: `${shipment} ${customer} ${carrier} ${approvedByCheck ? String(ap?.notes ?? "") : ""}`.toLowerCase(),
   };

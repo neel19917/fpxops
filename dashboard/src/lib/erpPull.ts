@@ -259,6 +259,29 @@ export function downloadAuditExcel(auditId: string, which: AuditExcelWhich): Pro
 }
 
 /** One saved screenshot of the invoice FreightPOP showed when Get Invoice was pressed (signed in). */
+/** How sure FPX is that one shipment's approval is right, and what is missing. */
+export interface ApprovalCheck {
+  confidence: number;
+  pass: boolean;
+  missing: string[];
+  issues: string[];
+  cautions: string[];
+}
+export interface ApprovalChecks { threshold: number; checks: Record<string, ApprovalCheck> }
+
+/** The approval check of every approved shipment in a pull (rules only, nothing is stored). */
+export async function fetchApprovalChecks(auditId: string): Promise<ApprovalChecks> {
+  const token = await getAccessTokenOrWait();
+  const res = await fetch(`${apiUrl}/api/audits/invoice/${encodeURIComponent(auditId)}/approval-checks`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.error ? String(body.error) : `The server returned ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function fetchInvoiceShot(auditId: string, file: string): Promise<Blob> {
   const token = await getAccessTokenOrWait();
   const res = await fetch(`${apiUrl}/api/audits/invoice/${encodeURIComponent(auditId)}/invoice-shot?file=${encodeURIComponent(file)}`, {

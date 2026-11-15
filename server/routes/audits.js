@@ -10,6 +10,7 @@ import {
 import { transactionRows, upsertTransactions, approvalRows, upsertApprovals } from "../lib/erpStore.js";
 import { ERP_MASTERS, buildErpMaster, transactionPieceRows, upsertPieceRows } from "../lib/erpMaster.js";
 import { transactionRow } from "../lib/erpStore.js";
+import { APPROVAL_CONFIDENCE_MIN, checkApproval } from "../lib/approvalCheck.js";
 
 export const auditsRouter = Router();
 
@@ -624,6 +625,89 @@ auditsRouter.post("/erp/shipment-records", async (req, res) => {
   const { error } = await supabase.from("fpx_shipment_records").upsert(rows, { onConflict: "shipment_id,kind" });
   if (error) console.warn(`[FPX] shipment records not stored: ${error.message}`);
   res.json({ stored: error ? 0 : rows.length, failed: error ? rows.length : 0, ...(error ? { error: error.message } : {}) });
+});
+
+// POST /audits/erp/click-log — the hosted browser's click audit log: every
+// click a job made on a FreightPOP page (kept in fpx_click_log).
+// Body: { clicks: [{ at, n, label, tag?, page?, shipment_id?, blocked?,
+//         by_person?, request_id?, job?, run_by? }] } (at most 500).
+// Responds { stored, failed }.
+auditsRouter.post("/erp/click-log", async (req, res) => {
+  const list = Array.isArray(req.body?.clicks) ? req.body.clicks.slice(0, 500) : null;
+  if (!list) return res.status(400).json({ error: "body.clicks must be a list" });
+  const text = (v, max) => (v == null || v === "" ? null : String(v).slice(0, max));
+  const rows = [];
+  for (const c of list) {
+    const label = text(c?.label, 200);
+    if (!label) continue;
+    const at = new Date(c.at);
+    rows.push({
+      clicked_at: isNaN(at.getTime()) ? new Date().toISOString() : at.toISOString(),
+      request_id: isUuid(c.request_id) ? c.request_id : null,
+      job: text(c.job, 40), run_by: text(c.run_by, 200),
+      n: Number.isInteger(c.n) ? c.n : null,
+      label, tag: text(c.tag, 20), page: text(c.page, 200), shipment_id: text(c.shipment_id, 60),
+      blocked: c.blocked === true, by_person: c.by_person === true,
+    });
+  }
+  if (!rows.length) return res.json({ stored: 0, failed: 0 });
+  const { error } = await supabase.from("fpx_click_log").insert(rows);
+  if (error) console.warn(`[FPX] click log not stored: ${error.message}`);
+  res.json({ stored: error ? 0 : rows.length, failed: error ? rows.length : 0, ...(error ? { error: error.message } : {}) });
+});
+
+// GET /audits/invoice/:id/approval-checks — for every shipment of an ERP pull
+// whose carrier invoice is approved: how sure FPX is that the approval is
+// right (0–100), and what is missing or does not match. Rules only (see
+// lib/approvalCheck.js); nothing is stored.
+// Responds { threshold, checks: { [shipment_id]: { confidence, pass, missing,
+// issues, cautions } } }.
+auditsRouter.get("/invoice/:id/approval-checks", async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: "Invoice audit not found" });
+  const { data: run, error } = await supabase
+    .from("fpx_invoice_audits").select("id, shipment_type").eq("id", req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!run) return res.status(404).json({ error: "Invoice audit not found" });
+  if (run.shipment_type !== "erp_pending") return res.json({ threshold: APPROVAL_CONFIDENCE_MIN, checks: {} });
+  const loaded = await loadAuditRows(run.id);
+  if (loaded.error) return res.status(500).json({ error: loaded.error });
+  // Only shipments with an approved carrier invoice have an approval to check.
+  const rows = loaded.rows.filter((r) => {
+    const raw = r.raw || {};
+    const flagged = Array.isArray(raw.flags) && raw.flags.map(String).includes("invoice not approved");
+    return r.shipment_id && ((r.bill_amount != null && !flagged) || raw.approval?.status === "approved");
+  });
+  const inChunks = async (table, column, values, select) => {
+    const out = [];
+    for (let i = 0; i < values.length; i += 200) {
+      const { data, error: e } = await supabase.from(table).select(select).in(column, values.slice(i, i + 200));
+      if (e) throw new Error(e.message);
+      out.push(...(data || []));
+    }
+    return out;
+  };
+  try {
+    const ids = [...new Set(rows.map((r) => String(r.shipment_id)))];
+    const tracking = [...new Set(rows.map((r) => String(r.raw?.tracking ?? "").trim()).filter(Boolean))];
+    const [views, approvals] = await Promise.all([
+      inChunks("fpx_shipment_records", "shipment_id", ids, "shipment_id, kind, data, text, files").then((l) => l.filter((v) => v.kind === "view_shipment")),
+      inChunks("fpx_audit_approvals", "tracking_number", tracking, "tracking_number, approved_by, invoice_amount, quote_amount, invoice_number, approved_date, data"),
+    ]);
+    const viewOf = new Map(views.map((v) => [String(v.shipment_id), v]));
+    // The newest approval of a tracking number is the one that stands.
+    const approvalOf = new Map();
+    for (const a of approvals) {
+      const had = approvalOf.get(a.tracking_number);
+      if (!had || String(a.approved_date || "") > String(had.approved_date || "")) approvalOf.set(a.tracking_number, a);
+    }
+    const checks = {};
+    for (const r of rows) {
+      checks[String(r.shipment_id)] = checkApproval(r, viewOf.get(String(r.shipment_id)) || null, approvalOf.get(String(r.raw?.tracking ?? "").trim()) || null);
+    }
+    res.json({ threshold: APPROVAL_CONFIDENCE_MIN, checks });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // GET /audits/erp/master?which=transactions|approvals[&format=json]

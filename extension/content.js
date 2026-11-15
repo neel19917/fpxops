@@ -3613,6 +3613,8 @@ function fpxErpPoll() {
     pause: fpxErp.wantPause || null,
     // Get-invoices job only: a screenshot is wanted now ({ shipment_id }).
     shot: fpxErp.wantShot || null,
+    // Every click since the last poll (emptied when read).
+    clicks: fpxErp.clicks ? fpxErp.clicks.splice(0) : [],
   };
 }
 
@@ -3715,6 +3717,53 @@ function erpLog(text, level = "info") {
   dlog("[FPX-ERP]", level, text);
   if (fpxErp) fpxErp.lines.push({ level, text: String(text) });
 }
+
+// ── Click monitor ──
+// Every click made on a FreightPOP page while a job is running is written to
+// the job's log and handed to the browser service, which keeps it in
+// fpx_click_log. A click on a control that sends, cancels or deletes is
+// stopped before FreightPOP sees it, whatever part of FPX made it.
+const CLICK_NEVER = /cancel shipment|request pickup|generate return|e-?mail|\bresend\b|file a claim|non-?conformance|\bdelete\b|\bvoid\b|\bdispute\b/i;
+function fpxClickTarget(e) {
+  const t = e.target && e.target.closest ? e.target : null;
+  if (!t) return null;
+  const el = t.closest("button, a, input, select, [role='button'], [role='tab'], .btn, [ng-click], [onclick], label, li, th") || t;
+  let label = el.tagName === "INPUT" ? (el.type === "checkbox" || el.type === "radio" ? `${el.type} ${el.name || el.id || ""}` : el.value || el.placeholder || el.name || el.id) : (el.innerText || el.textContent || "");
+  label = String(label || "").replace(/\s+/g, " ").trim() || el.getAttribute("title") || el.getAttribute("aria-label") || "";
+  if (!label) label = `<${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${typeof el.className === "string" && el.className ? `.${el.className.trim().split(/\s+/).slice(0, 2).join(".")}` : ""}>`;
+  return { el, label: label.slice(0, 80) };
+}
+function fpxWatchClicks(doc) {
+  if (!doc || doc.__fpxClicksWatched) return;
+  doc.__fpxClicksWatched = true;
+  const running = () => fpxErp && !fpxErp.done;
+  const never = (hit) => hit.label.length <= 60 && CLICK_NEVER.test(hit.label);
+  for (const type of ["mousedown", "mouseup", "pointerdown", "pointerup"]) {
+    doc.addEventListener(type, (e) => {
+      if (!running()) return;
+      const hit = fpxClickTarget(e);
+      if (hit && never(hit)) { e.stopImmediatePropagation(); e.preventDefault(); }
+    }, true);
+  }
+  doc.addEventListener("click", (e) => {
+    if (!running()) return;
+    const hit = fpxClickTarget(e);
+    if (!hit) return;
+    const blocked = never(hit);
+    if (blocked) { e.stopImmediatePropagation(); e.preventDefault(); }
+    const state = fpxErp;
+    state.clickN = (state.clickN || 0) + 1;
+    let page = "";
+    try { const w = doc.defaultView || window; page = (w.location.pathname + w.location.hash).slice(0, 160); } catch { /* unknown */ }
+    (state.clicks = state.clicks || []).push({
+      n: state.clickN, at: new Date().toISOString(), label: hit.label, tag: hit.el.tagName.toLowerCase(),
+      page, blocked, shipment_id: state.shipment || null, by_person: e.isTrusted === true,
+    });
+    if (blocked) erpLog(`Click ${state.clickN} BLOCKED · "${hit.label}" — FPX never presses this`, "warn");
+    else erpLog(`Click ${state.clickN} · ${hit.label}${state.shipment ? ` · shipment ${state.shipment}` : ""}`);
+  }, true);
+}
+fpxWatchClicks(document);
 
 function erpNum(n) { return Number(n || 0).toLocaleString("en-US"); }
 
@@ -4991,7 +5040,7 @@ function giDialogRoots(d) {
   const root = d.closest(".modal, .k-window, [role='dialog'], .modal-dialog, .ui-dialog") || d;
   const roots = [root];
   for (const f of root.querySelectorAll("iframe")) {
-    try { if (f.contentDocument && f.contentDocument.body) roots.push(f.contentDocument.body); } catch { /* another site: not readable */ }
+    try { if (f.contentDocument && f.contentDocument.body) { fpxWatchClicks(f.contentDocument); roots.push(f.contentDocument.body); } } catch { /* another site: not readable */ }
   }
   return roots;
 }
@@ -5609,6 +5658,7 @@ async function erpGetInvoices(optsJson) {
     };
 
     const one = async (id) => {
+      state.shipment = String(id);
       let clicked = false;
       let emitted = false;
       let shot = false;
