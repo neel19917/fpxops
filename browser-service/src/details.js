@@ -42,18 +42,34 @@ async function api(path, init = {}) {
   return res.json();
 }
 
-// note: "q=<shipment id>:<quote id>,<shipment id>:<quote id>"
+// note: "q=<shipment id>:<quote id>[:<sale>:<cost>],…" — sale and cost are the
+// two figures FreightPOP's own shipment grid hands this page when a person
+// opens it (the page shows the cost it is given; it does not look it up).
 function quotesFromNote(note) {
   const out = new Map();
   const m = /(?:^|;)\s*q=([^;]*)/.exec(String(note || ""));
   for (const pair of (m ? m[1] : "").split(",")) {
-    const [sid, qid] = pair.split(":").map((x) => String(x || "").trim());
-    if (/^\d+$/.test(sid) && /^\d+$/.test(qid)) out.set(sid, qid);
+    const [sid, qid, sale, cost] = pair.split(":").map((x) => String(x || "").trim());
+    if (!/^\d+$/.test(sid) || !/^\d+$/.test(qid)) continue;
+    const num = (v) => (/^\d+(\.\d+)?$/.test(v) ? Number(v) : null);
+    out.set(sid, { quoteId: qid, sale: num(sale), cost: num(cost) });
   }
   return out;
 }
 
-const detailUrl = (quoteId) => `${FP_ORIGIN}/ShipmentDetail.html?${new URLSearchParams({ FromHistory: "true", QuoteID: quoteId, FromEmailLink: "false", IsFromIframe: "false", bh: "true" })}`;
+// The same address FreightPOP's dashboard builds for its DETAILS button
+// (Broker/Scripts/Dashboard.js, ViewShipHistory), opened as a page of its own.
+function detailUrl({ quoteId, sale, cost }) {
+  const p = new URLSearchParams({ FromHistory: "true", QuoteID: quoteId, FromEmailLink: "false", IsFromIframe: "false" });
+  if (sale != null) p.set("Amount", String(sale));
+  p.set("bh", "true");
+  if (cost != null) {
+    p.set("co", String(cost));
+    p.set("pr", sale != null && sale > cost ? (sale - cost).toFixed(2) : "0");
+  }
+  p.set("v", "");
+  return `${FP_ORIGIN}/ShipmentDetail.html?${p}`;
+}
 
 // Runs in the page, before FreightPOP's scripts: nothing can be pressed
 // except an element this job has marked with data-fpx-allowed.
@@ -84,8 +100,9 @@ async function readLogin(email) {
   }
 }
 
-async function readOne(page, shipmentId, quoteId, log) {
-  await page.goto(detailUrl(quoteId), { waitUntil: "domcontentloaded", timeout: PAGE_WAIT_MS });
+async function readOne(page, shipmentId, quote, log) {
+  const quoteId = quote.quoteId;
+  await page.goto(detailUrl(quote), { waitUntil: "domcontentloaded", timeout: PAGE_WAIT_MS });
   if (/login/i.test(new URL(page.url()).pathname + new URL(page.url()).hash)) throw Object.assign(new Error("FreightPOP asked for a login: sign in again on the FreightPOP login page, then read again"), { fatal: true });
   // The page fills in from FreightPOP's API: wait for this shipment's ids, then for the text to stop growing.
   const ready = await page.waitForFunction(
@@ -122,9 +139,9 @@ async function readOne(page, shipmentId, quoteId, log) {
   // The one click this job makes: the quote's DETAILS link (opens Quote Detail, read only).
   let quoteText = "";
   const marked = await page.evaluate(() => {
-    const leaf = [...document.querySelectorAll("a, button, span, label")]
-      .filter((el) => el.getClientRects().length && /^details$/i.test((el.innerText || el.textContent || "").trim()))
-      .find((el) => /Quote\s*:/i.test((el.parentElement?.innerText || "") + (el.parentElement?.parentElement?.innerText || "")));
+    // FreightPOP's own control: <span id="RateBreakDownSpan"><b onclick="ShowRateBreakDown()">DETAILS</b></span>
+    const leaf = [...document.querySelectorAll("[onclick*='ShowRateBreakDown']")]
+      .find((el) => el.getClientRects().length && /^details$/i.test((el.innerText || el.textContent || "").trim()));
     if (!leaf) return false;
     leaf.setAttribute("data-fpx-allowed", "1");
     leaf.click();
@@ -136,23 +153,20 @@ async function readOne(page, shipmentId, quoteId, log) {
       method: "POST", signal: AbortSignal.timeout(20_000),
       body: JSON.stringify({ clicks: [{ at: new Date().toISOString(), n: 1, label: "DETAILS (quote breakdown)", tag: "a", page: "/ShipmentDetail.html", shipment_id: String(shipmentId), job: DETAILS_SCOPE, request_id: log.requestId, run_by: log.who }] }),
     }).catch(() => {});
-    const shown = await page.waitForFunction(() => /QUOTE DETAIL/i.test(document.body.innerText), { timeout: 15_000, polling: 300 }).then(() => true, () => false);
+    const shown = await page.waitForFunction(() => {
+      const m = document.querySelector("#RateBreakDownModal");
+      return !!m && m.getClientRects().length > 0 && /TOTAL/i.test(m.innerText || "");
+    }, { timeout: 20_000, polling: 300 }).then(() => true, () => false);
     if (shown) {
       await sleep(800);
-      quoteText = await page.evaluate(() => {
-        const clean = (t) => String(t || "").replace(/[ \t ]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
-        const boxes = [...document.querySelectorAll(".modal, .k-window, [role='dialog'], .modal-content, div")]
-          .filter((el) => el.getClientRects().length && /^\s*QUOTE DETAIL/i.test(el.innerText || ""));
-        // The smallest element that starts with the heading is the panel itself.
-        boxes.sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
-        return boxes.length ? clean(boxes[0].innerText).slice(0, 20000) : "";
-      });
+      quoteText = await page.evaluate(() => String(document.querySelector("#RateBreakDownModal").innerText || "")
+        .replace(/[ \t ]+/g, " ").replace(/\s*\n\s*/g, "\n").trim().slice(0, 20000));
     }
     if (!quoteText) log(`Quote Detail did not open for shipment ${shipmentId}: stored without the breakdown`, "warn");
   } else {
     log(`No DETAILS link beside the quote for shipment ${shipmentId}: stored without the breakdown`, "warn");
   }
-  return { shipment_id: String(shipmentId), quote_id: String(quoteId), text: main.text, inputs: main.inputs, quote_text: quoteText, url: main.url };
+  return { shipment_id: String(shipmentId), quote_id: String(quoteId), text: main.text, inputs: main.inputs, quote_text: quoteText, url: main.url, cost_given: quote.cost != null };
 }
 
 async function run(request) {

@@ -97,7 +97,10 @@ export function parseShipmentDetail(record) {
   if (!nmfc && loose.length > 1 && /^[\d-]+$/.test(loose[0])) nmfc = loose[0];
 
   const second = under(lines, "CARRIER", 2); // the carrier again, then its service (LTL, Parcel…)
-  const vendorKey = Object.keys(inputs).find((k) => /vendor name/i.test(k));
+  const vendorKey = Object.keys(inputs).find((k) => /vendor\s*name/i.test(k));
+  // The page shows the cost it is handed when opened; it does not look one up.
+  // Opened without it, its cost and gross profit lines are not real figures.
+  const costGiven = record.cost_given !== false;
   const quote = parseQuoteDetail(record.quote_text);
   const banner = lines.find((l) => /^(Confirmation Number\s*=|Pickup Request number is)/i.test(l));
   const quoteNo = /(?:^|\n)Quote:\s*(\S+)/i.exec(text);
@@ -133,8 +136,8 @@ export function parseShipmentDetail(record) {
     shipment_quote: toNumber(first("SHIPMENT QUOTE")),
     quote_number: quoteNo ? quoteNo[1].slice(0, 80) : null,
     sale: toNumber(first("SHIPMENT SALE")),
-    cost: toNumber(first("SHIPMENT COST")),
-    gross_profit: toNumber(first("GROSS PROFIT")),
+    cost: costGiven ? toNumber(first("SHIPMENT COST")) : null,
+    gross_profit: costGiven ? toNumber(first("GROSS PROFIT")) : null,
     quote_freight: quote.freight,
     quote_fuel: quote.fuel,
     quote_accessorial_total: quote.accessorial_total,

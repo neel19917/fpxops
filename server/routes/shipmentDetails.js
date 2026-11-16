@@ -25,21 +25,27 @@ const isShipmentId = (v) => /^\d{1,15}$/.test(String(v ?? ""));
 // FreightPOP's quote id for a shipment: its Shipment Details page opens by it.
 // The tracking scrape keeps it (raw_data.QuotesId); so do the History Report
 // rows and any earlier read.
-async function quoteIdFor(shipmentId) {
+// With it go the two figures FreightPOP's own grid hands that page: the sale
+// (the grid's RateWithOutMarkedUp, despite its name) and the cost. The page
+// shows the cost it is handed; it does not look one up.
+// → { quote, sale, cost } (sale / cost null when not known), or null.
+async function quoteFor(shipmentId) {
   const tries = [
-    () => supabase.from("fpx_shipments").select("q:raw_data->>QuotesId").eq("shipment_id", shipmentId).order("updated_at", { ascending: false }).limit(1),
-    () => supabase.from("fpx_shipment_details").select("q:quote_id").eq("shipment_id", shipmentId).limit(1),
-    () => supabase.from("fpx_erp_transactions").select("q:data->>QuoteID").eq("shipment_id", shipmentId).limit(1),
+    () => supabase.from("fpx_shipments").select("q:raw_data->>QuotesId, sale:raw_data->>RateWithOutMarkedUp, cost:raw_data->>cost").eq("shipment_id", shipmentId).order("updated_at", { ascending: false }).limit(1),
+    () => supabase.from("fpx_erp_transactions").select("q:data->>QuoteID, sale:data->>Shipment Marked-Up Rate, cost:data->>Shipment Rate without mark up").eq("shipment_id", shipmentId).limit(1),
+    () => supabase.from("fpx_shipment_details").select("q:quote_id, sale, cost").eq("shipment_id", shipmentId).limit(1),
   ];
+  const num = (v) => { const n = Number(String(v ?? "").replace(/[$,\s]/g, "")); return String(v ?? "").trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null; };
   for (const run of tries) {
     try {
       const { data } = await run();
       const q = String(data?.[0]?.q ?? "").trim();
-      if (/^\d+$/.test(q) && q !== "0") return q;
+      if (/^\d+$/.test(q) && q !== "0") return { quote: q, sale: num(data[0].sale), cost: num(data[0].cost) };
     } catch { /* next source */ }
   }
   return null;
 }
+const quoteIdFor = async (shipmentId) => (await quoteFor(shipmentId))?.quote ?? null;
 
 async function latestJob(shipmentId) {
   const { data } = await supabase
@@ -105,8 +111,9 @@ shipmentDetailsRouter.post("/:shipmentId/refresh", async (req, res) => {
   if (!isShipmentId(id)) return res.status(400).json({ error: "shipment id must be a number" });
   const who = req.user?.email || null;
   if (!who) return res.status(403).json({ error: "Sign in to the dashboard to read from FreightPOP: the read uses your FreightPOP login" });
-  const quoteId = await quoteIdFor(id);
-  if (!quoteId) return res.status(409).json({ error: "FPX does not know this shipment's FreightPOP quote id yet" });
+  const found = await quoteFor(id);
+  if (!found) return res.status(409).json({ error: "FPX does not know this shipment's FreightPOP quote id yet" });
+  const quoteId = found.quote;
   const { data: open } = await supabase
     .from("fpx_scrape_requests").select("id, status")
     .eq("scope", SHIPMENT_DETAILS_SCOPE).in("status", ["pending", "claimed"]).contains("tracking_numbers", [id])
@@ -114,7 +121,7 @@ shipmentDetailsRouter.post("/:shipmentId/refresh", async (req, res) => {
   if (open?.[0]) return res.json({ request: open[0], coalesced: true });
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
-    .insert({ scope: SHIPMENT_DETAILS_SCOPE, tracking_numbers: [id], note: `q=${id}:${quoteId}`, requested_by: who })
+    .insert({ scope: SHIPMENT_DETAILS_SCOPE, tracking_numbers: [id], note: `q=${id}:${quoteId}${found.cost != null ? `:${found.sale ?? ""}:${found.cost}` : ""}`, requested_by: who })
     .select("id, status").single();
   if (error) return res.status(500).json({ error: error.message });
   logAudit(req, {

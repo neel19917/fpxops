@@ -157,6 +157,11 @@ describe("parseShipmentDetail", () => {
     assert.equal(r.quote_total, null); // no Quote Detail was read
   });
 
+  test("a page opened without the cost keeps no cost or gross profit", () => {
+    const r = parseShipmentDetail({ shipment_id: "15325790", text: TEXT, cost_given: false, inputs: { VendorName: "AAA Cooper" } });
+    assert.deepEqual([r.sale, r.cost, r.gross_profit, r.vendor_name], [168.26, null, null, "AAA Cooper"]);
+  });
+
   test("describes what was read in one line", () => {
     assert.equal(describeDetail(row), "FreightPOP Inc / AAA Cooper · sale $168.26 · cost $155.80 · gross profit $12.46 · quote: freight $108.00 + fuel $60.26 + accessorials $0.00 = $168.26");
   });
