@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
-import { ArrowDown, ArrowUp, CheckCircle2, Download, Sparkles, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, Download, Sparkles, X } from "lucide-react";
 import { api } from "../lib/api";
 import { fmtDate, fmtDateTime, fmtNum, fmtPct, fmtRelative } from "../lib/format";
 import type { ApprovalState, ApprovalSummary, GetInvoiceState, GpAudit, GpAuditRow, InvoiceAudit, InvoiceAuditDetail, InvoiceAuditFiles, InvoiceAuditRow } from "../lib/types";
@@ -829,15 +829,23 @@ function WidePanel({ open, onClose, title, subtitle, children }: { open: boolean
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
+  // Full screen: the table is wide, and nothing behind it is useful while it is open.
   return (
     <>
-      <div
-        onClick={onClose}
-        className={`fixed inset-0 z-20 bg-slate-900/30 backdrop-blur-sm transition-opacity ${open ? "opacity-100" : "opacity-0 pointer-events-none"}`}
-      />
-      <aside className={`fixed top-0 right-0 z-30 h-full w-full lg:w-[94vw] max-w-[1600px] bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col transform transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}>
-        <div className="shrink-0 border-b border-slate-200 flex items-start justify-between gap-3 px-6 pt-5 pb-4">
-          <div className="min-w-0">
+      <aside
+        aria-hidden={!open}
+        className={`fixed inset-0 z-30 bg-white flex flex-col transform transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full pointer-events-none"}`}
+      >
+        <div className="shrink-0 border-b border-slate-200 flex items-center gap-4 px-6 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            title="Back to Invoice Audits (Esc)"
+            className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 ring-1 ring-slate-200 bg-white hover:bg-slate-50 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
+          >
+            <ArrowLeft className="h-4 w-4" /> Back
+          </button>
+          <div className="min-w-0 flex-1">
             <div className="text-xs font-medium text-slate-500 uppercase tracking-wide">Invoice audit</div>
             <h2 className="text-lg font-semibold truncate">{title}</h2>
             {subtitle ? <div className="text-sm text-slate-500 truncate">{subtitle}</div> : null}
