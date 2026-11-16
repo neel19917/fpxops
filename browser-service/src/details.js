@@ -72,10 +72,10 @@ function quotesFromNote(note) {
   const out = new Map();
   const m = /(?:^|;)\s*q=([^;]*)/.exec(String(note || ""));
   for (const pair of (m ? m[1] : "").split(",")) {
-    const [sid, qid, sale, cost] = pair.split(":").map((x) => String(x || "").trim());
+    const [sid, qid, sale, cost, alt] = pair.split(":").map((x) => String(x || "").trim());
     if (!/^\d+$/.test(sid) || !/^\d+$/.test(qid)) continue;
     const num = (v) => (/^\d+(\.\d+)?$/.test(v) ? Number(v) : null);
-    out.set(sid, { quoteId: qid, sale: num(sale), cost: num(cost) });
+    out.set(sid, { quoteId: qid, sale: num(sale), cost: num(cost), altQuoteId: /^\d+$/.test(alt || "") ? alt : null });
   }
   return out;
 }
@@ -124,15 +124,23 @@ async function readLogin(email) {
 }
 
 async function readOne(page, shipmentId, quote, log) {
-  const quoteId = quote.quoteId;
-  await page.goto(detailUrl(quote), { waitUntil: "domcontentloaded", timeout: PAGE_WAIT_MS });
-  if (/login/i.test(new URL(page.url()).pathname + new URL(page.url()).hash)) throw Object.assign(new Error("FreightPOP asked for a login: sign in again on the FreightPOP login page, then read again"), { fatal: true });
-  // The page fills in from FreightPOP's API: wait for this shipment's ids, then for the text to stop growing.
-  const ready = await page.waitForFunction(
-    (q) => new RegExp(`QuoteID:\\s*${q}\\b`).test(document.body ? document.body.innerText : ""),
-    { timeout: PAGE_WAIT_MS, polling: 500 }, quoteId,
-  ).then(() => true, () => false);
-  if (!ready) throw new Error(`FreightPOP's Shipment Details page did not show quote ${quoteId} within ${PAGE_WAIT_MS / 1000}s`);
+  // A spot quote opens by its spot quote id; if that page is not this
+  // shipment's, the shipment's own quote id is tried.
+  let quoteId = quote.quoteId;
+  let ready = false;
+  for (const tryId of [quote.quoteId, quote.altQuoteId].filter(Boolean)) {
+    quoteId = tryId;
+    await page.goto(detailUrl({ ...quote, quoteId: tryId }), { waitUntil: "domcontentloaded", timeout: PAGE_WAIT_MS });
+    if (/login/i.test(new URL(page.url()).pathname + new URL(page.url()).hash)) throw Object.assign(new Error("FreightPOP asked for a login: sign in again on the FreightPOP login page, then read again"), { fatal: true });
+    // The page fills in from FreightPOP's API: wait for this shipment's id, then for the text to stop growing.
+    ready = await page.waitForFunction(
+      (sid) => new RegExp(`ShipmentID:\\s*${sid}\\b`).test(document.body ? document.body.innerText : ""),
+      { timeout: quote.altQuoteId && tryId === quote.quoteId ? 25_000 : PAGE_WAIT_MS, polling: 500 }, String(shipmentId),
+    ).then(() => true, () => false);
+    if (ready) break;
+    if (quote.altQuoteId && tryId === quote.quoteId) log(`Shipment ${shipmentId} · quote ${tryId} did not show this shipment — trying its own quote ${quote.altQuoteId}`, "warn");
+  }
+  if (!ready) throw new Error(`FreightPOP's Shipment Details page did not show shipment ${shipmentId} (quote ${quoteId})`);
   let len = -1;
   for (let i = 0, calm = 0; i < 24 && calm < 3; i++) {
     const n = await page.evaluate(() => document.body.innerText.length);
@@ -176,16 +184,17 @@ async function readOne(page, shipmentId, quote, log) {
       method: "POST", signal: AbortSignal.timeout(20_000),
       body: JSON.stringify({ clicks: [{ at: new Date().toISOString(), n: 1, label: "DETAILS (quote breakdown)", tag: "a", page: "/ShipmentDetail.html", shipment_id: String(shipmentId), job: DETAILS_SCOPE, request_id: log.requestId, run_by: log.who }] }),
     }).catch(() => {});
+    // Usually open within a second. A shipment with no breakdown (some truckloads) never opens it.
     const shown = await page.waitForFunction(() => {
       const m = document.querySelector("#RateBreakDownModal");
       return !!m && m.getClientRects().length > 0 && /TOTAL/i.test(m.innerText || "");
-    }, { timeout: 20_000, polling: 300 }).then(() => true, () => false);
+    }, { timeout: 6_000, polling: 250 }).then(() => true, () => false);
     if (shown) {
-      await sleep(800);
+      await sleep(500);
       quoteText = await page.evaluate(() => String(document.querySelector("#RateBreakDownModal").innerText || "")
         .replace(/[ \t ]+/g, " ").replace(/\s*\n\s*/g, "\n").trim().slice(0, 20000));
     }
-    if (!quoteText) log(`Quote Detail did not open for shipment ${shipmentId}: stored without the breakdown`, "warn");
+    if (!quoteText) log(`Shipment ${shipmentId} has no quote breakdown panel: stored without it`);
   } else {
     log(`No DETAILS link beside the quote for shipment ${shipmentId}: stored without the breakdown`, "warn");
   }
@@ -217,7 +226,7 @@ async function run(request) {
       const list = await api("/api/shipment-details/sweep-list", { signal: AbortSignal.timeout(120_000) });
       quotes = new Map();
       for (const r of (list.shipments || []).slice(0, MAX_SWEEP)) {
-        if (/^\d+$/.test(String(r.shipment_id)) && /^\d+$/.test(String(r.quote))) quotes.set(String(r.shipment_id), { quoteId: String(r.quote), sale: r.sale ?? null, cost: r.cost ?? null });
+        if (/^\d+$/.test(String(r.shipment_id)) && /^\d+$/.test(String(r.quote))) quotes.set(String(r.shipment_id), { quoteId: String(r.quote), sale: r.sale ?? null, cost: r.cost ?? null, altQuoteId: /^\d+$/.test(String(r.alt_quote ?? "")) ? String(r.alt_quote) : null });
       }
       ids = [...quotes.keys()];
       if (list.skipped) log(`${list.skipped} tracked shipment(s) have no FreightPOP quote id yet and are left out`, "warn");

@@ -31,7 +31,7 @@ const isShipmentId = (v) => /^\d{1,15}$/.test(String(v ?? ""));
 // → { quote, sale, cost } (sale / cost null when not known), or null.
 async function quoteFor(shipmentId) {
   const tries = [
-    () => supabase.from("fpx_shipments").select("q:raw_data->>QuotesId, sale:raw_data->>RateWithOutMarkedUp, cost:raw_data->>cost").eq("shipment_id", shipmentId).order("updated_at", { ascending: false }).limit(1),
+    () => supabase.from("fpx_shipments").select("q:raw_data->>QuotesId, spot:raw_data->>BrokerSpotQuoteId, sale:raw_data->>RateWithOutMarkedUp, cost:raw_data->>cost").eq("shipment_id", shipmentId).order("updated_at", { ascending: false }).limit(1),
     () => supabase.from("fpx_erp_transactions").select("q:data->>QuoteID, sale:data->>Shipment Marked-Up Rate, cost:data->>Shipment Rate without mark up").eq("shipment_id", shipmentId).limit(1),
     () => supabase.from("fpx_shipment_details").select("q:quote_id, sale, cost").eq("shipment_id", shipmentId).limit(1),
   ];
@@ -39,8 +39,8 @@ async function quoteFor(shipmentId) {
   for (const run of tries) {
     try {
       const { data } = await run();
-      const q = String(data?.[0]?.q ?? "").trim();
-      if (/^\d+$/.test(q) && q !== "0") return { quote: q, sale: num(data[0].sale), cost: num(data[0].cost) };
+      const picked = data?.[0] ? pickQuote(data[0].q, data[0].spot) : null;
+      if (picked) return { ...picked, sale: num(data[0].sale), cost: num(data[0].cost) };
     } catch { /* next source */ }
   }
   return null;
@@ -97,7 +97,7 @@ async function trackedShipments() {
   for (let from = 0; from < 20000; from += 1000) {
     const { data, error } = await supabase
       .from("fpx_shipments")
-      .select("shipment_id, customer_name, company_name, q:raw_data->>QuotesId, sale:raw_data->>RateWithOutMarkedUp, cost:raw_data->>cost")
+      .select("shipment_id, customer_name, company_name, q:raw_data->>QuotesId, spot:raw_data->>BrokerSpotQuoteId, sale:raw_data->>RateWithOutMarkedUp, cost:raw_data->>cost")
       .is("archived_at", null).not("shipment_id", "is", null).gte("scraped_at", since)
       .order("scraped_at", { ascending: false }).order("id", { ascending: true }).range(from, from + 999);
     if (error) throw new Error(error.message);
@@ -111,6 +111,19 @@ async function trackedShipments() {
 }
 const money = (v) => { const n = Number(String(v ?? "").replace(/[$,\s]/g, "")); return String(v ?? "").trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null; };
 
+// Which quote id opens a shipment's page. A broker spot quote (truckload,
+// mostly) is opened by its spot quote id, exactly as FreightPOP's grid does
+// (Dashboard.js: "if (BrokerSpotQuoteId > 0) scope = BrokerSpotQuoteId"): that
+// page carries the sale to the customer. The shipment's own quote id is kept
+// as a second try. → { quote, alt_quote } or null.
+function pickQuote(quotesId, spotId) {
+  const ok = (v) => { const t = String(v ?? "").trim(); return /^\d+$/.test(t) && t !== "0" ? t : null; };
+  const own = ok(quotesId);
+  const spot = ok(spotId);
+  if (spot) return { quote: spot, alt_quote: own && own !== spot ? own : null };
+  return own ? { quote: own, alt_quote: null } : null;
+}
+
 // GET /shipment-details/sweep-list — for the hosted browser: every tracked
 // shipment that has a FreightPOP quote id, with the sale and cost to open its
 // page with. Responds { shipments: [{ shipment_id, quote, sale, cost }], skipped }.
@@ -120,9 +133,9 @@ shipmentDetailsRouter.get("/sweep-list", async (_req, res) => {
     const shipments = [];
     let skipped = 0;
     for (const [id, r] of tracked) {
-      const q = String(r.q ?? "").trim();
-      if (!/^\d+$/.test(q) || q === "0") { skipped++; continue; }
-      shipments.push({ shipment_id: id, quote: q, sale: money(r.sale), cost: money(r.cost) });
+      const picked = pickQuote(r.q, r.spot);
+      if (!picked) { skipped++; continue; }
+      shipments.push({ shipment_id: id, ...picked, sale: money(r.sale), cost: money(r.cost) });
     }
     res.json({ shipments, skipped });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -216,7 +229,7 @@ shipmentDetailsRouter.post("/:shipmentId/refresh", async (req, res) => {
   if (open?.[0]) return res.json({ request: open[0], coalesced: true });
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
-    .insert({ scope: SHIPMENT_DETAILS_SCOPE, tracking_numbers: [id], note: `q=${id}:${quoteId}${found.cost != null ? `:${found.sale ?? ""}:${found.cost}` : ""}`, requested_by: who })
+    .insert({ scope: SHIPMENT_DETAILS_SCOPE, tracking_numbers: [id], note: `q=${id}:${quoteId}:${found.cost != null ? `${found.sale ?? ""}:${found.cost}` : ":"}${found.alt_quote ? `:${found.alt_quote}` : ""}`, requested_by: who })
     .select("id, status").single();
   if (error) return res.status(500).json({ error: error.message });
   logAudit(req, {
