@@ -101,6 +101,13 @@ export function parseShipmentDetail(record) {
   // The page shows the cost it is handed when opened; it does not look one up.
   // Opened without it, its cost and gross profit lines are not real figures.
   const costGiven = record.cost_given !== false;
+  // A broker spot quote: this page shows the carrier's side only, so the sale
+  // and cost FreightPOP's grid holds for the shipment are the ones kept.
+  const grid = record.spot === true && toNumber(record.grid_sale) != null && toNumber(record.grid_cost) != null
+    ? { sale: toNumber(record.grid_sale), cost: toNumber(record.grid_cost) } : null;
+  const pageSale = toNumber(first("SHIPMENT SALE"));
+  const pageCost = costGiven ? toNumber(first("SHIPMENT COST")) : null;
+  const pageProfit = costGiven ? toNumber(first("GROSS PROFIT")) : null;
   const quote = parseQuoteDetail(record.quote_text);
   const banner = lines.find((l) => /^(Confirmation Number\s*=|Pickup Request number is)/i.test(l));
   const quoteNo = /(?:^|\n)Quote:\s*(\S+)/i.exec(text);
@@ -135,16 +142,17 @@ export function parseShipmentDetail(record) {
     linear_feet: toNumber(first("TOTAL LINEAR FEET")),
     shipment_quote: toNumber(first("SHIPMENT QUOTE")),
     quote_number: quoteNo ? quoteNo[1].slice(0, 80) : null,
-    sale: toNumber(first("SHIPMENT SALE")),
-    cost: costGiven ? toNumber(first("SHIPMENT COST")) : null,
-    gross_profit: costGiven ? toNumber(first("GROSS PROFIT")) : null,
+    sale: grid ? grid.sale : pageSale,
+    cost: grid ? grid.cost : pageCost,
+    gross_profit: grid ? Math.round((grid.sale - grid.cost) * 100) / 100 : pageProfit,
+    financials_source: grid ? "grid_spot_quote" : "page",
     quote_freight: quote.freight,
     quote_fuel: quote.fuel,
     quote_accessorial_total: quote.accessorial_total,
     quote_total: quote.total,
     quote_accessorials: quote.accessorials,
     raw_text: text.slice(0, 200_000),
-    data: { inputs, quote_text: String(record.quote_text || "").slice(0, 20_000), url: textOrNull(record.url, 400) },
+    data: { ...(grid ? { page_financials: { sale: pageSale, cost: pageCost, gross_profit: pageProfit } } : {}), inputs, quote_text: String(record.quote_text || "").slice(0, 20_000), url: textOrNull(record.url, 400) },
   };
 }
 

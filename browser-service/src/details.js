@@ -75,7 +75,7 @@ function quotesFromNote(note) {
     const [sid, qid, sale, cost, alt] = pair.split(":").map((x) => String(x || "").trim());
     if (!/^\d+$/.test(sid) || !/^\d+$/.test(qid)) continue;
     const num = (v) => (/^\d+(\.\d+)?$/.test(v) ? Number(v) : null);
-    out.set(sid, { quoteId: qid, sale: num(sale), cost: num(cost), altQuoteId: /^\d+$/.test(alt || "") ? alt : null });
+    out.set(sid, { quoteId: qid, sale: num(sale), cost: num(cost), altQuoteId: /^\d+$/.test(alt || "") ? alt : null, spot: alt === "s" });
   }
   return out;
 }
@@ -198,7 +198,7 @@ async function readOne(page, shipmentId, quote, log) {
   } else {
     log(`No DETAILS link beside the quote for shipment ${shipmentId}: stored without the breakdown`, "warn");
   }
-  return { shipment_id: String(shipmentId), quote_id: String(quoteId), text: main.text, inputs: main.inputs, quote_text: quoteText, url: main.url, cost_given: quote.cost != null };
+  return { shipment_id: String(shipmentId), quote_id: String(quoteId), text: main.text, inputs: main.inputs, quote_text: quoteText, url: main.url, cost_given: quote.cost != null, spot: quote.spot === true, grid_sale: quote.sale, grid_cost: quote.cost };
 }
 
 async function run(request) {
@@ -226,7 +226,7 @@ async function run(request) {
       const list = await api("/api/shipment-details/sweep-list", { signal: AbortSignal.timeout(120_000) });
       quotes = new Map();
       for (const r of (list.shipments || []).slice(0, MAX_SWEEP)) {
-        if (/^\d+$/.test(String(r.shipment_id)) && /^\d+$/.test(String(r.quote))) quotes.set(String(r.shipment_id), { quoteId: String(r.quote), sale: r.sale ?? null, cost: r.cost ?? null, altQuoteId: /^\d+$/.test(String(r.alt_quote ?? "")) ? String(r.alt_quote) : null });
+        if (/^\d+$/.test(String(r.shipment_id)) && /^\d+$/.test(String(r.quote))) quotes.set(String(r.shipment_id), { quoteId: String(r.quote), sale: r.sale ?? null, cost: r.cost ?? null, altQuoteId: null, spot: r.spot === true });
       }
       ids = [...quotes.keys()];
       if (list.skipped) log(`${list.skipped} tracked shipment(s) have no FreightPOP quote id yet and are left out`, "warn");

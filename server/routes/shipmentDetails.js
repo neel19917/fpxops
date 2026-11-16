@@ -111,17 +111,16 @@ async function trackedShipments() {
 }
 const money = (v) => { const n = Number(String(v ?? "").replace(/[$,\s]/g, "")); return String(v ?? "").trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null; };
 
-// Which quote id opens a shipment's page. A broker spot quote (truckload,
-// mostly) is opened by its spot quote id, exactly as FreightPOP's grid does
-// (Dashboard.js: "if (BrokerSpotQuoteId > 0) scope = BrokerSpotQuoteId"): that
-// page carries the sale to the customer. The shipment's own quote id is kept
-// as a second try. → { quote, alt_quote } or null.
+// Which quote id opens a shipment's page, and whether the shipment was sold
+// through a broker spot quote (truckload, mostly). A spot-quoted shipment's own
+// page shows the carrier's side only (sale = cost). Its sale to the customer is
+// on FreightPOP's grid (Amount = RateWithOutMarkedUp, cost = cost: the two
+// figures its DETAILS button passes along), so those are what is kept for it.
+// → { quote, spot } or null.
 function pickQuote(quotesId, spotId) {
   const ok = (v) => { const t = String(v ?? "").trim(); return /^\d+$/.test(t) && t !== "0" ? t : null; };
   const own = ok(quotesId);
-  const spot = ok(spotId);
-  if (spot) return { quote: spot, alt_quote: own && own !== spot ? own : null };
-  return own ? { quote: own, alt_quote: null } : null;
+  return own ? { quote: own, spot: !!ok(spotId) } : null;
 }
 
 // GET /shipment-details/sweep-list — for the hosted browser: every tracked
@@ -229,7 +228,7 @@ shipmentDetailsRouter.post("/:shipmentId/refresh", async (req, res) => {
   if (open?.[0]) return res.json({ request: open[0], coalesced: true });
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
-    .insert({ scope: SHIPMENT_DETAILS_SCOPE, tracking_numbers: [id], note: `q=${id}:${quoteId}:${found.cost != null ? `${found.sale ?? ""}:${found.cost}` : ":"}${found.alt_quote ? `:${found.alt_quote}` : ""}`, requested_by: who })
+    .insert({ scope: SHIPMENT_DETAILS_SCOPE, tracking_numbers: [id], note: `q=${id}:${quoteId}:${found.cost != null ? `${found.sale ?? ""}:${found.cost}` : ":"}${found.spot ? ":s" : ""}`, requested_by: who })
     .select("id, status").single();
   if (error) return res.status(500).json({ error: error.message });
   logAudit(req, {

@@ -50,3 +50,9 @@ create table if not exists public.fpx_shipment_details (
 create index if not exists fpx_shipment_details_quote_idx on public.fpx_shipment_details (quote_id);
 create index if not exists fpx_shipment_details_carrier_idx on public.fpx_shipment_details (carrier);
 alter table public.fpx_shipment_details enable row level security;
+
+-- Applied to production 2026-11-16 (Supabase migration "shipment_details_financials_source").
+-- Where sale / cost / gross_profit came from: 'page', or 'grid_spot_quote' for a
+-- broker spot quote (its page shows the carrier's side only; the page's own
+-- numbers are kept in data.page_financials).
+alter table public.fpx_shipment_details add column if not exists financials_source text not null default 'page';

@@ -162,6 +162,13 @@ describe("parseShipmentDetail", () => {
     assert.deepEqual([r.sale, r.cost, r.gross_profit, r.vendor_name], [168.26, null, null, "AAA Cooper"]);
   });
 
+  test("a spot-quoted shipment keeps the grid's sale and cost, and the page's beside them", () => {
+    const r = parseShipmentDetail({ shipment_id: "15325790", text: TEXT, spot: true, grid_sale: 200, grid_cost: 155.8 });
+    assert.deepEqual([r.sale, r.cost, r.gross_profit, r.financials_source], [200, 155.8, 44.2, "grid_spot_quote"]);
+    assert.deepEqual(r.data.page_financials, { sale: 168.26, cost: 155.8, gross_profit: 12.46 });
+    assert.equal(parseShipmentDetail({ shipment_id: "15325790", text: TEXT }).financials_source, "page");
+  });
+
   test("describes what was read in one line", () => {
     assert.equal(describeDetail(row), "FreightPOP Inc / AAA Cooper · sale $168.26 · cost $155.80 · gross profit $12.46 · quote: freight $108.00 + fuel $60.26 + accessorials $0.00 = $168.26");
   });
