@@ -176,6 +176,29 @@ async function setScrapePaused(action: "pause" | "resume") {
   }
 }
 
+// The details job: a read-only job that runs in its own separate Chrome, apart
+// from the scrape and invoicing windows. For each tracked shipment it opens
+// FreightPOP's Shipment Details page and reads it; it changes nothing there.
+// A sweep is one run over every tracked shipment.
+export interface DetailsLogLine { t: string; level: "info" | "warn" | "error" | "done"; text: string }
+export interface DetailsCounts { total: number; done: number; stored: number; failed: number }
+export interface DetailsState {
+  state: "idle" | "busy";
+  current: null | { requestId: string; user: string; startedAt: string; sweep: boolean; counts: DetailsCounts; shipment: string | null; stopping: boolean; log: DetailsLogLine[] }; // log = last 500 lines
+  last: null | { requestId: string; user: string; ok: boolean; note: string; finishedAt: string; counts: DetailsCounts; log: DetailsLogLine[] };
+}
+
+// An older service has no /details endpoints and answers 404.
+export const DETAILS_NEEDS_UPDATE = "The hosted browser needs its next update before this page works.";
+async function detailsCall<T>(path: string, init?: RequestInit): Promise<T> {
+  try {
+    return await call<T>(path, init);
+  } catch (e) {
+    if (e instanceof HostedBrowserError && e.status === 404) throw new HostedBrowserError(DETAILS_NEEDS_UPDATE, 404);
+    throw e;
+  }
+}
+
 // "Ask FPX" assistant (browser-service/src/assistant.js).
 export type AssistantAction =
   | { type: "open_shipment"; id: string; label?: string }
@@ -288,6 +311,10 @@ export const hostedBrowser = {
   /** Pause the running scrape; it resumes by itself after 30 minutes. */
   pauseScrape: () => setScrapePaused("pause"),
   resumeScrape: () => setScrapePaused("resume"),
+  /** The details job: what it is reading now, and how its last run ended. */
+  detailsState: () => detailsCall<DetailsState>("/details/state"),
+  /** Stop the running details job after the shipment it is on. */
+  stopDetails: () => detailsCall<{ stopping: boolean }>("/details/stop", { method: "POST" }),
   pipeline: () => call<{
     scrape: { running: boolean | null; lastRun: { startedAt: string; finishedAt: string; ok: boolean; saved: number | null; note: string } | null };
     assistant: { index: { at: number; ok: boolean; rows: number; ms: number }; embeddings: { running: boolean; at: number; embedded: number; lastError: string | null } } | null;

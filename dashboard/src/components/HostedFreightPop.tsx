@@ -54,8 +54,8 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
   onUrl?: (url: string) => void;
   /** Server's check: does this browser hold a FreightPOP login? */
   onSignedIn?: (signedIn: boolean) => void;
-  /** "scrape" / "invoicing": read-only view of the user's running scrape window, or of their invoicing session's window. */
-  target?: "tab" | "scrape" | "invoicing";
+  /** "scrape" / "invoicing" / "details": read-only view of the user's running scrape window, of their invoicing session's window, or of the shipment details browser. */
+  target?: "tab" | "scrape" | "invoicing" | "details";
   onEnded?: (reason: string) => void;
   /** True while the pane is hidden: the service stops encoding frames. */
   paused?: boolean;
@@ -227,7 +227,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
           if (watchOnly && !liveThisConn && watchRetries < 30) {
             watchRetries++;
             setStatus("connecting");
-            setError("Waiting for the scrape window to open…");
+            setError(target === "details" ? "Waiting for the details browser to open…" : "Waiting for the scrape window to open…");
             retryTimer = setTimeout(connect, 2000);
             return;
           }
@@ -581,7 +581,7 @@ export const HostedFreightPop = forwardRef<HostedFreightPopHandle, {
             "mt-3 text-xs px-3 py-1.5 rounded-full shadow ring-1 pointer-events-auto " +
             (status === "denied" ? "bg-rose-50 text-rose-800 ring-rose-200" : "bg-white text-slate-700 ring-slate-200")
           }>
-            {status === "connecting" ? (target === "invoicing" ? "Connecting to the invoicing session…" : watchOnly ? "Connecting to the scrape…" : "Connecting to hosted FreightPOP…")
+            {status === "connecting" ? (target === "invoicing" ? "Connecting to the invoicing session…" : target === "details" ? "Connecting to the details browser…" : watchOnly ? "Connecting to the scrape…" : "Connecting to hosted FreightPOP…")
               : status === "reconnecting" ? "Reconnecting to hosted FreightPOP…"
               : null}
             {error ? <span className={status === "live" ? "" : "ml-1"}>{error}</span> : null}

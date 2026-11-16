@@ -4,6 +4,10 @@ import { apiUrl, getAccessTokenOrWait } from "./api";
 // FreightPOP's Shipment Details page for one shipment and the server stores the
 // result. These calls only read that stored record and ask for a fresh read;
 // nothing here changes anything in FreightPOP.
+//
+// The "Shipment details" monitor page uses the same stored records for every
+// tracked shipment: one call lists them all, another asks the hosted browser
+// to read them all again (a sweep). Both are still read-only in FreightPOP.
 
 export interface ShipmentDetailsAccessorial { name: string; amount: number | null }
 
@@ -66,6 +70,29 @@ export function fetchShipmentDetails(shipmentId: string): Promise<ShipmentDetail
 /** Ask the hosted browser to read the shipment's details from FreightPOP again. */
 export function requestShipmentDetailsRefresh(shipmentId: string): Promise<ShipmentDetailsRefreshResponse> {
   return call(`/api/shipment-details/${encodeURIComponent(shipmentId)}/refresh`, "POST");
+}
+
+// One stored record per tracked shipment, trimmed to what the list shows.
+export interface ShipmentDetailsListRow { shipment_id: string; customer: string | null; carrier: string | null; tracking_number: string | null; sale: number | null; cost: number | null; gross_profit: number | null; quote_freight: number | null; quote_fuel: number | null; quote_accessorial_total: number | null; quote_total: number | null; captured_at: string }
+
+export interface ShipmentDetailsList {
+  tracked: number;   // shipments on the tracking dashboard now
+  read: number;      // of those, how many have stored details
+  totals: { sale: number; cost: number; gross_profit: number };
+  rows: ShipmentDetailsListRow[];
+}
+
+// coalesced = a sweep was already waiting or running, so this is that one.
+export interface ShipmentDetailsSweepResponse { request: { id: string; status: string }; coalesced?: boolean }
+
+/** The stored FreightPOP details for every tracked shipment, with totals. */
+export function fetchShipmentDetailsList(): Promise<ShipmentDetailsList> {
+  return call("/api/shipment-details", "GET");
+}
+
+/** Ask the hosted browser to read the details of every tracked shipment again. */
+export function requestShipmentDetailsSweep(): Promise<ShipmentDetailsSweepResponse> {
+  return call("/api/shipment-details/sweep", "POST");
 }
 
 export function isReadRunning(job: ShipmentDetailsJob | null | undefined): boolean {

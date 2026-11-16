@@ -45,6 +45,7 @@ const ScrapeLogsPage  = lazy(() => import("./pages/ScrapeLogs").then((m) => ({ d
 const FreightPopLoginPage = lazy(() => import("./pages/FreightPopLogin").then((m) => ({ default: m.FreightPopLoginPage })));
 const ScrapingPage    = lazy(() => import("./pages/Scraping").then((m) => ({ default: m.ScrapingPage })));
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
+const ShipmentDetailsMonitorPage = lazy(() => import("./pages/ShipmentDetailsMonitor").then((m) => ({ default: m.ShipmentDetailsMonitorPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
@@ -52,6 +53,7 @@ const TAB_PATH: Record<TabId, string> = {
   tasks: "/tasks",
   ops: "/ops",
   scraping: "/scraping",
+  shipment_details: "/tracking/details",
   freightpop: "/freightpop",
   notes: "/notes",
   analyses: "/analyses",
@@ -105,6 +107,8 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/shares")) return "shares";
   if (pathname.startsWith("/feedback")) return "feedback";
   if (pathname.startsWith("/install")) return "install";
+  // Exact match only: /tracking/details123 is a shipment id, not this page.
+  if (pathname === "/tracking/details" || pathname === "/tracking/details/") return "shipment_details";
   return "tracking";
 }
 
@@ -254,6 +258,9 @@ function AuthedApp() {
           <Routes>
             <Route path="/" element={<Navigate to="/tasks" replace />} />
             <Route path="/tracking" element={<ShipmentsRoute />} />
+            {/* The shipment details monitor, not a shipment whose id is "details". */}
+            <Route path="/tracking/details" element={<ShipmentDetailsMonitorPage />} />
+            <Route path="/tracking/details/*" element={<Navigate to="/tracking/details" replace />} />
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
             {/* /tasks opens whichever view the user last chose (v2 by

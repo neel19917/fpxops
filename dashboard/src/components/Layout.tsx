@@ -1,4 +1,4 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail, FileCheck2 } from "lucide-react";
+import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail, FileCheck2, ScanSearch } from "lucide-react";
 import { AskSearchTrigger } from "./AssistantPanel";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
@@ -6,7 +6,7 @@ import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoicing" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "shipment_details" | "freightpop" | "notes" | "analyses" | "gp" | "invoicing" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude";
 
 interface TabDef {
   id: TabId;
@@ -26,6 +26,7 @@ const ALL_TABS: TabDef[] = [
   { id: "tasks",    label: "Tasks",          Icon: ListChecks,   group: "primary" },
   { id: "emails",   label: "Email Studio",   Icon: Mail,         group: "primary" },
   { id: "scraping", label: "Scraping",       Icon: MonitorPlay,  group: "primary" },
+  { id: "shipment_details", label: "Shipment details", Icon: ScanSearch, group: "primary" },
   { id: "ops",      label: "Ops",            Icon: Activity,     group: "primary" },
   // Tracking is out of the main row (Tasks is the landing page); it stays
   // reachable under More, and shipment links still open it.
@@ -209,7 +210,8 @@ export function Layout({ tab, onTab, children }: Props) {
         </div>
       ) : null}
 
-      <main className="flex-1 max-w-[1500px] w-full mx-auto p-6">{children}</main>
+      {/* Shipment details is a monitor: it takes the whole viewport width. */}
+      <main className={tab === "shipment_details" ? "flex-1 w-full min-w-0 p-3 flex flex-col" : "flex-1 max-w-[1500px] w-full mx-auto p-6"}>{children}</main>
 
       {pickerOpen ? <ImpersonateModal onClose={() => setPickerOpen(false)} /> : null}
 
