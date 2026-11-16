@@ -12,6 +12,7 @@ process.on("unhandledRejection", (e) => {
 });
 import { ChatAnthropic } from "@langchain/anthropic";
 import { buildGraph } from "./graph.js";
+import { shipmentDetailsRouter } from "./routes/shipmentDetails.js";
 import { requireAuth, bootstrapAdminKey, bootstrapAdminEmail } from "./lib/auth.js";
 import { isDbReady, supabase } from "./lib/supabase.js";
 import { getSettings } from "./lib/settings.js";
@@ -141,6 +142,7 @@ api.use("/tasks", tasksRouter);
 api.use("/feedback", feedbackRouter);
 api.use("/audit-log", auditLogRouter);
 api.use("/ops", opsRouter);
+api.use("/shipment-details", shipmentDetailsRouter);
 app.use("/api", api);
 
 // Admin routes (admin scope OR admin role).

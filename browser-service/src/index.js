@@ -20,6 +20,7 @@ function allowChat(email) {
   return true;
 }
 import { startLoginKeepAlive } from "./keepalive.js";
+import { startDetailsWorker, detailsWorkerState } from "./details.js";
 import { listSchedules, createSchedule, updateSchedule, deleteSchedule, runScheduleNow, startScheduler } from "./schedules.js";
 
 const sessions = new Set();
@@ -67,6 +68,8 @@ const server = http.createServer(async (req, res) => {
       // One per lane: a deploy is only safe when BOTH are idle.
       scrapeWorker: config.scrapeWorker ? (workerBusy("scrape") ? "busy" : "idle") : "off",
       invoicingWorker: config.scrapeWorker ? (workerBusy("invoicing") ? "busy" : "idle") : "off",
+      // The read-only shipment details job, in its own browser.
+      detailsWorker: config.scrapeWorker ? detailsWorkerState() : "off",
       selfTest: selfTestResult,
       runHistory: supabaseEnabled ? "supabase" : "local",
       assistant: assistantEnabled,
@@ -482,7 +485,7 @@ server.listen(config.port, async () => {
   console.log(`[fpx-browser] listening on :${config.port}${config.devNoAuth ? " (DEV: auth disabled)" : ""}`);
   startSettings();
   initRuns().catch((e) => console.warn("[runs] init failed:", e.message));
-  if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); startInvoicingMirror(); }
+  if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); startInvoicingMirror(); startDetailsWorker(); }
   startLoginKeepAlive();
   startAssistantIndexer();
   selfTest().then((r) => {

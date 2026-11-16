@@ -41,7 +41,12 @@ const SCOPES = ["all", "selected", "erp_audit", GET_INVOICE_SCOPE, APPROVAL_CHEC
 // run or an approval check. Any other claimer would treat the row as a full rescrape, so it is
 // never handed one.
 const HOSTED_WORKER = "fpx-browser";
-const HOSTED_ONLY_SCOPES = ["erp_audit", GET_INVOICE_SCOPE, APPROVAL_CHECK_SCOPE];
+// "shipment_details": the read-only job that opens FreightPOP's Shipment
+// Details page for shipments on the tracking dashboard (its own worker, in its
+// own browser; queued by routes/shipmentDetails.js).
+export const SHIPMENT_DETAILS_SCOPE = "shipment_details";
+const INVOICING_SCOPES = ["erp_audit", GET_INVOICE_SCOPE, APPROVAL_CHECK_SCOPE];
+const HOSTED_ONLY_SCOPES = [...INVOICING_SCOPES, SHIPMENT_DETAILS_SCOPE];
 
 // Puts the rows of a get-invoice request that are still waiting ("requested")
 // back to "not_started". Rows that already have a result are left alone.
@@ -321,7 +326,8 @@ opsRouter.get("/rescrape/pending", async (req, res) => {
   // invoicing jobs (ERP pull, get invoices, approval check) in two separate
   // sessions, each polling for its own kind.
   const only = String(req.query.only || "");
-  if (only === "invoicing") query = query.in("scope", HOSTED_ONLY_SCOPES);
+  if (only === "invoicing") query = query.in("scope", INVOICING_SCOPES);
+  else if (only === "details") query = query.eq("scope", SHIPMENT_DETAILS_SCOPE);
   else if (only === "scrape") query = query.not("scope", "in", `(${HOSTED_ONLY_SCOPES.join(",")})`);
   const { data: rows, error } = await query
     .order("requested_at", { ascending: true }).limit(1);
