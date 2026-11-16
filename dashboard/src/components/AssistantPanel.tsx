@@ -39,7 +39,7 @@ export function AskSearchTrigger() {
 }
 
 const PAGE_PATHS: Record<string, string> = {
-  tracking: "/tracking", tasks: "/tasks/v2", ops: "/ops", scraping: "/scraping",
+  tracking: "/tracking", shipment_details: "/tracking/details", tasks: "/tasks/v2", ops: "/ops", scraping: "/scraping",
   notes: "/notes", analyses: "/analyses", gp: "/audits/gp", invoice: "/audits/invoice",
 };
 
@@ -183,7 +183,7 @@ export function AssistantPanel() {
   }, []);
 
   function perform(a: AssistantAction) {
-    if (a.type === "open_shipment") navigate(`/tracking/${a.id}`);
+    if (a.type === "open_shipment") navigate(a.tab && a.tab !== "overview" ? `/tracking/${a.id}/${a.tab}` : `/tracking/${a.id}`);
     else if (a.type === "open_task") navigate(`/tasks/v2/${a.task_id}`);
     else if (a.type === "navigate") navigate(PAGE_PATHS[a.page] || "/tracking");
     else if (a.type === "filter_shipments") {

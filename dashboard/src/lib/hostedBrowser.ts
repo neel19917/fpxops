@@ -201,7 +201,7 @@ async function detailsCall<T>(path: string, init?: RequestInit): Promise<T> {
 
 // "Ask FPX" assistant (browser-service/src/assistant.js).
 export type AssistantAction =
-  | { type: "open_shipment"; id: string; label?: string }
+  | { type: "open_shipment"; id: string; label?: string; tab?: string }
   | { type: "open_task"; task_id: string; label?: string }
   | { type: "filter_shipments"; query?: string; action?: "YES" | "NO" | "ERROR"; customer?: string }
   | { type: "navigate"; page: string };

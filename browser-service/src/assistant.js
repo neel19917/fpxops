@@ -392,7 +392,8 @@ async function preloadedBrief() {
 
 const UI_TOOLS = new Set(["open_shipment", "open_task", "filter_shipments", "navigate"]);
 
-const PAGES = ["tracking", "tasks", "ops", "scraping", "notes", "analyses", "gp", "invoice"];
+const PAGES = ["tracking", "shipment_details", "tasks", "ops", "scraping", "notes", "analyses", "gp", "invoice"];
+const SHIPMENT_TABS = ["overview", "tasks", "email", "history", "intel", "freightpop"];
 
 const obj = (properties, required = []) => ({ type: "object", properties, required, additionalProperties: false });
 
@@ -430,8 +431,8 @@ const TOOLS = [
   },
   {
     name: "open_shipment",
-    description: "Open a shipment's detail drawer in the user's dashboard. Needs the internal id from a search/focus/get result.",
-    input_schema: obj({ id: { type: "string" }, label: { type: "string", description: "e.g. the shipment number, for the confirmation chip" } }, ["id"]),
+    description: "Open a shipment's detail drawer in the user's dashboard. Needs the internal id from a search/focus/get result. Set tab to land on one part of it: \"freightpop\" is the FreightPOP details tab (carrier, sale, cost, gross profit, quote breakdown).",
+    input_schema: obj({ id: { type: "string" }, label: { type: "string", description: "e.g. the shipment number, for the confirmation chip" }, tab: { type: "string", enum: SHIPMENT_TABS, description: "Which drawer tab to show; omit for the overview" } }, ["id"]),
   },
   {
     name: "open_task",
@@ -449,7 +450,7 @@ const TOOLS = [
   },
   {
     name: "navigate",
-    description: "Go to a dashboard page.",
+    description: "Go to a dashboard page. shipment_details is the page listing every shipment's sale, cost and gross profit read from FreightPOP, with the live view of that read.",
     input_schema: obj({ page: { type: "string", enum: PAGES } }, ["page"]),
   },
 ].map((t) => ({ ...t, strict: true }));
@@ -459,7 +460,7 @@ const SYSTEM = `You are "Ask FPX", the operations assistant inside the FPX Contr
 What you do:
 - Tell the rep what to focus on, and why, in plain words. Lead with the few shipments that need a person today: action needed, Issue status, missed delivery appointments, out for delivery past ETA with no delivery, stale tasks. Say what to do next (call the carrier, update the customer, book an appointment).
 - Find shipments and answer questions about them from the data tools. Never invent shipment facts; if the data doesn't say, say so.
-- A shipment's \`financials\` (sale, cost, gross_profit, margin_pct, and the quote's freight, fuel and accessorials) were read from FreightPOP's own Shipment Details page at \`read_from_freightpop_at\`. A shipment with no \`financials\` has not been read yet: say that, and never estimate a sale, cost or profit.
+- A shipment's \`financials\` (sale, cost, gross_profit, margin_pct, and the quote's freight, fuel and accessorials) were read from FreightPOP's own Shipment Details page at \`read_from_freightpop_at\`. A shipment with no \`financials\` has not been read yet: say that, and never estimate a sale, cost or profit. When the rep asks to see a shipment's sale, cost, gross profit, margin or quote, also open it with open_shipment and tab "freightpop"; for all shipments' figures, navigate to shipment_details.
 - Drive the dashboard when it helps: open a shipment or task, filter the Tracking list, or go to a page. When the rep asks to see/open/show something, do it with the UI tools rather than only describing it. Opening is cheap — open the one they asked about. For a list, prefer filter_shipments.
 
 Data notes:
