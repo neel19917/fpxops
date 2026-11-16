@@ -20,7 +20,7 @@ function allowChat(email) {
   return true;
 }
 import { startLoginKeepAlive } from "./keepalive.js";
-import { startDetailsWorker, detailsWorkerState } from "./details.js";
+import { startDetailsWorker, detailsWorkerState, detailsState, requestDetailsStop } from "./details.js";
 import { listSchedules, createSchedule, updateSchedule, deleteSchedule, runScheduleNow, startScheduler } from "./schedules.js";
 
 const sessions = new Set();
@@ -79,7 +79,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404).end();
 });
 
-const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/pause|scrape\/resume|scrape\/log|runs|schedules|assistant|admin)(\/|$)/;
+const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/pause|scrape\/resume|scrape\/log|details\/state|details\/stop|runs|schedules|assistant|admin)(\/|$)/;
 
 async function readJson(req, maxBytes = 64 * 1024) {
   let body = "";
@@ -139,6 +139,10 @@ async function handleApi(req, res, url, who) {
   if (p === "/me" && m === "GET") {
     return json(res, 200, { user: who.email, isAdmin: who.isAdmin, browser: userStatus(who.email) });
   }
+  // The read-only shipment details job (its own browser): state, progress and
+  // the last 500 log lines of the running job and of the last one; and stop.
+  if (p === "/details/state" && m === "GET") return json(res, 200, detailsState(who));
+  if (p === "/details/stop" && m === "POST") return json(res, 200, { stopping: requestDetailsStop(who) });
   if (p === "/stats" && m === "GET") {
     const days = Math.min(30, Math.max(1, Number(url.searchParams.get("days")) || 30));
     const browsers = poolStats();
@@ -449,7 +453,7 @@ wss.on("connection", (ws, req) => {
           // Mid login-reset: have the client retry in a moment (normal backoff).
           if (resetting.has(who.email.toLowerCase())) { ws.close(1013, "login reset in progress"); return; }
           // "scrape" / "invoicing": watch that lane's job window, read-only.
-          const target = LANES.includes(msg.target) ? msg.target : "tab";
+          const target = LANES.includes(msg.target) || msg.target === "details" ? msg.target : "tab";
           // Per-user cap, server limit and registration: see admit().
           session = await withUserLock(who.email.toLowerCase(), () => admit(ws, who, target));
         } finally {

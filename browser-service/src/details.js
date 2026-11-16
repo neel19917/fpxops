@@ -19,7 +19,10 @@ import { config } from "./config.js";
 
 export const DETAILS_SCOPE = "shipment_details";
 const VARIANT = "details";
-const MAX_SHIPMENTS = 20;
+const MAX_SHIPMENTS = 20;       // a request that names its shipments
+const MAX_SWEEP = 3000;         // a sweep of every tracked shipment
+const SWEEP_LIMIT_MS = 4 * 60 * 60_000;
+const LOG_KEEP = 5000;
 const PAGE_WAIT_MS = 60_000;
 const FP_ORIGIN = "https://app.freightpop.com";
 // A small page on FreightPOP's own address: enough to read and write its
@@ -28,10 +31,30 @@ const LOGIN_CARRIER_URL = `${FP_ORIGIN}/Scripts/PageScripts/Config.js`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let busy = false;
-let last = null; // the last finished job, for /health
+let current = null; // the running job: { requestId, user, startedAt, sweep, counts, shipment, stopping, log }
+let livePage = null; // its window, for read-only watching
+let last = null;    // the last finished job
 
 export const detailsWorkerState = () => (busy ? "busy" : "idle");
-export const detailsLast = () => last;
+// What the monitor page shows. Only the person running a job (or an admin) sees its log.
+export function detailsState(who) {
+  const mine = (job) => job && (job.user === who.email || who.isAdmin);
+  return {
+    state: busy ? "busy" : "idle",
+    current: mine(current) ? { ...current, log: current.log.slice(-500) } : null,
+    last: mine(last) ? { ...last, log: last.log.slice(-500) } : null,
+  };
+}
+// The job's window, for the watch-only live view. Only its owner may watch.
+export function detailsPageFor(email) {
+  return current && current.user === email && livePage && !livePage.isClosed() ? livePage : null;
+}
+// Stop after the shipment in progress.
+export function requestDetailsStop(who) {
+  if (!current || (current.user !== who.email && !who.isAdmin)) return false;
+  current.stopping = true;
+  return true;
+}
 
 async function api(path, init = {}) {
   const res = await fetch(`${config.apiUrl}${path}`, {
@@ -172,20 +195,38 @@ async function readOne(page, shipmentId, quote, log) {
 async function run(request) {
   const startedAt = Date.now();
   const who = String(request.requested_by || "");
+  const sweep = /(?:^|;)\s*all=1\b/.test(String(request.note || ""));
   const lines = [];
-  const log = (text, level = "info") => { lines.push({ t: new Date().toISOString(), level, text: String(text) }); console.log(`[details] ${level} ${text}`); };
+  const job = { requestId: request.id, user: who, startedAt: new Date(startedAt).toISOString(), sweep, counts: { total: 0, done: 0, stored: 0, failed: 0 }, shipment: null, stopping: false, log: lines };
+  current = job;
+  const log = (text, level = "info") => {
+    lines.push({ t: new Date().toISOString(), level, text: String(text) });
+    if (lines.length > LOG_KEEP) lines.splice(0, lines.length - LOG_KEEP);
+    console.log(`[details] ${level} ${text}`);
+  };
   log.requestId = request.id;
   log.who = who;
-  const quotes = quotesFromNote(request.note);
-  const ids = (Array.isArray(request.tracking_numbers) ? request.tracking_numbers : []).map(String).filter((id) => quotes.has(id)).slice(0, MAX_SHIPMENTS);
-  let ok = false, note = "", stored = 0, failed = 0;
+  let ok = false, note = "";
   let lease = null, page = null;
   try {
     if (!who.includes("@")) throw new Error(`The request has no person to run as (requested_by="${who}")`);
-    if (!ids.length) throw new Error("The request names no shipment with a FreightPOP quote id");
+    // Which shipments: the ones the request names, or every tracked shipment.
+    let quotes = quotesFromNote(request.note);
+    let ids = (Array.isArray(request.tracking_numbers) ? request.tracking_numbers : []).map(String).filter((id) => quotes.has(id)).slice(0, MAX_SHIPMENTS);
+    if (sweep) {
+      const list = await api("/api/shipment-details/sweep-list", { signal: AbortSignal.timeout(120_000) });
+      quotes = new Map();
+      for (const r of (list.shipments || []).slice(0, MAX_SWEEP)) {
+        if (/^\d+$/.test(String(r.shipment_id)) && /^\d+$/.test(String(r.quote))) quotes.set(String(r.shipment_id), { quoteId: String(r.quote), sale: r.sale ?? null, cost: r.cost ?? null });
+      }
+      ids = [...quotes.keys()];
+      if (list.skipped) log(`${list.skipped} tracked shipment(s) have no FreightPOP quote id yet and are left out`, "warn");
+    }
+    if (!ids.length) throw new Error(sweep ? "No tracked shipment has a FreightPOP quote id yet: run a scrape first" : "The request names no shipment with a FreightPOP quote id");
+    job.counts.total = ids.length;
     if (!hasProfile(who)) await saveCookiesNow(who);
     if (!hasProfile(who)) throw new Error(`${who} hasn't logged in to FreightPOP in the hosted view yet`);
-    log(`Claimed shipment details · ${ids.length} shipment(s) — running as ${who} in a separate browser · read only`);
+    log(`Claimed shipment details · ${ids.length} shipment(s)${sweep ? " (every tracked shipment)" : ""} — running as ${who} in a separate browser · read only`);
 
     const login = await readLogin(who);
     if (!login.length) throw new Error("No FreightPOP login was found in your hosted browser: sign in on the FreightPOP login page, then read again");
@@ -198,40 +239,54 @@ async function run(request) {
     lease.browser.on("targetcreated", async (t) => {
       try { if (t.type() === "page" && t.opener() === page.target()) { const p = await t.page(); if (p) await p.close(); } } catch { /* gone */ }
     });
+    livePage = page;
 
+    let inARow = 0; // failures in a row: several means the login or FreightPOP itself is gone
     for (const id of ids) {
+      if (job.stopping) { log(`Stopped by ${who} after ${job.counts.done} of ${ids.length}`, "warn"); break; }
+      if (Date.now() - startedAt > SWEEP_LIMIT_MS) { log(`Stopped: the ${SWEEP_LIMIT_MS / 3_600_000}-hour limit was reached after ${job.counts.done} of ${ids.length}`, "warn"); break; }
+      job.shipment = id;
       try {
         const record = await readOne(page, id, quotes.get(id), log);
         const out = await api("/api/shipment-details", { method: "POST", signal: AbortSignal.timeout(30_000), body: JSON.stringify({ by: who, records: [record] }) });
-        if (out?.stored) { stored++; log(`Shipment ${id} · stored · ${out.summary?.[0] || `${record.text.length} characters`}`, "done"); }
-        else { failed++; log(`Shipment ${id} · read, but not stored (${String(out?.error || "the API refused it").slice(0, 160)})`, "error"); }
+        if (out?.stored) { job.counts.stored++; inARow = 0; log(`Shipment ${id} · stored · ${out.summary?.[0] || `${record.text.length} characters`}`, "done"); }
+        else { job.counts.failed++; inARow++; log(`Shipment ${id} · read, but not stored (${String(out?.error || "the API refused it").slice(0, 160)})`, "error"); }
       } catch (e) {
-        failed++;
+        job.counts.failed++; inARow++;
         log(`Shipment ${id} · ${String(e.message || e).slice(0, 300)}`, "error");
         if (e.fatal) throw e;
       }
+      job.counts.done++;
+      if (inARow >= 6) throw new Error(`Stopped: ${inARow} shipments in a row could not be read. Check the FreightPOP login, then read again`);
+      if (job.counts.done % 25 === 0) log(`${job.counts.done} of ${ids.length} done · ${job.counts.stored} stored · ${job.counts.failed} failed`);
+      await sleep(400); // a breath between pages
     }
-    ok = stored > 0;
-    note = `${stored} of ${ids.length} shipment(s) read from FreightPOP${failed ? ` · ${failed} failed` : ""}`;
+    ok = job.counts.stored > 0;
+    note = `${job.counts.stored} of ${ids.length} shipment(s) read from FreightPOP${job.counts.failed ? ` · ${job.counts.failed} failed` : ""}${job.counts.done < ids.length ? ` · stopped after ${job.counts.done}` : ""}`;
     if (!ok) note = lines.filter((l) => l.level === "error").pop()?.text || note;
   } catch (e) {
     note = String(e.message || e).slice(0, 400);
+    if (job.counts.stored) note = `${job.counts.stored} of ${job.counts.total} read, then: ${note}`.slice(0, 480);
     log(`Failed: ${note}`, "error");
   } finally {
+    livePage = null;
+    job.shipment = null;
     if (page) await page.close().catch(() => {});
     if (lease) lease.release();
     await closeUserBrowser(who, VARIANT).catch(() => {});
   }
   log(`Finished: ${note}`, ok ? "done" : "error");
+  const stored = job.counts.stored;
   await api(`/api/ops/rescrape/${request.id}/complete`, { method: "POST", body: JSON.stringify({ result_count: stored, note, ...(ok ? {} : { error: true }) }) })
     .catch((e) => console.warn("[details] could not complete the request:", e.message));
   try {
     recordRun({
       id: request.id, source: "manual", user: who, startedAt: new Date(startedAt).toISOString(), finishedAt: new Date().toISOString(),
-      durationMs: Date.now() - startedAt, ok, note, counts: { scraped: stored, saved: stored, uploadErrors: failed, total: ids.length },
+      durationMs: Date.now() - startedAt, ok, note, counts: { scraped: stored, saved: stored, uploadErrors: job.counts.failed, total: job.counts.total },
     }, lines);
   } catch (e) { console.warn("[details] run not recorded:", e.message); }
-  last = { requestId: request.id, ok, note, finishedAt: new Date().toISOString() };
+  last = { requestId: request.id, user: who, ok, note, finishedAt: new Date().toISOString(), counts: { ...job.counts }, log: lines };
+  current = null;
 }
 
 async function tick() {

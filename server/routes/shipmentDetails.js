@@ -82,6 +82,101 @@ shipmentDetailsRouter.post("/", async (req, res) => {
   res.json({ stored: rows.length, failed: refused, summary: rows.map(describeDetail) });
 });
 
+// Every shipment on the tracking dashboard now (not archived), one entry per
+// shipment id, with what FreightPOP's grid hands the Shipment Details page.
+// "Now" = seen by the latest scrape (or within 6 hours before it): older rows
+// that were never archived are no longer in FreightPOP's grid.
+async function trackedShipments() {
+  const out = new Map();
+  const { data: newest, error: e0 } = await supabase
+    .from("fpx_shipments").select("scraped_at").is("archived_at", null).not("scraped_at", "is", null)
+    .order("scraped_at", { ascending: false }).limit(1);
+  if (e0) throw new Error(e0.message);
+  if (!newest?.[0]?.scraped_at) return out;
+  const since = new Date(new Date(newest[0].scraped_at).getTime() - 6 * 3_600_000).toISOString();
+  for (let from = 0; from < 20000; from += 1000) {
+    const { data, error } = await supabase
+      .from("fpx_shipments")
+      .select("shipment_id, customer_name, company_name, q:raw_data->>QuotesId, sale:raw_data->>RateWithOutMarkedUp, cost:raw_data->>cost")
+      .is("archived_at", null).not("shipment_id", "is", null).gte("scraped_at", since)
+      .order("scraped_at", { ascending: false }).order("id", { ascending: true }).range(from, from + 999);
+    if (error) throw new Error(error.message);
+    for (const r of data || []) {
+      const id = String(r.shipment_id || "").trim();
+      if (isShipmentId(id) && !out.has(id)) out.set(id, r);
+    }
+    if (!data || data.length < 1000) break;
+  }
+  return out;
+}
+const money = (v) => { const n = Number(String(v ?? "").replace(/[$,\s]/g, "")); return String(v ?? "").trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null; };
+
+// GET /shipment-details/sweep-list — for the hosted browser: every tracked
+// shipment that has a FreightPOP quote id, with the sale and cost to open its
+// page with. Responds { shipments: [{ shipment_id, quote, sale, cost }], skipped }.
+shipmentDetailsRouter.get("/sweep-list", async (_req, res) => {
+  try {
+    const tracked = await trackedShipments();
+    const shipments = [];
+    let skipped = 0;
+    for (const [id, r] of tracked) {
+      const q = String(r.q ?? "").trim();
+      if (!/^\d+$/.test(q) || q === "0") { skipped++; continue; }
+      shipments.push({ shipment_id: id, quote: q, sale: money(r.sale), cost: money(r.cost) });
+    }
+    res.json({ shipments, skipped });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// POST /shipment-details/sweep — ask the hosted browser to read the details
+// of every tracked shipment. Runs as the person asking. A sweep already
+// waiting or running is returned as is. Responds { request: { id, status } }.
+shipmentDetailsRouter.post("/sweep", async (req, res) => {
+  const who = req.user?.email || null;
+  if (!who) return res.status(403).json({ error: "Sign in to the dashboard to read from FreightPOP: the read uses your FreightPOP login" });
+  const { data: open } = await supabase
+    .from("fpx_scrape_requests").select("id, status, note")
+    .eq("scope", SHIPMENT_DETAILS_SCOPE).in("status", ["pending", "claimed"])
+    .order("requested_at", { ascending: false }).limit(20);
+  const running = (open || []).find((r) => /(?:^|;)\s*all=1\b/.test(String(r.note || "")));
+  if (running) return res.json({ request: { id: running.id, status: running.status }, coalesced: true });
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .insert({ scope: SHIPMENT_DETAILS_SCOPE, note: "all=1", requested_by: who })
+    .select("id, status").single();
+  if (error) return res.status(500).json({ error: error.message });
+  logAudit(req, {
+    action: "rescrape_request", entity_type: "scrape_request", entity_id: data.id,
+    summary: "Asked for every tracked shipment's details to be read from FreightPOP",
+    metadata: { scope: SHIPMENT_DETAILS_SCOPE, sweep: true },
+  });
+  res.json({ request: data });
+});
+
+// GET /shipment-details — what is stored for the shipments on the tracking
+// dashboard now. Responds { tracked, read, totals: { sale, cost, gross_profit },
+// rows: [{ shipment_id, customer, carrier, tracking_number, sale, cost,
+// gross_profit, quote_freight, quote_fuel, quote_accessorial_total,
+// quote_total, captured_at }] }, newest read first.
+shipmentDetailsRouter.get("/", async (_req, res) => {
+  try {
+    const tracked = await trackedShipments();
+    const ids = [...tracked.keys()];
+    const rows = [];
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data, error } = await supabase
+        .from("fpx_shipment_details")
+        .select("shipment_id, carrier, tracking_number, sale, cost, gross_profit, quote_freight, quote_fuel, quote_accessorial_total, quote_total, captured_at")
+        .in("shipment_id", ids.slice(i, i + 200));
+      if (error) throw new Error(error.message);
+      for (const d of data || []) rows.push({ ...d, customer: tracked.get(d.shipment_id)?.customer_name || tracked.get(d.shipment_id)?.company_name || null });
+    }
+    rows.sort((a, b) => String(b.captured_at).localeCompare(String(a.captured_at)));
+    const sum = (k) => Math.round(rows.reduce((t, r) => t + (Number(r[k]) || 0), 0) * 100) / 100;
+    res.json({ tracked: ids.length, read: rows.length, totals: { sale: sum("sale"), cost: sum("cost"), gross_profit: sum("gross_profit") }, rows });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // GET /shipment-details/:shipmentId — the stored details of one shipment, the
 // latest read request for it, and whether a read can be asked for.
 // Responds { details | null, job | null, can_refresh, reason? }.

@@ -1,6 +1,7 @@
 import { acquireUserBrowser, openWindowPage, ExtensionContexts, noteUrl, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
 import { recordSession } from "./usage.js";
 import { lanePageFor } from "./worker.js";
+import { detailsPageFor } from "./details.js";
 import { get as setting, onChange as onSettingsChange } from "./settings.js";
 
 // Live-view data sent, in 1-minute buckets for the last hour (admin cost view).
@@ -114,7 +115,8 @@ export class ViewerSession {
   constructor(ws, who, { target = "tab" } = {}) {
     this.ws = ws;
     this.who = who;
-    this.watchLane = target === "scrape" || target === "invoicing" ? target : null;
+    // "details": the read-only shipment details job, in its own browser.
+    this.watchLane = target === "scrape" || target === "invoicing" || target === "details" ? target : null;
     this.watchOnly = !!this.watchLane;
     this.ownsPage = !this.watchOnly;
     this.page = null;
@@ -321,10 +323,10 @@ export class ViewerSession {
   async open() {
     this.startedAt = Date.now();
     if (this.watchOnly) {
-      const what = this.watchLane === "invoicing" ? "invoicing job" : "scrape";
-      this.page = lanePageFor(this.watchLane, this.who.email);
+      const what = this.watchLane === "invoicing" ? "invoicing job" : this.watchLane === "details" ? "shipment details read" : "scrape";
+      this.page = this.watchLane === "details" ? detailsPageFor(this.who.email) : lanePageFor(this.watchLane, this.who.email);
       if (!this.page) { this.send({ type: "ended", reason: `No ${what} is running in your browser` }); this.ws.close(4004, `no ${what}`); return; }
-      this.onPageClose = () => { this.send({ type: "ended", reason: this.watchLane === "invoicing" ? "Invoicing job finished" : "Scrape finished" }); try { this.ws.close(4004, `${what} ended`); } catch {} };
+      this.onPageClose = () => { this.send({ type: "ended", reason: this.watchLane === "invoicing" ? "Invoicing job finished" : this.watchLane === "details" ? "Shipment details read finished" : "Scrape finished" }); try { this.ws.close(4004, `${what} ended`); } catch {} };
       // on(), not once(): puppeteer's once() wraps the handler, and close()
       // could then not remove it.
       this.page.on("close", this.onPageClose);
