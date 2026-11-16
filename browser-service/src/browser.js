@@ -290,6 +290,15 @@ async function finishLaunch(entry, browser) {
   return browser;
 }
 
+// Write this user's login to disk now, if their browser is running. A fresh
+// sign-in is otherwise only saved by the 5-minute timer, and until then a job
+// would be told the user "hasn't logged in yet".
+export async function saveCookiesNow(email) {
+  const entry = pool.get(profileKey(email));
+  if (!entry?.browser?.connected) return false;
+  try { await saveCookies(entry); return true; } catch (e) { console.warn(`[browser] cookie save for ${email} failed:`, e.message); return false; }
+}
+
 async function saveCookies(entry) {
   if (!entry.browser?.connected) return;
   // Browser-level CDP call on the root connection. (browser.target()

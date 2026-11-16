@@ -1,4 +1,4 @@
-import { acquireUserBrowser, hasProfile, getServiceWorker, openWindowPage, ExtensionContexts, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
+import { acquireUserBrowser, hasProfile, saveCookiesNow, getServiceWorker, openWindowPage, ExtensionContexts, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
 import { config } from "./config.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -709,6 +709,8 @@ async function runJob(lane, job) {
   let note = "";
   try {
     if (!email.includes("@")) throw new Error(`Request has no user (requested_by="${email}") — rescrapes must come from a signed-in rep`);
+    // Signed in a moment ago (for example after "Reset my login"): keep that login first.
+    if (!hasProfile(email)) await saveCookiesNow(email);
     if (!hasProfile(email)) throw new Error(`${email} hasn't logged in to FreightPOP in the hosted view yet`);
     let result;
     if (kind === "erp_audit") {
