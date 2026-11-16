@@ -91,6 +91,24 @@ function shotLabel(file: string): string {
 }
 const shotExt = (file: string) => (file.split(".").pop() || "").toLowerCase();
 
+// The saved files, one tab per kind of document. A file's tab comes from the
+// button it was saved from (the same name shotLabel reads).
+const TABS: { key: string; label: string; test: (file: string) => boolean }[] = [
+  { key: "invoice", label: "Invoice", test: (f) => !/-view-/.test(f) },
+  { key: "bol", label: "BOL and labels", test: (f) => /-view-print-shipping-labels-bol-/.test(f) },
+  { key: "rate", label: "Rate confirmation", test: (f) => /-view-print-rate-confirmation-/.test(f) },
+  { key: "quote", label: "Quote", test: (f) => /-view-details-/.test(f) },
+  { key: "shipment", label: "Shipment details", test: (f) => /-view-\d+\.png$/.test(f) },
+  { key: "accessorials", label: "Accessorials", test: (f) => /-view-view-/.test(f) },
+  { key: "documents", label: "Documents and notes", test: (f) => /-view-(documents|notes|broker-notes|print-documents)-/.test(f) },
+  { key: "other", label: "Other", test: () => true },
+];
+function tabOf(file: string): string {
+  return (TABS.find((t) => t.test(file)) ?? TABS[TABS.length - 1]).key;
+}
+// The document itself before a picture of the page it came from.
+const pdfFirst = (a: string, b: string) => Number(b.endsWith(".pdf")) - Number(a.endsWith(".pdf"));
+
 function Fact({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="min-w-0">
@@ -153,6 +171,9 @@ export function InvoiceRecordModal({ auditId, row, onClose }: {
   const approved = !!group && group !== "not_approved";
   const approvedOn = approved ? approvalDate(row.ap) : "";
   const fileId = (row.shipment || "shipment").replace(/[^\w.-]+/g, "_");
+  const tabs = TABS.map((t) => ({ ...t, files: row.shots.filter((f) => tabOf(f) === t.key).sort(pdfFirst) })).filter((t) => t.files.length > 0);
+  const [tabPick, setTabPick] = useState<string | null>(null);
+  const tab = tabs.find((t) => t.key === tabPick) ?? tabs[0] ?? null;
 
   return createPortal(
     <div
@@ -219,7 +240,26 @@ export function InvoiceRecordModal({ auditId, row, onClose }: {
             </div>
           ) : (
             <div className="space-y-4">
-              {row.shots.map((file, i) => (
+              <div role="tablist" aria-label="Saved documents" className="flex gap-1 flex-wrap border-b border-slate-200">
+                {tabs.map((t) => {
+                  const on = t.key === tab?.key;
+                  return (
+                    <button
+                      key={t.key}
+                      type="button"
+                      role="tab"
+                      aria-selected={on}
+                      onClick={() => setTabPick(t.key)}
+                      className={"px-3 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 rounded-t-md "
+                        + (on ? "border-violet-600 text-violet-700" : "border-transparent text-slate-500 hover:text-slate-900 hover:border-slate-300")}
+                    >
+                      {t.label}
+                      <span className={"ml-1.5 text-xs tabular-nums " + (on ? "text-violet-500" : "text-slate-400")}>{t.files.length}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {(tab?.files ?? []).map((file, i) => (
                 <Shot
                   key={file}
                   auditId={auditId}
