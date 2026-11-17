@@ -7,6 +7,7 @@ import {
   downloadPushedExcel, fetchPushed, matchCsv, matchPushed, saveBlob, splitPasted,
   type MatchResponse, type MatchResult, type PushedFilters, type PushedList, type PushedRow,
 } from "../lib/erpPushed";
+import { PushedRecordModal } from "../components/invoicing/PushedRecordModal";
 
 // Pushed to ERP: the invoices FreightPOP has already exported to the ERP
 // (NetSuite), to match against NetSuite. Read only.
@@ -251,6 +252,7 @@ export function InvoicesPushedPage() {
   const [search, setSearch] = useState("");
   const [q, setQ] = useState("");
   const [offset, setOffset] = useState(0);
+  const [openRow, setOpenRow] = useState<PushedRow | null>(null);
   const [list, setList] = useState<PushedList | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -433,10 +435,16 @@ export function InvoicesPushedPage() {
                 const refs = references(r);
                 const more = r.invoice_numbers.length - (r.invoice_number ? 1 : 0);
                 return (
-                  <tr key={r.shipment_id ?? `${r.tracking_number}|${r.invoice_number}`} className="hover:bg-slate-50/60">
+                  <tr
+                    key={r.shipment_id ?? `${r.tracking_number}|${r.invoice_number}`}
+                    onClick={r.shipment_id ? () => setOpenRow(r) : undefined}
+                    title={r.shipment_id ? "See the saved screenshot and documents" : undefined}
+                    className={"hover:bg-slate-50/60 " + (r.shipment_id ? "cursor-pointer" : "")}
+                  >
                     <td className={TD + " pl-6 whitespace-nowrap"}>
-                      <span className="font-medium text-slate-900">{r.shipment_id ?? dash}</span>
+                      <span className="font-medium text-sky-700">{r.shipment_id ?? dash}</span>
                       <span className="block text-xs text-slate-500">{r.tracking_number ?? ""}</span>
+                      {r.saved_files ? <span className="mt-1 inline-block text-[11px] rounded-full px-2 py-0.5 bg-emerald-50 text-emerald-800 ring-1 ring-emerald-200">{r.saved_files} saved file{r.saved_files === 1 ? "" : "s"}</span> : null}
                     </td>
                     <td className={TD + " whitespace-nowrap text-slate-700"}>{r.billing_invoice_number ?? dash}</td>
                     <td className={TD + " whitespace-nowrap text-slate-700"}>
@@ -483,6 +491,7 @@ export function InvoicesPushedPage() {
       </section>
 
       <MatchBox />
+      {openRow ? <PushedRecordModal row={openRow} onClose={() => setOpenRow(null)} /> : null}
     </div>
   );
 }

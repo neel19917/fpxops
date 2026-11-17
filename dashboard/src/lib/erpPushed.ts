@@ -39,6 +39,8 @@ export interface PushedRow {
   payee: string | null;
   /** When the row was last read from FreightPOP. */
   last_seen_at: string | null;
+  /** Files (screenshots, documents) FPX has saved for the shipment; list rows only. */
+  saved_files?: number;
 }
 
 export interface PushedTotals {
@@ -158,6 +160,14 @@ async function call(path: string, init?: RequestInit): Promise<Response> {
 /** One page of pushed invoices, with totals and per-day counts of everything the filter matches. */
 export async function fetchPushed(filters: PushedFilters, signal?: AbortSignal): Promise<PushedList> {
   const res = await call(`${BASE}${queryOf(filters, true)}`, signal ? { signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]) } : undefined);
+  return res.json();
+}
+
+export interface PushedRecord { kind: string; audit_id: string | null; files: string[]; captured_at: string | null; captured_by: string | null }
+export interface PushedRecords { shipment_id: string; quote_id: string | null; records: PushedRecord[] }
+/** The screenshots and documents FPX has saved for one shipment. */
+export async function fetchPushedRecords(shipmentId: string): Promise<PushedRecords> {
+  const res = await call(`${BASE}/records/${encodeURIComponent(shipmentId)}`);
   return res.json();
 }
 

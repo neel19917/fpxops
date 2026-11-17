@@ -82,7 +82,48 @@ erpPushedRouter.get("/", async (req, res) => {
   if (filters.error) return res.status(400).json({ error: filters.error });
   try {
     const snap = await snapshot("pushed");
-    res.json({ ...listPushed(snap.rows, filters), read_at: snap.read_at });
+    const out = listPushed(snap.rows, filters);
+    // How many files FPX has saved for each shipment on this page (0 = none yet).
+    const saved = await savedFileCounts(out.data.map((r) => r.shipment_id));
+    res.json({ ...out, data: out.data.map((r) => ({ ...r, saved_files: saved.get(String(r.shipment_id)) || 0 })), read_at: snap.read_at });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+// shipment id → number of files kept in fpx_shipment_records. A failed read
+// counts as none: the list still loads.
+async function savedFileCounts(ids) {
+  const out = new Map();
+  const keys = [...new Set(ids.filter(Boolean).map(String))];
+  for (let i = 0; i < keys.length; i += 200) {
+    try {
+      const { data, error } = await supabase.from("fpx_shipment_records").select("shipment_id, files").in("shipment_id", keys.slice(i, i + 200));
+      if (error) continue;
+      for (const r of data || []) out.set(r.shipment_id, (out.get(r.shipment_id) || 0) + (Array.isArray(r.files) ? r.files.length : 0));
+    } catch { /* none */ }
+  }
+  return out;
+}
+
+// GET /audits/erp/pushed/records/:shipmentId — what FPX has saved for one
+// shipment: the screenshots and documents of each capture, and the quote id
+// FreightPOP's own Shipment Details page opens by.
+// Responds { shipment_id, quote_id, records: [{ kind, audit_id, files, captured_at, captured_by }] }.
+erpPushedRouter.get("/records/:shipmentId", async (req, res) => {
+  const id = String(req.params.shipmentId || "").trim();
+  if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "Not a shipment id" });
+  try {
+    const [recs, tx] = await Promise.all([
+      supabase.from("fpx_shipment_records").select("kind, audit_id, files, captured_at, captured_by").eq("shipment_id", id).order("captured_at", { ascending: false }),
+      supabase.from("fpx_erp_transactions").select("q:data->>QuoteID").eq("shipment_id", id).limit(1),
+    ]);
+    if (recs.error) return res.status(500).json({ error: recs.error.message });
+    res.json({
+      shipment_id: id,
+      quote_id: tx.error ? null : String(tx.data?.[0]?.q || "").trim() || null,
+      records: (recs.data || []).map((r) => ({ ...r, files: Array.isArray(r.files) ? r.files : [] })),
+    });
   } catch (e) {
     res.status(500).json({ error: e?.message || String(e) });
   }
