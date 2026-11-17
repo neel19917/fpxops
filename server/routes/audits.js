@@ -13,6 +13,27 @@ import { transactionRow } from "../lib/erpStore.js";
 import { APPROVAL_CONFIDENCE_MIN, checkApproval } from "../lib/approvalCheck.js";
 import { createHash } from "node:crypto";
 import { historyItems, recordScrapeHistory, readBefore } from "../lib/scrapeHistory.js";
+import { queueInvoiceDocuments } from "../lib/invoiceDocs.js";
+
+// Hands the files of stored captures to the invoice reader (one row per file
+// in fpx_invoice_documents, read in the background). `captures` is
+// [{ shipment_id, audit_id, files }]; a shipment's files are queued together.
+// Not awaited and never throws, so the route that calls it is unaffected.
+function queueSavedFiles(captures) {
+  try {
+    const byShipment = new Map();
+    for (const c of captures || []) {
+      if (!c?.audit_id || !Array.isArray(c.files) || !c.files.length) continue;
+      const key = `${c.audit_id}|${c.shipment_id}`;
+      const had = byShipment.get(key) || { shipment_id: c.shipment_id, audit_id: c.audit_id, files: [] };
+      had.files.push(...c.files);
+      byShipment.set(key, had);
+    }
+    for (const c of byShipment.values()) queueInvoiceDocuments(supabase, c).catch(() => {});
+  } catch (e) {
+    console.warn(`[FPX] invoice documents not queued: ${e?.message || e}`);
+  }
+}
 
 // Who or what handed a read in, for fpx_scrape_history.
 const readBy = (req) => String(req.body?.by || req.apiKey?.name || req.user?.email || "").trim() || null;
@@ -424,6 +445,10 @@ auditsRouter.post("/invoice/:id/get-invoice-results", async (req, res) => {
     else if (!failedShipments.has(id)) updated += 1;
   }
   if (failedShipments.size) console.warn(`[FPX] get-invoice results for ${run.id}: ${failedShipments.size} shipment(s) not saved`);
+  // The saved files of the shipments that were stored get read into fpx_invoice_documents.
+  queueSavedFiles([...byShipment.values()]
+    .filter((r) => r.shots?.length && out.matched.has(r.shipment_id) && !failedShipments.has(r.shipment_id))
+    .map((r) => ({ shipment_id: r.shipment_id, audit_id: run.id, files: r.shots })));
   res.json({ updated, unknown, failed: failedShipments.size });
 });
 
@@ -654,6 +679,8 @@ auditsRouter.post("/erp/shipment-records", async (req, res) => {
       console.warn(`[FPX] shipment records: scrape history not recorded: ${e?.message || e}`);
     }
   }
+  // The saved files of what was stored get read into fpx_invoice_documents.
+  if (!error) queueSavedFiles(rows);
   res.json({ stored: error ? 0 : rows.length, failed: error ? rows.length : 0, ...(error ? { error: error.message } : {}) });
 });
 
@@ -795,7 +822,7 @@ function erpInvoicingFilters(query, { q, kind }) {
   if (kind) out = out.eq("approved_by_kind", kind);
   if (q) {
     const like = `"%${q}%"`;
-    out = out.or(["shipment_id", "tracking_number", "customer_name", "carrier"].map((c) => `${c}.ilike.${like}`).join(","));
+    out = out.or(["shipment_id", "tracking_number", "customer_name", "carrier", "approved_invoice_number"].map((c) => `${c}.ilike.${like}`).join(","));
   }
   return out;
 }
@@ -805,7 +832,8 @@ function erpInvoicingFilters(query, { q, kind }) {
 // charge first.
 //   bucket            exported | approved_ready | invoice_not_approved | no_invoice
 //   approved_by_kind  edi | person | unknown
-//   q                 part of a shipment id, tracking number, customer or carrier
+//   q                 part of a shipment id, tracking number, customer, carrier
+//                     or approved invoice number
 //   limit             default 200, at most 1000;  offset  default 0
 // Responds { data, counts: { exported, approved_ready, invoice_not_approved,
 // no_invoice }, totals: { all, matching }, limit, offset }. counts are per

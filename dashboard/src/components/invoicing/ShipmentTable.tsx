@@ -36,22 +36,46 @@ function ApproverPill({ row }: { row: Row }) {
   }
 }
 
-/** Opens the saved screenshots of the invoice. Only for rows that have some. */
+/**
+ * Opens the saved screenshots of the invoice. Only for rows that have some.
+ * Outside the list you tick from, a click anywhere on the row does the same;
+ * this small button is what the keyboard reaches, and what a ticking row uses.
+ */
 function RecordButton({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) {
   if (row.shots.length === 0) return null;
   return (
-    <div className="mt-2">
-      <button
-        type="button"
-        onClick={(e) => { e.stopPropagation(); onOpen(row); }}
-        aria-label={`View invoice record for shipment ${row.shipment}`}
-        title="The screenshot FPX saved of the invoice FreightPOP showed"
-        className="inline-flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1 whitespace-nowrap bg-white text-violet-700 ring-1 ring-violet-200 hover:bg-violet-50 hover:text-violet-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-500"
-      >
-        <FileImage className="h-3.5 w-3.5 shrink-0" />
-        View invoice record
-      </button>
-    </div>
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); onOpen(row); }}
+      aria-label={`View invoice record for shipment ${row.shipment}`}
+      title="View the invoice record: the screenshot FPX saved of the invoice FreightPOP showed"
+      className="inline-flex items-center justify-center h-6 w-6 rounded-md text-violet-700 hover:bg-violet-100 hover:text-violet-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-500"
+    >
+      <FileImage className="h-4 w-4 shrink-0" aria-hidden="true" />
+    </button>
+  );
+}
+
+/** Why a try at getting an invoice did not work, in plain words. The job's own note stays behind Details. */
+function plainReason(note: string | null | undefined): string {
+  const t = String(note ?? "");
+  if (/stopp/i.test(t)) return "The run was stopped before this one finished";
+  if (/sign(ed)?[ -]?in|log[ -]?in/i.test(t)) return "FreightPOP asked to sign in again";
+  if (/time[d]?[ -]?out|took too long/i.test(t)) return "FreightPOP took too long to answer";
+  if (/not approved/i.test(t)) return "The invoice is not approved in FreightPOP";
+  if (/not found|could ?n[o']t find|no (matching )?(row|shipment)/i.test(t)) return "Could not find the shipment in FreightPOP";
+  if (/could ?n[o']t open|did ?n[o']t open|failed to open/i.test(t)) return "Could not open the shipment";
+  return "Could not get the invoice";
+}
+
+/** The job's own step-by-step note, folded away: useful when something needs explaining, noise otherwise. */
+function RawNote({ note }: { note: string | null | undefined }) {
+  if (!note) return null;
+  return (
+    <details className="mt-1 text-xs text-slate-500" onClick={(e) => e.stopPropagation()}>
+      <summary className="cursor-pointer select-none w-fit text-slate-400 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-500">Details</summary>
+      <div className="mt-1 break-words max-w-sm">{note}</div>
+    </details>
   );
 }
 
@@ -97,16 +121,18 @@ function CheckCells({ row }: { row: Row }) {
   );
 }
 
-function Result({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) {
+function Result({ row }: { row: Row }) {
   const inProgress = row.gi?.status === "requested";
   return (
     <>
       <span className={"inline-block text-xs rounded-full px-2.5 py-1 whitespace-nowrap ring-1 "
         + (inProgress ? "bg-sky-50 text-sky-800 ring-sky-200" : "bg-emerald-50 text-emerald-800 ring-emerald-200")}>
-        {inProgress ? "In progress" : "Sent"}
+        {inProgress ? "Sending now" : "Invoice sent"}
       </span>
-      {row.gi?.note ? <div className="text-xs text-slate-500 mt-1 break-words max-w-sm">{row.gi.note}</div> : null}
-      <RecordButton row={row} onOpen={onOpen} />
+      <div className="text-xs text-slate-500 mt-1">
+        {inProgress ? "FPX is working on this one" : row.shots.length ? "Record saved. Click the row to see it." : "No record was saved"}
+      </div>
+      <RawNote note={row.gi?.note} />
     </>
   );
 }
@@ -158,7 +184,7 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
             <th className={TH + " text-right"}>Charge</th>
             {review ? (
               <>
-                <th className={TH}>Confidence</th>
+                <th className={TH}>Score</th>
                 <th className={TH + " pr-6"}>What is missing or needs a look</th>
               </>
             ) : bucket === "approved" ? (
@@ -188,12 +214,26 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
             const on = pick && selected.has(r.id);
             const full = pick && !on && atCap;
             const when = r.gi?.at || r.gi?.requested_at;
+            // What a click on the row does: tick it in the list you send from;
+            // elsewhere open its saved invoice record, or (needs a second look,
+            // nothing saved) the shipment in FreightPOP.
+            const hasRecord = r.shots.length > 0;
+            const canOpen = review && !!shipmentUrl(r);
+            const onRow = pick ? (full ? undefined : () => onToggle(r.id))
+              : hasRecord ? () => setRecord(r)
+              : canOpen ? () => openShipment(r)
+              : undefined;
+            const rowTitle = pick ? undefined
+              : hasRecord ? "Open the saved invoice record"
+              : canOpen ? "Open this shipment in FreightPOP (your hosted browser)"
+              : review ? "FreightPOP's quote id for this shipment is not known yet, so it can't be opened from here"
+              : undefined;
             return (
               <tr
                 key={r.id}
-                onClick={pick && !full ? () => onToggle(r.id) : review && shipmentUrl(r) ? () => openShipment(r) : undefined}
-                title={review ? (shipmentUrl(r) ? "Open this shipment in FreightPOP (your hosted browser)" : "FreightPOP's quote id for this shipment is not known yet, so it can't be opened from here") : undefined}
-                className={(pick || (review && shipmentUrl(r)) ? "cursor-pointer " : "") + (on ? "bg-violet-50/70" : "hover:bg-slate-50/70")}
+                onClick={onRow}
+                title={rowTitle}
+                className={(pick || onRow ? "cursor-pointer " : "") + (on ? "bg-violet-50/70" : "hover:bg-slate-50/70")}
               >
                 {pick ? (
                   <td className="pl-6 pr-2 py-3.5 align-top">
@@ -210,13 +250,16 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
                   </td>
                 ) : null}
                 <td className={TD + (pick ? "" : " pl-6")}>
-                  <div className="font-medium text-slate-900 whitespace-nowrap">{r.shipment || "—"}</div>
+                  <div className="flex items-center gap-1.5 font-medium text-slate-900 whitespace-nowrap">
+                    {r.shipment || "—"}
+                    <RecordButton row={r} onOpen={setRecord} />
+                  </div>
                   {r.failed ? (
-                    <div className="text-xs text-rose-700 mt-1 break-words max-w-xs">
-                      Last try failed{r.gi?.note ? `: ${r.gi.note}` : ""}
-                    </div>
+                    <>
+                      <div className="text-xs text-rose-700 mt-1 break-words max-w-xs">Last try did not work. {plainReason(r.gi?.note)}.</div>
+                      <RawNote note={r.gi?.note} />
+                    </>
                   ) : null}
-                  {bucket === "approved" || review ? <RecordButton row={r} onOpen={setRecord} /> : null}
                   {review && shipmentUrl(r) ? (
                     <button
                       type="button"
@@ -256,7 +299,7 @@ export function ShipmentTable({ bucket, auditId, rows, empty, selected, atCap, a
                   </>
                 ) : (
                   <>
-                    <td className={TD}><Result row={r} onOpen={setRecord} /></td>
+                    <td className={TD}><Result row={r} /></td>
                     <td className={TD + " pr-6 whitespace-nowrap text-slate-500"}>{when ? fmtDateTime(when) : "—"}</td>
                   </>
                 )}

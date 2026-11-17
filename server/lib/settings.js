@@ -61,6 +61,11 @@ const FALLBACKS = {
   // Shipment analysis model (Haiku 5.5: ~80% cheaper than Haiku 4.5, same
   // verdicts on a 20-shipment replay). "" = model.default / model.large.
   "model.shipment_analysis": "claude-haiku-5-5",
+  // Reading saved invoice files into fpx_invoice_documents (lib/invoiceExtract.js):
+  // one call per PDF or screenshot, strict JSON back. Opus 5.5 by default —
+  // amounts and reference numbers read off a scan have to be right. Haiku 5.5
+  // is ~40x cheaper if volume grows; change it in Admin → Settings.
+  "model.invoice_ocr": process.env.ANTHROPIC_MODEL_INVOICE_OCR || "claude-opus-5-5",
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   // Large = long prompts (≥ ~12k chars) and any board-level synthesis.
   // Bumped to Opus 5 on 2026-09-22: the tasks page moved to heavier

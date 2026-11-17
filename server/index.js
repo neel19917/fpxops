@@ -34,6 +34,8 @@ import { feedbackRouter } from "./routes/feedback.js";
 import { auditLogRouter } from "./routes/auditLog.js";
 import { settingsRouter } from "./routes/settings.js";
 import { opsRouter } from "./routes/ops.js";
+import { invoiceDocsRouter } from "./routes/invoiceDocs.js";
+import { startInvoiceDocWorker, backfillFromRecords } from "./lib/invoiceDocs.js";
 import { erpPushedRouter } from "./routes/erpPushed.js";
 import { lookbackRouter } from "./routes/lookback.js";
 import { scrapeHistoryRouter } from "./routes/scrapeHistory.js";
@@ -148,6 +150,7 @@ api.use("/audit-log", auditLogRouter);
 api.use("/ops/lookback", lookbackRouter);
 api.use("/ops", opsRouter);
 api.use("/scrape-history", scrapeHistoryRouter);
+api.use("/invoice-docs", invoiceDocsRouter);
 api.use("/shipment-details", shipmentDetailsRouter);
 app.use("/api", api);
 
@@ -234,6 +237,11 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`[FPX] API server listening on ${HOST}:${PORT}`);
   console.log(`[FPX] CORS origins: ${rawOrigins.join(", ") || "(none)"}`);
   if (!isDbReady()) console.warn("[FPX] ⚠️  Supabase env vars missing — reads/writes will fail");
+  // Reads every saved invoice and document into fpx_invoice_documents; at
+  // start it also queues any saved file that has not been read yet.
+  if (startInvoiceDocWorker()) {
+    backfillFromRecords(supabase).catch((e) => console.warn(`[FPX] invoice documents: could not queue saved files (${e?.message || e})`));
+  }
 });
 server.on("error", (e) => {
   console.error("[FPX] server.listen error:", e.stack || e);

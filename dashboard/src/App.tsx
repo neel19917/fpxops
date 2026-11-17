@@ -26,6 +26,7 @@ const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ def
 const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
 const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
 const InvoicesPushedPage = lazy(() => import("./pages/InvoicesPushed").then((m) => ({ default: m.InvoicesPushedPage })));
+const InvoicesHubPage = lazy(() => import("./pages/InvoicesHub").then((m) => ({ default: m.InvoicesHubPage })));
 const InvoicingPage   = lazy(() => import("./pages/Invoicing").then((m) => ({ default: m.InvoicingPage })));
 const ApiKeysPage     = lazy(() => import("./pages/ApiKeys").then((m) => ({ default: m.ApiKeysPage })));
 const UsersPage       = lazy(() => import("./pages/Users").then((m) => ({ default: m.UsersPage })));
@@ -60,7 +61,7 @@ const TAB_PATH: Record<TabId, string> = {
   analyses: "/analyses",
   gp: "/audits/gp",
   invoice: "/audits/invoice",
-  invoicing: "/invoicing",
+  invoicing: "/invoices",
   shares: "/shares",
   feedback: "/feedback",
   install: "/install",
@@ -96,8 +97,8 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/data-flow")) return "data_flow";
   if (pathname.startsWith("/claude")) return "claude";
   if (pathname.startsWith("/audits/gp")) return "gp";
-  if (pathname.startsWith("/audits/invoice")) return "invoice";
-  if (pathname.startsWith("/invoicing")) return "invoicing";
+  // One nav entry, Invoices, covers the guided page and the screens it leads to.
+  if (pathname.startsWith("/audits/invoice") || pathname.startsWith("/invoicing") || pathname.startsWith("/invoices")) return "invoicing";
   if (pathname.startsWith("/email-studio")) return "emails";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
@@ -290,6 +291,7 @@ function AuthedApp() {
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
+            <Route path="/invoices" element={<InvoicesHubPage />} />
             <Route path="/invoicing/pushed" element={<InvoicesPushedPage />} />
             <Route path="/invoicing" element={<InvoicingPage />} />
             <Route path="/shares" element={<ShareLinksPage />} />

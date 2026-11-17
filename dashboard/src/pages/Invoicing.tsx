@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { RefreshCw, Search } from "lucide-react";
+import { ArrowLeft, RefreshCw, Search } from "lucide-react";
 import { api, type ScrapeRequest } from "../lib/api";
 import { hostedBrowser } from "../lib/hostedBrowser";
 import {
@@ -16,7 +16,7 @@ import { ErpPullMonitor, type ErpMonitorStatus } from "../components/ErpPullMoni
 import { ErrorBlock } from "../components/ErrorBlock";
 import { GetInvoiceModal, type GetInvoiceItem } from "../components/GetInvoiceModal";
 import { BucketCards, BucketCardsSkeleton, type BucketCard } from "../components/invoicing/BucketCards";
-import { Counted, MenuAction, MoreMenu, ProgressStrip, Segmented, SelectionBar, type StepState, type StripControls } from "../components/invoicing/Controls";
+import { Counted, GuideStrip, MenuAction, MenuGroup, MenuLink, MoreMenu, ProgressStrip, Segmented, SelectionBar, type GuideStep, type StepState, type StripControls } from "../components/invoicing/Controls";
 import { ShipmentTable } from "../components/invoicing/ShipmentTable";
 import { hideFrame } from "../lib/freightpopFrame";
 import { ago, byCharge, dayLabel, plural, sumCharge, toRow, type BucketKey, type Row } from "../components/invoicing/model";
@@ -26,11 +26,17 @@ import { ago, byCharge, dayLabel, plural, sumCharge, toRow, type BucketKey, type
 // (ready to invoice), not approved, and invoice sent. The bucket rules are in
 // components/invoicing/model.ts. One button refreshes both FreightPOP reads
 // back to back in the hosted browser. The detailed table stays on Invoice Audits.
+//
+// The page is laid out for someone new to it: a title, one sentence, one main
+// button, then a numbered guide that says what to do next. Everything else
+// (downloads, other pages, refresh settings) is in the More menu.
 
 const PAGE_SIZE = 200;
 const REFRESH_MS = 10_000;
 const CHAIN_KEY = "fpx.invoicing.refresh";
 const CHAIN_MAX_AGE_MS = 3 * 60 * 60 * 1000;
+// A list older than this is refreshed first: the guide points back to step 1.
+const STALE_MS = 24 * 60 * 60 * 1000;
 
 const BUCKETS: readonly BucketKey[] = ["approved", "not-approved", "sent", "review"];
 // Links made before the buckets were renamed still open the right one.
@@ -504,58 +510,66 @@ export function InvoicingPage() {
   ].filter(Boolean);
   const cards: BucketCard[] = [
     {
-      key: "approved", label: "Approved · ready to invoice", count: lists.approved.length, total: sumCharge(lists.approved),
+      key: "approved", label: "Ready to invoice", count: lists.approved.length, total: sumCharge(lists.approved),
+      meaning: "Approved in FreightPOP. Tick the ones to send.",
+      hint: "FreightPOP shows an approved carrier invoice for each of these, and no invoice has been sent yet",
       breakdown: !lists.approved.length ? "Nothing waiting for its invoice"
         : !anyChecked ? "Approver names appear after a refresh"
         : approvedParts.join(" · "),
     },
     {
-      key: "not-approved", label: "Not approved", count: lists.notApproved.length, total: sumCharge(lists.notApproved),
+      key: "not-approved", label: "Not approved yet", count: lists.notApproved.length, total: sumCharge(lists.notApproved),
+      meaning: "Waiting on an approval or a carrier invoice.",
+      hint: "Nothing to do here until the carrier invoice is approved in FreightPOP",
       breakdown: lists.notApproved.length
         ? `${n(lists.received.length)} invoice not approved · ${n(lists.noInvoice.length)} no invoice yet`
         : "Nothing waiting on approval",
     },
     {
       key: "sent", label: "Invoice sent", count: lists.sent.length, total: sumCharge(lists.sent),
+      meaning: "Done. Click a row to see what was saved.",
+      hint: "Get Invoice was pressed in FreightPOP for these shipments",
       breakdown: lists.requested.length ? `${n(lists.requested.length)} more in progress`
         : lists.sent.length ? "Get Invoice was pressed in FreightPOP"
         : "None sent from this list yet",
     },
     {
-      key: "review", label: `Needs review · under ${threshold}% confidence`, count: lists.review.length, total: sumCharge(lists.review),
+      key: "review", label: "Needs a second look", count: lists.review.length, total: sumCharge(lists.review),
+      meaning: "Something is missing or does not match.",
+      hint: `Ready or sent shipments that score under ${threshold}% on FPX's checks`,
       breakdown: checksError ? "The checks could not be loaded"
         : !checks ? "Checking…"
-        : lists.review.length ? `${n(lists.review.filter((r) => r.check?.issues.length).length)} do not match · ${n(lists.review.filter((r) => r.check?.missing.length).length)} missing something`
-        : "Every approval checks out",
+        : lists.review.length ? `Score under ${threshold}% · ${n(lists.review.filter((r) => r.check?.issues.length).length)} do not match · ${n(lists.review.filter((r) => r.check?.missing.length).length)} missing something`
+        : "Everything checks out",
     },
   ];
 
   const count = tab === "review" ? lists.review.length : tab === "approved" ? lists.approved.length : tab === "not-approved" ? lists.notApproved.length : lists.sent.length;
   const heading = tab === "review"
-    ? (checksError ? "The approval checks could not be loaded." : count ? `${n(count)} approved ${plural(count, "shipment scores", "shipments score")} under ${threshold}% confidence.` : `Every approved shipment scores ${threshold}% or higher.`)
+    ? (checksError ? "The approval checks could not be loaded." : count ? `${n(count)} ${plural(count, "shipment needs", "shipments need")} a second look.` : "Nothing needs a second look.")
     : tab === "approved"
-    ? (count ? `${n(count)} ${plural(count, "shipment is", "shipments are")} approved and ready. Select the ones to invoice.` : "Nothing is approved and ready right now.")
+    ? (count ? `${n(count)} ${plural(count, "shipment is", "shipments are")} ready to invoice. Tick the ones to send.` : "Nothing is ready to invoice right now.")
     : tab === "not-approved"
       ? (count ? `${n(count)} ${plural(count, "shipment is", "shipments are")} not approved yet.` : "Nothing is waiting on approval.")
       : (count ? `${n(count)} ${plural(count, "invoice was", "invoices were")} sent from this list.` : "No invoices have been sent from this list yet.");
   const subheading = tab === "review"
-    ? (checksError || "Each approved or invoiced shipment starts at 100%. Points come off for anything FPX does not hold (shipment details, invoice PDF, bill of lading, rate confirmation, quote breakdown, proof of delivery), anything that does not match, and approvals that were forced or made on a corrected invoice. Lowest score first.")
+    ? (checksError || `These scored under ${threshold}% on FPX's checks. Click a row to see its saved invoice record, or open it in FreightPOP. Each ready or sent shipment starts at 100%. Points come off for anything FPX does not hold (shipment details, invoice PDF, bill of lading, rate confirmation, quote breakdown, proof of delivery), anything that does not match, and approvals that were forced or made on a corrected invoice. Lowest score first.`)
     : tab === "approved"
     ? (!count ? "Shipments appear here once their carrier invoice is approved in FreightPOP."
       : !anyChecked ? "FreightPOP's report shows an approved carrier invoice for each. Approver names appear after the next refresh."
       : "FreightPOP shows an approved carrier invoice for each. Nothing is sent until you review the list.")
     : tab === "not-approved"
-      ? (!count ? "Every shipment on this list is approved or already invoiced."
-        : waitingView === "received" ? "A carrier invoice arrived for these, but nobody has approved it in FreightPOP. Once approved, they move to Approved on the next refresh."
+      ? (!count ? "Every shipment on this list is ready to invoice or already sent."
+        : waitingView === "received" ? "A carrier invoice arrived for these, but nobody has approved it in FreightPOP. Once approved, they move to Ready to invoice on the next refresh."
         : "No carrier invoice has arrived for these yet. Nothing to do until one does.")
       : lists.requested.length ? `${n(lists.requested.length)} more ${plural(lists.requested.length, "is", "are")} being sent now.`
-      : "Get Invoice was pressed in FreightPOP for these shipments.";
+      : "Get Invoice was pressed in FreightPOP for these shipments. Click a row to see the record FPX saved.";
 
   const shown = visible.slice(0, limit);
   const empty = q ? "Nothing matches that search."
-    : tab === "review" ? (checks ? "Nothing needs review." : "Checking…")
+    : tab === "review" ? (checks ? "Nothing needs a second look." : "Checking…")
     : tab === "approved" ? (
-      approvedView === "all" ? "Nothing is approved and ready right now."
+      approvedView === "all" ? "Nothing is ready to invoice right now."
       : approvedView === "shaun" ? "None of the approved shipments were approved by Shaun."
       : approvedView === "edi" ? "None of the approved shipments were approved by EDI."
       : "Nothing here."
@@ -563,13 +577,59 @@ export function InvoicingPage() {
     : tab === "not-approved" ? (waitingView === "received" ? "No carrier invoices are waiting on approval." : "Every shipment here has a carrier invoice.")
     : sentView === "done" ? "No invoices have been sent from this list yet." : "Nothing in progress.";
 
+  // ── The guide: four steps, the one to do now, and what to do next ──
+
+  const listAge = run ? now - Date.parse(run.created_at) : NaN;
+  const stale = Number.isFinite(listAge) && listAge > STALE_MS;
+  const sending = activeKind === "get_invoice";
+  const refreshing = busy && !sending;
+  // 0 = nothing left to do.
+  const currentStep = refreshing || stale ? 1
+    : sending || picked.length ? 3
+    : lists.approved.length ? 2
+    : lists.review.length ? 4
+    : 0;
+  const stepState = (i: number): GuideStep["state"] => (i === currentStep ? "current" : currentStep === 0 || i < currentStep ? "done" : "todo");
+  const guideSteps: GuideStep[] = [
+    {
+      title: "Refresh the list", state: stepState(1),
+      detail: refreshing ? "running now" : run ? `done ${ago(run.created_at, now)}` : "",
+    },
+    {
+      title: "Review what is ready", state: stepState(2),
+      detail: lists.approved.length ? `${n(lists.approved.length)} ready` : "nothing ready",
+      onClick: () => setTab("approved"),
+    },
+    {
+      title: "Send the invoices", state: stepState(3),
+      detail: sending ? "running now" : picked.length ? `${n(picked.length)} selected` : lists.sent.length ? `${n(lists.sent.length)} sent` : "none sent yet",
+      // Sending starts from the ready list; with nothing left to send, show what was sent.
+      onClick: () => setTab(lists.approved.length ? "approved" : "sent"),
+    },
+    {
+      title: "Check anything flagged", state: stepState(4),
+      detail: checksError ? "could not load" : !checks ? "checking" : n(lists.review.length),
+      onClick: () => setTab("review"),
+    },
+  ];
+  const guideNext = sending ? "FPX is sending the invoices in FreightPOP. It pauses after the first one so you can check it, then press Resume."
+    : refreshing ? "FPX is reading FreightPOP. This takes a few minutes. The list below updates when it is done."
+    : stale ? `This list is from ${ago(run?.created_at, now)}. Press Refresh from FreightPOP before sending anything.`
+    : picked.length ? "Press Get invoices at the bottom of the page. You get to confirm before anything is sent."
+    : lists.approved.length ? "Open Ready to invoice and tick the shipments to send. The box at the top of the list ticks them all."
+    : lists.review.length ? `${n(lists.review.length)} ${plural(lists.review.length, "shipment needs", "shipments need")} a second look. Open Needs a second look and click a row to check it.`
+    : "All caught up. Nothing to send or check right now.";
+
+  // One main button at a time: once shipments are ticked, Get invoices (in the
+  // bar at the bottom) is the main one and Refresh steps back.
+  const refreshQuiet = picked.length > 0;
   const refreshButton = (
     <button
       type="button"
       onClick={refreshAll}
       disabled={!!blocked}
       title={blocked || undefined}
-      className="px-4 py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2"
+      className={(refreshQuiet ? "bg-white text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50" : "bg-violet-600 text-white hover:bg-violet-700") + " px-4 py-2 rounded-lg inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2"}
     >
       <RefreshCw className={"h-4 w-4 " + (starting === "refresh" || chainRunning ? "animate-spin" : "")} aria-hidden="true" />
       {starting === "refresh" ? "Starting…" : chainRunning ? "Refreshing…" : "Refresh from FreightPOP"}
@@ -581,61 +641,73 @@ export function InvoicingPage() {
     <div className="space-y-6">
       <header className="flex items-start justify-between gap-4 flex-wrap">
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Invoicing</h1>
+          <Link to="/invoices" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:text-slate-900 rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500">
+            <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" /> All invoices
+          </Link>
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900 mt-1">Invoicing</h1>
           <p className="text-sm text-slate-600 mt-1">
             {run
-              ? <>Shipments not yet exported to ERP{range ? ` · ${range}` : ""} · updated {ago(run.created_at, now)}</>
+              ? <>Shipments not yet pushed to ERP{range ? `, ${range}` : ""}. List updated {ago(run.created_at, now)}.</>
               : loading ? "Loading the latest list from FreightPOP…"
-              : "See which shipments are approved, and send their invoices in bulk."}
+              : "See which shipments are ready to invoice, and send their invoices in one go."}
           </p>
-          <div className="mt-2">
-            <Link to="/invoicing/pushed" className="text-sm font-medium text-sky-700 hover:underline">Pushed to ERP: see what has already been pushed and match it with NetSuite →</Link>
-          </div>
-          {run ? (
-            <div className="mt-2 flex items-center gap-x-4 gap-y-1 flex-wrap">
-              {files?.not_exported === true ? (
-                <button type="button" onClick={() => downloadExcel("not-exported")} disabled={!!excel.busy} className={quietLink}>
-                  {excel.busy === "not-exported" ? "Downloading…" : "Download Excel (FreightPOP format)"}
-                </button>
-              ) : null}
-              {files?.audit_history === true ? (
-                <button type="button" onClick={() => downloadExcel("audit-history")} disabled={!!excel.busy} className={quietLink} title="FreightPOP's Audit History export from the last approval check (.xlsx)">
-                  {excel.busy === "audit-history" ? "Downloading…" : "Audit history (Excel)"}
-                </button>
-              ) : null}
-              <Link to={`/audits/invoice?run=${encodeURIComponent(run.id)}`} className={quietLink}>Open the full audit</Link>
-              {excel.error ? <span className="text-sm text-rose-700">{excel.error}</span> : null}
-            </div>
-          ) : null}
         </div>
         <div className="flex items-center gap-2">
           <MoreMenu>
-            <div className="space-y-2">
-              <div className="text-xs font-medium text-slate-500">What a refresh reads</div>
-              <Segmented label="Months to read" value={months} choices={MONTH_CHOICES} onPick={setMonths} disabled={busy} />
-              <Segmented label="Shipment type" value={shipType} choices={ERP_TYPE_CHOICES} onPick={setShipType} disabled={busy} />
-            </div>
-            <div className="border-t border-slate-100 pt-3 space-y-1">
+            <MenuGroup title="What a refresh reads">
+              <div className="space-y-2 pt-1">
+                <Segmented label="Months to read" value={months} choices={MONTH_CHOICES} onPick={setMonths} disabled={busy} />
+                <Segmented label="Shipment type" value={shipType} choices={ERP_TYPE_CHOICES} onPick={setShipType} disabled={busy} />
+              </div>
+            </MenuGroup>
+            <MenuGroup title="Other actions">
               {run ? (
                 <MenuAction
-                  title={starting === "approvals" ? "Starting…" : "Check approvals (Recently Approved + History)"}
-                  hint={`Quicker: keeps this list and only re-reads who approved what. ${anyChecked && checkedAt ? `Last checked ${ago(checkedAt, now)}.` : "Not checked yet."}`}
+                  title={starting === "approvals" ? "Starting…" : "Check approvals only"}
+                  hint={`Quicker than a refresh: keeps this list and only re-reads who approved what (FreightPOP's Recently Approved and History). ${anyChecked && checkedAt ? `Last checked ${ago(checkedAt, now)}.` : "Not checked yet."}`}
                   onClick={approvalsOnly}
                   disabled={!!blocked}
                   disabledReason={blocked || undefined}
                 />
               ) : null}
               <MenuAction
-                title={monitorOpen ? "Hide the invoicing session" : "Show the invoicing session"}
-                hint="The live view of FPX working in FreightPOP, with its log."
+                title={monitorOpen ? "Hide the live view" : "Show the live view"}
+                hint="Watch FPX working in FreightPOP, with its log."
                 onClick={() => setMonitorOpen((v) => !v)}
               />
-            </div>
+            </MenuGroup>
+            {run && (files?.not_exported === true || files?.audit_history === true) ? (
+              <MenuGroup title="Downloads">
+                {files?.not_exported === true ? (
+                  <MenuAction
+                    title={excel.busy === "not-exported" ? "Downloading…" : "This list (Excel)"}
+                    hint="The shipment list in FreightPOP's own format."
+                    onClick={() => { void downloadExcel("not-exported"); }}
+                    disabled={!!excel.busy}
+                  />
+                ) : null}
+                {files?.audit_history === true ? (
+                  <MenuAction
+                    title={excel.busy === "audit-history" ? "Downloading…" : "Audit history (Excel)"}
+                    hint="FreightPOP's Audit History export from the last approval check."
+                    onClick={() => { void downloadExcel("audit-history"); }}
+                    disabled={!!excel.busy}
+                  />
+                ) : null}
+              </MenuGroup>
+            ) : null}
+            <MenuGroup title="Other views">
+              <MenuLink to="/invoicing/pushed" title="Pushed to ERP" hint="See what has already been pushed and match it with NetSuite." />
+              {run ? (
+                <MenuLink to={`/audits/invoice?run=${encodeURIComponent(run.id)}`} title="Full detail of this list" hint="Every shipment and every column, on the Invoice Audits page." />
+              ) : null}
+            </MenuGroup>
           </MoreMenu>
           {firstRun ? null : refreshButton}
         </div>
       </header>
 
+      {excel.error ? <ErrorBlock compact>{excel.error}</ErrorBlock> : null}
       {actionError ? <ErrorBlock compact>{actionError}</ErrorBlock> : null}
       {!busy && monitor?.blocked && monitor.blocked !== "Loading…" ? (
         <ErrorBlock tone="warning" compact>
@@ -696,6 +768,8 @@ export function InvoicingPage() {
         ) : null
       ) : (
         <>
+          <GuideStrip steps={guideSteps} next={guideNext} />
+
           <BucketCards cards={cards} selected={tab} onSelect={setTab} />
 
           <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm overflow-hidden" aria-label={cards.find((c) => c.key === tab)?.label}>

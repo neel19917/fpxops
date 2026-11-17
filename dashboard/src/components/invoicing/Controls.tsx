@@ -1,15 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Loader2, Pause, Play, Square, X } from "lucide-react";
-import {
-  GET_INVOICE_BUTTONS, GET_INVOICE_BUTTON_PRESETS, GET_INVOICE_MAX, cleanGetInvoiceButtons, getInvoiceButtonPreset,
-  getInvoiceButtonsLabel, loadGetInvoiceButtons, saveGetInvoiceButtons, type GetInvoiceButtonChoice, type GetInvoiceButtonKey,
-} from "../../lib/erpPull";
+import { GET_INVOICE_MAX, getInvoiceButtonsLabel, loadGetInvoiceButtons } from "../../lib/erpPull";
 import { fmtNum } from "../../lib/format";
 import { fmtMoney } from "./model";
 
-// The page's small controls: the filter switch, the "More" menu, the slim
-// progress strip under the header (with Pause / Resume and Stop for the running
-// job) and the bar that appears once shipments are ticked.
+// The page's small controls: the filter switch, the "More" menu, the numbered
+// guide under the header, the slim progress strip (with Pause / Resume and Stop
+// for the running job) and the bar that appears once shipments are ticked.
 
 const FOCUS = "focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-1";
 
@@ -86,6 +84,75 @@ export function MenuAction({ title, hint, onClick, disabled, disabledReason }: {
       <div className="text-sm font-medium text-slate-900">{title}</div>
       <div className="text-xs text-slate-500 mt-0.5">{hint}</div>
     </button>
+  );
+}
+
+/** A small heading over a set of entries in the More menu. */
+export function MenuGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="border-t border-slate-100 pt-3 first:border-t-0 first:pt-0">
+      <div className="text-xs font-medium text-slate-500 mb-1">{title}</div>
+      <div className="space-y-1">{children}</div>
+    </div>
+  );
+}
+
+/** A More menu entry that goes to another page. */
+export function MenuLink({ to, title, hint }: { to: string; title: string; hint: string }) {
+  return (
+    <Link to={to} className={"block rounded-lg px-3 py-2 -mx-1 hover:bg-slate-50 " + FOCUS}>
+      <div className="text-sm font-medium text-slate-900">{title}</div>
+      <div className="text-xs text-slate-500 mt-0.5">{hint}</div>
+    </Link>
+  );
+}
+
+// ── Guide ──
+
+export interface GuideStep {
+  title: string;
+  /** The real state of this step, in a few words: "done 7 hr ago", "54 ready". */
+  detail: string;
+  state: "done" | "current" | "todo";
+  /** Shows the matching list below. A step without one is plain text. */
+  onClick?: () => void;
+}
+
+/**
+ * The numbered steps of the job, always in the same order, with the one to do
+ * now highlighted and one plain sentence saying what to do next.
+ */
+export function GuideStrip({ steps, next }: { steps: GuideStep[]; next: string }) {
+  return (
+    <nav aria-label="Steps" className="rounded-xl bg-white ring-1 ring-slate-200 px-4 py-3 space-y-2">
+      <ol className="flex items-center gap-x-1 gap-y-2 flex-wrap text-sm">
+        {steps.map((s, i) => {
+          const now = s.state === "current";
+          const body = (
+            <>
+              <span className={"h-5 w-5 shrink-0 rounded-full inline-flex items-center justify-center text-[11px] font-semibold "
+                + (now ? "bg-violet-600 text-white" : s.state === "done" ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500")}>
+                {s.state === "done" ? <Check className="h-3 w-3" aria-hidden="true" /> : i + 1}
+              </span>
+              <span className={now ? "font-semibold text-violet-900" : s.state === "done" ? "text-slate-700" : "text-slate-500"}>{s.title}</span>
+              {s.detail ? <span className={"tabular-nums " + (now ? "text-violet-700" : "text-slate-400")}>({s.detail})</span> : null}
+            </>
+          );
+          const cls = "inline-flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left " + (now ? "bg-violet-50 ring-1 ring-violet-200 " : "");
+          return (
+            <li key={s.title} className="inline-flex items-center gap-1" aria-current={now ? "step" : undefined}>
+              {i > 0 ? <ChevronRight className="h-4 w-4 text-slate-300 shrink-0" aria-hidden="true" /> : null}
+              {s.onClick ? (
+                <button type="button" onClick={s.onClick} className={cls + (now ? "hover:bg-violet-100 " : "hover:bg-slate-50 ") + FOCUS}>{body}</button>
+              ) : (
+                <span className={cls}>{body}</span>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+      <p className="text-sm text-slate-700 px-2.5"><span className="font-medium text-slate-900">Next: </span>{next}</p>
+    </nav>
   );
 }
 
@@ -304,93 +371,29 @@ export function ProgressStrip({ steps, text, tone, expanded, onToggle, onDismiss
 
 // ── Bulk action ──
 
-/**
- * Which View Shipment buttons the run presses. The choice is kept in this
- * browser (erpPull's saveGetInvoiceButtons), and requestGetInvoices sends the
- * saved choice, so nothing has to be handed on from here.
- */
-function ButtonChoice() {
-  const [choice, setChoice] = useState<GetInvoiceButtonChoice>(() => loadGetInvoiceButtons());
-  const [open, setOpen] = useState(false);
-  const wrap = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const away = (e: MouseEvent) => { if (wrap.current && !wrap.current.contains(e.target as Node)) setOpen(false); };
-    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
-    document.addEventListener("mousedown", away);
-    document.addEventListener("keydown", esc);
-    return () => { document.removeEventListener("mousedown", away); document.removeEventListener("keydown", esc); };
-  }, [open]);
-  const pick = (next: GetInvoiceButtonChoice) => { setChoice(next); saveGetInvoiceButtons(next); };
-  const on = (key: GetInvoiceButtonKey) => choice === null || choice.includes(key);
-  const flip = (key: GetInvoiceButtonKey) => {
-    const now = GET_INVOICE_BUTTONS.map((b) => b.key).filter((k) => (k === key ? !on(k) : on(k)));
-    pick(cleanGetInvoiceButtons(now));
-  };
-  const preset = getInvoiceButtonPreset(choice);
-  return (
-    <div ref={wrap} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        title="Choose which View Shipment buttons the run presses for each shipment"
-        className="px-3 py-2 rounded-lg text-sm text-slate-200 ring-1 ring-white/20 hover:bg-white/10 flex items-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
-      >
-        <span className="text-slate-400">Buttons:</span> {getInvoiceButtonsLabel(choice)}
-        <ChevronDown className="h-4 w-4" aria-hidden="true" />
-      </button>
-      {open ? (
-        <div role="dialog" aria-label="View Shipment buttons to press" className="absolute bottom-full right-0 mb-2 w-80 max-w-[calc(100vw-2rem)] max-h-[70vh] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl ring-1 ring-slate-200 p-3 space-y-3">
-          <div>
-            <div className="text-sm font-semibold">View Shipment buttons to press</div>
-            <div className="text-xs text-slate-500 mt-0.5">The invoice is always fetched. Buttons you leave out are not clicked. Buttons that send or change anything are never clicked.</div>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {GET_INVOICE_BUTTON_PRESETS.map((p) => (
-              <button
-                key={p.key}
-                type="button"
-                title={p.hint}
-                aria-pressed={preset === p.key}
-                onClick={() => pick(p.buttons)}
-                className={"px-2.5 py-1 rounded-full text-xs font-medium ring-1 " + (preset === p.key ? "bg-violet-600 text-white ring-violet-600 " : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50 ") + FOCUS}
-              >
-                {p.label}
-              </button>
-            ))}
-          </div>
-          <div className="space-y-1">
-            {GET_INVOICE_BUTTONS.map((b) => (
-              <label key={b.key} className="flex items-center gap-2 text-sm cursor-pointer">
-                <input type="checkbox" checked={on(b.key)} onChange={() => flip(b.key)} className="rounded border-slate-300 text-violet-600" />
-                {b.label}
-              </label>
-            ))}
-          </div>
-          <div className="text-xs text-slate-500">Remembered in this browser for the next run. The run's log says which buttons were chosen.</div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 /** Sticks to the bottom of the window while shipments are ticked. */
 export function SelectionBar({ count, total, moreAfterBatch, blocked, onGet, onClear }: {
   count: number; total: number; moreAfterBatch: boolean; blocked: string | null; onGet: () => void; onClear: () => void;
 }) {
+  // Which View Shipment buttons the run presses is chosen in the confirm window
+  // and remembered in this browser. Read on every render, so a change made
+  // there shows here; mentioned only when it is not the default (everything).
+  const buttons = loadGetInvoiceButtons();
   return (
     <div className="sticky bottom-4 z-20 flex justify-center pointer-events-none">
       <div role="region" aria-label="Selected shipments" className="pointer-events-auto rounded-2xl bg-slate-900 text-white shadow-xl px-5 py-3 flex items-center gap-x-5 gap-y-2 flex-wrap max-w-full">
         <div className="text-sm">
           <span className="font-semibold tabular-nums">{fmtNum(count)} selected</span>
           <span className="text-slate-300 tabular-nums"> · {fmtMoney(total)}</span>
+          {buttons !== null ? (
+            <div className="text-xs text-slate-400 mt-0.5" title="You can change this in the next step, before anything is sent">
+              Buttons to press on each shipment: {getInvoiceButtonsLabel(buttons)}
+            </div>
+          ) : null}
           {moreAfterBatch ? <div className="text-xs text-slate-400 mt-0.5">{fmtNum(GET_INVOICE_MAX)} is one run's worth. Run the next batch after this one.</div> : null}
           {blocked ? <div className="text-xs text-amber-300 mt-0.5">{blocked}</div> : null}
         </div>
         <div className="flex items-center gap-2 ml-auto">
-          <ButtonChoice />
           <button type="button" onClick={onClear} className="px-3 py-2 rounded-lg text-sm text-slate-300 hover:text-white hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-white">
             Clear
           </button>

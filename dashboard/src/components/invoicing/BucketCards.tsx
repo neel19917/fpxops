@@ -1,7 +1,8 @@
 import { fmtNum } from "../../lib/format";
 import { fmtDollars, type BucketKey } from "./model";
 
-// The three buckets and the needs-review view, as large buttons. The selected one decides what the
+// The four lists as large buttons: ready to invoice, not approved yet, invoice
+// sent, and the ones that need a second look. The selected one decides what the
 // table below shows.
 
 export interface BucketCard {
@@ -9,8 +10,12 @@ export interface BucketCard {
   label: string;
   count: number;
   total: number;
-  /** One line under the numbers: who approved, or why not. */
+  /** One short line saying what this list is. */
+  meaning: string;
+  /** A quieter line of detail: who approved, or why not. */
   breakdown: string;
+  /** The finer print, shown on hover. */
+  hint?: string;
 }
 
 const TONE: Record<BucketKey, { dot: string; count: string; on: string }> = {
@@ -24,7 +29,7 @@ export function BucketCards({ cards, selected, onSelect }: {
   cards: BucketCard[]; selected: BucketKey; onSelect: (key: BucketKey) => void;
 }) {
   return (
-    <div className="grid gap-4 min-[700px]:grid-cols-2 min-[1200px]:grid-cols-[1.3fr_1fr_1fr_1fr]" role="group" aria-label="Shipments by invoice status">
+    <div className="grid gap-4 min-[700px]:grid-cols-2 min-[1200px]:grid-cols-[1.3fr_1fr_1fr_1fr]" role="group" aria-label="Shipments by where their invoice stands">
       {cards.map((c) => {
         const tone = TONE[c.key];
         const on = selected === c.key;
@@ -34,18 +39,20 @@ export function BucketCards({ cards, selected, onSelect }: {
             type="button"
             onClick={() => onSelect(c.key)}
             aria-pressed={on}
+            title={c.hint}
             className={"text-left rounded-2xl p-6 shadow-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2 "
               + (on ? tone.on : "bg-white ring-1 ring-slate-200 hover:ring-slate-300 hover:bg-slate-50/60")}
           >
-            <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
               <span className={"h-2 w-2 rounded-full " + tone.dot} aria-hidden="true" />
               {c.label}
             </div>
+            <div className="mt-1 text-sm text-slate-600">{c.meaning}</div>
             <div className="mt-3 flex items-baseline gap-3 flex-wrap">
               <span className={"text-5xl font-semibold tracking-tight tabular-nums leading-none " + tone.count}>{fmtNum(c.count)}</span>
               <span className="text-base text-slate-600 tabular-nums">{fmtDollars(c.total)}</span>
             </div>
-            <div className="mt-3 text-sm text-slate-500">{c.breakdown}</div>
+            <div className="mt-3 text-xs text-slate-500">{c.breakdown}</div>
           </button>
         );
       })}

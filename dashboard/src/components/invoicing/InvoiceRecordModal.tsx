@@ -98,8 +98,8 @@ const TABS: { key: string; label: string; test: (file: string) => boolean }[] = 
   { key: "bol", label: "BOL and labels", test: (f) => /-view-print-shipping-labels-bol-/.test(f) },
   { key: "rate", label: "Rate confirmation", test: (f) => /-view-print-rate-confirmation-/.test(f) },
   { key: "quote", label: "Quote", test: (f) => /-view-details-/.test(f) },
-  { key: "shipment", label: "Shipment details", test: (f) => /-view-\d+\.png$/.test(f) },
   { key: "accessorials", label: "Accessorials", test: (f) => /-view-view-/.test(f) },
+  { key: "shipment", label: "Shipment details", test: (f) => /-view-\d+\.png$/.test(f) },
   { key: "documents", label: "Documents and notes", test: (f) => /-view-(documents|notes|broker-notes|print-documents)-/.test(f) },
   { key: "other", label: "Other", test: () => true },
 ];
