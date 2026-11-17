@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { freshness } from "./freshness.js";
 
 // "Ask FPX" — an ops assistant for the dashboard, on the Claude API.
 //
@@ -24,22 +25,55 @@ export const assistantEnabled = !!(process.env.ANTHROPIC_API_KEY && SB_URL && SB
 
 const client = assistantEnabled ? new Anthropic() : null;
 
-async function sb(pathAndQuery) {
-  const res = await fetch(`${SB_URL}/rest/v1/${pathAndQuery}`, {
+// Every read has a deadline. Before, fetch() had none: one slow query (the
+// DISTINCT ON view fpx_shipments_latest filtered by a non-key column, or an
+// ilike over it) left the chat waiting with "Searching…" on screen forever.
+const SB_TIMEOUT_MS = 10_000;
+const TOOL_TIMEOUT_MS = 12_000;      // per tool call; the model gets an error result to explain
+const CLAUDE_TIMEOUT_MS = 90_000;    // per model request (streaming)
+const TURN_DEADLINE_MS = 150_000;    // a whole question, all steps together
+
+function timeoutError(what, ms) {
+  const e = new Error(`${what} timed out after ${Math.round(ms / 1000)} s`);
+  e.timeout = true;
+  return e;
+}
+
+async function sbFetch(url, init, timeoutMs) {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") throw timeoutError("Database read", timeoutMs);
+    throw e;
+  }
+}
+
+async function sb(pathAndQuery, timeoutMs = SB_TIMEOUT_MS) {
+  const res = await sbFetch(`${SB_URL}/rest/v1/${pathAndQuery}`, {
     headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}` },
-  });
+  }, timeoutMs);
   if (!res.ok) throw new Error(`Supabase ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
 
-async function sbPost(path, body, prefer) {
-  const res = await fetch(`${SB_URL}/rest/v1/${path}`, {
+async function sbPost(path, body, prefer, timeoutMs = SB_TIMEOUT_MS) {
+  const res = await sbFetch(`${SB_URL}/rest/v1/${path}`, {
     method: "POST",
     headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": "application/json", ...(prefer ? { prefer } : {}) },
     body: JSON.stringify(body),
-  });
+  }, timeoutMs);
   if (!res.ok) throw new Error(`Supabase ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.status === 204 ? null : res.json().catch(() => null);
+}
+
+// Resolves with the promise, or rejects after ms (the work itself is left to
+// finish or hit its own fetch deadline).
+function withTimeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(timeoutError(what, ms)), ms); }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 const enc = encodeURIComponent;
@@ -51,7 +85,9 @@ const trim = (s, n = 280) => (s == null ? null : String(s).length > n ? String(s
 let cutoffCache = { at: 0, value: null };
 async function dashboardCutoff() {
   if (Date.now() - cutoffCache.at < 60_000) return cutoffCache.value;
-  const rows = await sb("fpx_shipments_latest?select=scraped_at&order=scraped_at.desc&limit=1");
+  // The base table, not fpx_shipments_latest: ordering the DISTINCT ON view
+  // sorts every row first; the newest scraped_at is the same either way.
+  const rows = await sb("fpx_shipments?select=scraped_at&scraped_at=not.is.null&order=scraped_at.desc&limit=1");
   const newest = rows?.[0]?.scraped_at ? Date.parse(rows[0].scraped_at) : Date.now();
   cutoffCache = { at: Date.now(), value: new Date(newest - OFF_DASHBOARD_MS).toISOString() };
   return cutoffCache.value;
@@ -143,7 +179,11 @@ async function toolGetShipment({ shipment, tracking, id } = {}) {
   else if (shipment) q = `shipment_id=eq.${enc(shipment)}`;
   else if (tracking) q = `tracking_number=eq.${enc(tracking)}`;
   else return { error: "Give shipment, tracking or id" };
-  const rows = await sb(`fpx_shipments_latest?select=${SHIP_COLS},ship_from,ship_to,origin,comments,tracking_comments,pickup_response&${q}&limit=1`);
+  // The base table, newest read first. fpx_shipments_latest is DISTINCT ON
+  // (tracking_number), so a shipment_id filter on it can't use an index and
+  // sorts the whole table — this lookup is what hung for shipments that are
+  // not in the assistant index (delivered / invoicing-stage ones).
+  const rows = await sb(`fpx_shipments?select=${SHIP_COLS},ship_from,ship_to,origin,comments,tracking_comments,pickup_response&${q}&order=scraped_at.desc.nullslast&limit=1`);
   const s = rows[0];
   if (!s) return { error: "Not found (it may have been archived)" };
   const tasks = await sb(`fpx_shipment_tasks?select=id,title,status,assigned_to,created_at&shipment_id=eq.${s.id}&archived_at=is.null&order=created_at.desc&limit=10`);
@@ -184,7 +224,7 @@ export async function reindexAssistant(reason = "timer") {
   if (!assistantEnabled) return null;
   const t0 = Date.now();
   try {
-    const rows = await sbPost("rpc/fpx_assistant_reindex", {});
+    const rows = await sbPost("rpc/fpx_assistant_reindex", {}, undefined, 150_000); // runs up to its 120 s statement_timeout
     indexState = { at: Date.now(), ok: true, rows: Number(rows) || 0, ms: Date.now() - t0 };
     focusCache = { at: 0, rows: null };
     if (reason !== "timer") console.log(`[assistant] index rebuilt (${reason}): ${indexState.rows} shipments in ${indexState.ms}ms`);
@@ -201,11 +241,11 @@ export async function reindexAssistant(reason = "timer") {
 // After every rebuild, embed the records whose text changed. The function
 // caps CPU per request, so it embeds ~5 per call and we loop (2 in parallel).
 let embedState = { running: false, at: 0, embedded: 0, lastError: null };
-const embedFn = (body) => fetch(`${SB_URL}/functions/v1/fpx-embed`, {
+const embedFn = (body, timeoutMs = 60_000) => sbFetch(`${SB_URL}/functions/v1/fpx-embed`, {
   method: "POST",
   headers: { apikey: SB_KEY, "content-type": "application/json" },
   body: JSON.stringify(body),
-}).then(async (r) => {
+}, timeoutMs).then(async (r) => {
   const j = await r.json().catch(() => null);
   if (!r.ok) throw new Error(`fpx-embed ${r.status}: ${j?.error || j?.message || ""}`);
   return j;
@@ -252,7 +292,7 @@ export function assistantIndexStatus() {
 async function queryEmbedding(text) {
   const t = String(text || "").trim();
   if (t.length < 6 || /^[\d\s-]+$/.test(t) || t.split(/\s+/).length < 2) return null;
-  try { return (await embedFn({ mode: "query", text: t })).embedding || null; } catch { return null; }
+  try { return (await embedFn({ mode: "query", text: t }, 6_000)).embedding || null; } catch { return null; } // no embedding → keyword search only
 }
 
 export function startAssistantIndexer() {
@@ -374,14 +414,159 @@ const DATA_TOOLS = {
   search_shipments: withFallback(ixSearch, toolSearchShipments),
   get_shipment: withFallback(ixGetShipment, toolGetShipment),
   dashboard_summary: withFallback(ixSummary, toolSummary),
+  get_invoice_record: toolInvoiceRecord,
+  search_invoice_documents: toolSearchInvoiceDocuments,
 };
+
+// Tools that read several tables get a longer deadline than the default.
+const TOOL_TIMEOUTS = { get_invoice_record: 20_000, search_invoice_documents: 15_000 };
+
+// ---------------- invoice / shipment analysis ----------------
+// Everything FPX holds about one shipment's money and paperwork, by its
+// FreightPOP shipment number. Every read is an eq on a key or an indexed
+// column — never an ilike on fpx_erp_transactions or the fpx_erp_invoicing
+// view (which joins ~48k transactions to ~22k approvals and times out).
+
+const TX_COLS = "shipment_id,tracking_number,tracking_key,customer_name,carrier,service,status,shipped_date,charge,cost,gross_profit,approved_invoice_amount,invoice_approved_date,not_approved_invoice_amount,billing_invoice_number,exported_to_erp,first_seen_at,last_seen_at,last_pull_audit_id,quote_id:data->>QuoteID";
+const APPROVAL_COLS = "approval_key,invoice_number,invoice_amount,approved_date,approved_by,approved_by_kind,exported_date,variance,notes,last_seen_at";
+const DOC_COLS = "doc_type,file,invoice_number,invoice_date,carrier,tracking_number,bol_number,po_number,total,subtotal,fuel_surcharge,accessorial_total,line_items,summary,confidence,warnings,extracted_at";
+const DETAIL_COLS = "sale,cost,gross_profit,financials_source,quote_id,quote_number,quote_freight,quote_fuel,quote_accessorial_total,quote_total,quote_accessorials,carrier,tracking_number,po_number,so_number,captured_at";
+const TRACK_COLS = "id,shipment_status,carrier_name,tracking_number,customer_name,scraped_at,archived_at";
+
+const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
+const round2 = (v) => (v == null ? null : Math.round(v * 100) / 100);
+const newest = (rows, key) => rows.map((r) => r?.[key]).filter(Boolean).sort().pop() || null;
+
+// Where the invoice stands, in plain words — same rule as fpx_erp_invoicing.bucket.
+function invoiceStage(tx, approvals) {
+  if (!tx) return { stage: "not_in_erp_report", words: "Not in the ERP transactions report FPX pulled" };
+  if (tx.exported_to_erp === true) return { stage: "pushed_to_erp", words: "Pushed to the ERP" };
+  if (approvals.length || (num(tx.approved_invoice_amount) || 0) !== 0) return { stage: "approved", words: "Carrier invoice approved — not pushed to the ERP yet" };
+  if ((num(tx.not_approved_invoice_amount) || 0) !== 0) return { stage: "not_approved", words: "Carrier invoice received but not approved" };
+  return { stage: "waiting_for_carrier_invoice", words: "Waiting for the carrier invoice" };
+}
+
+async function toolInvoiceRecord({ shipment_id } = {}) {
+  const id = String(shipment_id || "").trim();
+  if (!/^[A-Za-z0-9_-]{3,40}$/.test(id)) return { error: "Give the FreightPOP shipment number, e.g. 15631966" };
+  const e = enc(id);
+  const errors = [];
+  const settle = async (label, p, fallback) => {
+    try { return await p; } catch (err) { errors.push(`${label}: ${err.message}`); return fallback; }
+  };
+  const [txRows, detailRows, trackRows, docRows, history] = await Promise.all([
+    settle("ERP transactions", sb(`fpx_erp_transactions?select=${TX_COLS}&shipment_id=eq.${e}&limit=1`, 8_000), []),
+    settle("shipment details", sb(`fpx_shipment_details?select=${DETAIL_COLS}&shipment_id=eq.${e}&limit=1`, 8_000), []),
+    settle("tracking", sb(`fpx_shipments?select=${TRACK_COLS}&shipment_id=eq.${e}&order=scraped_at.desc.nullslast&limit=1`, 8_000), []),
+    settle("documents", sb(`fpx_invoice_documents?select=${DOC_COLS}&shipment_id=eq.${e}&status=eq.done&order=extracted_at.desc.nullslast&limit=12`, 8_000), []),
+    settle("change history", sb(`fpx_scrape_history?select=source,event,scraped_at,changes&source=in.(erp_transactions,shipment_details)&entity_key=eq.${e}&order=scraped_at.desc&limit=10`, 8_000), []),
+  ]);
+  const tx = txRows?.[0] || null;
+  const det = detailRows?.[0] || null;
+  const trk = trackRows?.[0] || null;
+  const docs = docRows || [];
+  const approvals = tx?.tracking_key
+    ? await settle("approvals", sb(`fpx_audit_approvals?select=${APPROVAL_COLS}&tracking_key=eq.${enc(tx.tracking_key)}&order=approved_date.desc.nullslast,last_seen_at.desc&limit=10`, 8_000), [])
+    : [];
+  const approvalHistory = approvals.length
+    ? await settle("approval history", sb(`fpx_scrape_history?select=source,entity_key,event,scraped_at,changes&source=eq.audit_approvals&entity_key=in.(${approvals.map((a) => `"${String(a.approval_key).replace(/"/g, "")}"`).map(enc).join(",")})&order=scraped_at.desc&limit=10`, 8_000), [])
+    : [];
+
+  if (!tx && !det && !trk && !docs.length) {
+    return { shipment_id: id, found: false, errors: errors.length ? errors : undefined,
+      note: errors.length ? "Some reads failed (see errors) — say so; the shipment may exist." : "FPX has no ERP, shipment details, tracking or document record for this shipment number." };
+  }
+
+  const charge = num(tx?.charge), cost = num(tx?.cost);
+  const gp = num(tx?.gross_profit) ?? (charge != null && cost != null ? charge - cost : null);
+  const approved = num(tx?.approved_invoice_amount);
+  const customerInvoices = docs.filter((d) => d.doc_type === "invoice" && num(d.total) != null);
+  const checks = [];
+  if (approved != null && approved !== 0 && cost != null && Math.abs(approved - cost) >= 0.01) {
+    checks.push({ check: "approved_carrier_amount_vs_cost", ok: false, approved_carrier_amount: approved, freightpop_cost: cost, difference: round2(approved - cost) });
+  } else if (approved != null && approved !== 0 && cost != null) {
+    checks.push({ check: "approved_carrier_amount_vs_cost", ok: true });
+  }
+  // The invoice FPX saved is the one sent to the customer: check it against the charge.
+  for (const d of customerInvoices) {
+    const total = num(d.total);
+    if (charge != null) checks.push({ check: "customer_invoice_total_vs_charge", file: d.file, invoice_number: d.invoice_number, ok: Math.abs(total - charge) < 0.01, invoice_total: total, charge, difference: round2(total - charge) });
+  }
+  if (det && charge != null && num(det.sale) != null && Math.abs(num(det.sale) - charge) >= 0.01) {
+    checks.push({ check: "shipment_details_sale_vs_erp_charge", ok: false, shipment_details_sale: num(det.sale), erp_charge: charge, difference: round2(num(det.sale) - charge) });
+  }
+  // Reference numbers the documents carry vs. what FreightPOP holds.
+  const refs = { tracking: tx?.tracking_number || trk?.tracking_number || det?.tracking_number || null, po: det?.po_number || null };
+  const norm = (v) => String(v || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  for (const d of docs) {
+    if (d.tracking_number && refs.tracking) checks.push({ check: "document_pro_matches_tracking", file: d.file, ok: norm(d.tracking_number) === norm(refs.tracking), document: d.tracking_number, freightpop: refs.tracking });
+    if (d.po_number && refs.po) checks.push({ check: "document_po_matches", file: d.file, ok: norm(d.po_number) === norm(refs.po), document: d.po_number, freightpop: refs.po });
+  }
+
+  const fresh = freshness({
+    tracking: trk?.scraped_at || null,
+    erp_transactions: tx?.last_seen_at || null,
+    ...(approvals.length ? { audit_approvals: newest(approvals, "last_seen_at") } : {}),
+    shipment_details: det?.captured_at || null,
+    documents: newest(docs, "extracted_at"),
+  });
+  const quoteId = tx?.quote_id || det?.quote_id || null;
+
+  return {
+    shipment_id: id,
+    found: true,
+    status: invoiceStage(tx, approvals),
+    // For open_in_freightpop (FreightPOP's Shipment Details needs the quote id).
+    quote_id: quoteId,
+    tracking_internal_id: trk?.id || null, // for open_shipment
+    customer: tx?.customer_name || trk?.customer_name || null,
+    carrier: tx?.carrier || trk?.carrier_name || det?.carrier || null,
+    money: {
+      charge, cost, gross_profit: round2(gp),
+      margin_pct: charge ? round2((gp / charge) * 100) : null,
+      approved_carrier_amount: approved, not_approved_carrier_amount: num(tx?.not_approved_invoice_amount),
+    },
+    erp_transaction: tx ? { ...tx, tracking_key: undefined, quote_id: undefined } : null,
+    approvals: approvals.map((a) => ({ ...a, notes: trim(a.notes, 300) })),
+    shipment_details: det ? { ...det, quote_accessorials: (det.quote_accessorials || []).slice(0, 15) } : null,
+    tracking: trk ? { status: trk.shipment_status, carrier: trk.carrier_name, tracking_number: trk.tracking_number, scraped_at: trk.scraped_at, archived_at: trk.archived_at } : null,
+    documents: docs.map((d) => ({
+      ...d,
+      line_items: Array.isArray(d.line_items) ? d.line_items.slice(0, 15) : d.line_items,
+      summary: trim(d.summary, 400),
+    })),
+    checks,
+    recent_changes: [...(history || []), ...approvalHistory]
+      .sort((a, b) => String(b.scraped_at).localeCompare(String(a.scraped_at))).slice(0, 10)
+      .map((h) => ({ ...h, changes: trim(JSON.stringify(h.changes), 400) })),
+    freshness: fresh,
+    errors: errors.length ? errors : undefined,
+  };
+}
+
+async function toolSearchInvoiceDocuments({ q, limit = 10 } = {}) {
+  const query = String(q || "").trim();
+  if (!query) return { error: "Give something to search for" };
+  const embedding = await queryEmbedding(query);
+  const rows = await sbPost("rpc/fpx_invoice_documents_search", {
+    p_query: query, p_embedding: embedding ? JSON.stringify(embedding) : null, p_limit: Math.min(20, Math.max(1, limit)),
+  }, undefined, 12_000);
+  return {
+    count: (rows || []).length,
+    documents: (rows || []).map((r) => ({
+      shipment_id: r.doc?.shipment_id, doc_type: r.doc?.doc_type, invoice_number: r.doc?.invoice_number,
+      carrier: r.doc?.carrier, total: r.doc?.total, summary: trim(r.doc?.summary, 240), score: Math.round((r.score || 0) * 100) / 100,
+    })),
+  };
+}
 
 // Pre-loaded brief for the first question of a conversation: the top focus
 // items + dashboard counts, so "what should I focus on" needs no tool call.
 async function preloadedBrief() {
   if (!indexFresh()) return null;
   try {
-    const [focus, summary] = await Promise.all([ixFocusList({ limit: 8 }), ixSummary()]);
+    // Never hold the question up for the brief: without it the model just calls a tool.
+    const [focus, summary] = await withTimeout(Promise.all([ixFocusList({ limit: 8 }), ixSummary()]), 5_000, "Pre-loaded brief");
     // Lean: just what's needed to rank and say the next step (≈2–3k tokens).
     const slim = focus.candidates;
     return { built: new Date(indexState.at).toISOString(), dashboard: summary, open_tasks_on_dashboard: focus.open_tasks_on_dashboard, top_focus: slim };
@@ -390,9 +575,9 @@ async function preloadedBrief() {
 
 // ---------------- UI tools (performed by the browser) ----------------
 
-const UI_TOOLS = new Set(["open_shipment", "open_task", "filter_shipments", "navigate"]);
+const UI_TOOLS = new Set(["open_shipment", "open_task", "filter_shipments", "navigate", "open_invoice", "open_in_freightpop"]);
 
-const PAGES = ["tracking", "shipment_details", "tasks", "ops", "scraping", "notes", "analyses", "gp", "invoice"];
+const PAGES = ["tracking", "shipment_details", "tasks", "ops", "scraping", "notes", "analyses", "gp", "invoice", "invoices", "invoice_reading", "pushed", "send_invoices"];
 const SHIPMENT_TABS = ["overview", "tasks", "email", "history", "intel", "freightpop"];
 
 const obj = (properties, required = []) => ({ type: "object", properties, required, additionalProperties: false });
@@ -450,8 +635,34 @@ const TOOLS = [
   },
   {
     name: "navigate",
-    description: "Go to a dashboard page. shipment_details is the page listing every shipment's sale, cost and gross profit read from FreightPOP, with the live view of that read.",
+    description: "Go to a dashboard page. shipment_details: every shipment's sale, cost and gross profit read from FreightPOP. invoices: the Invoices hub (where each shipment's invoice stands; refresh ERP data there). invoice_reading: the invoice documents FPX has read. pushed: invoices pushed to the ERP. send_invoices: send customer invoices. scraping: the Scraping page, where tracking and shipment details reads are run.",
     input_schema: obj({ page: { type: "string", enum: PAGES } }, ["page"]),
+  },
+  {
+    name: "get_invoice_record",
+    description: "Everything FPX holds about one shipment's invoicing, by FreightPOP shipment number: ERP transaction (charge, cost, GP, approved/not-approved carrier amounts, pushed to ERP), carrier invoice approvals, invoice documents FPX read (totals, line items, PRO/BOL/PO), Shipment Details financials, the tracking row, recent changes, pre-computed checks, a plain-words status, and a freshness block saying how old each source is and whether it is stale. Use for any 'analyze / check / audit this shipment or invoice' question.",
+    input_schema: obj({ shipment_id: { type: "string", description: "FreightPOP shipment number, e.g. 15631966" } }, ["shipment_id"]),
+  },
+  {
+    name: "search_invoice_documents",
+    description: "Search the invoice documents FPX has read (invoices, BOLs, rate confirmations) by invoice/PRO/BOL/PO number, carrier, bill-to, or a phrase like 'liftgate fee disputed'. Returns shipment numbers with document type, invoice number, total, summary.",
+    input_schema: obj({ q: { type: "string" }, limit: { type: "integer", description: "Max 20. Default 10." } }, ["q"]),
+  },
+  {
+    name: "open_invoice",
+    description: "Open one shipment's panel on the Invoices page in the rep's dashboard.",
+    input_schema: obj({ shipment_id: { type: "string", description: "FreightPOP shipment number" } }, ["shipment_id"]),
+  },
+  {
+    name: "open_in_freightpop",
+    description: "Open the shipment's Shipment Details page in FreightPOP itself (the rep's hosted FreightPOP window). Needs quote_id from get_invoice_record; pass charge and cost from it too when known.",
+    input_schema: obj({
+      shipment_id: { type: "string" },
+      quote_id: { type: "string" },
+      charge: { type: "number", description: "money.charge, when known" },
+      cost: { type: "number", description: "money.cost, when known" },
+      customer: { type: "string" },
+    }, ["shipment_id", "quote_id"]),
   },
 ].map((t) => ({ ...t, strict: true }));
 
@@ -469,6 +680,15 @@ Data notes:
 - Every open task is marked "high" priority, so priority alone doesn't rank anything — use the shipment facts.
 - The first message of a conversation may carry a pre-loaded brief: dashboard counts and only the TOP 8 focus items. Answer "what should I focus on" / "how are we doing" from it directly. For anything else — a category ("stuck at a terminal", "waiting on appointments", a carrier, a customer), a specific shipment, or more than the top items — call search_shipments or focus_list; the brief is not the whole board.
 
+Invoices and money ("analyze / check / audit this shipment", "what's going on with the invoice for 15631966"): call get_invoice_record with the shipment number (not get_shipment — an invoicing-stage shipment has usually left the tracking board). Answer as a short structured verdict, using only what it returns:
+- **Status** — status.words, in plain words (waiting for carrier invoice / not approved / approved / pushed to ERP).
+- **Money** — charge, cost, gross profit and margin; approved carrier amount vs FreightPOP cost; the customer invoice document total vs charge.
+- **Documents** — what the documents FPX read say, and whether their PRO / BOL / PO match FreightPOP (see checks).
+- **Doesn't line up** — every check with ok false, with the amounts and difference. Say "nothing" if all line up.
+- **Freshness** — if freshness.any_stale, say it plainly, e.g. "ERP data last read 3 days ago — may be out of date", and offer to open the page that refreshes it (each stale source has refresh_page: invoices for ERP data/approvals, scraping for tracking and shipment details). If nothing is stale, one short line with the oldest read is enough.
+Never invent a number. When a source has nothing (no ERP row, no documents, details never read), say so. If the result has errors, say which reads failed. Offer open_invoice (the Invoices page panel) and open_in_freightpop (needs quote_id — say it can't be opened in FreightPOP when quote_id is null); do them when the rep asks to see or open it.
+- A tool result with an error (including "timed out") means that read failed: tell the rep in one line and answer from what did come back. Don't retry the same call more than once.
+
 Links: the reply is rendered with Markdown links. Link every shipment you mention to its page in FPX — [15496050](/tracking/<id>) using the internal id from tool results — and tasks as [task](/tasks/v2/<task_id>). You may also use full https:// links that appear in the data. Never invent URLs.
 
 Style: short and scannable — reps read this between calls. Default to under 120 words. For lists, at most 5 items, ONE line each: shipment number · customer · carrier — the problem — the next step. Offer "want more?" instead of listing everything. Use names and numbers, not internal ids. No preamble, no closing summary.`;
@@ -482,9 +702,29 @@ Style: short and scannable — reps read this between calls. Default to under 12
 const STATUS = {
   focus_list: "Ranking open tasks…", search_shipments: "Searching shipments…",
   get_shipment: "Opening the shipment…", dashboard_summary: "Counting the dashboard…",
+  get_invoice_record: "Reading the invoice record…", search_invoice_documents: "Searching invoice documents…",
 };
 
-export async function chat({ history = [], message, who, context, onEvent }) {
+// A stale source on an invoice record becomes a chip in the panel ("Data is
+// N days old — open"). It is never performed automatically; the rep clicks it.
+function addStaleAction(actions, rec) {
+  const f = rec.freshness;
+  const worst = Object.values(f.sources || {}).filter((s) => s.stale).sort((a, b) => (b.age_hours || 0) - (a.age_hours || 0))[0];
+  if (!worst) return;
+  const i = actions.findIndex((a) => a.type === "stale_data");
+  if (i >= 0) actions.splice(i, 1);
+  actions.push({
+    type: "stale_data",
+    shipment_id: rec.shipment_id,
+    age_hours: worst.age_hours,
+    sources: f.stale,
+    label: worst.label,
+    page: worst.refresh_page || "invoices",
+  });
+}
+
+// signal (optional): aborted when the browser goes away — stops the model call.
+export async function chat({ history = [], message, who, context, onEvent, signal }) {
   if (!assistantEnabled) throw new Error("Assistant not configured (ANTHROPIC_API_KEY / Supabase)");
   const t0 = Date.now();
   const messages = [...history];
@@ -499,6 +739,10 @@ export async function chat({ history = [], message, who, context, onEvent }) {
   const done = (out) => { logChatCost({ who, message, reply: out.reply, usage, ms: Date.now() - t0, actions, preloaded: !!brief }); return out; };
 
   for (let step = 0; step < MAX_STEPS; step++) {
+    if (signal?.aborted) throw new Error("The browser closed the request");
+    if (step > 0 && Date.now() - t0 > TURN_DEADLINE_MS) {
+      return done({ messages, reply: "This is taking too long — some lookups were slow. Try again, or ask about one shipment at a time.", actions, usage, timedOut: true });
+    }
     const params = {
       model: MODEL,
       max_tokens: 16000,
@@ -511,13 +755,16 @@ export async function chat({ history = [], message, who, context, onEvent }) {
       tools: TOOLS,
       messages,
     };
+    // A deadline per request (the SDK default is 10 minutes, retried twice —
+    // long enough to look like a hang) and the browser's abort signal.
+    const reqOpts = { timeout: CLAUDE_TIMEOUT_MS, maxRetries: 1, ...(signal ? { signal } : {}) };
     let response;
     if (onEvent) {
-      const stream = client.beta.messages.stream(params);
+      const stream = client.beta.messages.stream(params, reqOpts);
       stream.on("text", (delta) => onEvent({ type: "text", delta }));
       response = await stream.finalMessage();
     } else {
-      response = await client.beta.messages.create(params);
+      response = await client.beta.messages.create(params, reqOpts);
     }
     usage.input += response.usage?.input_tokens || 0;
     usage.output += response.usage?.output_tokens || 0;
@@ -554,7 +801,15 @@ export async function chat({ history = [], message, who, context, onEvent }) {
           actions.push(action);
           out = { done: true, applied: block.input, note: "Applied in the rep's dashboard exactly as shown in `applied`. Don't call it again for the same request." };
         } else if (DATA_TOOLS[block.name]) {
-          out = await DATA_TOOLS[block.name](block.input || {});
+          const ms = TOOL_TIMEOUTS[block.name] || TOOL_TIMEOUT_MS;
+          try {
+            out = await withTimeout(DATA_TOOLS[block.name](block.input || {}), ms, `Lookup ${block.name}`);
+          } catch (e) {
+            // Hand the model an error it can explain instead of failing the turn.
+            console.warn(`[assistant] tool ${block.name} failed:`, e.message);
+            return { type: "tool_result", tool_use_id: block.id, is_error: true, content: JSON.stringify({ error: e.message, timed_out: !!e.timeout }) };
+          }
+          if (block.name === "get_invoice_record" && out?.freshness?.any_stale) addStaleAction(actions, out);
         } else {
           out = { error: `Unknown tool ${block.name}` };
         }

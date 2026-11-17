@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { FileText, Loader2, Search, X } from "lucide-react";
 import { fmtNum } from "../../lib/format";
 import {
-  HUB_STEP_SHORT, fetchHubList, hubDay, hubMoney, isAbort, searchInvoiceDocs,
+  HUB_STEP_SHORT, SEARCH_FAILED_MESSAGE, fetchHubList, hubDay, hubMoney, isAbort, searchInvoiceDocs,
   type HubList, type HubRow, type InvoiceDocHit,
 } from "../../lib/invoicesHub";
+import { StaleDot } from "./StaleDot";
 
 // The search at the top of the Invoices page: one box that looks through every
 // shipment FPX has read from FreightPOP and through the text read off saved
@@ -17,7 +18,7 @@ const SHOWN = 8;
 type Shipments =
   | { status: "loading" }
   | { status: "ready"; list: HubList }
-  | { status: "error"; message: string };
+  | { status: "error" };
 
 /** null = still looking, or not available: the group is not shown. */
 type Docs = InvoiceDocHit[] | null;
@@ -92,7 +93,9 @@ export function FindInvoice({ query, onQueryChange, onOpen, totalKnown }: {
       (list) => { if (!ctl.signal.aborted) setShipments({ status: "ready", list }); },
       (e: unknown) => {
         if (ctl.signal.aborted || isAbort(e)) return;
-        setShipments({ status: "error", message: (e as Error)?.message || "The search could not be run." });
+        // What the server said (a database error, say) is not shown: only the plain message.
+        console.warn("[FPX] invoice search failed:", e);
+        setShipments({ status: "error" });
       },
     );
     searchInvoiceDocs(term, SHOWN, ctl.signal).then(
@@ -160,7 +163,7 @@ export function FindInvoice({ query, onQueryChange, onOpen, totalKnown }: {
                 </div>
               ) : shipments.status === "error" ? (
                 <p role="alert" className="px-3 py-3 text-sm text-rose-700 break-words">
-                  The search did not work. {shipments.message}{" "}
+                  {SEARCH_FAILED_MESSAGE}{" "}
                   <button type="button" onClick={() => setAttempt((n) => n + 1)} className="underline hover:text-rose-900 rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500">Try again</button>
                 </p>
               ) : rows.length === 0 ? (
@@ -177,7 +180,10 @@ export function FindInvoice({ query, onQueryChange, onOpen, totalKnown }: {
                       return (
                         <li key={r.shipment_id}>
                           <button type="button" onClick={() => onOpen(r.shipment_id, r)} className={rowCls}>
-                            <span className="font-semibold text-slate-900 whitespace-nowrap">{r.shipment_id}</span>
+                            <span className="font-semibold text-slate-900 whitespace-nowrap inline-flex items-center gap-1.5">
+                              {r.shipment_id}
+                              <StaleDot lastSeenAt={r.last_seen_at} />
+                            </span>
                             <span className="min-w-0 flex-1 basis-48">
                               <span className="block text-sm text-slate-700 truncate">{who || "Customer and carrier not listed"}</span>
                               {r.tracking_number ? <span className="block text-xs text-slate-500 truncate">Tracking {r.tracking_number}</span> : null}
@@ -191,7 +197,12 @@ export function FindInvoice({ query, onQueryChange, onOpen, totalKnown }: {
                   </ul>
                   {all != null && all > rows.length ? (
                     <p className="px-3 mt-2 text-sm text-slate-500">
-                      Showing the first {fmtNum(rows.length)} of {fmtNum(all)}. The steps below show them all, split by where each one stands.
+                      Showing the first {fmtNum(rows.length)} of {fmtNum(all)}{shipments.status === "ready" && shipments.list.truncated ? "+" : ""}. The steps below show them all, split by where each one stands.
+                    </p>
+                  ) : null}
+                  {shipments.status === "ready" && shipments.list.truncated ? (
+                    <p className="px-3 mt-1 text-sm text-slate-500">
+                      This search matches a lot of shipments, so only the biggest {fmtNum(all)} by charge are counted. Type more of the name or number to narrow it.
                     </p>
                   ) : null}
                 </>

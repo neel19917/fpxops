@@ -13,7 +13,7 @@ import { supabase } from "../lib/supabase.js";
 import { isUuid } from "../lib/getInvoice.js";
 import { DOC_TYPES } from "../lib/invoiceExtract.js";
 import {
-  backfillFromRecords, retryFailed, kickInvoiceDocs, queryEmbedding, invoiceDocWorkerEnabled,
+  backfillFromRecords, retryFailed, kickInvoiceDocs, queryEmbedding, invoiceDocWorkerEnabled, invoiceDocsState,
 } from "../lib/invoiceDocs.js";
 
 export const invoiceDocsRouter = Router();
@@ -132,6 +132,112 @@ invoiceDocsRouter.post("/process", async (req, res) => {
   res.json({
     queued, processing,
     ...(processing ? {} : { reason: "Reading is off on this server (ANTHROPIC_API_KEY is not set)" }),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The reading log and live state (the dashboard's "Reading invoices" page).
+// Read only.
+// ---------------------------------------------------------------------------
+const LOG_TABLE = "fpx_invoice_doc_log";
+export const LOG_COLS = ["id", "at", "document_id", "shipment_id", "file", "doc_type", "step", "level", "message", "ms", "cost_usd"];
+export const LOG_LEVELS = ["info", "ok", "warn", "error"];
+
+// The /log query string, checked. Returns { error } or the filters:
+// { since_id: number|null, document_id, shipment_id, levels: string[]|null, limit }.
+// level may be one level or a comma list ("warn,error").
+export function parseLogQuery(q = {}) {
+  let since_id = null;
+  if (q.since_id != null && String(q.since_id).trim() !== "") {
+    const n = Number(q.since_id);
+    if (!Number.isSafeInteger(n) || n < 0) return { error: "since_id must be a log line's id" };
+    since_id = n;
+  }
+  let document_id = null;
+  if (q.document_id != null && String(q.document_id).trim() !== "") {
+    if (!isUuid(String(q.document_id).trim())) return { error: "document_id must be a document's id" };
+    document_id = String(q.document_id).trim();
+  }
+  const shipment_id = q.shipment_id != null && String(q.shipment_id).trim() ? String(q.shipment_id).trim().slice(0, 100) : null;
+  let levels = null;
+  if (q.level != null && String(q.level).trim() !== "") {
+    levels = [...new Set(String(q.level).split(",").map((s) => s.trim()).filter(Boolean))];
+    const bad = levels.find((l) => !LOG_LEVELS.includes(l));
+    if (bad) return { error: `level must be one of ${LOG_LEVELS.join(", ")}` };
+  }
+  return { since_id, document_id, shipment_id, levels, limit: intIn(q.limit, 200, 1, 1000) };
+}
+
+export const pickLog = (row) => ({
+  id: Number(row?.id) || 0,
+  at: row?.at ?? null,
+  document_id: row?.document_id ?? null,
+  shipment_id: row?.shipment_id ?? null,
+  file: row?.file ?? null,
+  doc_type: row?.doc_type ?? null,
+  step: row?.step ?? null,
+  level: LOG_LEVELS.includes(row?.level) ? row.level : "info",
+  message: row?.message ?? "",
+  ms: row?.ms == null ? null : Number(row.ms),
+  cost_usd: row?.cost_usd == null ? null : Number(row.cost_usd),
+});
+
+// The newest id among the lines, or the one the caller already had.
+export const lastIdOf = (lines, since_id = null) =>
+  lines.reduce((m, l) => (l.id > m ? l.id : m), since_id ?? 0) || null;
+
+// Midnight UTC of the day `now` falls in, as an ISO string.
+export const startOfUtcDay = (now = new Date()) =>
+  new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+
+// Sum of cost_usd, ignoring blanks; rounded to 1/10000 of a dollar.
+export const sumCost = (rows) =>
+  Math.round((rows || []).reduce((s, r) => s + (Number(r?.cost_usd) || 0), 0) * 10_000) / 10_000;
+
+// GET /log?since_id=&document_id=&shipment_id=&level=&limit=
+// Lines of the reading log. Without since_id: the newest `limit` lines,
+// newest first. With since_id: only lines after it, oldest first (for live
+// tailing). limit default 200, at most 1000. Responds { data: LogLine[],
+// last_id } — last_id is the newest id seen (pass it back as since_id).
+invoiceDocsRouter.get("/log", async (req, res) => {
+  const f = parseLogQuery(req.query);
+  if (f.error) return res.status(400).json({ error: f.error });
+  let query = supabase.from(LOG_TABLE).select(LOG_COLS.join(", "));
+  if (f.since_id != null) query = query.gt("id", f.since_id);
+  if (f.document_id) query = query.eq("document_id", f.document_id);
+  if (f.shipment_id) query = query.eq("shipment_id", f.shipment_id);
+  if (f.levels) query = query.in("level", f.levels);
+  const { data, error } = await query.order("id", { ascending: f.since_id != null }).limit(f.limit);
+  if (error) return res.status(500).json({ error: error.message });
+  const lines = (data || []).map(pickLog);
+  res.json({ data: lines, last_id: lastIdOf(lines, f.since_id) });
+});
+
+// GET /state
+// What the reader is doing now on this API server, with the counts:
+// { enabled, running, run, reading: [...],            (lib/invoiceDocs.js)
+//   total, by_status, by_doc_type, last_extracted_at, cost_usd,
+//   queue: { pending, processing, failed }, cost_today_usd }
+// cost_today_usd sums the log's cost_usd since midnight UTC.
+invoiceDocsRouter.get("/state", async (_req, res) => {
+  const since = startOfUtcDay();
+  const [summary, today] = await Promise.all([
+    supabase.rpc("fpx_invoice_documents_summary"),
+    supabase.from(LOG_TABLE).select("cost_usd").gte("at", since).not("cost_usd", "is", null).limit(20_000),
+  ]);
+  if (summary.error) return res.status(500).json({ error: summary.error.message });
+  const s = summary.data || {};
+  const by_status = Object.fromEntries(STATUSES.map((k) => [k, Number(s.by_status?.[k]) || 0]));
+  res.json({
+    ...invoiceDocsState(),
+    total: Number(s.total) || 0,
+    by_status,
+    by_doc_type: Object.fromEntries(DOC_TYPES.map((k) => [k, Number(s.by_doc_type?.[k]) || 0])),
+    last_extracted_at: s.last_extracted_at || null,
+    cost_usd: Number(s.cost_usd) || 0,
+    queue: { pending: by_status.pending, processing: by_status.processing, failed: by_status.failed },
+    // null when the log could not be read (e.g. the table is not there yet).
+    cost_today_usd: today.error ? null : sumCost(today.data),
   });
 });
 

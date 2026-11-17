@@ -12,6 +12,9 @@ import { ERP_MASTERS, buildErpMaster, transactionPieceRows, upsertPieceRows } fr
 import { transactionRow } from "../lib/erpStore.js";
 import { APPROVAL_CONFIDENCE_MIN, checkApproval } from "../lib/approvalCheck.js";
 import { createHash } from "node:crypto";
+import {
+  ID_CHUNK, SEARCH_TIMEOUT_MESSAGE, chunk, ilikeAny, isTimeoutError, mergeIds, pageOfMatches, searchPlan,
+} from "../lib/invoicingSearch.js";
 import { historyItems, recordScrapeHistory, readBefore } from "../lib/scrapeHistory.js";
 import { queueInvoiceDocuments } from "../lib/invoiceDocs.js";
 
@@ -815,16 +818,57 @@ auditsRouter.get("/erp/master", async (req, res) => {
 const ERP_BUCKETS = ["exported", "approved_ready", "invoice_not_approved", "no_invoice"];
 const APPROVER_KINDS = ["edi", "person", "unknown"];
 
-// The `q` and `approved_by_kind` filters of the invoicing list, on a query of
-// the fpx_erp_invoicing view.
-function erpInvoicingFilters(query, { q, kind }) {
-  let out = query;
-  if (kind) out = out.eq("approved_by_kind", kind);
-  if (q) {
-    const like = `"%${q}%"`;
-    out = out.or(["shipment_id", "tracking_number", "customer_name", "carrier", "approved_invoice_number"].map((c) => `${c}.ilike.${like}`).join(","));
-  }
-  return out;
+// The `approved_by_kind` filter of the invoicing list, on a query of the
+// fpx_erp_invoicing view. (A search `q` is not filtered on the view: see
+// searchErpInvoicing.)
+function erpInvoicingFilters(query, { kind }) {
+  return kind ? query.eq("approved_by_kind", kind) : query;
+}
+
+// The shipment ids a search matches, found on the base tables (not the view,
+// whose join to the latest approval made every search scan all shipments):
+// shipment/tracking/billing invoice number, customer and carrier on
+// fpx_erp_transactions, and carrier invoice/tracking numbers on
+// fpx_audit_approvals through their tracking key. Biggest charge first, at
+// most SEARCH_ID_CAP. See lib/invoicingSearch.js.
+async function matchingShipmentIds(plan) {
+  const throwIf = (r) => { if (r.error) throw r.error; return r.data || []; };
+  const direct = plan.tx.length
+    ? supabase.from("fpx_erp_transactions").select("shipment_id")
+      .or(ilikeAny(plan.tx, plan.term))
+      .order("charge", { ascending: false, nullsFirst: false })
+      .limit(plan.cap + 1).then(throwIf)
+    : Promise.resolve([]);
+  const viaApprovals = plan.approvals.length
+    ? supabase.from("fpx_audit_approvals").select("tracking_key")
+      .or(ilikeAny(plan.approvals, plan.term))
+      .not("tracking_key", "is", null)
+      .limit(plan.cap + 1).then(throwIf)
+      .then(async (rows) => {
+        const keys = [...new Set(rows.map((r) => r.tracking_key).filter(Boolean))].slice(0, plan.cap);
+        const parts = await Promise.all(chunk(keys, ID_CHUNK).map((part) =>
+          supabase.from("fpx_erp_transactions").select("shipment_id").in("tracking_key", part).then(throwIf)));
+        return parts.flat();
+      })
+    : Promise.resolve([]);
+  const [a, b] = await Promise.all([direct, viaApprovals]);
+  return mergeIds([a.map((r) => r.shipment_id), b.map((r) => r.shipment_id)], plan.cap);
+}
+
+// A search of the invoicing list: the matched ids, then only those shipments
+// from the view (slim rows for the counts, full rows for the page).
+async function searchErpInvoicing({ q, kind, bucket, limit, offset }) {
+  const throwIf = (r) => { if (r.error) throw r.error; return r.data || []; };
+  const plan = searchPlan(q);
+  const { ids, truncated } = plan.kind === "empty" ? { ids: [], truncated: false } : await matchingShipmentIds(plan);
+  const slim = (await Promise.all(chunk(ids, ID_CHUNK).map((part) =>
+    supabase.from("fpx_erp_invoicing").select("shipment_id, bucket, approved_by_kind, charge").in("shipment_id", part).then(throwIf)))).flat();
+  const { counts, pageIds } = pageOfMatches(slim, { kind, bucket, limit, offset });
+  const full = (await Promise.all(chunk(pageIds, ID_CHUNK).map((part) =>
+    supabase.from("fpx_erp_invoicing").select("*").in("shipment_id", part).then(throwIf)))).flat();
+  const at = new Map(pageIds.map((id, i) => [id, i]));
+  const data = full.filter((r) => at.has(String(r.shipment_id))).sort((x, y) => at.get(String(x.shipment_id)) - at.get(String(y.shipment_id)));
+  return { data, counts, truncated };
 }
 
 // GET /audits/erp/invoicing?bucket=&approved_by_kind=&q=&limit=&offset=
@@ -832,14 +876,18 @@ function erpInvoicingFilters(query, { q, kind }) {
 // charge first.
 //   bucket            exported | approved_ready | invoice_not_approved | no_invoice
 //   approved_by_kind  edi | person | unknown
-//   q                 part of a shipment id, tracking number, customer, carrier
-//                     or approved invoice number
+//   q                 part of a shipment id, tracking number, billing invoice
+//                     number, customer, carrier, or a carrier invoice number
+//                     (any approval of the shipment's tracking number)
 //   limit             default 200, at most 1000;  offset  default 0
 // Responds { data, counts: { exported, approved_ready, invoice_not_approved,
-// no_invoice }, totals: { all, matching }, limit, offset }. counts are per
-// bucket with `q` and `approved_by_kind` applied (not `bucket`); a count that
-// could not be read is null. totals.all is their sum, totals.matching the rows
-// the whole filter matches (for paging).
+// no_invoice }, totals: { all, matching }, limit, offset } (+ truncated: true
+// when a search matched more than SEARCH_ID_CAP shipments; then only the
+// biggest-charge ones are listed and counted). counts are per bucket with `q`
+// and `approved_by_kind` applied (not `bucket`); a count that could not be read
+// is null. totals.all is their sum, totals.matching the rows the whole filter
+// matches (for paging). A search that times out answers 503 with
+// { error: SEARCH_TIMEOUT_MESSAGE, code: "search_timeout" }.
 auditsRouter.get("/erp/invoicing", async (req, res) => {
   const one = (v) => (Array.isArray(v) ? v[0] : v);
   const bucket = String(one(req.query.bucket) ?? "").trim();
@@ -859,7 +907,26 @@ auditsRouter.get("/erp/invoicing", async (req, res) => {
   const limit = Math.min(1000, Math.max(1, int(req.query.limit, 200)));
   const offset = Math.max(0, int(req.query.offset, 0));
 
-  let list = erpInvoicingFilters(supabase.from("fpx_erp_invoicing").select("*"), { q, kind });
+  if (q) {
+    try {
+      const found = await searchErpInvoicing({ q, kind, bucket, limit, offset });
+      const all = ERP_BUCKETS.reduce((a, b) => a + found.counts[b], 0);
+      return res.json({
+        data: found.data,
+        counts: found.counts,
+        totals: { all, matching: bucket ? found.counts[bucket] : all },
+        limit,
+        offset,
+        ...(found.truncated ? { truncated: true } : {}),
+      });
+    } catch (e) {
+      console.warn(`[FPX] invoicing search "${q}" failed: ${e?.message || e}`);
+      if (isTimeoutError(e)) return res.status(503).json({ error: SEARCH_TIMEOUT_MESSAGE, code: "search_timeout" });
+      return res.status(500).json({ error: "The search could not be run. Try again.", code: "search_failed" });
+    }
+  }
+
+  let list = erpInvoicingFilters(supabase.from("fpx_erp_invoicing").select("*"), { kind });
   if (bucket) list = list.eq("bucket", bucket);
   list = list
     .order("charge", { ascending: false, nullsFirst: false })
@@ -868,7 +935,7 @@ auditsRouter.get("/erp/invoicing", async (req, res) => {
   const countOf = async (b) => {
     try {
       const { count, error } = await erpInvoicingFilters(
-        supabase.from("fpx_erp_invoicing").select("shipment_id", { count: "exact", head: true }), { q, kind },
+        supabase.from("fpx_erp_invoicing").select("shipment_id", { count: "exact", head: true }), { kind },
       ).eq("bucket", b);
       return error ? null : count || 0;
     } catch {

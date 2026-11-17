@@ -226,6 +226,34 @@ async function logAnalysis(sb, claim, meta, { summary = null, error = null } = {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Log and live state (the "Reading invoices" page)
+// ---------------------------------------------------------------------------
+const LOG_TABLE = "fpx_invoice_doc_log";
+// Writes one line of the reading log. Never throws: the log must not stop a read.
+export async function logStep(sb, claim, step, message, { level = "info", ms = null, cost_usd = null } = {}) {
+  try {
+    const { error } = await sb.from(LOG_TABLE).insert({
+      document_id: claim?.id || null, shipment_id: claim?.shipment_id || null, file: claim?.file || null,
+      doc_type: claim?.doc_type || null, step, level, message: String(message).slice(0, 1000), ms, cost_usd,
+    });
+    if (error) warnOnce("doclog", `reading log not written: ${error.message}`);
+  } catch (e) {
+    warnOnce("doclog", `reading log not written: ${e?.message || e}`);
+  }
+}
+// What this server is doing right now: the run, and each file being read.
+const live = { run: null, reading: new Map() };
+export function invoiceDocsState() {
+  return {
+    enabled: invoiceDocWorkerEnabled(),
+    running: Boolean(running),
+    run: live.run ? { ...live.run } : null,
+    reading: [...live.reading.values()].map((r) => ({ ...r })),
+  };
+}
+const fileName = (f) => String(f || "").replace(/^invoices\//, "");
+
 // Reads one claimed row. Returns "done" | "unchanged" | "copied" | "failed".
 // Never throws.
 export async function processOne(sb, claim, { extract = extractDocument, embed = embedText } = {}) {
@@ -235,6 +263,11 @@ export async function processOne(sb, claim, { extract = extractDocument, embed =
     if (error) throw new Error(`Could not save: ${error.message}`);
   };
   let meta = null;
+  const t0 = Date.now();
+  const now = { id: claim.id, shipment_id: claim.shipment_id, file: claim.file, doc_type: claim.doc_type, step: "downloading", since: stamp() };
+  live.reading.set(claim.id, now);
+  const at = (step) => { now.step = step; now.since = stamp(); };
+  await logStep(sb, claim, "started", `Reading ${fileName(claim.file)} (${claim.doc_type}) for shipment ${claim.shipment_id}${claim.attempts > 1 ? `, try ${claim.attempts}` : ""}`);
   try {
     const mime = mimeOf(claim.file);
     let blob = null;
@@ -245,10 +278,12 @@ export async function processOne(sb, claim, { extract = extractDocument, embed =
     if (!blob) throw new Error("Could not download the file from storage");
     const bytes = Buffer.from(await blob.arrayBuffer());
     const hash = sha256(bytes);
+    await logStep(sb, claim, "downloaded", `Downloaded ${Math.round(bytes.length / 1024)} KB (${mime})`, { ms: Date.now() - t0 });
 
     // Same bytes as the last time it was read: nothing to do.
     if (claim.extracted_at && claim.content_sha256 === hash) {
       await save({ status: "done", error: null });
+      await logStep(sb, claim, "unchanged", "Same file as last time it was read: kept the earlier reading, no Claude call", { level: "ok", ms: Date.now() - t0 });
       return "unchanged";
     }
 
@@ -266,11 +301,27 @@ export async function processOne(sb, claim, { extract = extractDocument, embed =
       row.warnings = row.warnings || [];
       meta = { model: twins[0].model || null, input_tokens: 0, output_tokens: 0, cost_usd: 0, copied: true };
       result = "copied";
+      await logStep(sb, claim, "copied", "The same file was already read under another pull: copied that reading, no Claude call", { level: "ok" });
     } else {
+      at("reading");
+      const tc = Date.now();
+      await logStep(sb, claim, "sent", "Sent to Claude to read");
       const got = await extract({ bytes, mime, docType: claim.doc_type, shipmentId: claim.shipment_id });
       const { extraction, ...rest } = got;
       meta = rest;
       row = normalizeExtraction(extraction);
+      const named = ["invoice_number", "invoice_date", "carrier", "tracking_number", "bol_number", "po_number", "total"].filter((c) => row[c] != null && row[c] !== "");
+      const extra = Object.keys(row.fields || {}).length;
+      const lines = (row.line_items || []).length;
+      await logStep(sb, claim, "read",
+        `Read by ${meta.model || "Claude"}: ${named.length ? named.map((c) => `${c.replace(/_/g, " ")} ${c === "total" ? `$${row[c]}` : row[c]}`).join(", ") : "no main fields found"}`
+        + `; ${extra} other field${extra === 1 ? "" : "s"}, ${lines} line item${lines === 1 ? "" : "s"}`
+        + `${row.confidence != null ? `; confidence ${Math.round(Number(row.confidence) * 100)}%` : ""}`
+        + `${meta.input_tokens ? `; ${meta.input_tokens}+${meta.output_tokens} tokens` : ""}`,
+        { level: named.length ? "ok" : "warn", ms: Date.now() - tc, cost_usd: meta.cost_usd ?? null });
+      if (Array.isArray(row.warnings) && row.warnings.length) {
+        await logStep(sb, claim, "read", `Claude noted: ${row.warnings.slice(0, 3).join(" · ")}`, { level: "warn" });
+      }
     }
 
     await save({
@@ -282,6 +333,8 @@ export async function processOne(sb, claim, { extract = extractDocument, embed =
 
     // Chunks for search by meaning. A chunk the embed function could not do
     // is saved without one and filled in by the next sweep.
+    at("embedding");
+    const te = Date.now();
     const bodies = chunksForRow(row, { docType: claim.doc_type });
     const chunks = [];
     let embedDown = false;
@@ -292,8 +345,13 @@ export async function processOne(sb, claim, { extract = extractDocument, embed =
     }
     const { error: chunkErr } = await sb.rpc("fpx_invoice_document_set_chunks", { p_document_id: claim.id, p_chunks: chunks });
     if (chunkErr) warnOnce("chunks", `search chunks not saved: ${chunkErr.message}`);
+    const embedded = chunks.filter((c) => c.embedding).length;
+    await logStep(sb, claim, "embedded",
+      chunkErr ? `Search chunks not saved: ${chunkErr.message}` : `Split into ${chunks.length} search chunk${chunks.length === 1 ? "" : "s"}, ${embedded} embedded${embedded < chunks.length ? " (the rest are filled in by the next sweep)" : ""}`,
+      { level: chunkErr ? "error" : embedded < chunks.length ? "warn" : "ok", ms: Date.now() - te });
 
     await save({ status: "done" });
+    await logStep(sb, claim, "done", `Done in ${((Date.now() - t0) / 1000).toFixed(1)}s`, { level: "ok", ms: Date.now() - t0, cost_usd: meta?.cost_usd ?? null });
     return result;
   } catch (e) {
     meta = meta || e?.meta || null;
@@ -307,7 +365,11 @@ export async function processOne(sb, claim, { extract = extractDocument, embed =
         ...(e?.meta ? { model: e.meta.model, input_tokens: e.meta.input_tokens, output_tokens: e.meta.output_tokens, cost_usd: e.meta.cost_usd } : {}),
       }).eq("id", claim.id);
     } catch { /* the claim times out and is taken again */ }
+    await logStep(sb, claim, "failed", `Failed: ${message}${e?.permanent ? " (will not be tried again)" : (claim.attempts || 0) < MAX_ATTEMPTS ? " (will be tried again)" : " (no tries left)"}`,
+      { level: "error", ms: Date.now() - t0, cost_usd: e?.meta?.cost_usd ?? null });
     return "failed";
+  } finally {
+    live.reading.delete(claim.id);
   }
 }
 
@@ -360,17 +422,26 @@ export function kickInvoiceDocs({ limit = 500, concurrency = 3 } = {}) {
   if (!invoiceDocWorkerEnabled()) return false;
   if (running) { again = true; return true; }
   running = (async () => {
+    live.run = { started_at: new Date().toISOString(), processed: 0, done: 0, copied: 0, unchanged: 0, failed: 0 };
     try {
       do {
         again = false;
         const r = await processPending({ limit, concurrency });
+        for (const k of ["processed", "done", "copied", "unchanged", "failed"]) live.run[k] += r[k] || 0;
         if (r.processed) console.log(`[FPX] invoice documents: read ${r.done}, copied ${r.copied}, unchanged ${r.unchanged}, failed ${r.failed}`);
       } while (again);
+      if (live.run.processed) {
+        const r = live.run;
+        await logStep(supabase, null, "run",
+          `Run finished: ${r.processed} file${r.processed === 1 ? "" : "s"} (${r.done} read, ${r.copied} copied, ${r.unchanged} unchanged, ${r.failed} failed) in ${Math.round((Date.now() - Date.parse(r.started_at)) / 1000)}s`,
+          { level: r.failed ? "warn" : "ok", ms: Date.now() - Date.parse(r.started_at) });
+      }
       await embedMissingChunks();
     } catch (e) {
       warnOnce("run", `worker stopped: ${e?.message || e}`);
     } finally {
       running = null;
+      if (live.run) live.run = { ...live.run, finished_at: new Date().toISOString() };
     }
   })();
   return true;

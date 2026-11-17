@@ -212,16 +212,24 @@ async function detailsCall<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 // "Ask FPX" assistant (browser-service/src/assistant.js).
+const STREAM_IDLE_MS = 60_000;
 export type AssistantAction =
   | { type: "open_shipment"; id: string; label?: string; tab?: string }
   | { type: "open_task"; task_id: string; label?: string }
   | { type: "filter_shipments"; query?: string; action?: "YES" | "NO" | "ERROR"; customer?: string }
-  | { type: "navigate"; page: string };
+  | { type: "navigate"; page: string }
+  /** Invoices page, with that shipment's panel open. */
+  | { type: "open_invoice"; shipment_id: string }
+  /** FreightPOP's own Shipment Details page, in the hosted FreightPOP window. */
+  | { type: "open_in_freightpop"; shipment_id: string; quote_id: string; charge?: number | null; cost?: number | null; customer?: string | null }
+  /** A source behind an answer is older than its threshold. Shown as a chip; never performed automatically. */
+  | { type: "stale_data"; shipment_id?: string; age_hours: number; sources: string[]; label?: string; page: string };
 
 export type AssistantStreamEvent =
   | { type: "text"; delta: string }
   | { type: "status"; text: string }
-  | { type: "reset" };
+  | { type: "reset" }
+  | { type: "ping" };
 
 export interface AssistantChatSummary { id: string; title: string; turn_count: number; updated_at: string }
 export interface AssistantChat {
@@ -277,10 +285,20 @@ export const hostedBrowser = {
   ): Promise<AssistantReply> => {
     if (!HOSTED_BROWSER_URL) throw new Error("Hosted browser not configured (VITE_FPX_BROWSER_URL)");
     const token = await getAccessTokenOrWait();
+    // The service sends a line at least every 10 s ("ping" while a lookup
+    // runs). A minute of silence means the stream is stuck: give up rather
+    // than show "Searching…" forever.
+    const ctrl = new AbortController();
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    let stalled = false;
+    const arm = () => { clearTimeout(idle); idle = setTimeout(() => { stalled = true; ctrl.abort(); }, STREAM_IDLE_MS); };
+    arm();
+    try {
     const res = await fetch(`${HOSTED_BROWSER_URL}/assistant/chat/stream`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify(body),
+      signal: ctrl.signal,
     });
     if (res.status === 404 || res.status === 405) return hostedBrowser.assistantChat(body);
     if (!res.ok || !res.body) {
@@ -293,6 +311,7 @@ export const hostedBrowser = {
     let final: AssistantReply | null = null;
     for (;;) {
       const { done, value } = await reader.read();
+      arm();
       if (value) buf += dec.decode(value, { stream: true });
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
@@ -306,12 +325,18 @@ export const hostedBrowser = {
         try { ev = JSON.parse(line) as Wire; } catch { continue; }
         if (ev.type === "done") final = { messages: ev.messages || [], reply: ev.reply || "", actions: ev.actions || [] };
         else if (ev.type === "error") throw new Error(ev.error || "Assistant error");
-        else onEvent(ev);
+        else if (ev.type !== "ping") onEvent(ev);
       }
       if (done) break;
     }
-    if (!final) throw new Error("The answer was cut off — try again");
+    if (!final) throw new Error("The connection closed before an answer arrived — try again");
     return final;
+    } catch (e) {
+      if (stalled) throw new Error("No answer for a minute — the lookup may be stuck. Try again.");
+      throw e;
+    } finally {
+      clearTimeout(idle);
+    }
   },
   /** Ask FPX history — the signed-in person's own conversations. */
   listChats: () => call<{ chats: AssistantChatSummary[] }>("/assistant/chats"),

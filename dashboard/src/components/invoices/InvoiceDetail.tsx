@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, ExternalLink, FileText, Loader2, X } from "lucide-react";
+import { Link } from "react-router-dom";
+import { AlertTriangle, Clock, ExternalLink, FileText, Loader2, RefreshCw, X } from "lucide-react";
 import { fetchPushedRecords, type PushedRecords } from "../../lib/erpPushed";
 import { openInFreightPop } from "../../lib/freightpopFrame";
 import { fmtDateTime } from "../../lib/format";
 import {
-  HUB_STEP_SHORT, NotAvailableError, fetchHubShipment, fetchInvoiceDocs, hubApprover, hubDay, hubMoney,
-  hubStatusSentence, hubStepNumber, isAbort, processInvoiceDocs,
+  HUB_STEP_SHORT, NotAvailableError, REFRESH_FROM_FREIGHTPOP_PATH, STALE_HOURS, fetchHubShipment, fetchInvoiceDocs,
+  hubAgo, hubApprover, hubDay, hubMoney, hubStatusSentence, hubStepNumber, isAbort, isStale, processInvoiceDocs,
   type HubRow, type InvoiceDoc,
 } from "../../lib/invoicesHub";
 import { ScrapeHistory } from "../ScrapeHistory";
@@ -86,6 +87,84 @@ const cellMoney = (v: number | string | null): string => {
   const n = typeof v === "number" ? v : Number(String(v).replace(/[$,\s]/g, ""));
   return Number.isFinite(n) ? hubMoney(n) : String(v);
 };
+
+/** "3 hours ago (Nov 16, 4:05 PM)", or the fallback when there is no time. */
+function readAt(at: string | null, fallback: string): string {
+  const ago = hubAgo(at);
+  return ago ? `${ago} (${fmtDateTime(at)})` : fallback;
+}
+
+/**
+ * When each part of this panel was last read from FreightPOP, with an amber
+ * flag when the shipment's ERP data is older than STALE_HOURS.
+ */
+function Freshness({ erpSeen, erpStale, docsRead, docsKnown, filesSaved, filesKnown, canOpen, onOpen }: {
+  erpSeen: string | null;
+  erpStale: boolean;
+  docsRead: string | null;
+  docsKnown: "loading" | "ready" | "hidden" | "error";
+  filesSaved: string | null;
+  filesKnown: "loading" | "ready" | "error";
+  canOpen: boolean;
+  onOpen: () => void;
+}) {
+  const refresh = (
+    <Link to={REFRESH_FROM_FREIGHTPOP_PATH} className={quietLink + " inline-flex items-center gap-1"}>
+      <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" /> Refresh from FreightPOP
+    </Link>
+  );
+  const open = (
+    <button
+      type="button"
+      onClick={onOpen}
+      disabled={!canOpen}
+      title={canOpen ? "Open this shipment in FreightPOP, in your hosted browser" : "FreightPOP's quote id for this shipment has not been read, so it cannot be opened from here"}
+      className={quietLink + " inline-flex items-center gap-1 disabled:cursor-not-allowed"}
+    >
+      <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" /> Open in FreightPOP
+    </button>
+  );
+  return (
+    <div className="space-y-3">
+      {erpStale ? (
+        <div role="note" className="rounded-xl p-3 text-sm flex items-start gap-2 ring-1 bg-amber-50 ring-amber-200 text-amber-900">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium">Last read from FreightPOP {hubAgo(erpSeen)} — may be out of date</div>
+            <div className="mt-0.5 text-amber-800">
+              FPX has not read this shipment from FreightPOP in over {STALE_HOURS} hours, so its status and amounts may have changed since.
+            </div>
+            <div className="mt-2 flex items-center gap-4 flex-wrap">{refresh}{open}</div>
+          </div>
+        </div>
+      ) : null}
+      <dl className="rounded-xl ring-1 ring-slate-200 px-4 py-3 text-xs text-slate-600 space-y-1">
+        <div className="flex items-start gap-2">
+          <Clock className="h-3.5 w-3.5 mt-0.5 shrink-0 text-slate-400" aria-hidden="true" />
+          <dt className="font-medium text-slate-700 whitespace-nowrap">Status and amounts:</dt>
+          <dd className={"min-w-0 break-words " + (erpStale ? "text-amber-800 font-medium" : "")}>
+            {erpSeen ? `read from FreightPOP ${readAt(erpSeen, "")}` : "when FPX last read this from FreightPOP is not known"}
+          </dd>
+        </div>
+        {filesKnown === "error" ? null : (
+          <div className="flex items-start gap-2">
+            <Clock className="h-3.5 w-3.5 mt-0.5 shrink-0 text-slate-400" aria-hidden="true" />
+            <dt className="font-medium text-slate-700 whitespace-nowrap">Saved files:</dt>
+            <dd className="min-w-0 break-words">{filesKnown === "loading" ? "…" : filesSaved ? `saved ${readAt(filesSaved, "")}` : "none saved yet"}</dd>
+          </div>
+        )}
+        {docsKnown === "hidden" || docsKnown === "error" ? null : (
+          <div className="flex items-start gap-2">
+            <Clock className="h-3.5 w-3.5 mt-0.5 shrink-0 text-slate-400" aria-hidden="true" />
+            <dt className="font-medium text-slate-700 whitespace-nowrap">Invoice documents:</dt>
+            <dd className="min-w-0 break-words">{docsKnown === "loading" ? "…" : docsRead ? `read ${readAt(docsRead, "")}` : "not read yet"}</dd>
+          </div>
+        )}
+        {!erpStale ? <div className="pt-1 flex items-center gap-4 flex-wrap">{refresh}</div> : null}
+      </dl>
+    </div>
+  );
+}
 
 /** What FPX read off one saved document. */
 function DocCard({ doc, approved }: { doc: InvoiceDoc; approved: number | null }) {
@@ -229,7 +308,12 @@ export function InvoiceDetail({ shipmentId, row, onClose }: { shipmentId: string
     setLoadedRow({ status: "loading" });
     fetchHubShipment(shipmentId, ctl.signal).then(
       (r) => { if (!ctl.signal.aborted) setLoadedRow(r ? { status: "ready", row: r } : { status: "missing" }); },
-      (e: unknown) => { if (!ctl.signal.aborted && !isAbort(e)) setLoadedRow({ status: "error", message: (e as Error)?.message || "The shipment could not be loaded." }); },
+      (e: unknown) => {
+        if (ctl.signal.aborted || isAbort(e)) return;
+        // What the server said (a database error, say) is not shown.
+        console.warn("[FPX] shipment could not be loaded:", e);
+        setLoadedRow({ status: "error", message: "This shipment could not be loaded. Try again in a moment." });
+      },
     );
     return () => ctl.abort();
   }, [shipmentId, given, rowAttempt]);
@@ -321,6 +405,18 @@ export function InvoiceDetail({ shipmentId, row, onClose }: { shipmentId: string
   const approvedOn = r ? hubDay(r.approved_date) : "";
   const subtitle = r ? [r.customer_name, r.carrier].filter(Boolean).join(" · ") : "";
 
+  function openShipment() {
+    if (!quoteId) return;
+    openInFreightPop({ url: shipmentUrl(r, quoteId), label: `Shipment ${shipmentId}`, customerName: r?.customer_name ?? null });
+    onClose();
+  }
+
+  // ── When each part was last read from FreightPOP ──
+  const erpSeen = r?.last_seen_at ?? null;
+  const erpStale = isStale(erpSeen);
+  const docsRead = docList.map((d) => d.extracted_at).filter((t): t is string => !!t).sort().pop() ?? null;
+  const filesSaved = [...groups.values()].map((g) => g.at).filter((t): t is string => !!t).sort().pop() ?? null;
+
   return createPortal(
     <div className="fixed inset-0 z-50">
       <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onClick={onClose} aria-hidden="true" />
@@ -339,7 +435,7 @@ export function InvoiceDetail({ shipmentId, row, onClose }: { shipmentId: string
             <button
               type="button"
               disabled={!quoteId}
-              onClick={() => { if (quoteId) { openInFreightPop({ url: shipmentUrl(r, quoteId), label: `Shipment ${shipmentId}`, customerName: r?.customer_name ?? null }); onClose(); } }}
+              onClick={openShipment}
               title={quoteId ? "Open this shipment in FreightPOP, in your hosted browser" : "FreightPOP's quote id for this shipment has not been read, so it cannot be opened from here"}
               className="px-3 py-2 rounded-lg bg-white text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
             >
@@ -374,6 +470,17 @@ export function InvoiceDetail({ shipmentId, row, onClose }: { shipmentId: string
                 ) : null}
                 <p className="text-base text-slate-900 leading-relaxed">{hubStatusSentence(r)}</p>
               </div>
+
+              <Freshness
+                erpSeen={erpSeen}
+                erpStale={erpStale}
+                docsRead={docsRead}
+                docsKnown={docs.status}
+                filesSaved={filesSaved}
+                filesKnown={files.status}
+                canOpen={!!quoteId}
+                onOpen={openShipment}
+              />
 
               <dl className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-4">
                 <Fact label="Customer charge"><span className="tabular-nums">{hubMoney(r.charge)}</span></Fact>

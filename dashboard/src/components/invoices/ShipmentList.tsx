@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { fmtNum } from "../../lib/format";
 import {
-  fetchHubList, hubApprover, hubDay, hubMoney, hubStep, isAbort,
+  SEARCH_FAILED_MESSAGE, fetchHubList, hubApprover, hubDay, hubMoney, hubStep, isAbort,
   type ApproverKind, type HubList, type HubRow, type HubStep,
 } from "../../lib/invoicesHub";
+import { StaleDot } from "./StaleDot";
 
 // The shipments in one step of the Invoices page, 50 at a time, biggest
 // charge first. Read only; clicking a shipment opens its details.
@@ -64,7 +65,9 @@ export function ShipmentList({ step, query, onOpen }: {
       },
       (e: unknown) => {
         if (ctl.signal.aborted || isAbort(e)) return;
-        setError((e as Error)?.message || "The shipments could not be loaded.");
+        // A failed search says one plain thing, never what the database said.
+        console.warn("[FPX] invoice list failed:", e);
+        setError(q ? SEARCH_FAILED_MESSAGE : "The shipments could not be loaded. Try again in a moment.");
         setLoading(false);
       },
     );
@@ -125,7 +128,7 @@ export function ShipmentList({ step, query, onOpen }: {
 
       {error ? (
         <div role="alert" className="px-5 py-3 text-sm text-rose-800 bg-rose-50 border-b border-rose-200">
-          The shipments could not be loaded. {error}{" "}
+          {error}{" "}
           <button type="button" onClick={() => setAttempt((n) => n + 1)} className="underline text-rose-700 hover:text-rose-900">Try again</button>
         </div>
       ) : null}
@@ -161,6 +164,7 @@ export function ShipmentList({ step, query, onOpen }: {
                 return (
                   <tr key={r.shipment_id} onClick={() => onOpen(r.shipment_id, r)} className="hover:bg-slate-50 cursor-pointer align-top">
                     <td className="px-4 py-2.5 whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1.5">
                       <button
                         type="button"
                         onClick={(e) => { e.stopPropagation(); onOpen(r.shipment_id, r); }}
@@ -169,6 +173,8 @@ export function ShipmentList({ step, query, onOpen }: {
                       >
                         {r.shipment_id}
                       </button>
+                      <StaleDot lastSeenAt={r.last_seen_at} />
+                      </span>
                     </td>
                     <td className="px-4 py-2.5 text-slate-800 max-w-[16rem] break-words">{r.customer_name || "—"}</td>
                     <td className="px-4 py-2.5 text-slate-800 max-w-[14rem] break-words">{r.carrier || "—"}</td>

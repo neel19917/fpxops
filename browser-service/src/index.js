@@ -262,17 +262,26 @@ async function handleApi(req, res, url, who) {
     if (!message) return json(res, 400, { error: "message required" });
     const history = Array.isArray(body.history) ? body.history.slice(-60) : [];
     res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-store", "x-accel-buffering": "no" });
-    const emit = (ev) => { if (!res.writableEnded) res.write(JSON.stringify(ev) + "\n"); };
+    const emit = (ev) => { if (!res.writableEnded && !res.destroyed) { try { res.write(JSON.stringify(ev) + "\n"); } catch { /* socket gone */ } } };
     const t0 = Date.now();
+    // Stop the model call when the browser goes away (closed panel, reload).
+    const abort = new AbortController();
+    res.on("close", () => { if (!res.writableFinished) abort.abort(); });
+    // Keep-alive: a line every 10 s so proxies don't drop a quiet stream while
+    // a slow lookup runs. The dashboard ignores "ping".
+    const ping = setInterval(() => emit({ type: "ping" }), 10_000);
     try {
-      const out = await chat({ history, message, who, context: body.context || null, onEvent: emit });
+      const out = await chat({ history, message, who, context: body.context || null, onEvent: emit, signal: abort.signal });
       console.log(`[assistant] ${who.email} (stream): ${out.usage.steps} step(s) [${out.usage.tools.join(",")}], ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), cost ${(out.usage.cost_usd || 0).toFixed(4)} USD, ${Date.now() - t0}ms`);
       emit({ type: "done", ...out });
       if (body.chatId) saveChatTurn({ chatId: body.chatId, email: who.email, message, reply: out.reply, actions: out.actions, messages: out.messages })
         .catch((e) => console.warn("[assistant] history save failed:", e.message));
     } catch (e) {
-      console.warn("[assistant] stream error:", e.status || "", e.message);
+      console.warn("[assistant] stream error:", e.status || "", e.message, `${Date.now() - t0}ms`);
+      // Always a final event, so the panel never waits forever.
       emit({ type: "error", error: e.status === 429 ? "Claude is rate-limited right now — try again in a moment" : `Assistant error: ${e.message}` });
+    } finally {
+      clearInterval(ping);
     }
     return res.end();
   }

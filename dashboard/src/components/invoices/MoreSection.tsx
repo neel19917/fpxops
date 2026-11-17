@@ -12,6 +12,7 @@ const SCREENS: readonly { to: string; label: string; hint: string }[] = [
   { to: "/invoicing", label: "Send invoices (advanced)", hint: "The full sending screen, with every option." },
   { to: "/audits/invoice", label: "Past audit runs", hint: "Earlier checks of carrier invoices against quotes." },
   { to: "/invoicing/pushed", label: "Pushed to ERP and NetSuite match", hint: "Everything already pushed, and a way to compare it with NetSuite." },
+  { to: "/invoices/reading", label: "Reading invoices (live log)", hint: "Watch FPX read each saved invoice and document with Claude, step by step." },
 ];
 
 const DOWNLOADS: readonly { which: ErpMasterWhich; label: string; hint: string }[] = [

@@ -41,6 +41,8 @@ export interface HubList {
   totals: { all: number | null; matching: number | null };
   limit: number;
   offset: number;
+  /** A search matched more shipments than the server looks at: only the biggest-charge ones are listed and counted. */
+  truncated?: boolean;
 }
 
 export interface HubListFilters {
@@ -190,6 +192,48 @@ export function hubDay(s: string | null | undefined): string {
   const sameYear = d.getFullYear() === new Date().getFullYear();
   return d.toLocaleDateString("en-US", sameYear ? { month: "short", day: "numeric" } : { month: "short", day: "numeric", year: "numeric" });
 }
+
+// ── How fresh the data is ──
+
+/** ERP data read longer ago than this may be out of date. */
+export const STALE_HOURS = 36;
+
+/** Hours since a time, or null when there is no (valid) time. */
+export function hoursSince(s: string | null | undefined, now = Date.now()): number | null {
+  if (!s) return null;
+  const t = new Date(s).getTime();
+  return Number.isNaN(t) ? null : Math.max(0, (now - t) / 3_600_000);
+}
+
+/** True when FPX last read this from FreightPOP more than STALE_HOURS ago. Unknown times are not flagged. */
+export function isStale(s: string | null | undefined, now = Date.now()): boolean {
+  const h = hoursSince(s, now);
+  return h != null && h > STALE_HOURS;
+}
+
+/** "just now", "5 minutes ago", "3 hours ago", "3 days ago", or "" when unknown. */
+export function hubAgo(s: string | null | undefined, now = Date.now()): string {
+  const h = hoursSince(s, now);
+  if (h == null) return "";
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"} ago`;
+  const min = Math.round(h * 60);
+  if (min < 1) return "just now";
+  if (min < 60) return plural(min, "minute");
+  if (h < 48) return plural(Math.round(h), "hour");
+  return plural(Math.round(h / 24), "day");
+}
+
+/** The tooltip of the amber dot on a row whose ERP data is old. */
+export function staleTitle(s: string | null | undefined): string {
+  const ago = hubAgo(s);
+  return `Last read from FreightPOP ${ago || "a while ago"}. It may be out of date.`;
+}
+
+/** Said when a search fails, whatever the server said. */
+export const SEARCH_FAILED_MESSAGE = "Search took too long. Try a shipment, invoice or tracking number.";
+
+/** Where the button that reads FreightPOP again lives. */
+export const REFRESH_FROM_FREIGHTPOP_PATH = "/invoicing";
 
 /** Who approved it, in plain words: "EDI", a person's name, or "". */
 export function hubApprover(row: Pick<HubRow, "approved_by" | "approved_by_kind">): string {
