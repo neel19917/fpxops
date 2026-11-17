@@ -66,6 +66,18 @@ const FALLBACKS = {
   // amounts and reference numbers read off a scan have to be right. Haiku 5.5
   // is ~40x cheaper if volume grows; change it in Admin → Settings.
   "model.invoice_ocr": process.env.ANTHROPIC_MODEL_INVOICE_OCR || "claude-opus-5-5",
+  // How saved invoice files are sent to Claude (lib/invoiceBatch.js):
+  //   "batch"  (default) waiting files go out together every
+  //            invoice_ocr.batch_every_minutes as one Message Batch — half
+  //            the price, results within 24 hours (most within the hour)
+  //   "direct" each file is read as soon as it is saved, full price
+  // "Read now" for one shipment always uses the direct call.
+  "invoice_ocr.mode": "batch",
+  // Minutes between batches (at least 5).
+  "invoice_ocr.batch_every_minutes": 60,
+  // Most files sent in one go. A batch that would pass ~100 MB of request is
+  // split into several (the API's cap is 100,000 requests or 256 MB).
+  "invoice_ocr.batch_max_docs": 200,
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   // Large = long prompts (≥ ~12k chars) and any board-level synthesis.
   // Bumped to Opus 5 on 2026-09-22: the tasks page moved to heavier

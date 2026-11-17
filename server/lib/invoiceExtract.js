@@ -469,8 +469,13 @@ export function fileBlock({ bytes, mime }) {
   throw new ExtractError(`A ${mime || "file of unknown type"} cannot be read`, { permanent: true });
 }
 
-// The request body, without the model-specific parts. Exported for tests.
-export function buildRequest({ model, bytes, mime, docType = "other", shipmentId = null, effort = process.env.INVOICE_OCR_EFFORT || "low" }) {
+// The request body. ONE function builds it for both ways of reading a file:
+//   * the direct Messages API call (extractDocument below)
+//   * a Message Batches request (lib/invoiceBatch.js), with batch: true —
+//     the same model, system prompt, schema, effort and max_tokens; only
+//     `fallbacks` is left out because the Batches API refuses it.
+// Returns { body, fallbacks } (fallbacks: send the server-side-fallback beta header).
+export function buildRequest({ model, bytes, mime, docType = "other", shipmentId = null, effort = process.env.INVOICE_OCR_EFFORT || "low", batch = false }) {
   const id = String(model || "");
   const body = {
     model,
@@ -492,9 +497,39 @@ export function buildRequest({ model, bytes, mime, docType = "other", shipmentId
   if (/^claude-(opus-(4-[6-9]|[5-9])|sonnet-(4-6|[5-9])|haiku-[5-9]|fable|mythos)/.test(id)) body.output_config.effort = effort;
   // If the model declines, let the API hand the same request to its fallback
   // (same rule as shipmentAnalysisCall in lib/anthropic.js; Haiku has none).
-  const fallbacks = /^claude-(opus-5|sonnet-5|fable-5)/.test(id);
+  // Not in a batch: the Batches API rejects `fallbacks`.
+  const fallbacks = !batch && /^claude-(opus-5|sonnet-5|fable-5)/.test(id);
   if (fallbacks) body.fallbacks = "default";
   return { body, fallbacks };
+}
+
+export const ANTHROPIC_VERSION = "2023-06-01";
+// Message Batches bill every token at half the standard price.
+export const BATCH_DISCOUNT = 0.5;
+
+// Turns one Messages API response (from a direct call, or the `message` of a
+// succeeded batch result) into { extraction, ...meta }. meta = { model,
+// input_tokens, output_tokens, cost_usd, stop_reason, duration_ms }; cost_usd
+// is multiplied by `discount` (BATCH_DISCOUNT for a batch). Throws
+// ExtractError carrying meta; `permanent` says a retry would not help.
+export function readMessage(json, { model = null, durationMs = null, discount = 1 } = {}) {
+  const usage = json?.usage || {};
+  const input_tokens = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
+  const output_tokens = usage.output_tokens || 0;
+  const served = json?.model || model;
+  const meta = {
+    model: served, input_tokens, output_tokens,
+    cost_usd: Math.round(costUsd(served, input_tokens, output_tokens) * discount * 1e6) / 1e6,
+    stop_reason: json?.stop_reason || null, duration_ms: durationMs,
+  };
+  const fail = (message, permanent) => Object.assign(new ExtractError(message, { permanent }), { meta });
+  if (json?.stop_reason === "refusal") throw fail("Claude declined to read this file", true);
+  if (json?.stop_reason === "max_tokens") throw fail("The document is too long to read in one go (the answer was cut off)", true);
+  const text = (json?.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join("");
+  let extraction;
+  try { extraction = JSON.parse(text); } catch { throw fail("Claude's answer was not valid JSON", false); }
+  if (!extraction || typeof extraction !== "object" || Array.isArray(extraction)) throw fail("Claude's answer was not a JSON object", false);
+  return { extraction, ...meta };
 }
 
 // Reads one file. Returns { extraction, model, input_tokens, output_tokens,
@@ -515,7 +550,7 @@ export async function extractDocument({ bytes, mime, docType = "other", shipment
       headers: {
         "Content-Type": "application/json",
         "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
+        "anthropic-version": ANTHROPIC_VERSION,
         ...(fallbacks ? { "anthropic-beta": "server-side-fallback-2026-07-01" } : {}),
       },
       body: JSON.stringify(body),
@@ -530,20 +565,5 @@ export async function extractDocument({ bytes, mime, docType = "other", shipment
     throw new ExtractError(`Claude API ${resp.status}: ${text.slice(0, 300)}`, { permanent: [400, 413, 422].includes(resp.status) });
   }
   const json = await resp.json();
-  const usage = json.usage || {};
-  const input_tokens = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
-  const output_tokens = usage.output_tokens || 0;
-  const served = json.model || model;
-  const meta = {
-    model: served, input_tokens, output_tokens, cost_usd: costUsd(served, input_tokens, output_tokens),
-    stop_reason: json.stop_reason || null, duration_ms: Date.now() - startedAt,
-  };
-  const fail = (message, permanent) => Object.assign(new ExtractError(message, { permanent }), { meta });
-  if (json.stop_reason === "refusal") throw fail("Claude declined to read this file", true);
-  if (json.stop_reason === "max_tokens") throw fail("The document is too long to read in one go (the answer was cut off)", true);
-  const text = (json.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join("");
-  let extraction;
-  try { extraction = JSON.parse(text); } catch { throw fail("Claude's answer was not valid JSON", false); }
-  if (!extraction || typeof extraction !== "object" || Array.isArray(extraction)) throw fail("Claude's answer was not a JSON object", false);
-  return { extraction, ...meta };
+  return readMessage(json, { model, durationMs: Date.now() - startedAt });
 }

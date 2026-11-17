@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowLeft, Download, Maximize2, Minimize2, Pause, Play, RotateCcw, Search } from "lucide-react";
+import { ArrowLeft, Download, Maximize2, Minimize2, Pause, Play, RefreshCw, RotateCcw, Search, Send } from "lucide-react";
 import {
-  fetchReaderState, fetchReadingLog, processWaiting,
-  type LogLine, type ReaderState, type ReadingNow, type ReadingStep,
+  checkBatchesNow, fetchBatches, fetchReaderState, fetchReadingLog, processWaiting, submitBatchNow,
+  type Batch, type LogLine, type ReaderState, type ReadingNow, type ReadingStep,
 } from "../lib/invoiceReading";
 import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
 
@@ -14,9 +14,12 @@ import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
 //   - GET /state: what the reader is doing now on the API server, and counts
 //   - GET /log:   every step of every file (fpx_invoice_doc_log), tailed live
 //   - POST /process: the two buttons
+//   - GET /batches, POST /batches/submit, /batches/poll: batch mode (waiting
+//     files sent to Claude together every few minutes at half price)
 
 const LOG_POLL_MS = 2000;
 const STATE_POLL_MS = 3000;
+const BATCH_POLL_MS = 30_000;
 const FIRST_LOAD = 500;
 const MAX_LINES = 3000;
 
@@ -50,6 +53,52 @@ const timeOf = (at: string | null) => {
   return isNaN(d.getTime()) ? at : d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
 };
 const isProblem = (l: LogLine) => l.level === "warn" || l.level === "error";
+const plural = (n: number, one: string, many = one + "s") => `${fmtNum(n)} ${n === 1 ? one : many}`;
+
+/** "in 23 min (2:30 PM)" for a time ahead; "any moment now" once it has passed. */
+function fmtUntil(at: string | null | undefined, now: number): string | null {
+  if (!at) return null;
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) return null;
+  const clock = new Date(t).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const min = Math.round((t - now) / 60_000);
+  if (min <= 0) return `any moment now (${clock})`;
+  if (min < 60) return `in ${min} min (${clock})`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `in ${h} h${m ? ` ${m} min` : ""} (${clock})`;
+}
+
+const batchProblems = (b: Batch) => (b.errored || 0) + (b.expired || 0) + (b.canceled || 0);
+
+function batchStatus(b: Batch): { label: string; cls: string } {
+  if (b.status === "failed") return { label: "Failed", cls: "bg-rose-50 text-rose-800 ring-rose-200" };
+  if (b.results_applied_at) return { label: "Done", cls: "bg-emerald-50 text-emerald-800 ring-emerald-200" };
+  if (b.status === "ended") return { label: "Saving results", cls: "bg-violet-50 text-violet-800 ring-violet-200" };
+  if (b.status === "sending") return { label: "Sending", cls: "bg-slate-100 text-slate-700 ring-slate-200" };
+  if (b.status === "canceling") return { label: "Stopping", cls: "bg-amber-50 text-amber-800 ring-amber-200" };
+  return { label: "Waiting for Claude", cls: "bg-amber-50 text-amber-800 ring-amber-200" };
+}
+
+function submitText(r: { sent_docs: number; batches: unknown[]; unchanged: number; copied: number; failed: number }): string {
+  const extra: string[] = [];
+  if (r.unchanged) extra.push(`${plural(r.unchanged, "file")} had not changed`);
+  if (r.copied) extra.push(`${plural(r.copied, "file")} copied from an earlier read`);
+  if (r.failed) extra.push(`${plural(r.failed, "file")} could not be sent`);
+  const tail = extra.length ? ` (${extra.join(", ")}).` : ".";
+  if (!r.sent_docs) return `Nothing was waiting to send${tail}`;
+  const n = r.batches?.length || 1;
+  return `Sent ${plural(r.sent_docs, "file")} in ${plural(n, "batch", "batches")}${tail} Claude answers within 24 hours, usually much sooner.`;
+}
+
+function pollText(r: { checked: number; ended: number; applied_docs: number; failed_docs: number; still_open: number }): string {
+  if (!r.checked) return "No batches were waiting for Claude.";
+  const parts = [`Checked ${plural(r.checked, "batch", "batches")}: ${fmtNum(r.ended)} finished`];
+  if (r.applied_docs) parts.push(`${plural(r.applied_docs, "file")} saved`);
+  if (r.failed_docs) parts.push(`${plural(r.failed_docs, "file")} could not be read`);
+  if (r.still_open) parts.push(`${fmtNum(r.still_open)} still waiting for Claude`);
+  return parts.join(", ") + ".";
+}
 
 function csvOf(lines: LogLine[]): string {
   const cols: (keyof LogLine)[] = ["id", "at", "level", "step", "shipment_id", "file", "doc_type", "message", "ms", "cost_usd", "document_id"];
@@ -147,7 +196,10 @@ export function InvoiceReadingPage() {
   const [q, setQ] = useState("");
   const lastId = useRef<number | null>(null);
 
-  const [busy, setBusy] = useState<null | "read" | "retry">(null);
+  const [busy, setBusy] = useState<null | "read" | "retry" | "submit" | "poll">(null);
+  /** undefined: not loaded yet; null: this server has no batches page (older server). */
+  const [batches, setBatches] = useState<Batch[] | null | undefined>(undefined);
+  const [batchesErr, setBatchesErr] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<{ text: string; bad: boolean } | null>(null);
 
   const [now, setNow] = useState(() => Date.now());
@@ -182,6 +234,25 @@ export function InvoiceReadingPage() {
     const t = setInterval(() => { void pollState(); }, STATE_POLL_MS);
     return () => clearInterval(t);
   }, [visible, pollState]);
+
+  // ---- batches: slower than the state, every 30 s ----
+  const pollBatches = useCallback(async () => {
+    try {
+      const b = await fetchBatches(50);
+      if (!alive.current) return;
+      setBatches(b);
+      setBatchesErr(null);
+    } catch (e) {
+      if (alive.current) setBatchesErr(errText(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!visible) return;
+    void pollBatches();
+    const t = setInterval(() => { void pollBatches(); }, BATCH_POLL_MS);
+    return () => clearInterval(t);
+  }, [visible, pollBatches]);
 
   // ---- log: the newest lines first, then only what is new ----
   const pollLog = useCallback(async () => {
@@ -264,7 +335,14 @@ export function InvoiceReadingPage() {
     try {
       const r = await processWaiting({ retryFailed: kind === "retry" });
       if (!alive.current) return;
-      if (!r.processing) {
+      if (!r.processing && r.mode === "batch") {
+        const when = fmtUntil(r.next_submit_at, Date.now());
+        const added = r.queued ? `${plural(r.queued, "file")} added to the queue. ` : "";
+        setActionMsg({
+          text: `${added}${r.reason || "Waiting files go in the next batch."}${when ? ` Next batch ${when}.` : ""} Press "Send batch now" to send them sooner.`,
+          bad: false,
+        });
+      } else if (!r.processing) {
         setActionMsg({ text: r.reason || "Reading did not start on this server.", bad: true });
       } else {
         const what = kind === "retry" ? "Failed files will be tried again" : "Reading started";
@@ -274,6 +352,22 @@ export function InvoiceReadingPage() {
         });
       }
       void pollState();
+    } catch (e) {
+      if (alive.current) setActionMsg({ text: errText(e), bad: true });
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const runBatch = async (kind: "submit" | "poll") => {
+    setBusy(kind);
+    setActionMsg(null);
+    try {
+      const text = kind === "submit" ? submitText(await submitBatchNow()) : pollText(await checkBatchesNow());
+      if (!alive.current) return;
+      setActionMsg({ text, bad: false });
+      void pollState();
+      void pollBatches();
     } catch (e) {
       if (alive.current) setActionMsg({ text: errText(e), bad: true });
     } finally {
@@ -293,6 +387,17 @@ export function InvoiceReadingPage() {
   const lastRead = state?.last_extracted_at ?? null;
   // Re-read `now` so the "ago" text moves every second.
   const lastReadAgo = now && lastRead ? fmtRelative(lastRead) : null;
+
+  const mode = state?.mode;
+  const batchMode = mode === "batch";
+  const everyMin = state?.batch_every_minutes;
+  const modeText = mode === "batch"
+    ? `Batch: sent every ${everyMin ? fmtNum(everyMin) : "few"} min at half price`
+    : mode === "direct" ? "Direct: each file is read as soon as it is saved" : null;
+  const nextBatch = batchMode ? fmtUntil(state?.next_submit_at, now) : null;
+  const openBatches = state?.open_batches;
+  const batchBtnOff = busy !== null || state?.enabled === false || !!state?.batch_busy;
+  const batchBtnTitle = state?.enabled === false ? "Reading is off on this server" : state?.batch_busy ? "A batch is being sent or checked right now" : undefined;
 
   const statusText = !state
     ? "Loading…"
@@ -325,6 +430,16 @@ export function InvoiceReadingPage() {
                 <RotateCcw className="h-4 w-4" aria-hidden="true" /> {busy === "retry" ? "Starting…" : `Retry failed (${fmtNum(failed)})`}
               </button>
             ) : null}
+            {batchMode ? (
+              <>
+                <button type="button" onClick={() => runBatch("submit")} disabled={batchBtnOff} className={SECONDARY_BTN} title={batchBtnTitle}>
+                  <Send className="h-4 w-4" aria-hidden="true" /> {busy === "submit" ? "Sending…" : "Send batch now"}
+                </button>
+                <button type="button" onClick={() => runBatch("poll")} disabled={batchBtnOff} className={SECONDARY_BTN} title={batchBtnTitle}>
+                  <RefreshCw className={"h-4 w-4" + (busy === "poll" ? " animate-spin" : "")} aria-hidden="true" /> {busy === "poll" ? "Checking…" : "Check batches"}
+                </button>
+              </>
+            ) : null}
             <button type="button" onClick={() => setFull((v) => !v)} className={SECONDARY_BTN}>
               {full ? <Minimize2 className="h-4 w-4" aria-hidden="true" /> : <Maximize2 className="h-4 w-4" aria-hidden="true" />}
               {full ? "Exit full screen" : "Full screen"}
@@ -345,6 +460,23 @@ export function InvoiceReadingPage() {
             <span className="text-xs text-amber-800">Reading is off on this server (no Claude key), so nothing new is read here.</span>
           ) : null}
         </div>
+
+        {modeText ? (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 tabular-nums">
+            <span className="font-medium text-slate-800">{modeText}</span>
+            {batchMode ? (
+              <>
+                <span>
+                  Next batch: {nextBatch ?? (state?.enabled === false ? "not scheduled (reading is off)" : "not scheduled")}
+                </span>
+                {openBatches != null ? (
+                  <span>{openBatches ? `${plural(openBatches, "batch", "batches")} waiting for Claude` : "No batches waiting for Claude"}</span>
+                ) : null}
+                {state?.batch_busy ? <span className="text-violet-700">Sending or checking a batch now…</span> : null}
+              </>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
           <Stat label="Read" value={fmtNum(counts?.done)} tone="emerald" hint="Files Claude has read and stored" />
@@ -392,6 +524,74 @@ export function InvoiceReadingPage() {
           <p className="text-sm text-slate-500">No file is being read right now.</p>
         )}
       </section>
+
+      {batches !== null && (batchMode || (batches && batches.length > 0) || batchesErr) ? (
+        <section className="shrink-0 rounded-xl bg-white ring-1 ring-slate-200 px-4 py-3 space-y-2">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 className="text-sm font-semibold text-slate-900">Batches</h2>
+            <span className="text-xs text-slate-500">Files sent to Claude together at half price. Claude answers within 24 hours.</span>
+          </div>
+          {batchesErr ? <Alert>{batchesErr}</Alert> : null}
+          {batches === undefined && !batchesErr ? (
+            <p className="text-sm text-slate-500">Loading batches…</p>
+          ) : batches && batches.length === 0 ? (
+            <p className="text-sm text-slate-500">No batches sent yet.</p>
+          ) : batches ? (
+            <div className="overflow-x-auto max-h-80 overflow-y-auto">
+              <table className="w-full text-sm">
+                <thead className="text-[11px] uppercase tracking-wide text-slate-500 text-left sticky top-0 bg-white">
+                  <tr>
+                    <th scope="col" className="py-1.5 pr-3 font-medium">Sent</th>
+                    <th scope="col" className="py-1.5 pr-3 font-medium">Status</th>
+                    <th scope="col" className="py-1.5 pr-3 font-medium text-right">Files</th>
+                    <th scope="col" className="py-1.5 pr-3 font-medium text-right">Read / Errors</th>
+                    <th scope="col" className="py-1.5 pr-3 font-medium text-right">Cost</th>
+                    <th scope="col" className="py-1.5 font-medium">Finished</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 tabular-nums">
+                  {batches.map((b) => {
+                    const st = batchStatus(b);
+                    const bad = batchProblems(b);
+                    const finished = b.results_applied_at || b.status === "ended" || b.status === "failed";
+                    return (
+                      <tr key={b.id} className="align-top">
+                        <td className="py-1.5 pr-3 text-slate-700 whitespace-nowrap" title={b.submitted_at ? fmtRelative(b.submitted_at) : undefined}>
+                          {b.submitted_at ? fmtDateTime(b.submitted_at) : "Not sent yet"}
+                        </td>
+                        <td className="py-1.5 pr-3">
+                          <span title={b.error || undefined}
+                            className={"inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 " + st.cls}>
+                            {st.label}
+                          </span>
+                          {b.error ? <div className="mt-0.5 text-xs text-rose-700 break-words max-w-xs">{b.error}</div> : null}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right text-slate-700">{fmtNum(b.request_count)}</td>
+                        <td className="py-1.5 pr-3 text-right whitespace-nowrap">
+                          {finished ? (
+                            <>
+                              <span className="text-emerald-700">{fmtNum(b.succeeded)}</span>
+                              <span className="text-slate-400"> / </span>
+                              <span className={bad ? "text-rose-700" : "text-slate-500"}
+                                title={bad ? `${fmtNum(b.errored)} could not be read, ${fmtNum(b.expired)} ran out of time, ${fmtNum(b.canceled)} stopped` : undefined}>
+                                {fmtNum(bad)}
+                              </span>
+                            </>
+                          ) : <span className="text-slate-400">—</span>}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right text-slate-700">
+                          {b.cost_usd == null ? "—" : money(b.cost_usd, b.cost_usd < 1 ? 4 : 2)}
+                        </td>
+                        <td className="py-1.5 text-slate-700 whitespace-nowrap">{b.ended_at ? fmtDateTime(b.ended_at) : "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
 
       <section className={"rounded-xl bg-white ring-1 ring-slate-200 flex flex-col min-h-0 " + (full ? "flex-1 min-h-[420px]" : "")}>
         <div className="px-4 py-3 border-b border-slate-200 flex flex-wrap items-center gap-2">

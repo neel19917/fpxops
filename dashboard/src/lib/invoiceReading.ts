@@ -2,10 +2,13 @@ import { apiUrl, getAccessTokenOrWait } from "./api";
 
 // Client calls for the "Reading invoices" page: the invoice reader's live
 // state and its step-by-step log, from /api/invoice-docs/state and /log,
-// plus the two buttons (POST /process).
+// plus the buttons (POST /process) and, in batch mode, the Message Batches
+// the reader sends to Claude (GET /batches, POST /batches/submit and /poll).
 
 export type LogLevel = "info" | "ok" | "warn" | "error";
-export type LogStep = "started" | "downloaded" | "unchanged" | "copied" | "sent" | "read" | "embedded" | "done" | "failed" | "run";
+export type LogStep =
+  | "started" | "downloaded" | "unchanged" | "copied" | "sent" | "read" | "embedded" | "done" | "failed" | "run"
+  | "batched" | "submitted" | "waiting";
 
 export interface LogLine {
   id: number;
@@ -63,12 +66,73 @@ export interface ReaderState {
   queue: { pending: number; processing: number; failed: number };
   /** null when the log could not be read. */
   cost_today_usd: number | null;
+  // Batch mode. Optional: an older server does not send these.
+  /** "batch": waiting files go to Claude together every few minutes; "direct": each file is read as soon as it is saved. */
+  mode?: ReaderMode;
+  batch_every_minutes?: number;
+  /** When the next automatic batch goes out; null in direct mode or when the worker is off. */
+  next_submit_at?: string | null;
+  /** Batches sent and not yet finished; null if unknown. */
+  open_batches?: number | null;
+  /** A batch is being sent or checked right now. */
+  batch_busy?: boolean;
 }
+
+export type ReaderMode = "batch" | "direct";
 
 export interface ProcessResult {
   queued: number;
   processing: boolean;
   reason?: string;
+  mode?: ReaderMode;
+  next_submit_at?: string | null;
+}
+
+export type BatchStatus = "sending" | "in_progress" | "canceling" | "ended" | "failed";
+
+export interface Batch {
+  id: string;
+  anthropic_batch_id: string | null;
+  status: BatchStatus;
+  request_count: number;
+  succeeded: number;
+  errored: number;
+  expired: number;
+  canceled: number;
+  model: string | null;
+  submitted_at: string | null;
+  ended_at: string | null;
+  /** Set once every result is saved; the batch is finished for the user. */
+  results_applied_at: string | null;
+  cost_usd: number | null;
+  error: string | null;
+  created_at: string;
+}
+
+export interface BatchSubmitResult {
+  sent_docs: number;
+  batches: { id: string; anthropic_batch_id: string | null; request_count: number }[];
+  unchanged: number;
+  copied: number;
+  failed: number;
+  claimed: number;
+}
+
+export interface BatchPollResult {
+  checked: number;
+  ended: number;
+  applied_docs: number;
+  failed_docs: number;
+  still_open: number;
+}
+
+/** An error from the server that keeps its HTTP status (0 when there was no answer). */
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
 }
 
 const TIMEOUT_MS = 30_000;
@@ -89,8 +153,8 @@ async function call(path: string, init?: RequestInit): Promise<Response> {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    if (body?.error) throw new Error(String(body.error));
-    throw new Error(res.status === 404 ? "The server does not have this page yet. It needs its next update." : `The server returned ${res.status}`);
+    if (body?.error) throw new ApiError(String(body.error), res.status);
+    throw new ApiError(res.status === 404 ? "The server does not have this page yet. It needs its next update." : `The server returned ${res.status}`, res.status);
   }
   return res;
 }
@@ -125,11 +189,40 @@ export async function fetchReaderState(signal?: AbortSignal): Promise<ReaderStat
   return res.json();
 }
 
-/** Queue every saved file that has not been read and start reading. */
-export async function processWaiting(opts: { retryFailed?: boolean } = {}): Promise<ProcessResult> {
-  const res = await call(`${BASE}/process`, {
-    method: "POST",
-    body: JSON.stringify(opts.retryFailed ? { retry_failed: true } : {}),
-  });
+/**
+ * Queue every saved file that has not been read and start reading. In batch
+ * mode the files go in the next batch unless `direct` is set, which reads
+ * them now with the direct API (with `shipmentId`: only that shipment's files).
+ */
+export async function processWaiting(opts: { retryFailed?: boolean; direct?: boolean; shipmentId?: string } = {}): Promise<ProcessResult> {
+  const body: Record<string, unknown> = {};
+  if (opts.retryFailed) body.retry_failed = true;
+  if (opts.direct) body.direct = true;
+  if (opts.shipmentId) body.shipment_id = opts.shipmentId;
+  const res = await call(`${BASE}/process`, { method: "POST", body: JSON.stringify(body) });
+  return res.json();
+}
+
+/** The newest batches first. Returns null when the server has no batches page yet (older server). */
+export async function fetchBatches(limit = 50, signal?: AbortSignal): Promise<Batch[] | null> {
+  try {
+    const res = await call(`${BASE}/batches?limit=${encodeURIComponent(String(limit))}`, withTimeout(signal));
+    const body = (await res.json()) as { data?: Batch[] };
+    return Array.isArray(body?.data) ? body.data : [];
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+/** Send every waiting file to Claude now as a batch. */
+export async function submitBatchNow(): Promise<BatchSubmitResult> {
+  const res = await call(`${BASE}/batches/submit`, { method: "POST" });
+  return res.json();
+}
+
+/** Ask Claude now whether the open batches are finished, and save any results. */
+export async function checkBatchesNow(): Promise<BatchPollResult> {
+  const res = await call(`${BASE}/batches/poll`, { method: "POST" });
   return res.json();
 }

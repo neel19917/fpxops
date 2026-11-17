@@ -6,7 +6,10 @@
 //   processPending()         take waiting rows → download from Storage →
 //                            Claude (lib/invoiceExtract.js) → save the columns
 //                            → chunks + embeddings → 'done'
-//   startInvoiceDocWorker()  kick after every queue + a sweep every 5 minutes
+//   startInvoiceDocWorker()  by invoice_ocr.mode: "direct" = kick after every
+//                            queue + a sweep every 5 minutes; "batch" (default)
+//                            = lib/invoiceBatch.js sends what is waiting every
+//                            invoice_ocr.batch_every_minutes at half price
 //
 // A file is read by Claude once: a row whose bytes have not changed
 // (content_sha256) is marked done again without a call, and a file with the
@@ -18,6 +21,9 @@ import { isUuid } from "./getInvoice.js";
 import {
   planFiles, mimeOf, sha256, normalizeExtraction, chunksForRow, extractDocument, EXTRACTED_COLS,
 } from "./invoiceExtract.js";
+// Circular on purpose: invoiceBatch.js uses the reading steps below; this file
+// only calls into it from the timer and kickForMode (never at load time).
+import { getBatchConfig, batchTick } from "./invoiceBatch.js";
 
 export const ERP_BUCKET = "erp-pulls";
 export const MAX_ATTEMPTS = 3;
@@ -98,7 +104,8 @@ export async function queueInvoiceDocuments(sb, { shipment_id, audit_id, files }
       if (error) throw new Error(error.message);
       if (u.patch.status === "pending") out.requeued += 1; else out.skipped += 1;
     }
-    if (kick && (out.queued || out.requeued)) kickInvoiceDocs();
+    // Direct mode reads at once; batch mode leaves them for the next batch.
+    if (kick && (out.queued || out.requeued)) kickForMode().catch(() => {});
     return out;
   } catch (e) {
     warnOnce("queue", `files not queued for reading: ${e?.message || e}`);
@@ -254,119 +261,152 @@ export function invoiceDocsState() {
 }
 const fileName = (f) => String(f || "").replace(/^invoices\//, "");
 
-// Reads one claimed row. Returns "done" | "unchanged" | "copied" | "failed".
+const stampNow = () => new Date().toISOString();
+async function saveDoc(sb, claim, patch) {
+  const { error } = await sb.from(TABLE).update({ ...patch, updated_at: stampNow() }).eq("id", claim.id);
+  if (error) throw new Error(`Could not save: ${error.message}`);
+}
+
+// The steps of reading one claimed row, shared by the direct read
+// (processOne) and the batch read (lib/invoiceBatch.js).
+//
+// prepareDoc: downloads the file and settles what needs no Claude call.
+// Returns { result, bytes, hash, mime, row?, meta? } where result is
+//   "unchanged"  same bytes as the last reading: the row is done again (finished here)
+//   "copied"     the same bytes were read under another pull: row + meta to save
+//   "read"       Claude has to read it
+// Throws when the file cannot be downloaded.
+export async function prepareDoc(sb, claim, { t0 = Date.now() } = {}) {
+  const mime = mimeOf(claim.file);
+  let blob = null;
+  try {
+    const { data, error } = await sb.storage.from(ERP_BUCKET).download(`${claim.audit_id}/${claim.file}`);
+    if (!error) blob = data;
+  } catch { /* handled below */ }
+  if (!blob) throw new Error("Could not download the file from storage");
+  const bytes = Buffer.from(await blob.arrayBuffer());
+  const hash = sha256(bytes);
+  await logStep(sb, claim, "downloaded", `Downloaded ${Math.round(bytes.length / 1024)} KB (${mime})`, { ms: Date.now() - t0 });
+
+  // Same bytes as the last time it was read: nothing to do.
+  if (claim.extracted_at && claim.content_sha256 === hash) {
+    await saveDoc(sb, claim, { status: "done", error: null });
+    await logStep(sb, claim, "unchanged", "Same file as last time it was read: kept the earlier reading, no Claude call", { level: "ok", ms: Date.now() - t0 });
+    return { result: "unchanged", bytes, hash, mime };
+  }
+
+  // The same bytes read under another pull: copy that reading.
+  const { data: twins } = await sb.from(TABLE)
+    .select(`${EXTRACTED_COLS.join(", ")}, model`)
+    .eq("content_sha256", hash).eq("status", "done").eq("doc_type", claim.doc_type).neq("id", claim.id)
+    .not("extracted_at", "is", null).limit(1);
+  if (twins?.length) {
+    const row = Object.fromEntries(EXTRACTED_COLS.map((c) => [c, twins[0][c] ?? null]));
+    row.line_items = row.line_items || [];
+    row.fields = row.fields || {};
+    row.warnings = row.warnings || [];
+    const meta = { model: twins[0].model || null, input_tokens: 0, output_tokens: 0, cost_usd: 0, copied: true };
+    await logStep(sb, claim, "copied", "The same file was already read under another pull: copied that reading, no Claude call", { level: "ok" });
+    return { result: "copied", bytes, hash, mime, row, meta };
+  }
+  return { result: "read", bytes, hash, mime };
+}
+
+// What Claude returned → the columns, with the "read" log lines. Returns the row.
+export async function rowFromExtraction(sb, claim, extraction, meta, { ms = null, via = "" } = {}) {
+  const row = normalizeExtraction(extraction);
+  const named = ["invoice_number", "invoice_date", "carrier", "tracking_number", "bol_number", "po_number", "total"].filter((c) => row[c] != null && row[c] !== "");
+  const extra = Object.keys(row.fields || {}).length;
+  const lines = (row.line_items || []).length;
+  await logStep(sb, claim, "read",
+    `Read by ${meta.model || "Claude"}${via}: ${named.length ? named.map((c) => `${c.replace(/_/g, " ")} ${c === "total" ? `$${row[c]}` : row[c]}`).join(", ") : "no main fields found"}`
+    + `; ${extra} other field${extra === 1 ? "" : "s"}, ${lines} line item${lines === 1 ? "" : "s"}`
+    + `${row.confidence != null ? `; confidence ${Math.round(Number(row.confidence) * 100)}%` : ""}`
+    + `${meta.input_tokens ? `; ${meta.input_tokens}+${meta.output_tokens} tokens` : ""}`,
+    { level: named.length ? "ok" : "warn", ms, cost_usd: meta.cost_usd ?? null });
+  if (Array.isArray(row.warnings) && row.warnings.length) {
+    await logStep(sb, claim, "read", `Claude noted: ${row.warnings.slice(0, 3).join(" · ")}`, { level: "warn" });
+  }
+  return row;
+}
+
+// Saves a reading (from Claude or copied), then chunks + embeddings, then
+// done. `patch` is added to the first save (the batch path clears
+// ocr_batch_id there). Throws when the row cannot be saved.
+export async function finishReading(sb, claim, { row, meta, hash, size, mime, t0 = Date.now(), embed = embedText, patch = {}, onStep = () => {} }) {
+  await saveDoc(sb, claim, {
+    ...row, content_sha256: hash, bytes: size, mime,
+    model: meta.model, input_tokens: meta.input_tokens, output_tokens: meta.output_tokens, cost_usd: meta.cost_usd,
+    extracted_at: stampNow(), error: null, ...patch,
+  });
+  if (!meta.copied) await logAnalysis(sb, claim, meta, { summary: row.summary });
+
+  // Chunks for search by meaning. A chunk the embed function could not do
+  // is saved without one and filled in by the next sweep.
+  onStep("embedding");
+  const te = Date.now();
+  const bodies = chunksForRow(row, { docType: claim.doc_type });
+  const chunks = [];
+  let embedDown = false;
+  for (let i = 0; i < bodies.length; i++) {
+    const embedding = embedDown ? null : await embed(sb, bodies[i]);
+    if (!embedding) embedDown = true;
+    chunks.push({ chunk_no: i, body: bodies[i], embedding });
+  }
+  const { error: chunkErr } = await sb.rpc("fpx_invoice_document_set_chunks", { p_document_id: claim.id, p_chunks: chunks });
+  if (chunkErr) warnOnce("chunks", `search chunks not saved: ${chunkErr.message}`);
+  const embedded = chunks.filter((c) => c.embedding).length;
+  await logStep(sb, claim, "embedded",
+    chunkErr ? `Search chunks not saved: ${chunkErr.message}` : `Split into ${chunks.length} search chunk${chunks.length === 1 ? "" : "s"}, ${embedded} embedded${embedded < chunks.length ? " (the rest are filled in by the next sweep)" : ""}`,
+    { level: chunkErr ? "error" : embedded < chunks.length ? "warn" : "ok", ms: Date.now() - te });
+
+  await saveDoc(sb, claim, { status: "done" });
+  await logStep(sb, claim, "done", `Done in ${((Date.now() - t0) / 1000).toFixed(1)}s`, { level: "ok", ms: Date.now() - t0, cost_usd: meta?.cost_usd ?? null });
+}
+
+// Marks a claimed row failed with the reason (e.permanent: not tried again;
+// e.meta: the Claude call's tokens and cost). `patch` is added to the save.
 // Never throws.
+export async function failDoc(sb, claim, e, { t0 = Date.now(), patch = {} } = {}) {
+  const message = String(e?.message || e).slice(0, 500);
+  if (e?.meta) await logAnalysis(sb, claim, e.meta, { error: message });
+  try {
+    await sb.from(TABLE).update({
+      status: "failed", error: message, updated_at: stampNow(),
+      // A file that would fail the same way again is not tried again.
+      ...(e?.permanent ? { attempts: Math.max(MAX_ATTEMPTS, claim.attempts || 0) } : {}),
+      ...(e?.meta ? { model: e.meta.model, input_tokens: e.meta.input_tokens, output_tokens: e.meta.output_tokens, cost_usd: e.meta.cost_usd } : {}),
+      ...patch,
+    }).eq("id", claim.id);
+  } catch { /* the claim times out and is taken again */ }
+  await logStep(sb, claim, "failed", `Failed: ${message}${e?.permanent ? " (will not be tried again)" : (claim.attempts || 0) < MAX_ATTEMPTS ? " (will be tried again)" : " (no tries left)"}`,
+    { level: "error", ms: Date.now() - t0, cost_usd: e?.meta?.cost_usd ?? null });
+}
+
+// Reads one claimed row with the direct Messages API. Returns "done" |
+// "unchanged" | "copied" | "failed". Never throws.
 export async function processOne(sb, claim, { extract = extractDocument, embed = embedText } = {}) {
-  const stamp = () => new Date().toISOString();
-  const save = async (patch) => {
-    const { error } = await sb.from(TABLE).update({ ...patch, updated_at: stamp() }).eq("id", claim.id);
-    if (error) throw new Error(`Could not save: ${error.message}`);
-  };
-  let meta = null;
   const t0 = Date.now();
-  const now = { id: claim.id, shipment_id: claim.shipment_id, file: claim.file, doc_type: claim.doc_type, step: "downloading", since: stamp() };
+  const now = { id: claim.id, shipment_id: claim.shipment_id, file: claim.file, doc_type: claim.doc_type, step: "downloading", since: stampNow() };
   live.reading.set(claim.id, now);
-  const at = (step) => { now.step = step; now.since = stamp(); };
+  const at = (step) => { now.step = step; now.since = stampNow(); };
   await logStep(sb, claim, "started", `Reading ${fileName(claim.file)} (${claim.doc_type}) for shipment ${claim.shipment_id}${claim.attempts > 1 ? `, try ${claim.attempts}` : ""}`);
   try {
-    const mime = mimeOf(claim.file);
-    let blob = null;
-    try {
-      const { data, error } = await sb.storage.from(ERP_BUCKET).download(`${claim.audit_id}/${claim.file}`);
-      if (!error) blob = data;
-    } catch { /* handled below */ }
-    if (!blob) throw new Error("Could not download the file from storage");
-    const bytes = Buffer.from(await blob.arrayBuffer());
-    const hash = sha256(bytes);
-    await logStep(sb, claim, "downloaded", `Downloaded ${Math.round(bytes.length / 1024)} KB (${mime})`, { ms: Date.now() - t0 });
-
-    // Same bytes as the last time it was read: nothing to do.
-    if (claim.extracted_at && claim.content_sha256 === hash) {
-      await save({ status: "done", error: null });
-      await logStep(sb, claim, "unchanged", "Same file as last time it was read: kept the earlier reading, no Claude call", { level: "ok", ms: Date.now() - t0 });
-      return "unchanged";
-    }
-
-    let row = null;
-    let result = "done";
-    // The same bytes read under another pull: copy that reading.
-    const { data: twins } = await sb.from(TABLE)
-      .select(`${EXTRACTED_COLS.join(", ")}, model`)
-      .eq("content_sha256", hash).eq("status", "done").eq("doc_type", claim.doc_type).neq("id", claim.id)
-      .not("extracted_at", "is", null).limit(1);
-    if (twins?.length) {
-      row = Object.fromEntries(EXTRACTED_COLS.map((c) => [c, twins[0][c] ?? null]));
-      row.line_items = row.line_items || [];
-      row.fields = row.fields || {};
-      row.warnings = row.warnings || [];
-      meta = { model: twins[0].model || null, input_tokens: 0, output_tokens: 0, cost_usd: 0, copied: true };
-      result = "copied";
-      await logStep(sb, claim, "copied", "The same file was already read under another pull: copied that reading, no Claude call", { level: "ok" });
-    } else {
+    const prep = await prepareDoc(sb, claim, { t0 });
+    if (prep.result === "unchanged") return "unchanged";
+    let { row, meta } = prep;
+    if (prep.result === "read") {
       at("reading");
       const tc = Date.now();
       await logStep(sb, claim, "sent", "Sent to Claude to read");
-      const got = await extract({ bytes, mime, docType: claim.doc_type, shipmentId: claim.shipment_id });
-      const { extraction, ...rest } = got;
+      const { extraction, ...rest } = await extract({ bytes: prep.bytes, mime: prep.mime, docType: claim.doc_type, shipmentId: claim.shipment_id });
       meta = rest;
-      row = normalizeExtraction(extraction);
-      const named = ["invoice_number", "invoice_date", "carrier", "tracking_number", "bol_number", "po_number", "total"].filter((c) => row[c] != null && row[c] !== "");
-      const extra = Object.keys(row.fields || {}).length;
-      const lines = (row.line_items || []).length;
-      await logStep(sb, claim, "read",
-        `Read by ${meta.model || "Claude"}: ${named.length ? named.map((c) => `${c.replace(/_/g, " ")} ${c === "total" ? `$${row[c]}` : row[c]}`).join(", ") : "no main fields found"}`
-        + `; ${extra} other field${extra === 1 ? "" : "s"}, ${lines} line item${lines === 1 ? "" : "s"}`
-        + `${row.confidence != null ? `; confidence ${Math.round(Number(row.confidence) * 100)}%` : ""}`
-        + `${meta.input_tokens ? `; ${meta.input_tokens}+${meta.output_tokens} tokens` : ""}`,
-        { level: named.length ? "ok" : "warn", ms: Date.now() - tc, cost_usd: meta.cost_usd ?? null });
-      if (Array.isArray(row.warnings) && row.warnings.length) {
-        await logStep(sb, claim, "read", `Claude noted: ${row.warnings.slice(0, 3).join(" · ")}`, { level: "warn" });
-      }
+      row = await rowFromExtraction(sb, claim, extraction, meta, { ms: Date.now() - tc });
     }
-
-    await save({
-      ...row, content_sha256: hash, bytes: bytes.length, mime,
-      model: meta.model, input_tokens: meta.input_tokens, output_tokens: meta.output_tokens, cost_usd: meta.cost_usd,
-      extracted_at: stamp(), error: null,
-    });
-    if (!meta.copied) await logAnalysis(sb, claim, meta, { summary: row.summary });
-
-    // Chunks for search by meaning. A chunk the embed function could not do
-    // is saved without one and filled in by the next sweep.
-    at("embedding");
-    const te = Date.now();
-    const bodies = chunksForRow(row, { docType: claim.doc_type });
-    const chunks = [];
-    let embedDown = false;
-    for (let i = 0; i < bodies.length; i++) {
-      const embedding = embedDown ? null : await embed(sb, bodies[i]);
-      if (!embedding) embedDown = true;
-      chunks.push({ chunk_no: i, body: bodies[i], embedding });
-    }
-    const { error: chunkErr } = await sb.rpc("fpx_invoice_document_set_chunks", { p_document_id: claim.id, p_chunks: chunks });
-    if (chunkErr) warnOnce("chunks", `search chunks not saved: ${chunkErr.message}`);
-    const embedded = chunks.filter((c) => c.embedding).length;
-    await logStep(sb, claim, "embedded",
-      chunkErr ? `Search chunks not saved: ${chunkErr.message}` : `Split into ${chunks.length} search chunk${chunks.length === 1 ? "" : "s"}, ${embedded} embedded${embedded < chunks.length ? " (the rest are filled in by the next sweep)" : ""}`,
-      { level: chunkErr ? "error" : embedded < chunks.length ? "warn" : "ok", ms: Date.now() - te });
-
-    await save({ status: "done" });
-    await logStep(sb, claim, "done", `Done in ${((Date.now() - t0) / 1000).toFixed(1)}s`, { level: "ok", ms: Date.now() - t0, cost_usd: meta?.cost_usd ?? null });
-    return result;
+    await finishReading(sb, claim, { row, meta, hash: prep.hash, size: prep.bytes.length, mime: prep.mime, t0, embed, onStep: at });
+    return prep.result === "copied" ? "copied" : "done";
   } catch (e) {
-    meta = meta || e?.meta || null;
-    const message = String(e?.message || e).slice(0, 500);
-    if (e?.meta) await logAnalysis(sb, claim, e.meta, { error: message });
-    try {
-      await sb.from(TABLE).update({
-        status: "failed", error: message, updated_at: stamp(),
-        // A file that would fail the same way again is not tried again.
-        ...(e?.permanent ? { attempts: Math.max(MAX_ATTEMPTS, claim.attempts || 0) } : {}),
-        ...(e?.meta ? { model: e.meta.model, input_tokens: e.meta.input_tokens, output_tokens: e.meta.output_tokens, cost_usd: e.meta.cost_usd } : {}),
-      }).eq("id", claim.id);
-    } catch { /* the claim times out and is taken again */ }
-    await logStep(sb, claim, "failed", `Failed: ${message}${e?.permanent ? " (will not be tried again)" : (claim.attempts || 0) < MAX_ATTEMPTS ? " (will be tried again)" : " (no tries left)"}`,
-      { level: "error", ms: Date.now() - t0, cost_usd: e?.meta?.cost_usd ?? null });
+    await failDoc(sb, claim, e, { t0 });
     return "failed";
   } finally {
     live.reading.delete(claim.id);
@@ -447,16 +487,63 @@ export function kickInvoiceDocs({ limit = 500, concurrency = 3 } = {}) {
   return true;
 }
 
-// Call once from server/index.js. Reads anything left waiting shortly after
-// start, then looks again every 5 minutes (retries, files queued while the
-// server was down). Does nothing — and returns false — without
-// ANTHROPIC_API_KEY, without a database, or under `node --test`.
+// After a capture is queued: read now in direct mode; in batch mode the
+// files wait for the next batch. Returns whether a direct run was started.
+export async function kickForMode() {
+  if (!invoiceDocWorkerEnabled()) return false;
+  const { mode } = await getBatchConfig();
+  return mode === "direct" ? kickInvoiceDocs() : false;
+}
+
+// Reads one shipment's (or one pull's) waiting files now with the direct API,
+// whatever the mode — for someone waiting on that shipment. Files already in
+// an open batch are left to it (the claim function does not hand them out).
+// Starts in the background; returns false when the worker is off.
+export function readNow({ shipment_id = null, audit_id = null, limit = 100 } = {}) {
+  if (!invoiceDocWorkerEnabled()) return false;
+  (async () => {
+    const r = await processPending({ shipment_id, audit_id, limit, concurrency: 3 });
+    if (r.processed) {
+      await logStep(supabase, null, "run",
+        `Read now${shipment_id ? ` for shipment ${shipment_id}` : ""}: ${r.processed} file${r.processed === 1 ? "" : "s"} (${r.done} read, ${r.copied} copied, ${r.unchanged} unchanged, ${r.failed} failed)`,
+        { level: r.failed ? "warn" : "ok" });
+    }
+  })().catch((e) => warnOnce("readnow", `read now stopped: ${e?.message || e}`));
+  return true;
+}
+
+// Call once from server/index.js. Every minute it looks at invoice_ocr.mode:
+//   direct: reads anything waiting shortly after start, then every 5 minutes
+//           (retries, files queued while the server was down)
+//   batch:  lib/invoiceBatch.js batchTick — a batch every
+//           invoice_ocr.batch_every_minutes
+// Open batches are checked every 5 minutes in both modes. Does nothing — and
+// returns false — without ANTHROPIC_API_KEY, without a database, or under
+// `node --test`.
 let sweep = null;
-export function startInvoiceDocWorker({ intervalMs = 5 * 60_000, firstRunMs = 20_000 } = {}) {
+export function startInvoiceDocWorker({ intervalMs = 5 * 60_000, tickMs = 60_000, firstRunMs = 20_000 } = {}) {
   if (!invoiceDocWorkerEnabled()) return false;
   if (sweep) return true;
-  setTimeout(() => kickInvoiceDocs(), firstRunMs).unref();
-  sweep = setInterval(() => kickInvoiceDocs(), intervalMs);
+  let lastKick = 0;
+  let ticking = false;
+  const tick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const { mode } = await getBatchConfig();
+      if (mode === "direct" && Date.now() - lastKick >= intervalMs - 1000) {
+        lastKick = Date.now();
+        kickInvoiceDocs();
+      }
+      await batchTick();
+    } catch (e) {
+      warnOnce("tick", `timer: ${e?.message || e}`);
+    } finally {
+      ticking = false;
+    }
+  };
+  setTimeout(tick, firstRunMs).unref();
+  sweep = setInterval(tick, tickMs);
   sweep.unref();
   return true;
 }

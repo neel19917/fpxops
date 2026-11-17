@@ -13,8 +13,11 @@ import { supabase } from "../lib/supabase.js";
 import { isUuid } from "../lib/getInvoice.js";
 import { DOC_TYPES } from "../lib/invoiceExtract.js";
 import {
-  backfillFromRecords, retryFailed, kickInvoiceDocs, queryEmbedding, invoiceDocWorkerEnabled, invoiceDocsState,
+  backfillFromRecords, retryFailed, kickInvoiceDocs, queryEmbedding, invoiceDocWorkerEnabled, invoiceDocsState, readNow,
 } from "../lib/invoiceDocs.js";
+import {
+  getBatchConfig, submitBatch, pollBatches, batchState, resetBatchTimer, countOpenBatches,
+} from "../lib/invoiceBatch.js";
 
 export const invoiceDocsRouter = Router();
 
@@ -107,18 +110,24 @@ invoiceDocsRouter.get("/summary", async (_req, res) => {
   });
 });
 
-// POST /process  body { shipment_id?, audit_id?, limit?, retry_failed? }
+// POST /process  body { shipment_id?, audit_id?, limit?, retry_failed?, direct? }
 // Queues every saved file (fpx_shipment_records.files) that has no row yet —
 // all of them, or one shipment's / one pull's — and starts reading. With
 // retry_failed, files that ran out of tries wait again. limit caps how many
-// files this run reads (default 500). Responds { queued, processing: true }
-// straight away; reading goes on in the background (watch GET /summary).
-// processing is false, with `reason`, when this server has no Claude key.
+// files this run reads (default 500).
+//   * direct: true (with shipment_id or audit_id): that shipment's files are
+//     read now with the direct API, whatever invoice_ocr.mode says
+//   * otherwise it follows the mode: direct reads now; batch leaves the files
+//     for the next batch (processing false, reason says when)
+// Responds { queued, processing, mode, next_submit_at?, reason? } straight
+// away; reading goes on in the background (watch GET /state).
 invoiceDocsRouter.post("/process", async (req, res) => {
   const body = req.body || {};
   const shipment_id = body.shipment_id != null && String(body.shipment_id).trim() ? String(body.shipment_id).trim() : null;
   if (body.audit_id != null && body.audit_id !== "" && !isUuid(body.audit_id)) return res.status(400).json({ error: "audit_id must be an audit's id" });
   const audit_id = body.audit_id || null;
+  const direct = body.direct === true;
+  if (direct && !shipment_id && !audit_id) return res.status(400).json({ error: "A direct read needs shipment_id (or audit_id)" });
 
   const filled = await backfillFromRecords(supabase, { shipment_id, audit_id });
   if (filled.error && !filled.queued) return res.status(500).json({ error: filled.error });
@@ -128,11 +137,77 @@ invoiceDocsRouter.post("/process", async (req, res) => {
     if (r.error) return res.status(500).json({ error: r.error });
     queued += r.retried;
   }
+  const off = { reason: "Reading is off on this server (ANTHROPIC_API_KEY is not set)" };
+  if (direct) {
+    const processing = readNow({ shipment_id, audit_id, limit: intIn(body.limit, 100, 1, 500) });
+    return res.json({ queued, processing, mode: "direct", ...(processing ? {} : off) });
+  }
+  const cfg = await getBatchConfig();
+  if (cfg.mode === "batch") {
+    const { next_submit_at } = batchState();
+    return res.json({
+      queued, processing: false, mode: "batch", next_submit_at,
+      reason: invoiceDocWorkerEnabled()
+        ? `Batch mode: waiting files are sent to Claude in the next batch (every ${cfg.everyMinutes} min, half price)`
+        : off.reason,
+    });
+  }
   const processing = kickInvoiceDocs({ limit: intIn(body.limit, 500, 1, 5000) });
-  res.json({
-    queued, processing,
-    ...(processing ? {} : { reason: "Reading is off on this server (ANTHROPIC_API_KEY is not set)" }),
-  });
+  res.json({ queued, processing, mode: "direct", ...(processing ? {} : off) });
+});
+
+// ---------------------------------------------------------------------------
+// Batches (invoice_ocr.mode = "batch"; lib/invoiceBatch.js)
+// ---------------------------------------------------------------------------
+const BATCHES = "fpx_invoice_ocr_batches";
+export const BATCH_COLS = [
+  "id", "anthropic_batch_id", "status", "request_count", "succeeded", "errored", "expired", "canceled",
+  "model", "submitted_at", "ended_at", "results_applied_at", "cost_usd", "error", "created_at",
+];
+const num = (v) => (v == null ? null : Number(v));
+export const pickBatch = (r) => ({
+  ...Object.fromEntries(BATCH_COLS.map((c) => [c, r?.[c] ?? null])),
+  request_count: Number(r?.request_count) || 0,
+  succeeded: Number(r?.succeeded) || 0,
+  errored: Number(r?.errored) || 0,
+  expired: Number(r?.expired) || 0,
+  canceled: Number(r?.canceled) || 0,
+  cost_usd: num(r?.cost_usd),
+});
+
+// GET /batches?limit=  newest first (default 50, at most 500).
+// Responds { data: Batch[] }.
+invoiceDocsRouter.get("/batches", async (req, res) => {
+  const limit = intIn(req.query.limit, 50, 1, 500);
+  const { data, error } = await supabase.from(BATCHES).select(BATCH_COLS.join(", "))
+    .order("created_at", { ascending: false }).limit(limit);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: (data || []).map(pickBatch) });
+});
+
+const busyReply = (res) => res.status(409).json({ error: "A batch is being sent or checked right now. Try again in a minute." });
+
+// POST /batches/submit — send what is waiting now, whatever the timer says
+// (and start the timer again from now). Responds { claimed, unchanged,
+// copied, failed, sent_docs, batches: [{ id, anthropic_batch_id, request_count }] }.
+invoiceDocsRouter.post("/batches/submit", async (_req, res) => {
+  if (!invoiceDocWorkerEnabled()) return res.status(409).json({ error: "Reading is off on this server (ANTHROPIC_API_KEY is not set)" });
+  const cfg = await getBatchConfig();
+  const r = await submitBatch();
+  if (r.busy) return busyReply(res);
+  if (cfg.mode === "batch") resetBatchTimer(cfg.everyMinutes);
+  if (r.error && !r.claimed) return res.status(500).json({ error: r.error });
+  res.json(r);
+});
+
+// POST /batches/poll — check open batches now and save the results of any
+// that ended. Responds { checked, ended, applied_docs, failed_docs, still_open }.
+invoiceDocsRouter.post("/batches/poll", async (_req, res) => {
+  if (!invoiceDocWorkerEnabled()) return res.status(409).json({ error: "Reading is off on this server (ANTHROPIC_API_KEY is not set)" });
+  const r = await pollBatches();
+  if (r.busy) return busyReply(res);
+  if (r.error && !r.checked) return res.status(500).json({ error: r.error });
+  res.json(r);
 });
 
 // ---------------------------------------------------------------------------
@@ -217,14 +292,19 @@ invoiceDocsRouter.get("/log", async (req, res) => {
 // What the reader is doing now on this API server, with the counts:
 // { enabled, running, run, reading: [...],            (lib/invoiceDocs.js)
 //   total, by_status, by_doc_type, last_extracted_at, cost_usd,
-//   queue: { pending, processing, failed }, cost_today_usd }
+//   queue: { pending, processing, failed }, cost_today_usd,
+//   mode: "batch" | "direct", batch_every_minutes, next_submit_at,
+//   open_batches (null when unknown), batch_busy }
 // cost_today_usd sums the log's cost_usd since midnight UTC.
 invoiceDocsRouter.get("/state", async (_req, res) => {
   const since = startOfUtcDay();
-  const [summary, today] = await Promise.all([
+  const [summary, today, cfg, open_batches] = await Promise.all([
     supabase.rpc("fpx_invoice_documents_summary"),
     supabase.from(LOG_TABLE).select("cost_usd").gte("at", since).not("cost_usd", "is", null).limit(20_000),
+    getBatchConfig(),
+    countOpenBatches(supabase).catch(() => null),
   ]);
+  const batch = batchState();
   if (summary.error) return res.status(500).json({ error: summary.error.message });
   const s = summary.data || {};
   const by_status = Object.fromEntries(STATUSES.map((k) => [k, Number(s.by_status?.[k]) || 0]));
@@ -238,6 +318,11 @@ invoiceDocsRouter.get("/state", async (_req, res) => {
     queue: { pending: by_status.pending, processing: by_status.processing, failed: by_status.failed },
     // null when the log could not be read (e.g. the table is not there yet).
     cost_today_usd: today.error ? null : sumCost(today.data),
+    mode: cfg.mode,
+    batch_every_minutes: cfg.everyMinutes,
+    next_submit_at: cfg.mode === "batch" ? batch.next_submit_at : null,
+    open_batches,
+    batch_busy: batch.busy,
   });
 });
 
