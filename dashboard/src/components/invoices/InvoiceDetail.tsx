@@ -122,7 +122,8 @@ function DocCard({ doc, approved }: { doc: InvoiceDoc; approved: number | null }
     .filter(([, v]) => v);
   const lines = Array.isArray(doc.line_items) ? doc.line_items : [];
   const warnings = (Array.isArray(doc.warnings) ? doc.warnings : doc.warnings ? [doc.warnings] : []).map(text).filter(Boolean);
-  const differs = doc.status === "done" && doc.total != null && approved != null && Math.abs(Number(doc.total) - approved) > 0.01;
+  // The saved invoice is the one sent to the customer, so it is checked against the charge.
+  const differs = doc.status === "done" && doc.doc_type === "invoice" && doc.total != null && approved != null && Math.abs(Number(doc.total) - approved) > 0.01;
 
   return (
     <article className="rounded-xl ring-1 ring-slate-200 bg-white overflow-hidden">
@@ -148,7 +149,7 @@ function DocCard({ doc, approved }: { doc: InvoiceDoc; approved: number | null }
             {differs ? (
               <div role="note" className="rounded-xl p-3 text-sm flex items-start gap-2 ring-1 bg-amber-50 ring-amber-200 text-amber-900">
                 <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" aria-hidden="true" />
-                <div>This document's total ({hubMoney(doc.total)}) is different from the amount approved in FreightPOP ({hubMoney(approved)}).</div>
+                <div>This document's total ({hubMoney(doc.total)}) is different from the charge FreightPOP holds for this shipment ({hubMoney(approved)}).</div>
               </div>
             ) : null}
             {doc.summary ? <p className="text-sm text-slate-700 leading-relaxed">{doc.summary}</p> : null}
@@ -451,7 +452,7 @@ export function InvoiceDetail({ shipmentId, row, onClose }: { shipmentId: string
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {docList.map((d) => <DocCard key={d.id} doc={d} approved={approvedAmount} />)}
+                  {docList.map((d) => <DocCard key={d.id} doc={d} approved={r?.charge ?? null} />)}
                 </div>
               )}
             </section>
