@@ -4,7 +4,9 @@ import {
   MAX_GET_INVOICE_IDS, isUuid, normalizeShipmentIds, missingShipmentIds,
   buildGetInvoiceNote, parseGetInvoiceNote, markRequested, mergeResult,
   resetRequested, normalizeResult, updateRowsRaw, isShotPath, normalizeShots,
+  GET_INVOICE_BUTTONS, GET_INVOICE_BUTTON_KEYS, normalizeButtons, describeButtons,
 } from "../lib/getInvoice.js";
+import { readFileSync } from "node:fs";
 
 const AUDIT = "3f2b6c1e-8a4d-4e0b-9c57-1d2e3f4a5b6c";
 const REQ = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
@@ -60,7 +62,7 @@ describe("get-invoice note", () => {
   it("round-trips", () => {
     for (const pauseFirst of [true, false]) {
       const note = buildGetInvoiceNote({ auditId: AUDIT, from: "2026-08-01", to: "2026-10-31", pauseFirst });
-      assert.deepEqual(parseGetInvoiceNote(note), { audit_id: AUDIT, from: "2026-08-01", to: "2026-10-31", pause_first: pauseFirst });
+      assert.deepEqual(parseGetInvoiceNote(note), { audit_id: AUDIT, from: "2026-08-01", to: "2026-10-31", pause_first: pauseFirst, buttons: null });
     }
   });
 
@@ -77,6 +79,90 @@ describe("get-invoice note", () => {
 
   it("treats a missing pause_first as on", () => {
     assert.equal(parseGetInvoiceNote(`audit=${AUDIT};from=a;to=b`).pause_first, true);
+  });
+});
+
+describe("View Shipment button choice", () => {
+  const base = { auditId: AUDIT, from: "2026-08-01", to: "2026-10-31" };
+  const read = (file) => readFileSync(new URL(`../../${file}`, import.meta.url), "utf8");
+
+  it("has short, unique keys that are safe inside the note", () => {
+    assert.equal(new Set(GET_INVOICE_BUTTON_KEYS).size, GET_INVOICE_BUTTON_KEYS.length);
+    for (const b of GET_INVOICE_BUTTONS) {
+      assert.match(b.key, /^[a-z_]{2,14}$/);
+      assert.notEqual(b.key, "none");
+      assert.ok(b.label);
+    }
+  });
+
+  it("means all when nothing is sent, or when every key is sent", () => {
+    assert.deepEqual(normalizeButtons(undefined), { buttons: null });
+    assert.deepEqual(normalizeButtons(null), { buttons: null });
+    assert.deepEqual(normalizeButtons([...GET_INVOICE_BUTTON_KEYS].reverse()), { buttons: null });
+  });
+
+  it("keeps an empty list as none, and puts a choice in the list's order", () => {
+    assert.deepEqual(normalizeButtons([]), { buttons: [] });
+    assert.deepEqual(normalizeButtons(["documents", " rate_conf ", "documents", "labels_bol"]), { buttons: ["labels_bol", "rate_conf", "documents"] });
+  });
+
+  it("refuses anything that is not a known key", () => {
+    for (const bad of ["rate_conf", {}, 5, ["delete"], ["rate_conf", "email"], [5], [null], ["none"]]) {
+      assert.ok(normalizeButtons(bad).error, JSON.stringify(bad));
+    }
+  });
+
+  it("leaves the note as it always was when all are pressed", () => {
+    assert.equal(buildGetInvoiceNote({ ...base }), `audit=${AUDIT};from=2026-08-01;to=2026-10-31;pause_first=1`);
+    assert.equal(buildGetInvoiceNote({ ...base, buttons: null }), `audit=${AUDIT};from=2026-08-01;to=2026-10-31;pause_first=1`);
+  });
+
+  it("round-trips a choice and none", () => {
+    const some = buildGetInvoiceNote({ ...base, buttons: ["rate_conf", "invoice"] });
+    assert.ok(some.endsWith(";pause_first=1;buttons=rate_conf,invoice"));
+    assert.deepEqual(parseGetInvoiceNote(some).buttons, ["rate_conf", "invoice"]);
+    const none = buildGetInvoiceNote({ ...base, pauseFirst: false, buttons: [] });
+    assert.ok(none.endsWith(";pause_first=0;buttons=none"));
+    assert.deepEqual(parseGetInvoiceNote(none).buttons, []);
+    assert.equal(parseGetInvoiceNote(none).pause_first, false);
+  });
+
+  it("drops keys it does not know when reading a note", () => {
+    assert.deepEqual(parseGetInvoiceNote(`audit=${AUDIT};from=a;to=b;buttons=delete,pod,nope`).buttons, ["pod"]);
+  });
+
+  it("stays short enough even with all but one key", () => {
+    const note = buildGetInvoiceNote({ ...base, buttons: GET_INVOICE_BUTTON_KEYS.slice(1) });
+    assert.ok(note.length < 300, String(note.length));
+  });
+
+  it("says the choice in words", () => {
+    assert.equal(describeButtons(null), "all View Shipment buttons");
+    assert.equal(describeButtons([]), "no View Shipment buttons (invoice only)");
+    assert.equal(describeButtons(["rate_conf", "documents"]), "View Shipment buttons: Print Rate Confirmation, Documents");
+  });
+
+  // The same keys are written out in the extension and the dashboard, which
+  // cannot import this file.
+  it("matches the extension's keys, in order", () => {
+    const block = /const VB_KEYS = \[([\s\S]*?)\n\];/.exec(read("extension/content.js"));
+    assert.ok(block, "VB_KEYS not found in extension/content.js");
+    assert.deepEqual([...block[1].matchAll(/\[\s*"([a-z_]+)"/g)].map((m) => m[1]), GET_INVOICE_BUTTON_KEYS);
+  });
+
+  it("matches the dashboard's keys and labels, in order", () => {
+    const block = /export const GET_INVOICE_BUTTONS = \[([\s\S]*?)\n\] as const;/.exec(read("dashboard/src/lib/erpPull.ts"));
+    assert.ok(block, "GET_INVOICE_BUTTONS not found in dashboard/src/lib/erpPull.ts");
+    const found = [...block[1].matchAll(/key: "([a-z_]+)", label: "([^"]+)"/g)].map((m) => ({ key: m[1], label: m[2] }));
+    assert.deepEqual(found, GET_INVOICE_BUTTONS);
+  });
+
+  it("names only real keys in the dashboard's Documents preset", () => {
+    const m = /GET_INVOICE_DOCUMENT_KEYS[^=]*= \[([^\]]*)\]/.exec(read("dashboard/src/lib/erpPull.ts"));
+    assert.ok(m);
+    const keys = [...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1]);
+    assert.deepEqual(keys, ["labels_bol", "print_docs", "rate_conf", "documents"]);
+    for (const k of keys) assert.ok(GET_INVOICE_BUTTON_KEYS.includes(k));
   });
 });
 

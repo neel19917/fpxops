@@ -25,6 +25,7 @@ const ExtLoginPage    = lazy(() => import("./pages/ExtLogin").then((m) => ({ def
 const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
 const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
 const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
+const InvoicesPushedPage = lazy(() => import("./pages/InvoicesPushed").then((m) => ({ default: m.InvoicesPushedPage })));
 const InvoicingPage   = lazy(() => import("./pages/Invoicing").then((m) => ({ default: m.InvoicingPage })));
 const ApiKeysPage     = lazy(() => import("./pages/ApiKeys").then((m) => ({ default: m.ApiKeysPage })));
 const UsersPage       = lazy(() => import("./pages/Users").then((m) => ({ default: m.UsersPage })));
@@ -289,6 +290,7 @@ function AuthedApp() {
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
+            <Route path="/invoicing/pushed" element={<InvoicesPushedPage />} />
             <Route path="/invoicing" element={<InvoicingPage />} />
             <Route path="/shares" element={<ShareLinksPage />} />
             <Route path="/feedback" element={<FeedbackPage />} />

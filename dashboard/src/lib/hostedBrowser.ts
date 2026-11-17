@@ -101,8 +101,17 @@ export interface FpTotalsPoint {
   tasksBefore?: TaskSnapshot | null; tasksAfter?: TaskSnapshot | null;
 }
 
+// What a schedule runs. Absent on an older service or schedule: "tracking".
+export type ScheduleJob = "tracking" | "erp_lookback" | "shipment_details";
+export type ScheduleShipmentType = "non-parcel" | "parcel" | "both";
+
 export interface ScrapeSchedule {
   id: string;
+  job?: ScheduleJob;
+  months?: number | null;                       // erp_lookback: how many months back (1-12)
+  shipmentType?: ScheduleShipmentType | null;   // erp_lookback
+  /** The last time the schedule fired, whether or not the run has finished. */
+  lastFired?: { at: string; requestId: string | null; queued: boolean; coalesced?: boolean; reason?: string | null } | null;
   owner: string;
   name: string;
   enabled: boolean;
@@ -116,7 +125,10 @@ export interface ScrapeSchedule {
   lastRun: { id: string; ok: boolean; finishedAt: string; durationMs: number; note: string; counts: ScrapeCounts | null } | null;
 }
 
-export type ScheduleInput = Pick<ScrapeSchedule, "name" | "days" | "times" | "tz"> & { enabled?: boolean; modes?: string[] | null };
+export type ScheduleInput = Pick<ScrapeSchedule, "name" | "days" | "times" | "tz"> & {
+  enabled?: boolean; modes?: string[] | null;
+  job?: ScheduleJob; months?: number | null; shipmentType?: ScheduleShipmentType | null;
+};
 
 export interface HostedStats {
   bootedAt: string;
@@ -330,7 +342,7 @@ export const hostedBrowser = {
   updateSchedule: (id: string, input: Partial<ScheduleInput>) =>
     call<{ schedule: ScrapeSchedule }>(`/schedules/${id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(input) }),
   deleteSchedule: (id: string) => call<{ deleted: boolean }>(`/schedules/${id}`, { method: "DELETE" }),
-  runScheduleNow: (id: string) => call<{ queued: boolean; reason?: string }>(`/schedules/${id}/run`, { method: "POST" }),
+  runScheduleNow: (id: string) => call<{ queued: boolean; reason?: string; coalesced?: boolean }>(`/schedules/${id}/run`, { method: "POST" }),
   // A run's saved log as text (admins: any run; others: their own).
   async runLogText(runId: string): Promise<string> {
     const token = await getAccessTokenOrWait();

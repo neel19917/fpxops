@@ -5109,6 +5109,46 @@ function giReadDialog(dIn) {
 // listed in the record as left alone.
 const VB_NEVER = /e-?mail|send|generate|request|edit|save|delete|remove|cancel|void|\badd\b|submit|update|create|approve|reject|upload|\bbook\b|duplicate|\bcopy\b|return|non-?conformance|claim|dispute|pay\b|re-?rate|reship|\bship\b(?! ?date)/i;
 const VB_SHOW = /^(print\b.*|view\b.*|download\b.*|show\b.*|see\b.*|change log|(.+ )?details|documents?|(.+ )?notes?|history|track(ing)?\b.*|pod|bol|labels?|invoice|attachments?)$/i;
+// The buttons VB_SHOW allows, as the families a person can choose from when
+// starting a run. The first row that matches a label names its key. Same keys
+// and order as GET_INVOICE_BUTTONS in server/lib/getInvoice.js (a server test
+// compares the two). A choice only ever narrows what is pressed: VB_NEVER and
+// VB_SHOW are checked first, whatever was chosen.
+const VB_KEYS = [
+  ["labels_bol", "Print Shipping Labels / BOL", /^(print\b.*\b(labels?|bol)\b.*|bol|labels?)$/i],
+  ["print_docs", "Print Documents", /^print\b.*documents?\b/i],
+  ["rate_conf", "Print Rate Confirmation", /^print\b.*rate\s*conf/i],
+  ["print_other", "Other Print buttons", /^print\b/i],
+  ["view", "View buttons", /^view\b/i],
+  ["download", "Download buttons", /^download\b/i],
+  ["show", "See / Show buttons", /^(show|see)\b/i],
+  ["change_log", "Change Log", /^change log$/i],
+  ["details", "Details buttons", /details$/i],
+  ["documents", "Documents", /^documents?$/i],
+  ["notes", "Notes", /notes?$/i],
+  ["history", "History", /^history$/i],
+  ["tracking", "Tracking", /^track(ing)?\b/i],
+  ["pod", "POD", /^pod$/i],
+  ["invoice", "Invoice", /^invoice$/i],
+  ["attachments", "Attachments", /^attachments?$/i],
+];
+// The key of a button label, or null when no family covers it.
+function vbKey(label) {
+  const row = VB_KEYS.find((k) => k[2].test(label));
+  return row ? row[0] : null;
+}
+// What the job was asked to press → null for all of them, else a Set of keys
+// (empty: none). Anything that is not a list means all, as before the choice existed.
+function vbChoice(buttons) {
+  if (!Array.isArray(buttons)) return null;
+  const known = new Set(VB_KEYS.map((k) => k[0]));
+  return new Set(buttons.map((k) => String(k ?? "").trim()).filter((k) => known.has(k)));
+}
+function vbChoiceText(choice) {
+  if (!choice) return "all";
+  if (!choice.size) return "none (invoice only)";
+  return VB_KEYS.filter((k) => choice.has(k[0])).map((k) => k[1]).join(", ");
+}
 const VB_BUTTONS = "button, a, input[type='button'], [role='button'], [role='tab'], .btn, [ng-click], [onclick], .nav-tabs li, .k-tabstrip-items li";
 const VB_DIALOGS = ".modal.in, .modal.show, .k-window, [role='dialog'], [role='alertdialog'], .bootbox, .ui-dialog, .popover, .k-animation-container";
 const vbClean = (t) => String(t || "").replace(/\s+/g, " ").trim();
@@ -5148,19 +5188,25 @@ function vbReadEl(el) {
   return { text: clean(el.innerText).slice(0, 100000), tables, links };
 }
 // → [{ label, did, opened?, text?, tables?, links?, files? }] — one entry per button found.
-async function vbRun(id, d, state, shots) {
+// choice: null presses every view-only button; a Set of VB_KEYS keys presses
+// only those. A button that was not chosen is listed and never clicked.
+async function vbRun(id, d, state, shots, choice = null) {
   const list = [];
   const found = vbFind(d);
+  const skipped = [];
+  let slots = 0; // a button's place among the view-only ones, chosen or not: the cap below is on the place
   for (const b of found) {
     if (/^(close|x|×)$/i.test(b.label)) continue;
     if (VB_NEVER.test(b.label)) list.push({ label: b.label, did: "left alone: it sends or changes something" });
     else if (!VB_SHOW.test(b.label)) list.push({ label: b.label, did: "left alone: not known to be view-only" });
-    else list.push({ label: b.label, did: "todo" });
+    else if (choice && !choice.has(vbKey(b.label))) { list.push({ label: b.label, did: "left alone: not chosen for this run", slot: slots++ }); skipped.push(b.label); }
+    else list.push({ label: b.label, did: "todo", slot: slots++ });
   }
+  if (skipped.length) erpLog(`View Shipment · ${id} · skipped by choice: ${skipped.join(", ").slice(0, 400)}`);
   let n = 0, stuck = 0;
   for (const item of list) {
     if (item.did !== "todo") continue;
-    if (stopRequested || n >= 14) { item.did = "not reached"; continue; }
+    if (stopRequested || n >= 14 || item.slot >= 14) { item.did = "not reached"; continue; }
     // Found again each time: an earlier button may have redrawn the view.
     const now = vbFind(d).find((x) => x.label === item.label);
     if (!now) { item.did = "no longer on screen"; continue; }
@@ -5529,7 +5575,8 @@ async function giSettleDialogs(id, before, out) {
   }
 }
 
-// optsJson: { from, to, shipmentIds, pauseFirst, runBy } — from / to are YYYY-MM-DD.
+// optsJson: { from, to, shipmentIds, pauseFirst, runBy, buttons } — from / to are YYYY-MM-DD.
+// buttons: the View Shipment buttons to press, as VB_KEYS keys; left out = all, [] = none.
 async function erpGetInvoices(optsJson) {
   if (fpxErp && !fpxErp.done) return; // already running in this page
   let opts = {};
@@ -5543,9 +5590,11 @@ async function erpGetInvoices(optsJson) {
   fpxErp = state;
   const st = { tab: "non-parcel", uiFilter: false };
   let shotsOn = true; // off after the browser service did not answer one screenshot request
+  const choice = vbChoice(opts.buttons); // null: every view-only button
   const summary = () => `${erpNum(state.counts.ok)} of ${erpNum(state.counts.total)} invoice(s) clicked` +
     (state.counts.failed ? ` · ${erpNum(state.counts.failed)} failed` : "") +
-    (state.counts.done < state.counts.total ? ` · ${erpNum(state.counts.total - state.counts.done)} not reached` : "");
+    (state.counts.done < state.counts.total ? ` · ${erpNum(state.counts.total - state.counts.done)} not reached` : "") +
+    (choice ? ` · View Shipment buttons: ${vbChoiceText(choice).slice(0, 160)}` : "");
 
   const record = (id, ok, note, shots) => {
     state.results.push({ shipment_id: id, ok: !!ok, note: String(note).slice(0, 480), at: new Date().toISOString(), shots: shots || [] });
@@ -5647,7 +5696,7 @@ async function erpGetInvoices(optsJson) {
                 // Then every view-only button inside it, each kept with what it showed.
                 try {
                   const extra = [];
-                  detail.buttons = await vbRun(id, d, state, extra);
+                  detail.buttons = await vbRun(id, d, state, extra, choice);
                   if (extra.length) out.shots = [...out.shots, ...extra].slice(0, 40);
                 } catch (e) {
                   if (e && (e.fpxStop || e.fpxFatal)) throw e;
@@ -5813,6 +5862,7 @@ async function erpGetInvoices(optsJson) {
       }
     };
 
+    erpLog(`View Shipment buttons chosen: ${vbChoiceText(choice)}`);
     await openReport();
     erpLog(`Report on screen · ${erpNum(ids.length)} shipment(s) to do, one at a time`);
 

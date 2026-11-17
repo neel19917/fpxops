@@ -12,6 +12,7 @@ import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
 import { HostedFreightPop } from "../components/HostedFreightPop";
 import { ScrapeLog } from "../components/ScrapeLog";
 import { SchedulesPane } from "../components/SchedulesPane";
+import { DataFlowHealth } from "../components/DataFlowHealth";
 import { Link } from "react-router-dom";
 
 // Scraping: run Refresh All in your own hosted browser, watch it, and see how
@@ -376,6 +377,9 @@ export function ScrapingPage() {
           <div className="text-sm text-slate-500">{startDisabledReason}</div>
         ) : null}
       </section>
+
+      {/* Is each data set still being read from FreightPOP? */}
+      <DataFlowHealth />
 
       {/* Scheduling */}
       {stats && hostedBrowser.enabled ? (

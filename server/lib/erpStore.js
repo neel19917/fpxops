@@ -14,6 +14,7 @@ import {
   normalizeShipmentId, findApprovalColumns, approvalColumnNames, classifyApprover,
   filterHistoryRows, approvalTime,
 } from "./approvalMatch.js";
+import { historyItems, recordScrapeHistory } from "./scrapeHistory.js";
 
 const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 const pad = (n) => String(n).padStart(2, "0");
@@ -372,39 +373,68 @@ async function readExisting(supabase, table, key, columns, keys) {
 
 // Reads what is stored for each chunk, plans its groups and upserts them.
 // Returns { upserted, failed, error? } (error: the first failure's message).
-async function upsertPlanned(supabase, { table, key, readColumns, rows, plan }) {
+// With `history` ({ source, fields, meta }) each stored group is compared with
+// what was stored before it, and first sightings and changed fields are
+// appended to fpx_scrape_history (lib/scrapeHistory.js). That uses the read
+// this function already makes, and can never fail or change the result.
+async function upsertPlanned(supabase, { table, key, readColumns, rows, plan, history }) {
   const out = { upserted: 0, failed: 0 };
   const list = Array.isArray(rows) ? rows.filter((r) => r && r[key]) : [];
   for (let i = 0; i < list.length; i += CHUNK) {
     const chunk = list.slice(i, i + CHUNK);
     let settled = 0; // rows of this chunk already counted
+    const stored = []; // rows of this chunk that were saved, as saved
+    let before = [];
     try {
       const existing = await readExisting(supabase, table, key, readColumns, chunk.map((r) => r[key]));
       if (existing.error) throw new Error(existing.error);
+      before = existing.rows;
       for (const group of plan(chunk, existing.rows)) {
         if (!group.length) continue;
         const { error } = await supabase.from(table).upsert(group, { onConflict: key });
-        if (error) { out.failed += group.length; out.error ??= message(error); } else out.upserted += group.length;
+        if (error) { out.failed += group.length; out.error ??= message(error); } else { out.upserted += group.length; stored.push(...group); }
         settled += group.length;
       }
     } catch (e) {
       out.failed += chunk.length - settled;
       out.error ??= message(e);
     }
+    if (history && stored.length) {
+      try {
+        const beforeBy = new Map(before.filter((r) => r && r[key] != null).map((r) => [String(r[key]), r]));
+        const items = historyItems(stored, beforeBy, { key, fields: history.fields, seenField: "last_seen_at" });
+        if (items.length) await recordScrapeHistory(supabase, history.source, items, history.meta);
+      } catch (e) {
+        console.warn(`[FPX] ${table}: scrape history not recorded: ${message(e)}`);
+      }
+    }
   }
   if (out.failed) console.warn(`[FPX] ${table}: ${out.failed} row(s) not stored: ${out.error}`);
   return out;
 }
 
+// The columns of each table whose changes are kept in fpx_scrape_history.
+export const TRANSACTION_HISTORY_FIELDS = [
+  "status", "charge", "cost", "gross_profit", "approved_invoice_amount", "invoice_approved_date",
+  "not_approved_invoice_amount", "billing_invoice_number", "exported_to_erp", "customer_invoice_sent", "carrier",
+];
+export const APPROVAL_HISTORY_FIELDS = ["invoice_amount", "approved_date", "approved_by", "exported_date", "variance", "notes"];
+// What is read of the stored rows before an upsert: what the plan needs, the
+// compared columns, and when the row was last read.
+export const TRANSACTION_READ_COLUMNS = ["shipment_id", ...TRANSACTION_HISTORY_FIELDS, "last_seen_at"].join(", ");
+export const APPROVAL_READ_COLUMNS = [...APPROVAL_COLUMNS, "last_seen_at"].join(", ");
+
 // Upserts fpx_erp_transactions rows (from transactionRows). first_seen_at is
 // never sent, so the database sets it on insert and an update leaves it;
 // exported_changed_at is sent only for shipments whose flag changed.
-export function upsertTransactions(supabase, rows) {
+// meta ({ request_id?, run_by? }) goes on the fpx_scrape_history rows.
+export function upsertTransactions(supabase, rows, meta = {}) {
   const now = new Date().toISOString();
   return upsertPlanned(supabase, {
     table: "fpx_erp_transactions",
     key: "shipment_id",
-    readColumns: "shipment_id, exported_to_erp",
+    readColumns: TRANSACTION_READ_COLUMNS,
+    history: { source: "erp_transactions", fields: TRANSACTION_HISTORY_FIELDS, meta },
     rows: dedupeTransactions(rows),
     plan: (chunk, existing) => {
       const { plain, flipped } = planTransactionUpsert(chunk, existing, now);
@@ -416,11 +446,13 @@ export function upsertTransactions(supabase, rows) {
 // Upserts fpx_audit_approvals rows (from approvalRows). first_seen_at is never
 // sent. A stored Recently Approved row is not replaced by a History row; only
 // its blank columns are filled in.
-export function upsertApprovals(supabase, rows) {
+// meta ({ request_id?, run_by? }) goes on the fpx_scrape_history rows.
+export function upsertApprovals(supabase, rows, meta = {}) {
   return upsertPlanned(supabase, {
     table: "fpx_audit_approvals",
     key: "approval_key",
-    readColumns: APPROVAL_COLUMNS.join(", "),
+    readColumns: APPROVAL_READ_COLUMNS,
+    history: { source: "audit_approvals", fields: APPROVAL_HISTORY_FIELDS, meta },
     rows: dedupeApprovals(rows),
     plan: (chunk, existing) => {
       const { write, fill } = planApprovalUpsert(chunk, existing);

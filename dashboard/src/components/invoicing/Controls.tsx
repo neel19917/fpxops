@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Loader2, Pause, Play, Square, X } from "lucide-react";
-import { GET_INVOICE_MAX } from "../../lib/erpPull";
+import {
+  GET_INVOICE_BUTTONS, GET_INVOICE_BUTTON_PRESETS, GET_INVOICE_MAX, cleanGetInvoiceButtons, getInvoiceButtonPreset,
+  getInvoiceButtonsLabel, loadGetInvoiceButtons, saveGetInvoiceButtons, type GetInvoiceButtonChoice, type GetInvoiceButtonKey,
+} from "../../lib/erpPull";
 import { fmtNum } from "../../lib/format";
 import { fmtMoney } from "./model";
 
@@ -301,6 +304,78 @@ export function ProgressStrip({ steps, text, tone, expanded, onToggle, onDismiss
 
 // ── Bulk action ──
 
+/**
+ * Which View Shipment buttons the run presses. The choice is kept in this
+ * browser (erpPull's saveGetInvoiceButtons), and requestGetInvoices sends the
+ * saved choice, so nothing has to be handed on from here.
+ */
+function ButtonChoice() {
+  const [choice, setChoice] = useState<GetInvoiceButtonChoice>(() => loadGetInvoiceButtons());
+  const [open, setOpen] = useState(false);
+  const wrap = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) => { if (wrap.current && !wrap.current.contains(e.target as Node)) setOpen(false); };
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", away);
+    document.addEventListener("keydown", esc);
+    return () => { document.removeEventListener("mousedown", away); document.removeEventListener("keydown", esc); };
+  }, [open]);
+  const pick = (next: GetInvoiceButtonChoice) => { setChoice(next); saveGetInvoiceButtons(next); };
+  const on = (key: GetInvoiceButtonKey) => choice === null || choice.includes(key);
+  const flip = (key: GetInvoiceButtonKey) => {
+    const now = GET_INVOICE_BUTTONS.map((b) => b.key).filter((k) => (k === key ? !on(k) : on(k)));
+    pick(cleanGetInvoiceButtons(now));
+  };
+  const preset = getInvoiceButtonPreset(choice);
+  return (
+    <div ref={wrap} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        title="Choose which View Shipment buttons the run presses for each shipment"
+        className="px-3 py-2 rounded-lg text-sm text-slate-200 ring-1 ring-white/20 hover:bg-white/10 flex items-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
+      >
+        <span className="text-slate-400">Buttons:</span> {getInvoiceButtonsLabel(choice)}
+        <ChevronDown className="h-4 w-4" aria-hidden="true" />
+      </button>
+      {open ? (
+        <div role="dialog" aria-label="View Shipment buttons to press" className="absolute bottom-full right-0 mb-2 w-80 max-w-[calc(100vw-2rem)] max-h-[70vh] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl ring-1 ring-slate-200 p-3 space-y-3">
+          <div>
+            <div className="text-sm font-semibold">View Shipment buttons to press</div>
+            <div className="text-xs text-slate-500 mt-0.5">The invoice is always fetched. Buttons you leave out are not clicked. Buttons that send or change anything are never clicked.</div>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {GET_INVOICE_BUTTON_PRESETS.map((p) => (
+              <button
+                key={p.key}
+                type="button"
+                title={p.hint}
+                aria-pressed={preset === p.key}
+                onClick={() => pick(p.buttons)}
+                className={"px-2.5 py-1 rounded-full text-xs font-medium ring-1 " + (preset === p.key ? "bg-violet-600 text-white ring-violet-600 " : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50 ") + FOCUS}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <div className="space-y-1">
+            {GET_INVOICE_BUTTONS.map((b) => (
+              <label key={b.key} className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={on(b.key)} onChange={() => flip(b.key)} className="rounded border-slate-300 text-violet-600" />
+                {b.label}
+              </label>
+            ))}
+          </div>
+          <div className="text-xs text-slate-500">Remembered in this browser for the next run. The run's log says which buttons were chosen.</div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 /** Sticks to the bottom of the window while shipments are ticked. */
 export function SelectionBar({ count, total, moreAfterBatch, blocked, onGet, onClear }: {
   count: number; total: number; moreAfterBatch: boolean; blocked: string | null; onGet: () => void; onClear: () => void;
@@ -315,6 +390,7 @@ export function SelectionBar({ count, total, moreAfterBatch, blocked, onGet, onC
           {blocked ? <div className="text-xs text-amber-300 mt-0.5">{blocked}</div> : null}
         </div>
         <div className="flex items-center gap-2 ml-auto">
+          <ButtonChoice />
           <button type="button" onClick={onClear} className="px-3 py-2 rounded-lg text-sm text-slate-300 hover:text-white hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-white">
             Clear
           </button>

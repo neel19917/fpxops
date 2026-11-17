@@ -300,7 +300,7 @@ async function handleApi(req, res, url, who) {
   const sm = /^\/schedules\/([0-9a-f-]{36})(\/run)?$/.exec(p);
   if (sm) {
     const [, id, run] = sm;
-    if (run && m === "POST") return json(res, 200, runScheduleNow(who, id));
+    if (run && m === "POST") return json(res, 200, await runScheduleNow(who, id));
     if (!run && m === "PUT") return json(res, 200, { schedule: updateSchedule(who, id, await readJson(req)) });
     if (!run && m === "DELETE") { deleteSchedule(who, id); return json(res, 200, { deleted: true }); }
   }

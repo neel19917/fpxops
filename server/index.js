@@ -34,6 +34,9 @@ import { feedbackRouter } from "./routes/feedback.js";
 import { auditLogRouter } from "./routes/auditLog.js";
 import { settingsRouter } from "./routes/settings.js";
 import { opsRouter } from "./routes/ops.js";
+import { erpPushedRouter } from "./routes/erpPushed.js";
+import { lookbackRouter } from "./routes/lookback.js";
+import { scrapeHistoryRouter } from "./routes/scrapeHistory.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -136,12 +139,15 @@ api.use(requireAuth());
 api.use("/shipments", shipmentsRouter);
 api.use("/analyses", analysesRouter);
 api.use("/analyze", analyzeRouter);
+api.use("/audits/erp/pushed", erpPushedRouter);
 api.use("/audits", auditsRouter);
 api.use("/share-links", shareLinksRouter);
 api.use("/tasks", tasksRouter);
 api.use("/feedback", feedbackRouter);
 api.use("/audit-log", auditLogRouter);
+api.use("/ops/lookback", lookbackRouter);
 api.use("/ops", opsRouter);
+api.use("/scrape-history", scrapeHistoryRouter);
 api.use("/shipment-details", shipmentDetailsRouter);
 app.use("/api", api);
 

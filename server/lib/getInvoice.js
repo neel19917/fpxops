@@ -45,13 +45,70 @@ export function missingShipmentIds(ids, rows) {
   return ids.filter((id) => !have.has(id));
 }
 
-// "audit=<uuid>;from=<date_from>;to=<date_to>;pause_first=<1|0>"
-export function buildGetInvoiceNote({ auditId, from, to, pauseFirst = true }) {
-  return `audit=${auditId};from=${from};to=${to};pause_first=${pauseFirst ? 1 : 0}`;
+// The View Shipment buttons a person can choose to have pressed. The key is
+// what travels in the request and the note; the label is what people read.
+// Every key is a family of labels the extension's VB_SHOW already allows
+// (extension/content.js, VB_KEYS — same keys, same order). Nothing that
+// sends or changes anything is here, and choosing a key never overrides the
+// extension's own "never click" rules.
+export const GET_INVOICE_BUTTONS = [
+  { key: "labels_bol", label: "Print Shipping Labels / BOL" },
+  { key: "print_docs", label: "Print Documents" },
+  { key: "rate_conf", label: "Print Rate Confirmation" },
+  { key: "print_other", label: "Other Print buttons" },
+  { key: "view", label: "View buttons" },
+  { key: "download", label: "Download buttons" },
+  { key: "show", label: "See / Show buttons (See Inner Items)" },
+  { key: "change_log", label: "Change Log" },
+  { key: "details", label: "Details buttons (Quote Details)" },
+  { key: "documents", label: "Documents" },
+  { key: "notes", label: "Notes" },
+  { key: "history", label: "History" },
+  { key: "tracking", label: "Tracking" },
+  { key: "pod", label: "POD" },
+  { key: "invoice", label: "Invoice" },
+  { key: "attachments", label: "Attachments" },
+];
+export const GET_INVOICE_BUTTON_KEYS = GET_INVOICE_BUTTONS.map((b) => b.key);
+
+// The choice as the dashboard sends it. Returns { buttons } or { error }.
+//   nothing sent, or every key  → { buttons: null }   press them all (as before)
+//   []                          → { buttons: [] }     press none: the invoice only
+//   some keys                   → { buttons: [...] }  in the list's own order
+export function normalizeButtons(input) {
+  if (input === undefined || input === null) return { buttons: null };
+  if (!Array.isArray(input)) return { error: "buttons must be a list" };
+  const asked = new Set();
+  for (const v of input) {
+    if (typeof v !== "string" || !GET_INVOICE_BUTTON_KEYS.includes(v.trim())) {
+      return { error: `Unknown View Shipment button: ${String(v).slice(0, 40)}` };
+    }
+    asked.add(v.trim());
+  }
+  const buttons = GET_INVOICE_BUTTON_KEYS.filter((k) => asked.has(k));
+  return { buttons: buttons.length === GET_INVOICE_BUTTON_KEYS.length ? null : buttons };
+}
+
+// The choice in words, for a log line or an audit entry.
+export function describeButtons(buttons) {
+  if (!Array.isArray(buttons)) return "all View Shipment buttons";
+  if (!buttons.length) return "no View Shipment buttons (invoice only)";
+  return `View Shipment buttons: ${buttons.map((k) => GET_INVOICE_BUTTONS.find((b) => b.key === k)?.label || k).join(", ")}`;
+}
+
+// "audit=<uuid>;from=<date_from>;to=<date_to>;pause_first=<1|0>" and, only
+// when a person chose which View Shipment buttons to press,
+// ";buttons=<key>,<key>" or ";buttons=none". No buttons part means all of
+// them, which is what every note written before the choice existed says.
+export function buildGetInvoiceNote({ auditId, from, to, pauseFirst = true, buttons = null }) {
+  const base = `audit=${auditId};from=${from};to=${to};pause_first=${pauseFirst ? 1 : 0}`;
+  if (!Array.isArray(buttons)) return base;
+  return `${base};buttons=${buttons.length ? buttons.join(",") : "none"}`;
 }
 
 // Reads the note back. Returns null when it isn't a get-invoice note (the
 // complete route replaces note with the result text, so that is expected).
+// buttons is null for "all", else the chosen keys ([] for none).
 export function parseGetInvoiceNote(note) {
   if (typeof note !== "string") return null;
   const parts = {};
@@ -61,11 +118,13 @@ export function parseGetInvoiceNote(note) {
     parts[piece.slice(0, eq).trim()] = piece.slice(eq + 1).trim();
   }
   if (!isUuid(parts.audit)) return null;
+  const asked = parts.buttons === undefined ? null : parts.buttons.split(",").map((k) => k.trim());
   return {
     audit_id: parts.audit,
     from: parts.from || null,
     to: parts.to || null,
     pause_first: parts.pause_first !== "0", // on unless switched off
+    buttons: asked ? GET_INVOICE_BUTTON_KEYS.filter((k) => asked.includes(k)) : null,
   };
 }
 

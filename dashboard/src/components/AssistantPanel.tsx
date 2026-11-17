@@ -221,11 +221,21 @@ export function AssistantPanel() {
     }
   }
 
-  if (!hostedBrowser.enabled || !open) return null;
+  if (!hostedBrowser.enabled) return null;
+  // Always on screen, above full-screen views that cover the header's search box.
+  if (!open) {
+    return (
+      <button type="button" onClick={() => setOpen(true)} title="Ask FPX (Ctrl/⌘ K)" aria-label="Ask FPX"
+        className="fixed bottom-4 right-4 z-[70] inline-flex items-center gap-2 rounded-full bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium pl-3 pr-4 py-2.5 shadow-lg ring-1 ring-violet-700/30">
+        <Search className="h-4 w-4" />
+        Ask FPX
+      </button>
+    );
+  }
 
   const empty = state.turns.length === 0 && !busy;
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-start justify-center p-4 pt-[10vh]" onClick={() => setOpen(false)}>
+    <div className="fixed inset-0 z-[80] bg-slate-900/40 flex items-start justify-center p-4 pt-[10vh]" onClick={() => setOpen(false)}>
       <div className="w-full max-w-2xl max-h-[78vh] rounded-2xl bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Search FPX">
         {/* The search box */}
         <form onSubmit={(e) => { e.preventDefault(); setShowHistory(false); send(input); }} className="flex items-center gap-3 px-4 py-3 border-b border-slate-100">

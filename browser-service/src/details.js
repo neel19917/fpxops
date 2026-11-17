@@ -257,7 +257,7 @@ async function run(request) {
       job.shipment = id;
       try {
         const record = await readOne(page, id, quotes.get(id), log);
-        const out = await api("/api/shipment-details", { method: "POST", signal: AbortSignal.timeout(30_000), body: JSON.stringify({ by: who, records: [record] }) });
+        const out = await api("/api/shipment-details", { method: "POST", signal: AbortSignal.timeout(30_000), body: JSON.stringify({ by: who, request_id: request.id, records: [record] }) });
         if (out?.stored) { job.counts.stored++; inARow = 0; log(`Shipment ${id} · stored · ${out.summary?.[0] || `${record.text.length} characters`}`, "done"); }
         else { job.counts.failed++; inARow++; log(`Shipment ${id} · read, but not stored (${String(out?.error || "the API refused it").slice(0, 160)})`, "error"); }
       } catch (e) {

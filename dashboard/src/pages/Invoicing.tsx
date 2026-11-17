@@ -588,6 +588,9 @@ export function InvoicingPage() {
               : loading ? "Loading the latest list from FreightPOP…"
               : "See which shipments are approved, and send their invoices in bulk."}
           </p>
+          <div className="mt-2">
+            <Link to="/invoicing/pushed" className="text-sm font-medium text-sky-700 hover:underline">Pushed to ERP: see what has already been pushed and match it with NetSuite →</Link>
+          </div>
           {run ? (
             <div className="mt-2 flex items-center gap-x-4 gap-y-1 flex-wrap">
               {files?.not_exported === true ? (

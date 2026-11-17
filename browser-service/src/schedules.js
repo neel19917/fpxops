@@ -3,13 +3,22 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config.js";
 import { enqueueScheduled } from "./worker.js";
-import { lastRunFor } from "./runs.js";
+import { lastRunFor, listRuns } from "./runs.js";
 
-// Scheduled Refresh All runs. Each schedule belongs to one person and runs in
-// THEIR hosted browser with THEIR FreightPOP login.
+// Scheduled runs. Each schedule belongs to one person and runs in THEIR
+// hosted browser with THEIR FreightPOP login.
 //
 //   { id, owner, name, enabled, days: [0..6] (0=Sun), times: ["07:00", ...],
-//     tz: "America/Los_Angeles", modes: ["LTL","Truckload"] | null (= all), createdAt, updatedAt }
+//     tz: "America/Los_Angeles", modes: ["LTL","Truckload"] | null (= all), createdAt, updatedAt,
+//     job: "tracking" | "erp_lookback" | "shipment_details" (missing = "tracking"),
+//     months: 1..12 | null, shipmentType: "non-parcel" | "parcel" | "both" | null (erp_lookback only),
+//     lastFired: { at, requestId, queued, coalesced, reason } | null (non-tracking jobs only) }
+//
+// job "tracking" is Refresh All, queued straight into this service's scrape
+// lane. The other jobs are queued through the API (POST /api/ops/lookback,
+// run_as the owner); the hosted browser claims that row later and records the
+// run under the API's request id, which lastFired remembers. For them modes is
+// null; months/shipmentType are null unless the job is erp_lookback.
 //
 // A 20s tick compares each schedule's local wall-clock time (in its own time
 // zone) to its times; a firing is remembered per date+time so it runs once.
@@ -28,6 +37,9 @@ function save() {
 }
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const JOBS = ["tracking", "erp_lookback", "shipment_details"];
+const SHIPMENT_TYPES = ["non-parcel", "parcel", "both"];
+const jobOf = (s) => s?.job || "tracking";
 
 function validTz(tz) {
   try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return true; } catch { return false; }
@@ -36,6 +48,10 @@ function validTz(tz) {
 // Validate + normalise user input. Throws with a readable message.
 function clean(input, existing) {
   const out = { ...(existing || {}) };
+  const job = input.job !== undefined ? String(input.job ?? "") : jobOf(existing);
+  if (!JOBS.includes(job)) throw new Error(`Unknown job "${job}" (use ${JOBS.join(", ")})`);
+  // Only written when asked for: a saved schedule with no job stays as it is.
+  if (input.job !== undefined) out.job = job;
   if (input.name !== undefined) out.name = String(input.name || "").trim().slice(0, 80);
   if (input.enabled !== undefined) out.enabled = !!input.enabled;
   if (input.days !== undefined) {
@@ -51,7 +67,8 @@ function clean(input, existing) {
     if (times.length > 12) throw new Error("At most 12 times per schedule");
     out.times = times.sort();
   }
-  if (input.modes !== undefined) {
+  if (job !== "tracking") out.modes = null;
+  else if (input.modes !== undefined) {
     // null / all three = every mode.
     const KNOWN = ["LTL", "Truckload", "Parcel"];
     const modes = input.modes == null ? [] : [...new Set((Array.isArray(input.modes) ? input.modes : []).map(String).filter((m) => KNOWN.includes(m)))];
@@ -62,6 +79,20 @@ function clean(input, existing) {
     if (!validTz(input.tz)) throw new Error(`Unknown time zone "${input.tz}"`);
     out.tz = input.tz;
   }
+  if (job === "erp_lookback") {
+    const raw = input.months ?? out.months ?? 1;
+    const months = typeof raw === "number" || (typeof raw === "string" && raw.trim()) ? Number(raw) : NaN;
+    if (!Number.isInteger(months) || months < 1 || months > 12) throw new Error("Months must be a whole number from 1 to 12");
+    const shipmentType = String(input.shipmentType ?? out.shipmentType ?? "non-parcel");
+    if (!SHIPMENT_TYPES.includes(shipmentType)) throw new Error(`Unknown shipment type "${shipmentType}" (use ${SHIPMENT_TYPES.join(", ")})`);
+    out.months = months;
+    out.shipmentType = shipmentType;
+  } else if (out.job) {
+    out.months = null;
+    out.shipmentType = null;
+  }
+  // lastFired belongs to the job that fired it.
+  if (existing && job !== jobOf(existing)) out.lastFired = null;
   return out;
 }
 
@@ -98,10 +129,26 @@ function cachedNext(s) {
   return value;
 }
 
+// A non-tracking job's run is recorded under the API's request id (no
+// scheduleId), so it is found by the id remembered at firing. runs.js keeps
+// the newest 200; an older run is no longer shown.
+function lastRunOf(s) {
+  if (jobOf(s) === "tracking") return lastRunFor(s.id);
+  const f = s.lastFired;
+  if (!f) return null;
+  const run = f.requestId != null ? listRuns(200).find((r) => String(r.id) === String(f.requestId)) : null;
+  if (run) return run;
+  // Never reached the queue: show why.
+  if (!f.queued) return { id: null, ok: false, finishedAt: f.at, durationMs: 0, note: f.reason || "not queued", counts: null };
+  return null;
+}
+
 function view(s) {
-  const last = lastRunFor(s.id);
+  const last = lastRunOf(s);
   return {
     ...s,
+    job: jobOf(s),
+    lastFired: s.lastFired || null,
     nextRunAt: cachedNext(s),
     lastRun: last && { id: last.id, ok: last.ok, finishedAt: last.finishedAt, durationMs: last.durationMs, note: last.note, counts: last.counts },
   };
@@ -121,14 +168,14 @@ function find(id, who) {
 
 export function createSchedule(who, input) {
   if (schedules.filter((s) => s.owner === who.email).length >= 10) throw new Error("At most 10 schedules per person");
-  const s = clean({ enabled: true, name: "", tz: "America/Los_Angeles", ...input }, null);
+  const s = clean({ enabled: true, name: "", tz: "America/Los_Angeles", job: "tracking", ...input }, null);
   if (!s.days) throw new Error("Pick at least one day");
   if (!s.times) throw new Error("Add at least one time");
   const now = new Date().toISOString();
   const row = { id: crypto.randomUUID(), owner: who.email, ...s, createdAt: now, updatedAt: now };
   schedules.push(row);
   save();
-  console.log(`[schedules] ${who.email} created ${row.id}: ${row.days.join(",")} @ ${row.times.join(",")} ${row.tz}`);
+  console.log(`[schedules] ${who.email} created ${row.id} (${row.job}): ${row.days.join(",")} @ ${row.times.join(",")} ${row.tz}`);
   return view(row);
 }
 
@@ -146,9 +193,46 @@ export function deleteSchedule(who, id) {
   console.log(`[schedules] ${who.email} deleted ${id}`);
 }
 
+// Queue a non-tracking job through the API, as the schedule's owner. Never
+// throws. → { queued, reason?, coalesced?, requestId? } (coalesced = the same
+// job was already waiting or running, which counts as queued).
+async function fireLookback(s) {
+  let out;
+  try {
+    if (!config.apiKey) out = { queued: false, reason: "FPX_API_KEY is not set on the hosted browser, so it cannot queue this job" };
+    else {
+      const body = jobOf(s) === "erp_lookback"
+        ? { jobs: ["erp"], months: s.months ?? 1, shipment_type: s.shipmentType || "non-parcel", run_as: s.owner }
+        : { jobs: ["shipment_details"], run_as: s.owner };
+      const res = await fetch(`${config.apiUrl}/api/ops/lookback`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": config.apiKey },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const text = await res.text().catch(() => "");
+      let data = null;
+      try { data = JSON.parse(text); } catch {}
+      const q = Array.isArray(data?.queued) ? data.queued[0] : null;
+      if (!res.ok) out = { queued: false, reason: String(data?.error || `API answered ${res.status} ${text}`).trim().slice(0, 200) };
+      else if (q) out = { queued: true, requestId: q.request_id ?? null, ...(q.coalesced ? { coalesced: true } : {}) };
+      else out = { queued: false, reason: String((Array.isArray(data?.skipped) && data.skipped[0]?.reason) || "the API queued nothing").slice(0, 200) };
+    }
+  } catch (e) {
+    out = { queued: false, reason: String(e?.name === "TimeoutError" ? "the API did not answer in 30s" : e?.message || e).slice(0, 200) };
+  }
+  // Not a user edit: updatedAt stays (the nextRunAt cache keys on it).
+  if (schedules.includes(s)) {
+    s.lastFired = { at: new Date().toISOString(), requestId: out.requestId ?? null, queued: out.queued, coalesced: !!out.coalesced, reason: out.reason || null };
+    save();
+  }
+  return out;
+}
+
+// Tracking answers at once; the other jobs answer with a promise.
 export function runScheduleNow(who, id) {
   const s = find(id, who);
-  return enqueueScheduled(s);
+  return jobOf(s) === "tracking" ? enqueueScheduled(s) : fireLookback(s);
 }
 
 function tick() {
@@ -161,6 +245,12 @@ function tick() {
     const key = `${w.date} ${w.time}`;
     if (fired.get(s.id) === key) continue;
     fired.set(s.id, key);
+    if (jobOf(s) !== "tracking") {
+      fireLookback(s)
+        .then((r) => console.log(`[schedules] ${s.id} (${s.owner}) ${jobOf(s)} fired for ${key} ${s.tz}: ${r.queued ? (r.coalesced ? "already queued or running" : "queued") : r.reason}`))
+        .catch((e) => console.warn(`[schedules] ${s.id} (${s.owner}) fired for ${key} ${s.tz}: ${e.message}`));
+      continue;
+    }
     const r = enqueueScheduled(s);
     console.log(`[schedules] ${s.id} (${s.owner}) fired for ${key} ${s.tz}: ${r.queued ? "queued" : r.reason}`);
   }

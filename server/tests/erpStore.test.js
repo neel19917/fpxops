@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   trackingKey, dateOnly, transactionRow, transactionRows, dedupeTransactions, planTransactionUpsert,
   approvalRow, approvalRows, dedupeApprovals, planApprovalUpsert, APPROVAL_COLUMNS,
-  upsertTransactions, upsertApprovals,
+  upsertTransactions, upsertApprovals, TRANSACTION_READ_COLUMNS, APPROVAL_READ_COLUMNS,
 } from "../lib/erpStore.js";
 import { normalizeShipmentId, matchApprovals } from "../lib/approvalMatch.js";
 
@@ -498,8 +498,8 @@ describe("planApprovalUpsert", () => {
 });
 
 // A stand-in for the supabase client that records what it is asked.
-function fakeDb({ existing = [], failRead = false, failUpsert = () => false, throwOn = null } = {}) {
-  const calls = { reads: [], upserts: [] };
+function fakeDb({ existing = [], failRead = false, failUpsert = () => false, throwOn = null, failHistory = false } = {}) {
+  const calls = { reads: [], upserts: [], history: [] };
   return {
     calls,
     from(table) {
@@ -513,6 +513,11 @@ function fakeDb({ existing = [], failRead = false, failUpsert = () => false, thr
               return { data: existing.filter((e) => keys.includes(e[key])), error: null };
             },
           };
+        },
+        async insert(rows) {
+          if (failHistory) throw new Error("history down");
+          calls.history.push({ table, rows });
+          return { error: null };
         },
         async upsert(rows, opts) {
           calls.upserts.push({ table, rows, opts });
@@ -531,7 +536,7 @@ describe("upsertTransactions", () => {
     const out = await upsertTransactions(db, [t("a"), t("b", "1"), t("c")]);
     assert.deepEqual(out, { upserted: 3, failed: 0 });
     assert.deepEqual(db.calls.reads.map((r) => [r.table, r.columns, r.key, r.keys]), [
-      ["fpx_erp_transactions", "shipment_id, exported_to_erp", "shipment_id", ["a", "b", "c"]],
+      ["fpx_erp_transactions", TRANSACTION_READ_COLUMNS, "shipment_id", ["a", "b", "c"]],
     ]);
     assert.equal(db.calls.upserts.length, 2);
     assert.deepEqual(db.calls.upserts.map((u) => u.rows.map((r) => r.shipment_id)), [["a", "c"], ["b"]]);
@@ -560,14 +565,59 @@ describe("upsertTransactions", () => {
   });
 });
 
+describe("upsertTransactions: what changed between reads", () => {
+  const t = (id, over = {}) => transactionRow(report({ ShipmentID: id, ...over }), { seenAt: SEEN });
+  const storedRow = (id, over = {}) => ({ ...t(id), last_seen_at: "2026-11-13T12:00:00+00:00", ...over });
+
+  it("records first sightings and changed fields, and nothing for an unchanged re-read", async () => {
+    const db = fakeDb({ existing: [storedRow("same"), storedRow("moved", { status: "In Transit", charge: 1000 })] });
+    const out = await upsertTransactions(db, [t("new"), t("same"), t("moved")], { request_id: AUDIT, run_by: "hosted browser" });
+    assert.deepEqual(out, { upserted: 3, failed: 0 });
+    assert.equal(db.calls.history.length, 1);
+    assert.equal(db.calls.history[0].table, "fpx_scrape_history");
+    const rows = db.calls.history[0].rows;
+    assert.deepEqual(rows.map((r) => [r.entity_key, r.event]), [["new", "first_seen"], ["moved", "changed"]]);
+    assert.ok(rows.every((r) => r.source === "erp_transactions" && r.request_id === AUDIT && r.run_by === "hosted browser" && r.scraped_at === SEEN));
+    assert.deepEqual(rows[1].changes, { status: { from: "In Transit", to: "Delivered" }, charge: { from: 1000, to: 1234.5 } });
+    assert.equal(rows[1].previous_scraped_at, "2026-11-13T12:00:00.000Z");
+    assert.equal(rows[0].previous_scraped_at, null);
+    assert.equal(rows[0].changes.status.from, null);
+  });
+
+  it("writes no history when nothing changed, or when the rows were not stored", async () => {
+    const same = fakeDb({ existing: [storedRow("a")] });
+    await upsertTransactions(same, [t("a")]);
+    assert.equal(same.calls.history.length, 0);
+    const failed = fakeDb({ failUpsert: () => true });
+    await upsertTransactions(failed, [t("a")]);
+    assert.equal(failed.calls.history.length, 0);
+  });
+
+  it("a history failure does not change the result", async () => {
+    const db = fakeDb({ failHistory: true });
+    assert.deepEqual(await upsertTransactions(db, [t("a")]), { upserted: 1, failed: 0 });
+  });
+});
+
 describe("upsertApprovals", () => {
+  it("records a changed approval with the row as it was stored", async () => {
+    const ra = approvalRow(recent(), RECENT_COLS, { seenAt: SEEN });
+    const db = fakeDb({ existing: [{ ...Object.fromEntries(APPROVAL_COLUMNS.map((c) => [c, ra[c]])), invoice_amount: 1, last_seen_at: "2026-11-13T12:00:00+00:00" }] });
+    await upsertApprovals(db, [ra], { run_by: "x" });
+    const rows = db.calls.history.flatMap((h) => h.rows);
+    assert.deepEqual(rows.map((r) => [r.source, r.entity_key, r.event, Object.keys(r.changes)]), [["audit_approvals", ra.approval_key, "changed", ["invoice_amount"]]]);
+    assert.equal(rows[0].changes.invoice_amount.from, 1);
+    assert.equal(rows[0].request_id, null);
+  });
+
   it("splits History rows that meet a stored Recently Approved row", async () => {
     const ra = approvalRow(recent(), RECENT_COLS, { seenAt: SEEN });
     const db = fakeDb({ existing: [Object.fromEntries(APPROVAL_COLUMNS.map((c) => [c, ra[c]]))] });
     const rows = approvalRows([history(), history({ "Tracking Number": "9" })], HISTORY_COLS, { source: "history", seenAt: SEEN }).rows;
     const out = await upsertApprovals(db, rows);
     assert.deepEqual(out, { upserted: 2, failed: 0 });
-    assert.equal(db.calls.reads[0].columns, APPROVAL_COLUMNS.join(", "));
+    assert.equal(db.calls.reads[0].columns, APPROVAL_READ_COLUMNS);
+    assert.ok(APPROVAL_COLUMNS.every((c) => APPROVAL_READ_COLUMNS.split(", ").includes(c)));
     assert.deepEqual(db.calls.upserts.map((u) => u.rows.map((r) => [r.approval_key, r.source, "data" in r])), [
       [["9|INV-100A", "history", true]],
       [["47976058|INV-100A", "recently_approved", false]],

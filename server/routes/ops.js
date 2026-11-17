@@ -4,6 +4,7 @@ import { logAudit } from "../lib/audit.js";
 import {
   GET_INVOICE_SCOPE, isUuid, normalizeShipmentIds, missingShipmentIds,
   buildGetInvoiceNote, parseGetInvoiceNote, markRequested, resetRequested, updateRowsRaw,
+  normalizeButtons, describeButtons,
 } from "../lib/getInvoice.js";
 import { APPROVAL_CHECK_SCOPE } from "../lib/approvalMatch.js";
 
@@ -28,7 +29,9 @@ export const opsRouter = Router();
 // pause_after_first? } asks the hosted browser to click FreightPOP's GET
 // INVOICE button for shipments a person ticked in an ERP pull. The ids travel
 // in tracking_numbers and the rest in note as
-// "audit=<uuid>;from=<date_from>;to=<date_to>;pause_first=<1|0>". Only one
+// "audit=<uuid>;from=<date_from>;to=<date_to>;pause_first=<1|0>", plus
+// ";buttons=<key>,<key>|none" when the body's optional buttons: string[] names
+// the View Shipment buttons to press (left out = all of them). Only one
 // such run may be queued or running at a time (409 otherwise).
 //
 // scope "approval_check": { audit_id } asks the hosted browser to take the
@@ -73,6 +76,10 @@ async function requestGetInvoice(req, res) {
   if (picked.error) return res.status(400).json({ error: picked.error });
   const ids = picked.ids;
   const pauseFirst = req.body?.pause_after_first !== false; // on unless switched off
+  // Which View Shipment buttons to press: nothing sent means all of them.
+  const chosen = normalizeButtons(req.body?.buttons);
+  if (chosen.error) return res.status(400).json({ error: chosen.error });
+  const buttons = chosen.buttons;
 
   if (!isUuid(auditId)) return res.status(404).json({ error: "Invoice audit not found" });
   const { data: audit, error: aErr } = await supabase
@@ -109,7 +116,7 @@ async function requestGetInvoice(req, res) {
     .insert({
       scope: GET_INVOICE_SCOPE,
       tracking_numbers: ids,
-      note: buildGetInvoiceNote({ auditId: audit.id, from: audit.date_from, to: audit.date_to, pauseFirst }),
+      note: buildGetInvoiceNote({ auditId: audit.id, from: audit.date_from, to: audit.date_to, pauseFirst, buttons }),
       requested_by: requestedBy,
     })
     .select().single();
@@ -118,8 +125,8 @@ async function requestGetInvoice(req, res) {
     action: "rescrape_request",
     entity_type: "scrape_request",
     entity_id: data.id,
-    summary: `Requested Get Invoice for ${ids.length} shipment(s)`,
-    metadata: { scope: GET_INVOICE_SCOPE, audit_id: audit.id, count: ids.length, shipment_ids: ids, pause_after_first: pauseFirst },
+    summary: `Requested Get Invoice for ${ids.length} shipment(s) · ${describeButtons(buttons)}`,
+    metadata: { scope: GET_INVOICE_SCOPE, audit_id: audit.id, count: ids.length, shipment_ids: ids, pause_after_first: pauseFirst, buttons: buttons ?? "all" },
   });
 
   // Show the chosen rows as requested. The request is already queued, so a

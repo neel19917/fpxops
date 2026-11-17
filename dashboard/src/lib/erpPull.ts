@@ -172,10 +172,89 @@ export function requestErpPull(months: number, shipment_type: ErpShipmentType = 
   return api.ops.requestRescrape({ scope: ERP_SCOPE, months, shipment_type } as never);
 }
 
-/** Queue a Get Invoice run for the picked shipments of one ERP audit. */
-export function requestGetInvoices(auditId: string, shipmentIds: string[], pauseAfterFirst: boolean): Promise<{ request: ScrapeRequest }> {
+// ── Which View Shipment buttons a Get Invoice run presses ──
+// After each invoice the run opens the shipment's View Shipment and presses
+// its view-only buttons. A person can limit that to some of them. Same keys
+// and labels as GET_INVOICE_BUTTONS in server/lib/getInvoice.js, which checks
+// what is sent (a server test compares the two lists).
+export const GET_INVOICE_BUTTONS = [
+  { key: "labels_bol", label: "Print Shipping Labels / BOL" },
+  { key: "print_docs", label: "Print Documents" },
+  { key: "rate_conf", label: "Print Rate Confirmation" },
+  { key: "print_other", label: "Other Print buttons" },
+  { key: "view", label: "View buttons" },
+  { key: "download", label: "Download buttons" },
+  { key: "show", label: "See / Show buttons (See Inner Items)" },
+  { key: "change_log", label: "Change Log" },
+  { key: "details", label: "Details buttons (Quote Details)" },
+  { key: "documents", label: "Documents" },
+  { key: "notes", label: "Notes" },
+  { key: "history", label: "History" },
+  { key: "tracking", label: "Tracking" },
+  { key: "pod", label: "POD" },
+  { key: "invoice", label: "Invoice" },
+  { key: "attachments", label: "Attachments" },
+] as const;
+export type GetInvoiceButtonKey = (typeof GET_INVOICE_BUTTONS)[number]["key"];
+/** null = every button (the default); [] = none, the invoice only. */
+export type GetInvoiceButtonChoice = GetInvoiceButtonKey[] | null;
+
+const GET_INVOICE_BUTTON_KEYS: GetInvoiceButtonKey[] = GET_INVOICE_BUTTONS.map((b) => b.key);
+const GET_INVOICE_DOCUMENT_KEYS: GetInvoiceButtonKey[] = ["labels_bol", "print_docs", "rate_conf", "documents"];
+export const GET_INVOICE_BUTTON_PRESETS: { key: string; label: string; hint: string; buttons: GetInvoiceButtonChoice }[] = [
+  { key: "all", label: "Everything", hint: "Every view-only button", buttons: null },
+  { key: "invoice", label: "Invoice only", hint: "Get the invoice and a picture of View Shipment; press none of its buttons", buttons: [] },
+  { key: "documents", label: "Documents", hint: "Labels / BOL, Print Documents, Rate Confirmation, Documents", buttons: GET_INVOICE_DOCUMENT_KEYS },
+];
+
+/** Known keys only, in the list's order; every key (or not a list) becomes null. */
+export function cleanGetInvoiceButtons(v: unknown): GetInvoiceButtonChoice {
+  if (!Array.isArray(v)) return null;
+  const keys = GET_INVOICE_BUTTON_KEYS.filter((k) => v.includes(k));
+  return keys.length === GET_INVOICE_BUTTON_KEYS.length ? null : keys;
+}
+
+/** The preset a choice equals, if any. */
+export function getInvoiceButtonPreset(choice: GetInvoiceButtonChoice): string | null {
+  const same = (a: GetInvoiceButtonChoice, b: GetInvoiceButtonChoice) => (a === null || b === null ? a === b : a.length === b.length && a.every((k) => b.includes(k)));
+  return GET_INVOICE_BUTTON_PRESETS.find((p) => same(p.buttons, choice))?.key ?? null;
+}
+
+/** "Everything", "Invoice only", "Documents" or "3 of 16 buttons". */
+export function getInvoiceButtonsLabel(choice: GetInvoiceButtonChoice): string {
+  const preset = GET_INVOICE_BUTTON_PRESETS.find((p) => p.key === getInvoiceButtonPreset(choice));
+  if (preset) return preset.label;
+  return `${choice?.length ?? 0} of ${GET_INVOICE_BUTTONS.length} buttons`;
+}
+
+const GET_INVOICE_BUTTONS_STORE = "fpx.getInvoice.buttons";
+/** The choice this browser made last time; everything when there is none. */
+export function loadGetInvoiceButtons(): GetInvoiceButtonChoice {
+  try {
+    const raw = localStorage.getItem(GET_INVOICE_BUTTONS_STORE);
+    return raw ? cleanGetInvoiceButtons(JSON.parse(raw)) : null;
+  } catch { return null; }
+}
+export function saveGetInvoiceButtons(choice: GetInvoiceButtonChoice): void {
+  try {
+    if (choice === null) localStorage.removeItem(GET_INVOICE_BUTTONS_STORE);
+    else localStorage.setItem(GET_INVOICE_BUTTONS_STORE, JSON.stringify(choice));
+  } catch { /* the choice still holds for this page */ }
+}
+
+/**
+ * Queue a Get Invoice run for the picked shipments of one ERP audit.
+ * buttons: which View Shipment buttons to press. Left out, it is the choice
+ * last saved in this browser (everything, when none was). Everything sends no
+ * buttons at all, so the request is the same as before the choice existed.
+ */
+export function requestGetInvoices(
+  auditId: string, shipmentIds: string[], pauseAfterFirst: boolean, buttons: GetInvoiceButtonChoice = loadGetInvoiceButtons(),
+): Promise<{ request: ScrapeRequest }> {
+  const chosen = buttons === null ? null : cleanGetInvoiceButtons(buttons);
   return api.ops.requestRescrape({
     scope: GET_INVOICE_SCOPE, audit_id: auditId, shipment_ids: shipmentIds, pause_after_first: pauseAfterFirst,
+    ...(chosen ? { buttons: chosen } : {}),
   } as never);
 }
 

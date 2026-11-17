@@ -577,6 +577,8 @@ async function claimAndRun(lane) {
     months: request.scope === "erp_audit" ? monthsFromNote(request.note) : null,
     shipmentType: request.scope === "erp_audit" ? typeFromNote(request.note) : null,
     erpOpts: request.scope === "erp_audit" ? erpOptsFromNote(request.note) : null,
+    // Queued by a schedule or an outside scheduler, not by a person at the page.
+    viaLookback: /(?:^|;)\s*via=lookback\b/.test(String(request.note || "")),
     approvalHistory: request.scope === "approval_check" ? historyFromNote(request.note) : null,
     getInvoice: request.scope === "get_invoice" ? getInvoiceFromRequest(request) : null,
     approvalAuditId: request.scope === "approval_check" ? auditFromNote(request.note) : null,
@@ -599,8 +601,11 @@ async function claimAndRun(lane) {
 }
 
 // A get-invoices request: the shipment ids are in tracking_numbers and the
-// rest in its note, "audit=<uuid>;from=YYYY-MM-DD;to=YYYY-MM-DD;pause_first=1|0".
-// Pause-first is on unless the note switches it off.
+// rest in its note, "audit=<uuid>;from=YYYY-MM-DD;to=YYYY-MM-DD;pause_first=1|0"
+// and, when a person chose which View Shipment buttons to press,
+// ";buttons=<key>,<key>" or ";buttons=none". Pause-first is on unless the note
+// switches it off. buttons is null (all of them) when the note has no buttons
+// part, else the chosen keys ([] for none); the extension knows the keys.
 export function getInvoiceFromRequest(request) {
   const parts = {};
   for (const piece of String(request?.note || "").split(";")) {
@@ -614,8 +619,10 @@ export function getInvoiceFromRequest(request) {
     from: date(parts.from),
     to: date(parts.to),
     pauseFirst: parts.pause_first !== "0",
+    buttons: parts.buttons === undefined ? null
+      : [...new Set(parts.buttons.toLowerCase().split(",").map((k) => k.trim()).filter((k) => /^[a-z_]+$/.test(k) && k !== "none"))],
     shipmentIds: [...new Set(list.map((v) => String(v ?? "").trim()).filter(Boolean))],
-    note: String(request?.note || "").slice(0, 200),
+    note: String(request?.note || "").slice(0, 400),
   };
 }
 
@@ -697,7 +704,8 @@ async function runJob(lane, job) {
     cur.counts = { total: gi.shipmentIds.length, done: 0, ok: 0, failed: 0 };
     cur.auditId = gi.auditId || null;
     logLine(lane, `Claimed get invoices · ${gi.shipmentIds.length} shipment(s) · report ${gi.from || "?"} to ${gi.to || "?"} · audit ${String(gi.auditId || "?").slice(0, 8)}` +
-      `${gi.pauseFirst ? " · pauses after the first" : ""} — running as ${email || "unknown user"}`);
+      `${gi.pauseFirst ? " · pauses after the first" : ""}` +
+      ` · View Shipment buttons: ${!Array.isArray(gi.buttons) ? "all" : gi.buttons.length ? gi.buttons.join(", ") : "none (invoice only)"} — running as ${email || "unknown user"}`);
   } else {
     if (job.modes) logLine(lane, `Limited to ${job.modes.join(" + ")} shipments`);
     logLine(lane, job.source === "schedule"
@@ -743,7 +751,7 @@ async function runJob(lane, job) {
     ok = true; note = result;
     console.log(`[worker] ${job.id} done: ${result}`);
     // A pull run by hand: the daily mirror runs as that person from now on.
-    if (kind === "erp_audit" && job.source === "manual" && !job.erpOpts?.backfill && email.includes("@") && mirror.owner !== email) {
+    if (kind === "erp_audit" && job.source === "manual" && !job.viaLookback && !job.erpOpts?.backfill && email.includes("@") && mirror.owner !== email) {
       mirror.owner = email; saveMirror();
       console.log(`[mirror] will run as ${email}`);
     }
@@ -1456,9 +1464,14 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
     note = await runPageJob(lane, browser, url, who, {
       noun: "get-invoices job",
       limitMs: GET_INVOICE_LIMIT_MS,
-      has: "typeof erpGetInvoices === 'function' && typeof fpxErpNote === 'function' && typeof fpxErpPoll === 'function'",
-      missing: "The extension in the hosted browser cannot get invoices (needs version 4.11 or later) — redeploy the browser service",
-      start: `erpGetInvoices(${JSON.stringify(JSON.stringify({ from: gi.from, to: gi.to, shipmentIds: gi.shipmentIds, pauseFirst: !!gi.pauseFirst, runBy: who }))}); 'started'`,
+      // A chosen set of buttons needs an extension that knows the choice: an
+      // older one would press them all, so the job does not start on it.
+      has: "typeof erpGetInvoices === 'function' && typeof fpxErpNote === 'function' && typeof fpxErpPoll === 'function'" +
+        (Array.isArray(gi.buttons) ? " && typeof vbChoice === 'function'" : ""),
+      missing: Array.isArray(gi.buttons)
+        ? "The extension in the hosted browser cannot limit which View Shipment buttons it presses (needs version 4.34 or later) — redeploy the browser service"
+        : "The extension in the hosted browser cannot get invoices (needs version 4.11 or later) — redeploy the browser service",
+      start: `erpGetInvoices(${JSON.stringify(JSON.stringify({ from: gi.from, to: gi.to, shipmentIds: gi.shipmentIds, pauseFirst: !!gi.pauseFirst, runBy: who, ...(Array.isArray(gi.buttons) ? { buttons: gi.buttons } : {}) }))}); 'started'`,
       blocked: () => promptOpen,
       setup: async ({ page, cdp, ext }) => {
         let ended = false;

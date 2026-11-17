@@ -3,6 +3,13 @@ import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { parseShipmentDetail, describeDetail } from "../lib/shipmentDetail.js";
 import { SHIPMENT_DETAILS_SCOPE } from "./ops.js";
+import { historyItems, recordScrapeHistory, readBefore } from "../lib/scrapeHistory.js";
+
+// The columns whose changes between two reads are kept in fpx_scrape_history.
+const HISTORY_FIELDS = [
+  "carrier", "tracking_number", "pickup_date", "delivery_date", "sale", "cost", "gross_profit", "financials_source",
+  "quote_id", "quote_number", "shipment_quote", "quote_freight", "quote_fuel", "quote_accessorial_total", "quote_total", "quote_accessorials",
+];
 
 // Shipment details read from FreightPOP's own Shipment Details page by the
 // hosted browser's read-only details job (browser-service/src/details.js),
@@ -32,7 +39,7 @@ const isShipmentId = (v) => /^\d{1,15}$/.test(String(v ?? ""));
 async function quoteFor(shipmentId) {
   const tries = [
     () => supabase.from("fpx_shipments").select("q:raw_data->>QuotesId, spot:raw_data->>BrokerSpotQuoteId, sale:raw_data->>RateWithOutMarkedUp, cost:raw_data->>cost").eq("shipment_id", shipmentId).order("updated_at", { ascending: false }).limit(1),
-    () => supabase.from("fpx_erp_transactions").select("q:data->>QuoteID, sale:data->>Shipment Marked-Up Rate, cost:data->>Shipment Rate without mark up").eq("shipment_id", shipmentId).limit(1),
+    () => supabase.from("fpx_erp_transactions").select("q:data->>QuoteID, sale:charge, cost").eq("shipment_id", shipmentId).limit(1),
     () => supabase.from("fpx_shipment_details").select("q:quote_id, sale, cost").eq("shipment_id", shipmentId).limit(1),
   ];
   const num = (v) => { const n = Number(String(v ?? "").replace(/[$,\s]/g, "")); return String(v ?? "").trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null; };
@@ -74,10 +81,25 @@ shipmentDetailsRouter.post("/", async (req, res) => {
     else refused++;
   }
   if (!rows.length) return res.json({ stored: 0, failed: refused, summary: [], error: refused ? "The text was not that shipment's Shipment Details page" : undefined });
+  // What is stored now, to tell what this read changes. When it cannot be
+  // read the details are still stored; only the change record is skipped.
+  const before = await readBefore(supabase, "fpx_shipment_details", "shipment_id", ["shipment_id", ...HISTORY_FIELDS, "captured_at"].join(", "), rows.map((r) => r.shipment_id));
   const { error } = await supabase.from("fpx_shipment_details").upsert(rows, { onConflict: "shipment_id" });
   if (error) {
     console.warn(`[FPX] shipment details not stored: ${error.message}`);
     return res.json({ stored: 0, failed: list.length, summary: [], error: error.message });
+  }
+  if (before.error) console.warn(`[FPX] shipment details: scrape history not recorded: ${before.error}`);
+  else {
+    try {
+      const beforeBy = new Map(before.rows.map((r) => [String(r.shipment_id), r]));
+      // Several reads of one shipment in a call: the last is what is stored.
+      const last = [...new Map(rows.map((r) => [String(r.shipment_id), r])).values()];
+      const items = historyItems(last, beforeBy, { key: "shipment_id", fields: HISTORY_FIELDS, seenField: "captured_at" });
+      await recordScrapeHistory(supabase, "shipment_details", items, { request_id: req.body?.request_id, run_by: by });
+    } catch (e) {
+      console.warn(`[FPX] shipment details: scrape history not recorded: ${e?.message || e}`);
+    }
   }
   res.json({ stored: rows.length, failed: refused, summary: rows.map(describeDetail) });
 });

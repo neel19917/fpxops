@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, FileText, X } from "lucide-react";
 import type { ScrapeRequest } from "../lib/api";
-import { GET_INVOICE_MAX, GET_INVOICE_SCOPE, approvalGroup, approvalHover, approvalLabel, approvalSourceLabel, getInvoiceLabel, requestGetInvoices, type ApprovalGroup } from "../lib/erpPull";
+import { GET_INVOICE_MAX, GET_INVOICE_SCOPE, approvalGroup, approvalHover, approvalLabel, approvalSourceLabel, getInvoiceLabel, requestGetInvoices, GET_INVOICE_BUTTONS, GET_INVOICE_BUTTON_PRESETS, getInvoiceButtonPreset, getInvoiceButtonsLabel, loadGetInvoiceButtons, saveGetInvoiceButtons, cleanGetInvoiceButtons, type ApprovalGroup, type GetInvoiceButtonChoice } from "../lib/erpPull";
 import { fmtDateTime, fmtNum } from "../lib/format";
 import type { ApprovalState, GetInvoiceState } from "../lib/types";
 
@@ -107,6 +107,16 @@ interface Props {
 export function GetInvoiceModal({ auditId, items, onClose, onStarted }: Props) {
   const [ticked, setTicked] = useState<Set<string>>(() => new Set(items.map((i) => i.id)));
   const [pauseAfterFirst, setPauseAfterFirst] = useState(true);
+  // Which View Shipment buttons this run presses (null = every one).
+  const [buttons, setButtonsState] = useState<GetInvoiceButtonChoice>(loadGetInvoiceButtons);
+  const [showButtons, setShowButtons] = useState(false);
+  const setButtons = (c: GetInvoiceButtonChoice) => { setButtonsState(c); saveGetInvoiceButtons(c); };
+  const buttonOn = (key: string) => buttons === null || (buttons as string[]).includes(key);
+  const toggleButton = (key: string) => {
+    const all = GET_INVOICE_BUTTONS.map((b) => b.key as string);
+    const now = buttons === null ? all : (buttons as string[]);
+    setButtons(cleanGetInvoiceButtons(now.includes(key) ? now.filter((k) => k !== key) : [...now, key]));
+  };
   const [reviewed, setReviewed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -167,7 +177,7 @@ export function GetInvoiceModal({ auditId, items, onClose, onStarted }: Props) {
     if (!canConfirm) return;
     setSubmitting(true); setError(null);
     try {
-      const res = await requestGetInvoices(auditId, shipmentIds, pauseAfterFirst && count > 1);
+      const res = await requestGetInvoices(auditId, shipmentIds, pauseAfterFirst && count > 1, buttons);
       if ((res.request?.scope as string) !== GET_INVOICE_SCOPE) {
         // A server that doesn't know this job yet answers with a regular scrape request.
         setError("The server queued a regular scrape instead of the invoice run. Get Invoice needs the next server update. Nothing was pressed in FreightPOP.");
@@ -308,6 +318,32 @@ export function GetInvoiceModal({ auditId, items, onClose, onStarted }: Props) {
               </span>
             </label>
           ) : null}
+
+          <div className="rounded-lg ring-1 ring-slate-200 p-3">
+            <div className="text-sm font-medium text-slate-900">Which View Shipment buttons to press</div>
+            <div className="text-xs text-slate-500 mt-0.5">FPX opens each chosen button, saves a copy and closes it. Buttons you leave out are not clicked. Cancel, Edit, Email and Delete buttons are never clicked.</div>
+            <div className="flex flex-wrap items-center gap-2 mt-2">
+              {GET_INVOICE_BUTTON_PRESETS.map((p) => (
+                <button key={p.key} type="button" title={p.hint} onClick={() => setButtons(p.buttons)}
+                  className={"px-2.5 py-1 rounded-md text-xs font-medium ring-1 " + (getInvoiceButtonPreset(buttons) === p.key ? "bg-violet-50 text-violet-700 ring-violet-300" : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50")}>
+                  {p.label}
+                </button>
+              ))}
+              <button type="button" onClick={() => setShowButtons((v) => !v)} className="text-xs text-sky-700 hover:underline ml-auto">
+                {showButtons ? "Hide the list" : `Choose buttons (${getInvoiceButtonsLabel(buttons)})`}
+              </button>
+            </div>
+            {showButtons ? (
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 mt-2">
+                {GET_INVOICE_BUTTONS.map((b) => (
+                  <label key={b.key} className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                    <input type="checkbox" checked={buttonOn(b.key)} onChange={() => toggleButton(b.key)} className="rounded border-slate-300 text-violet-600" />
+                    {b.label}
+                  </label>
+                ))}
+              </div>
+            ) : null}
+          </div>
 
           {tooMany ? <div className="text-sm text-rose-700">Pick up to {GET_INVOICE_MAX} shipments at a time. Untick {fmtNum(count - GET_INVOICE_MAX)} to continue.</div> : null}
           {error ? (

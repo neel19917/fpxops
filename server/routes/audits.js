@@ -11,6 +11,11 @@ import { transactionRows, upsertTransactions, approvalRows, upsertApprovals } fr
 import { ERP_MASTERS, buildErpMaster, transactionPieceRows, upsertPieceRows } from "../lib/erpMaster.js";
 import { transactionRow } from "../lib/erpStore.js";
 import { APPROVAL_CONFIDENCE_MIN, checkApproval } from "../lib/approvalCheck.js";
+import { createHash } from "node:crypto";
+import { historyItems, recordScrapeHistory, readBefore } from "../lib/scrapeHistory.js";
+
+// Who or what handed a read in, for fpx_scrape_history.
+const readBy = (req) => String(req.body?.by || req.apiKey?.name || req.user?.email || "").trim() || null;
 
 export const auditsRouter = Router();
 
@@ -524,7 +529,7 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
   const storedApprovals = { upserted: 0, failed: 0 };
   try {
     const mapped = approvalRows(body.rows, columns, { source, seenAt: checked_at });
-    const out = await upsertApprovals(supabase, mapped.rows);
+    const out = await upsertApprovals(supabase, mapped.rows, { request_id: run.id, run_by: readBy(req) });
     storedApprovals.upserted = out.upserted;
     storedApprovals.failed = out.failed;
   } catch (e) {
@@ -578,7 +583,7 @@ auditsRouter.post("/erp/transactions", async (req, res) => {
   });
   let out = { upserted: 0, failed: mapped.rows.length };
   try {
-    out = await upsertTransactions(supabase, mapped.rows);
+    out = await upsertTransactions(supabase, mapped.rows, { request_id: hasAudit ? body.audit_id : null, run_by: readBy(req) });
   } catch (e) {
     out.error = e?.message || String(e);
   }
@@ -593,6 +598,9 @@ auditsRouter.post("/erp/transactions", async (req, res) => {
     ...(out.error ? { error: out.error } : {}),
   });
 });
+
+// A captured text in fpx_scrape_history: its length and fingerprint, not the text.
+const textMark = (md5, chars) => (md5 ? `${chars ?? "?"} characters, md5 ${md5}` : null);
 
 // POST /audits/erp/shipment-records — what the hosted browser captured for
 // shipments in FreightPOP (kept in fpx_shipment_records, one row per shipment
@@ -622,8 +630,30 @@ auditsRouter.post("/erp/shipment-records", async (req, res) => {
     });
   }
   if (!rows.length) return res.json({ stored: 0, failed: 0 });
+  // What is stored now, to tell what this capture changes (the text by its
+  // fingerprint, not read back). When it cannot be read, nothing is recorded.
+  const before = await readBefore(supabase, "fpx_shipment_records", "shipment_id", "shipment_id, kind, files, text_md5, text_chars, captured_at", rows.map((r) => r.shipment_id));
   const { error } = await supabase.from("fpx_shipment_records").upsert(rows, { onConflict: "shipment_id,kind" });
   if (error) console.warn(`[FPX] shipment records not stored: ${error.message}`);
+  else if (before.error) console.warn(`[FPX] shipment records: scrape history not recorded: ${before.error}`);
+  else {
+    try {
+      const recordKey = (r) => `${r.shipment_id}|${r.kind}`;
+      const beforeBy = new Map(before.rows.map((r) => [recordKey(r), { files: [...(r.files || [])].sort(), text: textMark(r.text_md5, r.text_chars), captured_at: r.captured_at }]));
+      // Several records of one shipment and kind in a call: the last is what is stored.
+      const last = new Map(rows.map((r) => [recordKey(r), r]));
+      const after = [...last.values()].map((r) => ({
+        shipment_id: r.shipment_id, kind: r.kind, captured_at: r.captured_at,
+        files: [...r.files].sort(),
+        text: r.text == null ? null : textMark(createHash("md5").update(r.text, "utf8").digest("hex"), [...r.text].length),
+      }));
+      const items = historyItems(after, beforeBy, { key: recordKey, fields: ["files", "text"], seenField: "captured_at" });
+      const audits = new Set(rows.map((r) => r.audit_id).filter(Boolean));
+      await recordScrapeHistory(supabase, "shipment_record", items, { request_id: audits.size === 1 ? [...audits][0] : null, run_by: by });
+    } catch (e) {
+      console.warn(`[FPX] shipment records: scrape history not recorded: ${e?.message || e}`);
+    }
+  }
   res.json({ stored: error ? 0 : rows.length, failed: error ? rows.length : 0, ...(error ? { error: error.message } : {}) });
 });
 

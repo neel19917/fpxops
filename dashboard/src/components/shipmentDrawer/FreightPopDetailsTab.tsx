@@ -13,6 +13,7 @@ import {
   type ShipmentDetailsResponse,
 } from "../../lib/shipmentDetails";
 import { Field, Section } from "../Drawer";
+import { ScrapeHistory } from "../ScrapeHistory";
 
 const POLL_MS = 5000;
 // A read in progress survives a few failed checks in a row before the tab
@@ -182,6 +183,8 @@ export function FreightPopDetailsTab({ shipmentId }: { shipmentId: string | null
       </div>
 
       {details ? <DetailsBody d={details} /> : null}
+      {/* When it was read, and what each later read changed. */}
+      {details ? <ScrapeHistory source="shipment_details" entityKey={shipmentId} refreshKey={details.captured_at} /> : null}
     </>
   );
 }
