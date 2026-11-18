@@ -86,3 +86,24 @@ describe("Get Invoice export options", () => {
     assert.deepEqual(headers, ["Charge", "Charge (2)"]);
   });
 });
+
+describe("master-file Excel", async () => {
+  const { writeXlsx, filterSortXlsx, reshapeXlsx } = await import("../lib/xlsxWrite.js");
+  const { readXlsx } = await import("../lib/xlsxRead.js");
+  const { masterFileDrop } = await import("../lib/getInvoiceRuns.js");
+  const headers = ["Customer Id", "Customer Name", "ShipmentID", "Charge", "Appointment Set", "Appointment Date", "Pickup Response", "Spot Quote", "Customer Audit", "Billing Invoice Number"];
+  const row = (id, n) => Object.fromEntries(headers.map((h) => [h, h === "ShipmentID" ? id : h === "Charge" ? n : `${h} ${id}`]));
+  const book = writeXlsx(headers, [row("100", 10), row("200", 20), row("300", 30)]);
+
+  it("finds Customer Id and Appointment Set through Customer Audit by title", () => {
+    assert.deepEqual([...masterFileDrop(headers)].sort((a, b) => a - b), [0, 4, 5, 6, 7, 8]);
+    assert.equal(masterFileDrop(["A", "B", "C"]).size, 0);
+  });
+
+  it("drops those columns, keeps the rest in place and adds Scrape # last", () => {
+    const cut = filterSortXlsx(book, { keep: (o) => o.ShipmentID !== "200", compare: (a, b) => Number(b.ShipmentID) - Number(a.ShipmentID) });
+    const out = readXlsx(reshapeXlsx(cut, { drop: masterFileDrop, add: { title: "Scrape #", value: (o) => (o.ShipmentID === "300" ? 130 : null) } }));
+    assert.deepEqual(out.headers, ["Customer Name", "ShipmentID", "Charge", "Billing Invoice Number", "Scrape #"]);
+    assert.deepEqual(out.rows.map((r) => [r.ShipmentID, r.Charge, r["Billing Invoice Number"], r["Scrape #"]]), [["300", "30", "Billing Invoice Number 300", "130"], ["100", "10", "Billing Invoice Number 100", ""]]);
+  });
+});

@@ -166,6 +166,17 @@ export function downloadRunExcel(scrapeNumber: number, layout: ExportLayout | nu
   return download(`${BASE}/${encodeURIComponent(String(scrapeNumber))}/export.xlsx${layoutQuery(layout)}`, `GetInvoice-${scrapeNumber}.xlsx`);
 }
 
+/** One run in FreightPOP's own export format, laid out for the AP master file:
+ *  no Customer Id, no Appointment Set through Customer Audit, Scrape # last. */
+export function downloadRunMaster(scrapeNumber: number): Promise<void> {
+  return download(`${BASE}/${encodeURIComponent(String(scrapeNumber))}/master.xlsx`, `GetInvoice-Scrape-${scrapeNumber}-MasterFile.xlsx`, ZIP_TIMEOUT_MS);
+}
+
+/** Every run in master-file layout, each shipment with its newest scrape number. */
+export function downloadAllRunsMaster(): Promise<void> {
+  return download(`${BASE}/master.xlsx`, "GetInvoice-AllScrapes-MasterFile.xlsx", ZIP_TIMEOUT_MS);
+}
+
 /** One run as a ZIP: a folder per shipment with its files, plus the Excel. */
 export function downloadRunZip(scrapeNumber: number, layout: ExportLayout | null = null): Promise<void> {
   return download(`${BASE}/${encodeURIComponent(String(scrapeNumber))}/files.zip${layoutQuery(layout)}`, `GetInvoice-${scrapeNumber}.zip`, ZIP_TIMEOUT_MS);

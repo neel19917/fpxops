@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { ArrowLeft, ChevronDown, ChevronRight, Download, FileArchive, FileSpreadsheet, RefreshCw, SlidersHorizontal } from "lucide-react";
 import {
-  downloadAllRunsExcel, downloadAllRunsZip, downloadRunExcel, downloadRunZip, fetchRun, fetchRuns,
+  downloadAllRunsExcel, downloadAllRunsMaster, downloadAllRunsZip, downloadRunExcel, downloadRunMaster, downloadRunZip, fetchRun, fetchRuns,
   loadLayout, saveLayout, type ExportLayout,
   type Run, type RunDetail, type RunRow,
 } from "../lib/getInvoiceRuns";
@@ -164,6 +164,10 @@ export function GetInvoiceRunsPage() {
             <button type="button" onClick={() => runDownload("all", () => downloadAllRunsExcel(layout))} disabled={!!busy.all || !runs?.length} className={PRIMARY_BTN}>
               <Download className="h-4 w-4" aria-hidden="true" /> {busy.all ? "Preparing the file…" : "Download all runs (Excel)"}
             </button>
+            <button type="button" onClick={() => runDownload("allmaster", downloadAllRunsMaster)} disabled={!!busy.allmaster || !runs?.length} className={SECONDARY_BTN}
+              title="FreightPOP's own export without Customer Id and Appointment Set through Customer Audit, with Scrape # as the last column: ready to paste into the master file">
+              <FileSpreadsheet className="h-4 w-4" aria-hidden="true" /> {busy.allmaster ? "Preparing the file…" : "All runs, master-file format"}
+            </button>
             <button type="button" onClick={() => runDownload("allzip", () => downloadAllRunsZip(layout))} disabled={!!busy.allzip || !anyFiles} className={SECONDARY_BTN}
               title={runs && !anyFiles ? "No files have been saved by any run yet" : undefined}>
               <FileArchive className="h-4 w-4" aria-hidden="true" /> {busy.allzip ? "Building the ZIP…" : "Download all files (ZIP)"}
@@ -257,6 +261,11 @@ export function GetInvoiceRunsPage() {
                               <button type="button" className={SMALL_BTN} disabled={!!busy[`${n}:xlsx`]}
                                 onClick={() => runDownload(`${n}:xlsx`, () => downloadRunExcel(n, layout))}>
                                 <FileSpreadsheet className="h-3.5 w-3.5" aria-hidden="true" /> {busy[`${n}:xlsx`] ? "Preparing…" : "Excel"}
+                              </button>
+                              <button type="button" className={SMALL_BTN} disabled={!!busy[`${n}:master`]}
+                                title="FreightPOP's own export for this run, ready to paste into the master file (Customer Id and Appointment Set through Customer Audit removed, Scrape # last)"
+                                onClick={() => runDownload(`${n}:master`, () => downloadRunMaster(n))}>
+                                <FileSpreadsheet className="h-3.5 w-3.5" aria-hidden="true" /> {busy[`${n}:master`] ? "Preparing…" : "Master file"}
                               </button>
                               <button type="button" className={SMALL_BTN} disabled={!!busy[`${n}:zip`] || r.files === 0}
                                 title={r.files === 0 ? "No files were saved for this run" : undefined}

@@ -10,12 +10,13 @@
 //   GET /:n                    one run (by scrape number) and its shipments
 //   GET /:n/export.xlsx        one run as Excel
 //   GET /:n/files.zip          one run's files + its sheet
+//   GET /:n/master.xlsx, /master.xlsx   FreightPOP's own export in master-file layout
 import { Router } from "express";
 import { supabase } from "../lib/supabase.js";
-import { writeXlsx, zip } from "../lib/xlsxWrite.js";
+import { filterSortXlsx, reshapeXlsx, writeXlsx, zip } from "../lib/xlsxWrite.js";
 import { ERP_BUCKET } from "../lib/invoiceDocs.js";
 import {
-  EXPORT_COLUMNS, buildExport, buildRunRows, parseExportOptions, runShipmentIds, summarizeRun, zipPlan,
+  EXPORT_COLUMNS, buildExport, buildRunRows, masterFileDrop, parseExportOptions, runShipmentIds, summarizeRun, zipPlan,
 } from "../lib/getInvoiceRuns.js";
 
 export const getInvoiceRunsRouter = Router();
@@ -81,6 +82,45 @@ function sendXlsx(res, runs, rowsByRun, name, query) {
   res.send(buf);
 }
 
+// FreightPOP's own Transactions export (kept with each ERP pull), cut to the
+// runs' shipments in master-file layout: see masterFileDrop. Each shipment
+// carries the scrape number of its newest run. Null when no pull kept a file.
+async function masterSheet(runs, rowsByRun) {
+  const scrape = new Map(); // shipment → scrape number (runs come newest first)
+  const order = [];
+  const audits = [];
+  for (const run of runs) {
+    for (const r of rowsByRun.get(run.id) || []) {
+      if (!scrape.has(r.shipment_id)) { scrape.set(r.shipment_id, r.scrape_number); order.push(r.shipment_id); }
+      if (r.audit_id && !audits.includes(r.audit_id)) audits.push(r.audit_id);
+    }
+  }
+  const files = [];
+  for (const a of audits) {
+    for (const name of ["full.xlsx", "not-exported.xlsx"]) {
+      const { data, error } = await supabase.storage.from(ERP_BUCKET).download(`${a}/${name}`);
+      if (!error && data) { files.push(Buffer.from(await data.arrayBuffer())); break; }
+    }
+  }
+  if (!files.length) return null;
+  const idOf = (o) => String(o?.ShipmentID ?? o?.["Shipment ID"] ?? "").trim();
+  const rank = new Map(order.map((id, i) => [id, i]));
+  const seen = new Set();
+  const cut = filterSortXlsx(files[0], {
+    more: files.slice(1),
+    keep: (o) => { const id = idOf(o); if (!scrape.has(id) || seen.has(id)) return false; seen.add(id); return true; },
+    compare: (a, b) => rank.get(idOf(a)) - rank.get(idOf(b)),
+  });
+  return reshapeXlsx(cut, { drop: masterFileDrop, add: { title: "Scrape #", value: (o) => scrape.get(idOf(o)) ?? null } });
+}
+
+async function sendMaster(res, runs, rowsByRun, name) {
+  const buf = await masterSheet(runs, rowsByRun);
+  if (!buf) return res.status(404).json({ error: "FreightPOP's Transactions export was not kept for these shipments' ERP pull, so this file can't be made. Use the standard Excel instead." });
+  res.set({ "Content-Type": XLSX_TYPE, "Content-Disposition": `attachment; filename="${name}"`, "Content-Length": String(buf.length), "Cache-Control": "private, no-store" });
+  res.send(buf);
+}
+
 // The ZIP: one folder per shipment with its files and data.json (what FPX
 // holds for it in Supabase), and the Excel sheet at the root.
 async function sendZip(res, runs, rowsByRun, base, query) {
@@ -121,6 +161,12 @@ async function sendZip(res, runs, rowsByRun, base, query) {
   }
   entries.sort((a, b) => a.name.localeCompare(b.name));
   entries.unshift({ name: `${base}/${base}.xlsx`, data: sheet(runs, rowsByRun, query) });
+  try {
+    const master = await masterSheet(runs, rowsByRun);
+    if (master) entries.splice(1, 0, { name: `${base}/${base}-master-file.xlsx`, data: master });
+  } catch (e) {
+    missing.push(`master-file Excel: ${e?.message || e}`);
+  }
   if (missing.length) entries.push({ name: `${base}/MISSING-FILES.txt`, data: Buffer.from(`These files could not be read from storage:\n${missing.join("\n")}\n`) });
   const buf = zip(entries);
   res.set({ "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="${base}.zip"`, "Content-Length": String(buf.length), "Cache-Control": "private, no-store" });
@@ -143,6 +189,13 @@ getInvoiceRunsRouter.get("/export.xlsx", async (req, res) => {
   try {
     const { runs, rowsByRun } = await load();
     sendXlsx(res, runs, rowsByRun, `GetInvoice-AllScrapes-${day()}.xlsx`, req.query);
+  } catch (e) { fail(res, e); }
+});
+
+getInvoiceRunsRouter.get("/master.xlsx", async (_req, res) => {
+  try {
+    const { runs, rowsByRun } = await load();
+    await sendMaster(res, runs, rowsByRun, `GetInvoice-AllScrapes-MasterFile-${day()}.xlsx`);
   } catch (e) { fail(res, e); }
 });
 
@@ -175,6 +228,13 @@ getInvoiceRunsRouter.get("/:n/export.xlsx", async (req, res) => {
   try {
     const got = await oneRun(req, res);
     if (got) sendXlsx(res, got.runs, got.rowsByRun, `GetInvoice-Scrape-${got.n}.xlsx`, req.query);
+  } catch (e) { fail(res, e); }
+});
+
+getInvoiceRunsRouter.get("/:n/master.xlsx", async (req, res) => {
+  try {
+    const got = await oneRun(req, res);
+    if (got) await sendMaster(res, got.runs, got.rowsByRun, `GetInvoice-Scrape-${got.n}-MasterFile.xlsx`);
   } catch (e) { fail(res, e); }
 });
 

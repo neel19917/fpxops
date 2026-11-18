@@ -331,3 +331,60 @@ export function writeXlsx(headers, rows) {
   ];
   return zip(parts.map(([name, text]) => ({ name, data: Buffer.from(text, "utf8") })));
 }
+
+// FreightPOP's export `buf` → the same workbook with some columns taken out
+// and, optionally, one column added at the end. Cell values, types and styles
+// of every other cell are kept (shared strings stay shared); the columns to
+// the right of a removed one move left. Rows above the header (a title line)
+// are treated the same way.
+//   drop(headers) → Set of 0-based column indexes to remove
+//   add: { title, value(rowObject) → string | number | null }
+// The <cols> widths, merged cells and data validations are dropped (their
+// ranges no longer fit); <dimension> and <autoFilter> are rewritten.
+export function reshapeXlsx(buf, { drop = () => new Set(), add = null } = {}) {
+  const base = parseSheet(buf);
+  if (base.h < 0) throw new Error("the Excel file has no header row");
+  const width = Math.max(base.headers.length, ...base.rows.map((r) => r.vals.length));
+  const gone = drop(base.headers);
+  const newCol = new Map();
+  let k = 0;
+  for (let c = 0; c < width; c++) if (!gone.has(c)) newCol.set(c, k++);
+  const addAt = k; // the added column's index
+  const lastCol = add ? addAt : Math.max(0, k - 1);
+  const styleOf = (attrs) => (/\bs="(\d+)"/.exec(attrs) || [])[1];
+
+  const out = [];
+  let n = 0;
+  base.rows.forEach((r, idx) => {
+    n = r.num;
+    const cells = [];
+    let lastStyle;
+    for (const c of r.cells) {
+      const to = newCol.get(c.col);
+      if (to === undefined) continue;
+      const attrs = c.attrs.replace(/(\sr=")[A-Z]+(\d+")/, `$1${colName(to)}$2`);
+      cells.push(c.body ? `<c${attrs}>${c.body}</c>` : `<c${attrs}/>`);
+      lastStyle = styleOf(c.attrs) ?? lastStyle;
+    }
+    if (add && idx >= base.h) {
+      const ref = `${colName(addAt)}${r.num}`;
+      const s = lastStyle !== undefined ? ` s="${lastStyle}"` : "";
+      const v = idx === base.h ? add.title : add.value(rowObject(base.headers, r.vals) || {});
+      if (typeof v === "number" && Number.isFinite(v)) cells.push(`<c r="${ref}"${s}><v>${v}</v></c>`);
+      else if (v !== null && v !== undefined && v !== "") cells.push(`<c r="${ref}"${s} t="inlineStr"><is><t xml:space="preserve">${esc(String(v))}</t></is></c>`);
+    }
+    const open = r.open.replace(/\s(?:r|spans)="[^"]*"/g, "");
+    out.push(`<row r="${r.num}"${open}>${cells.join("")}</row>`);
+  });
+  const lastRow = n || 1;
+  const headRow = base.rows[base.h].num;
+  const before = base.xml.slice(0, base.dataStart)
+    .replace(/<dimension\b[^>]*\/>/, `<dimension ref="A1:${colName(lastCol)}${lastRow}"/>`)
+    .replace(/<cols>[\s\S]*?<\/cols>/, "");
+  const after = base.xml.slice(base.dataEnd)
+    .replace(/<autoFilter\b[^>]*?(\/>|>[\s\S]*?<\/autoFilter>)/, `<autoFilter ref="A${headRow}:${colName(lastCol)}${lastRow}"/>`)
+    .replace(/<mergeCells\b[\s\S]*?<\/mergeCells>/, "")
+    .replace(/<dataValidations\b[\s\S]*?<\/dataValidations>/, "");
+  const xml = before + out.join("") + after;
+  return zip([...base.files].map(([name, data]) => ({ name, data: name === base.sheetName ? Buffer.from(xml, "utf8") : data })));
+}

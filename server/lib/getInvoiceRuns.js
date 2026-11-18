@@ -252,3 +252,20 @@ export function withHistory(getInvoice) {
   hist.push(entry);
   return { ...gi, history: hist.slice(-MAX_HISTORY) };
 }
+
+// The master-file layout the AP team pastes into their own spreadsheet:
+// FreightPOP's Transactions export without "Customer Id" (column A) and
+// without "Appointment Set" through "Customer Audit" (columns BA to BE), with
+// the scrape number added as the last column so the rest still line up.
+// Found by header title, so a column FreightPOP moves is still the right one.
+export const MASTER_DROP_SINGLE = ["Customer Id"];
+export const MASTER_DROP_RANGE = ["Appointment Set", "Customer Audit"];
+export function masterFileDrop(headers) {
+  const norm = (h) => String(h ?? "").trim().toLowerCase();
+  const at = (t) => headers.findIndex((h) => norm(h) === norm(t));
+  const out = new Set();
+  for (const t of MASTER_DROP_SINGLE) { const i = at(t); if (i >= 0) out.add(i); }
+  const [from, to] = MASTER_DROP_RANGE.map(at);
+  if (from >= 0 && to >= from) for (let i = from; i <= to; i++) out.add(i);
+  return out;
+}
