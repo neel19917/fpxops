@@ -66,7 +66,9 @@ type DetailState = { loading: boolean; data?: RunDetail; error?: string };
 
 export function GetInvoiceRunsPage() {
   const alive = useRef(true);
-  useEffect(() => () => { alive.current = false; }, []);
+  // Set on every mount: React's development mode mounts twice, and a flag
+  // only ever cleared would drop every answer after the first unmount.
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [listErr, setListErr] = useState<string | null>(null);

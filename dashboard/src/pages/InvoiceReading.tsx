@@ -181,7 +181,9 @@ function ReadingCard({ r, now }: { r: ReadingNow; now: number }) {
 
 export function InvoiceReadingPage() {
   const alive = useRef(true);
-  useEffect(() => () => { alive.current = false; }, []);
+  // Set on every mount: React's development mode mounts twice, and a flag
+  // only ever cleared would drop every answer after the first unmount.
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const visible = usePageVisible();
 
   const [full, setFull] = useState(false);
