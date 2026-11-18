@@ -27,6 +27,7 @@ const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ defau
 const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
 const InvoicesPushedPage = lazy(() => import("./pages/InvoicesPushed").then((m) => ({ default: m.InvoicesPushedPage })));
 const InvoiceReadingPage = lazy(() => import("./pages/InvoiceReading").then((m) => ({ default: m.InvoiceReadingPage })));
+const GetInvoiceRunsPage = lazy(() => import("./pages/GetInvoiceRuns").then((m) => ({ default: m.GetInvoiceRunsPage })));
 const InvoicesHubPage = lazy(() => import("./pages/InvoicesHub").then((m) => ({ default: m.InvoicesHubPage })));
 const InvoicingPage   = lazy(() => import("./pages/Invoicing").then((m) => ({ default: m.InvoicingPage })));
 const ApiKeysPage     = lazy(() => import("./pages/ApiKeys").then((m) => ({ default: m.ApiKeysPage })));
@@ -294,6 +295,7 @@ function AuthedApp() {
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
             <Route path="/invoices" element={<InvoicesHubPage />} />
             <Route path="/invoices/reading" element={<InvoiceReadingPage />} />
+            <Route path="/invoices/get-invoice-runs" element={<GetInvoiceRunsPage />} />
             <Route path="/invoicing/pushed" element={<InvoicesPushedPage />} />
             <Route path="/invoicing" element={<InvoicingPage />} />
             <Route path="/shares" element={<ShareLinksPage />} />

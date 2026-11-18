@@ -177,6 +177,8 @@ describe("isUuid", () => {
 describe("raw.get_invoice state", () => {
   const raw = { rank: 3, charge: 512.5, customer: "Acme" };
   const stamp = { requested_at: "2026-11-13T10:00:00.000Z", requested_by: "pat@example.com", request_id: REQ };
+  // The per-run history is checked on its own below.
+  const noHist = ({ history: _h, ...g }) => g;
 
   it("markRequested keeps the rest of raw and does not change its input", () => {
     const next = markRequested(raw, stamp);
@@ -186,12 +188,12 @@ describe("raw.get_invoice state", () => {
 
   it("markRequested starts over, dropping an older result", () => {
     const old = mergeResult(markRequested(raw, { ...stamp, request_id: "old" }), { ok: false, note: "No button", at: "2026-11-01T00:00:00.000Z", by: "fpx-browser" });
-    assert.deepEqual(markRequested(old, stamp).get_invoice, { status: "requested", ...stamp });
+    assert.deepEqual(noHist(markRequested(old, stamp).get_invoice), { status: "requested", ...stamp });
   });
 
   it("mergeResult records done and keeps the requested fields and other keys", () => {
     const next = mergeResult(markRequested(raw, stamp), { ok: true, note: "Invoice requested", at: "2026-11-13T10:05:00.000Z", by: "fpx-browser" });
-    assert.deepEqual(next, {
+    assert.deepEqual({ ...next, get_invoice: noHist(next.get_invoice) }, {
       ...raw,
       get_invoice: { ...stamp, status: "done", note: "Invoice requested", at: "2026-11-13T10:05:00.000Z", by: "fpx-browser" },
     });
@@ -204,14 +206,14 @@ describe("raw.get_invoice state", () => {
   });
 
   it("mergeResult copes with a row that was never requested or has no raw", () => {
-    assert.deepEqual(mergeResult(null, { ok: true, at: "t" }), { get_invoice: { status: "done", note: null, at: "t", by: null } });
+    assert.deepEqual(mergeResult(null, { ok: true, at: "t" }), { get_invoice: { status: "done", note: null, at: "t", by: null } }); // no request id: no history
     assert.deepEqual(mergeResult({ rank: 1, get_invoice: "junk" }, { ok: true, at: "t" }).get_invoice.status, "done");
     assert.equal(mergeResult(["x"], { ok: true, at: "t" }).get_invoice.status, "done");
   });
 
   it("mergeResult stores screenshots at get_invoice.shots", () => {
     const next = mergeResult(markRequested(raw, stamp), { ok: true, at: "t", shots: ["invoices/1-1.png", "invoices/1-2.png"] });
-    assert.deepEqual(next.get_invoice, { ...stamp, status: "done", note: null, at: "t", by: null, shots: ["invoices/1-1.png", "invoices/1-2.png"] });
+    assert.deepEqual(noHist(next.get_invoice), { ...stamp, status: "done", note: null, at: "t", by: null, shots: ["invoices/1-1.png", "invoices/1-2.png"] });
   });
 
   it("mergeResult leaves out shots when there are none", () => {
@@ -224,11 +226,22 @@ describe("raw.get_invoice state", () => {
     const first = mergeResult(markRequested(raw, stamp), { ok: true, note: "Invoice shown", at: "t1", shots: ["invoices/1-1.png"] });
     for (const shots of [undefined, [], ["nope"]]) {
       const retry = mergeResult(first, { ok: false, note: "Page did not load", at: "t2", by: "fpx-browser", shots });
-      assert.deepEqual(retry.get_invoice, {
+      assert.deepEqual(noHist(retry.get_invoice), {
         ...stamp, status: "failed", note: "Page did not load", at: "t2", by: "fpx-browser", shots: ["invoices/1-1.png"],
       });
     }
     assert.deepEqual(first.get_invoice.shots, ["invoices/1-1.png"]); // input untouched
+  });
+
+  it("each run's result is kept in history, and a new request keeps it", () => {
+    const one = mergeResult(markRequested(raw, stamp), { ok: true, note: "Shown", at: "t1", shots: ["invoices/1-1.png"] });
+    assert.deepEqual(one.get_invoice.history, [{ request_id: REQ, status: "done", at: "t1", note: "Shown", shots: ["invoices/1-1.png"] }]);
+    const again = markRequested(one, { ...stamp, request_id: "second" });
+    assert.equal(again.get_invoice.history.length, 1);
+    const two = mergeResult(again, { ok: false, note: "No button", at: "t2" });
+    assert.deepEqual(two.get_invoice.history.map((h) => [h.request_id, h.status]), [[REQ, "done"], ["second", "failed"]]);
+    const retried = mergeResult(two, { ok: true, at: "t3" }); // the same run again replaces its own entry
+    assert.deepEqual(retried.get_invoice.history.map((h) => [h.request_id, h.status]), [[REQ, "done"], ["second", "done"]]);
   });
 
   it("a later result with screenshots replaces the list", () => {

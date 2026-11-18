@@ -1,3 +1,4 @@
+import { withHistory } from "./getInvoiceRuns.js";
 // "Get invoices" job: after a person reviews an ERP pull and ticks shipments,
 // the hosted browser clicks FreightPOP's GET INVOICE button for each one.
 // This file holds the parts that don't need a request: checking the ids,
@@ -155,9 +156,14 @@ export function markRequested(raw, { requested_at, requested_by = null, request_
   // Screenshots already saved for the shipment are a record: a new try keeps them.
   const base = asObject(raw);
   const kept = asObject(base.get_invoice).shots;
+  const history = asObject(base.get_invoice).history; // earlier runs' results stay on record
   return {
     ...base,
-    get_invoice: { status: "requested", requested_at, requested_by, request_id, ...(Array.isArray(kept) && kept.length ? { shots: kept } : {}) },
+    get_invoice: {
+      status: "requested", requested_at, requested_by, request_id,
+      ...(Array.isArray(kept) && kept.length ? { shots: kept } : {}),
+      ...(Array.isArray(history) && history.length ? { history } : {}),
+    },
   };
 }
 
@@ -171,7 +177,7 @@ export function mergeResult(raw, { ok, note = null, at, by = null, shots }) {
   const get_invoice = { ...asObject(base.get_invoice), status: ok ? "done" : "failed", note, at, by };
   const clean = normalizeShots(shots);
   if (clean.length) get_invoice.shots = clean;
-  return { ...base, get_invoice };
+  return { ...base, get_invoice: withHistory(get_invoice) };
 }
 
 // Puts a row that was waiting on a request back to "not_started". Returns null

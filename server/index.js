@@ -39,6 +39,7 @@ import { startInvoiceDocWorker, backfillFromRecords } from "./lib/invoiceDocs.js
 import { erpPushedRouter } from "./routes/erpPushed.js";
 import { lookbackRouter } from "./routes/lookback.js";
 import { scrapeHistoryRouter } from "./routes/scrapeHistory.js";
+import { getInvoiceRunsRouter } from "./routes/getInvoiceRuns.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -150,6 +151,7 @@ api.use("/audit-log", auditLogRouter);
 api.use("/ops/lookback", lookbackRouter);
 api.use("/ops", opsRouter);
 api.use("/scrape-history", scrapeHistoryRouter);
+api.use("/get-invoice-runs", getInvoiceRunsRouter);
 api.use("/invoice-docs", invoiceDocsRouter);
 api.use("/shipment-details", shipmentDetailsRouter);
 app.use("/api", api);
