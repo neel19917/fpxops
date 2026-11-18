@@ -35,6 +35,8 @@ export interface RunRow {
   shipment_id: string;
   status: RunRowStatus | string;
   note: string | null;
+  /** GET INVOICE was pushed for the shipment in this run. Missing from an older server. */
+  pushed?: boolean;
   clicked_at: string | null;
   customer_name: string | null;
   carrier: string | null;

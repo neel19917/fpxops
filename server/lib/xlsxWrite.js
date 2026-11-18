@@ -333,15 +333,16 @@ export function writeXlsx(headers, rows) {
 }
 
 // FreightPOP's export `buf` → the same workbook with some columns taken out
-// and, optionally, one column added at the end. Cell values, types and styles
+// and, optionally, columns added at the end. Cell values, types and styles
 // of every other cell are kept (shared strings stay shared); the columns to
 // the right of a removed one move left. Rows above the header (a title line)
 // are treated the same way.
 //   drop(headers) → Set of 0-based column indexes to remove
-//   add: { title, value(rowObject) → string | number | null }
+//   add: { title, value(rowObject) → string | number | null }, or a list of them
 // The <cols> widths, merged cells and data validations are dropped (their
 // ranges no longer fit); <dimension> and <autoFilter> are rewritten.
 export function reshapeXlsx(buf, { drop = () => new Set(), add = null } = {}) {
+  const adds = add ? (Array.isArray(add) ? add : [add]) : [];
   const base = parseSheet(buf);
   if (base.h < 0) throw new Error("the Excel file has no header row");
   const width = Math.max(base.headers.length, ...base.rows.map((r) => r.vals.length));
@@ -349,8 +350,8 @@ export function reshapeXlsx(buf, { drop = () => new Set(), add = null } = {}) {
   const newCol = new Map();
   let k = 0;
   for (let c = 0; c < width; c++) if (!gone.has(c)) newCol.set(c, k++);
-  const addAt = k; // the added column's index
-  const lastCol = add ? addAt : Math.max(0, k - 1);
+  const addAt = k; // the first added column's index
+  const lastCol = adds.length ? addAt + adds.length - 1 : Math.max(0, k - 1);
   const styleOf = (attrs) => (/\bs="(\d+)"/.exec(attrs) || [])[1];
 
   const out = [];
@@ -366,12 +367,15 @@ export function reshapeXlsx(buf, { drop = () => new Set(), add = null } = {}) {
       cells.push(c.body ? `<c${attrs}>${c.body}</c>` : `<c${attrs}/>`);
       lastStyle = styleOf(c.attrs) ?? lastStyle;
     }
-    if (add && idx >= base.h) {
-      const ref = `${colName(addAt)}${r.num}`;
+    if (adds.length && idx >= base.h) {
       const s = lastStyle !== undefined ? ` s="${lastStyle}"` : "";
-      const v = idx === base.h ? add.title : add.value(rowObject(base.headers, r.vals) || {});
-      if (typeof v === "number" && Number.isFinite(v)) cells.push(`<c r="${ref}"${s}><v>${v}</v></c>`);
-      else if (v !== null && v !== undefined && v !== "") cells.push(`<c r="${ref}"${s} t="inlineStr"><is><t xml:space="preserve">${esc(String(v))}</t></is></c>`);
+      const obj = idx === base.h ? null : rowObject(base.headers, r.vals) || {};
+      adds.forEach((a, i) => {
+        const ref = `${colName(addAt + i)}${r.num}`;
+        const v = obj ? a.value(obj) : a.title;
+        if (typeof v === "number" && Number.isFinite(v)) cells.push(`<c r="${ref}"${s}><v>${v}</v></c>`);
+        else if (v !== null && v !== undefined && v !== "") cells.push(`<c r="${ref}"${s} t="inlineStr"><is><t xml:space="preserve">${esc(String(v))}</t></is></c>`);
+      });
     }
     const open = r.open.replace(/\s(?:r|spans)="[^"]*"/g, "");
     out.push(`<row r="${r.num}"${open}>${cells.join("")}</row>`);

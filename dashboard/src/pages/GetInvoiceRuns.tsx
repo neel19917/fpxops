@@ -322,6 +322,7 @@ function RunShipments({ state, onRetry }: { state: DetailState | undefined; onRe
             <th scope="col" className={TH + " text-right"}>Charge</th>
             <th scope="col" className={TH + " text-right"} title="The total Claude read from the saved document">Total read</th>
             <th scope="col" className={TH}>Status</th>
+            <th scope="col" className={TH} title="Whether the GET INVOICE button was pushed for this shipment in this run">Pushed</th>
             <th scope="col" className={TH + " text-right"}>Files</th>
           </tr>
         </thead>
@@ -353,6 +354,9 @@ function ShipmentRow({ row }: { row: RunRow }) {
       <td className="py-1.5 pr-3">
         <span title={row.note || undefined}><Chip label={st.label} cls={st.cls} /></span>
         {row.note && row.status === "failed" ? <div className="mt-0.5 text-[11px] text-rose-700 max-w-[16rem] break-words">{row.note}</div> : null}
+      </td>
+      <td className="py-1.5 pr-3 whitespace-nowrap">
+        {row.pushed == null ? "—" : row.pushed ? <span className="text-emerald-700 font-medium">Yes</span> : <span className="text-slate-500">No</span>}
       </td>
       <td className="py-1.5 pr-3 text-right">{fmtNum(row.files.length)}</td>
     </tr>

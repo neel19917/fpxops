@@ -16,7 +16,7 @@ import { supabase } from "../lib/supabase.js";
 import { filterSortXlsx, reshapeXlsx, writeXlsx, zip } from "../lib/xlsxWrite.js";
 import { ERP_BUCKET } from "../lib/invoiceDocs.js";
 import {
-  EXPORT_COLUMNS, buildExport, buildRunRows, masterFileDrop, parseExportOptions, runShipmentIds, summarizeRun, zipPlan,
+  EXPORT_COLUMNS, buildExport, buildRunRows, giPushed, masterFileDrop, scrapeStatusLabel, parseExportOptions, runShipmentIds, summarizeRun, zipPlan,
 } from "../lib/getInvoiceRuns.js";
 
 export const getInvoiceRunsRouter = Router();
@@ -84,14 +84,17 @@ function sendXlsx(res, runs, rowsByRun, name, query) {
 
 // FreightPOP's own Transactions export (kept with each ERP pull), cut to the
 // runs' shipments in master-file layout: see masterFileDrop. Each shipment
-// carries the scrape number of its newest run. Null when no pull kept a file.
+// carries the scrape number and status of its newest run, and whether GET
+// INVOICE was pushed for it in any run. Null when no pull kept a file.
 async function masterSheet(runs, rowsByRun) {
-  const scrape = new Map(); // shipment → scrape number (runs come newest first)
+  const scrape = new Map(); // shipment → its newest run's row (runs come newest first)
+  const pushed = new Set(); // shipments GET INVOICE was pushed for, in any run
   const order = [];
   const audits = [];
   for (const run of runs) {
     for (const r of rowsByRun.get(run.id) || []) {
-      if (!scrape.has(r.shipment_id)) { scrape.set(r.shipment_id, r.scrape_number); order.push(r.shipment_id); }
+      if (giPushed(r)) pushed.add(r.shipment_id);
+      if (!scrape.has(r.shipment_id)) { scrape.set(r.shipment_id, r); order.push(r.shipment_id); }
       if (r.audit_id && !audits.includes(r.audit_id)) audits.push(r.audit_id);
     }
   }
@@ -111,7 +114,14 @@ async function masterSheet(runs, rowsByRun) {
     keep: (o) => { const id = idOf(o); if (!scrape.has(id) || seen.has(id)) return false; seen.add(id); return true; },
     compare: (a, b) => rank.get(idOf(a)) - rank.get(idOf(b)),
   });
-  return reshapeXlsx(cut, { drop: masterFileDrop, add: { title: "Scrape #", value: (o) => scrape.get(idOf(o)) ?? null } });
+  return reshapeXlsx(cut, {
+    drop: masterFileDrop,
+    add: [
+      { title: "Scrape #", value: (o) => scrape.get(idOf(o))?.scrape_number ?? null },
+      { title: "Scrape Status", value: (o) => scrapeStatusLabel(scrape.get(idOf(o))?.status) },
+      { title: "Get Invoice Pushed", value: (o) => (scrape.has(idOf(o)) ? (pushed.has(idOf(o)) ? "Yes" : "No") : null) },
+    ],
+  });
 }
 
 async function sendMaster(res, runs, rowsByRun, name) {

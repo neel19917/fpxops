@@ -76,6 +76,7 @@ export function buildRunRows(run, ctx) {
       shipment_id,
       status: e.status,
       note: e.note,
+      pushed: giPushed(e),
       clicked_at: e.at,
       audit_id: e.row?.audit_id ?? null,
       customer_name: t.customer_name ?? e.row?.customer_name ?? null,
@@ -118,6 +119,20 @@ export function summarizeRun(run, rows) {
   };
 }
 
+// Whether GET INVOICE was pushed for the shipment in this run: a finished
+// click, or a click the run stopped before it could check ("the button was
+// clicked"). Not reached, not started and waiting rows were never pushed.
+export function giPushed(r) {
+  if (!r) return false;
+  if (r.status === "done") return true;
+  return r.status === "failed" && /\bbutton was clicked\b/i.test(r.note || "");
+}
+const STATUS_LABEL = {
+  done: "Done", failed: "Failed", requested: "Waiting", not_started: "Not started",
+  not_reached: "Not reached", rerun: "Re-run later",
+};
+export const scrapeStatusLabel = (s) => STATUS_LABEL[s] || (s ? String(s) : null);
+
 // Every column the Excel export can have: key (used in the URL), label (the
 // default header), whether it is in the default sheet, and how it is read.
 const fileNames = (r) => r.files.map((f) => String(f).replace(/^invoices\//, "")).join(", ") || null;
@@ -127,6 +142,7 @@ export const EXPORT_COLUMNS = [
   { key: "scrape_date", label: "Scrape date (UTC)", on: true, get: (r, run) => utc(run.requested_at) },
   { key: "shipment_id", label: "Shipment ID", on: true, get: (r) => r.shipment_id },
   { key: "status", label: "Status", on: true, get: (r) => r.status },
+  { key: "pushed", label: "Get Invoice pushed", on: true, get: (r) => (giPushed(r) ? "Yes" : "No") },
   { key: "customer", label: "Customer", on: true, get: (r) => r.customer_name },
   { key: "carrier", label: "Carrier", on: true, get: (r) => r.carrier },
   { key: "tracking", label: "Tracking #", on: true, get: (r) => r.tracking_number },

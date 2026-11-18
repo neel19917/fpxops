@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildRunRows, exportRows, summarizeRun, zipPlan, runShipmentIds, withHistory, EXPORT_HEADERS, buildExport, parseExportOptions } from "../lib/getInvoiceRuns.js";
+import { buildRunRows, exportRows, giPushed, scrapeStatusLabel, summarizeRun, zipPlan, runShipmentIds, withHistory, EXPORT_HEADERS, buildExport, parseExportOptions } from "../lib/getInvoiceRuns.js";
 
 const A = "11111111-1111-4111-8111-111111111111";
 const r1 = { id: "run-1", scrape_number: 40, status: "done", requested_at: "2026-11-17T19:13:00Z", requested_by: "pat", tracking_numbers: ["100", "200", "100"], result_count: 1, note: "Stopped by user. 1 of 2 clicked" };
@@ -54,6 +54,16 @@ describe("Get Invoice runs", () => {
     assert.deepEqual(zipPlan(rows).map((p) => p.name), ["100/100-1.png", "200/200-1.png", "200/200-2.pdf"]);
   });
 
+  it("says whether GET INVOICE was pushed", () => {
+    assert.equal(giPushed({ status: "done" }), true);
+    assert.equal(giPushed({ status: "failed", note: "Stopped before the result could be checked · A new window opened · the button was clicked" }), true);
+    assert.equal(giPushed({ status: "failed", note: "No GET INVOICE button" }), false);
+    for (const s of ["not_reached", "not_started", "requested", "rerun"]) assert.equal(giPushed({ status: s }), false);
+    assert.deepEqual(["done", "not_reached", "x", null].map(scrapeStatusLabel), ["Done", "Not reached", "x", null]);
+    const out = exportRows([r1], new Map([[r1.id, buildRunRows(r1, ctx)]]));
+    assert.deepEqual(out.map((r) => r["Get Invoice pushed"]), ["Yes", "No"]);
+  });
+
   it("withHistory keeps one entry per run, newest last", () => {
     const g = withHistory({ request_id: "b", status: "done", history: [{ request_id: "a", status: "failed" }, { request_id: "b", status: "failed" }] });
     assert.deepEqual(g.history.map((h) => [h.request_id, h.status]), [["a", "failed"], ["b", "done"]]);
@@ -102,8 +112,19 @@ describe("master-file Excel", async () => {
 
   it("drops those columns, keeps the rest in place and adds Scrape # last", () => {
     const cut = filterSortXlsx(book, { keep: (o) => o.ShipmentID !== "200", compare: (a, b) => Number(b.ShipmentID) - Number(a.ShipmentID) });
-    const out = readXlsx(reshapeXlsx(cut, { drop: masterFileDrop, add: { title: "Scrape #", value: (o) => (o.ShipmentID === "300" ? 130 : null) } }));
-    assert.deepEqual(out.headers, ["Customer Name", "ShipmentID", "Charge", "Billing Invoice Number", "Scrape #"]);
-    assert.deepEqual(out.rows.map((r) => [r.ShipmentID, r.Charge, r["Billing Invoice Number"], r["Scrape #"]]), [["300", "30", "Billing Invoice Number 300", "130"], ["100", "10", "Billing Invoice Number 100", ""]]);
+    const out = readXlsx(reshapeXlsx(cut, { drop: masterFileDrop, add: [
+      { title: "Scrape #", value: (o) => (o.ShipmentID === "300" ? 130 : null) },
+      { title: "Scrape Status", value: (o) => (o.ShipmentID === "300" ? "Done" : "Not reached") },
+      { title: "Get Invoice Pushed", value: (o) => (o.ShipmentID === "300" ? "Yes" : "No") },
+    ] }));
+    assert.deepEqual(out.headers, ["Customer Name", "ShipmentID", "Charge", "Billing Invoice Number", "Scrape #", "Scrape Status", "Get Invoice Pushed"]);
+    assert.deepEqual(out.rows.map((r) => [r.ShipmentID, r.Charge, r["Billing Invoice Number"], r["Scrape #"], r["Scrape Status"], r["Get Invoice Pushed"]]),
+      [["300", "30", "Billing Invoice Number 300", "130", "Done", "Yes"], ["100", "10", "Billing Invoice Number 100", "", "Not reached", "No"]]);
+  });
+
+  it("still takes a single added column", () => {
+    const out = readXlsx(reshapeXlsx(book, { drop: masterFileDrop, add: { title: "Scrape #", value: () => 7 } }));
+    assert.equal(out.headers.at(-1), "Scrape #");
+    assert.deepEqual(out.rows.map((r) => r["Scrape #"]), ["7", "7", "7"]);
   });
 });
