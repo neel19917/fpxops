@@ -1,11 +1,13 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowLeft, ChevronDown, ChevronRight, Download, FileArchive, FileSpreadsheet, RefreshCw } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronRight, Download, FileArchive, FileSpreadsheet, RefreshCw, SlidersHorizontal } from "lucide-react";
 import {
   downloadAllRunsExcel, downloadAllRunsZip, downloadRunExcel, downloadRunZip, fetchRun, fetchRuns,
+  loadLayout, saveLayout, type ExportLayout,
   type Run, type RunDetail, type RunRow,
 } from "../lib/getInvoiceRuns";
 import { fmtDateTime, fmtNum } from "../lib/format";
+import { ExcelLayoutModal } from "../components/invoices/ExcelLayoutModal";
 
 // Get Invoice runs: every time the hosted browser clicks GET INVOICE in
 // FreightPOP for chosen shipments, the run gets a scrape number. Each run can
@@ -74,6 +76,10 @@ export function GetInvoiceRunsPage() {
   // Keys like "57:xlsx", "57:zip", "all".
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [dlErr, setDlErr] = useState<string | null>(null);
+  // The Excel layout chosen in "Customize Excel" (null = the standard sheet).
+  const [layout, setLayout] = useState<ExportLayout | null>(() => loadLayout());
+  const [customizing, setCustomizing] = useState(false);
+  const changeLayout = (l: ExportLayout | null) => { setLayout(l); saveLayout(l); };
 
   const loadRuns = useCallback(async () => {
     try {
@@ -155,12 +161,17 @@ export function GetInvoiceRunsPage() {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={() => runDownload("all", downloadAllRunsExcel)} disabled={!!busy.all || !runs?.length} className={PRIMARY_BTN}>
+            <button type="button" onClick={() => runDownload("all", () => downloadAllRunsExcel(layout))} disabled={!!busy.all || !runs?.length} className={PRIMARY_BTN}>
               <Download className="h-4 w-4" aria-hidden="true" /> {busy.all ? "Preparing the file…" : "Download all runs (Excel)"}
             </button>
-            <button type="button" onClick={() => runDownload("allzip", downloadAllRunsZip)} disabled={!!busy.allzip || !anyFiles} className={SECONDARY_BTN}
+            <button type="button" onClick={() => runDownload("allzip", () => downloadAllRunsZip(layout))} disabled={!!busy.allzip || !anyFiles} className={SECONDARY_BTN}
               title={runs && !anyFiles ? "No files have been saved by any run yet" : undefined}>
               <FileArchive className="h-4 w-4" aria-hidden="true" /> {busy.allzip ? "Building the ZIP…" : "Download all files (ZIP)"}
+            </button>
+            <button type="button" onClick={() => setCustomizing(true)} className={SECONDARY_BTN}
+              title="Choose the Excel's columns, their order and headers, the sort and which rows">
+              <SlidersHorizontal className="h-4 w-4" aria-hidden="true" /> Customize Excel
+              {layout ? <span className="rounded-full bg-violet-100 text-violet-800 px-1.5 text-[11px]">custom</span> : null}
             </button>
             <button type="button" onClick={refresh} disabled={refreshing} className={SECONDARY_BTN}>
               <RefreshCw className={"h-4 w-4" + (refreshing ? " animate-spin" : "")} aria-hidden="true" /> Refresh
@@ -173,6 +184,7 @@ export function GetInvoiceRunsPage() {
           </div>
         ) : null}
         {dlErr ? <Alert>{dlErr}</Alert> : null}
+        {customizing ? <ExcelLayoutModal layout={layout} onSave={changeLayout} onClose={() => setCustomizing(false)} /> : null}
         {listErr ? <Alert>{listErr}</Alert> : null}
       </header>
 
@@ -243,12 +255,12 @@ export function GetInvoiceRunsPage() {
                           {n != null ? (
                             <div className="inline-flex gap-1.5">
                               <button type="button" className={SMALL_BTN} disabled={!!busy[`${n}:xlsx`]}
-                                onClick={() => runDownload(`${n}:xlsx`, () => downloadRunExcel(n))}>
+                                onClick={() => runDownload(`${n}:xlsx`, () => downloadRunExcel(n, layout))}>
                                 <FileSpreadsheet className="h-3.5 w-3.5" aria-hidden="true" /> {busy[`${n}:xlsx`] ? "Preparing…" : "Excel"}
                               </button>
                               <button type="button" className={SMALL_BTN} disabled={!!busy[`${n}:zip`] || r.files === 0}
                                 title={r.files === 0 ? "No files were saved for this run" : undefined}
-                                onClick={() => runDownload(`${n}:zip`, () => downloadRunZip(n))}>
+                                onClick={() => runDownload(`${n}:zip`, () => downloadRunZip(n, layout))}>
                                 <FileArchive className="h-3.5 w-3.5" aria-hidden="true" /> {busy[`${n}:zip`] ? "Building the ZIP…" : "ZIP"}
                               </button>
                             </div>

@@ -10,12 +10,6 @@
 // later run clicked again shows status "rerun" in the earlier run, with the
 // later scrape number, and the files it has now.
 
-export const EXPORT_HEADERS = [
-  "Scrape #", "Scrape date (UTC)", "Shipment ID", "Status", "Customer", "Carrier", "Tracking #",
-  "Customer invoice #", "Invoice # (read from document)", "Charge", "Cost", "Approved amount",
-  "Invoice total (read from document)", "Total matches charge", "Exported to ERP", "Files", "File names",
-  "Clicked at (UTC)", "Requested by", "Note",
-];
 
 const asObject = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
 const num = (v) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
@@ -124,36 +118,107 @@ export function summarizeRun(run, rows) {
   };
 }
 
-// Rows → Excel rows keyed by EXPORT_HEADERS.
-export function exportRows(runs, rowsByRun) {
-  const out = [];
-  for (const run of runs) {
-    for (const r of rowsByRun.get(run.id) || []) {
-      out.push({
-        "Scrape #": r.scrape_number,
-        "Scrape date (UTC)": utc(run.requested_at),
-        "Shipment ID": r.shipment_id,
-        "Status": r.status,
-        "Customer": r.customer_name,
-        "Carrier": r.carrier,
-        "Tracking #": r.tracking_number,
-        "Customer invoice #": r.billing_invoice_number,
-        "Invoice # (read from document)": r.read_invoice_number,
-        "Charge": r.charge,
-        "Cost": r.cost,
-        "Approved amount": r.approved_invoice_amount,
-        "Invoice total (read from document)": r.read_total,
-        "Total matches charge": r.read_total == null || r.charge == null ? null : Math.abs(r.read_total - r.charge) <= 0.01 ? "yes" : "no",
-        "Exported to ERP": r.exported_to_erp,
-        "Files": r.files.length,
-        "File names": r.files.map((f) => String(f).replace(/^invoices\//, "")).join(", ") || null,
-        "Clicked at (UTC)": utc(r.clicked_at),
-        "Requested by": run.requested_by ?? null,
-        "Note": r.note,
-      });
-    }
+// Every column the Excel export can have: key (used in the URL), label (the
+// default header), whether it is in the default sheet, and how it is read.
+const fileNames = (r) => r.files.map((f) => String(f).replace(/^invoices\//, "")).join(", ") || null;
+const diff = (r) => (r.read_total == null || r.charge == null ? null : Math.round((r.read_total - r.charge) * 100) / 100);
+export const EXPORT_COLUMNS = [
+  { key: "scrape_number", label: "Scrape #", on: true, get: (r) => r.scrape_number },
+  { key: "scrape_date", label: "Scrape date (UTC)", on: true, get: (r, run) => utc(run.requested_at) },
+  { key: "shipment_id", label: "Shipment ID", on: true, get: (r) => r.shipment_id },
+  { key: "status", label: "Status", on: true, get: (r) => r.status },
+  { key: "customer", label: "Customer", on: true, get: (r) => r.customer_name },
+  { key: "carrier", label: "Carrier", on: true, get: (r) => r.carrier },
+  { key: "tracking", label: "Tracking #", on: true, get: (r) => r.tracking_number },
+  { key: "customer_invoice", label: "Customer invoice #", on: true, get: (r) => r.billing_invoice_number },
+  { key: "read_invoice", label: "Invoice # (read from document)", on: true, get: (r) => r.read_invoice_number },
+  { key: "charge", label: "Charge", on: true, get: (r) => r.charge },
+  { key: "cost", label: "Cost", on: true, get: (r) => r.cost },
+  { key: "approved", label: "Approved amount", on: true, get: (r) => r.approved_invoice_amount },
+  { key: "read_total", label: "Invoice total (read from document)", on: true, get: (r) => r.read_total },
+  { key: "total_matches", label: "Total matches charge", on: true, get: (r) => (diff(r) == null ? null : Math.abs(diff(r)) <= 0.01 ? "yes" : "no") },
+  { key: "exported", label: "Exported to ERP", on: true, get: (r) => r.exported_to_erp },
+  { key: "files", label: "Files", on: true, get: (r) => r.files.length },
+  { key: "file_names", label: "File names", on: true, get: fileNames },
+  { key: "clicked_at", label: "Clicked at (UTC)", on: true, get: (r) => utc(r.clicked_at) },
+  { key: "requested_by", label: "Requested by", on: true, get: (r, run) => run.requested_by ?? null },
+  { key: "note", label: "Note", on: true, get: (r) => r.note },
+  { key: "gross_profit", label: "Gross profit", on: false, get: (r) => (r.charge == null || r.cost == null ? null : Math.round((r.charge - r.cost) * 100) / 100) },
+  { key: "difference", label: "Read total minus charge", on: false, get: diff },
+  { key: "read_carrier", label: "Carrier (read from document)", on: false, get: (r) => r.read_carrier },
+  { key: "later_run", label: "Clicked again in scrape #", on: false, get: (r) => r.later_run },
+  { key: "audit_id", label: "ERP pull id", on: false, get: (r) => r.audit_id },
+];
+export const EXPORT_HEADERS = EXPORT_COLUMNS.filter((c) => c.on).map((c) => c.label);
+const COLUMN = new Map(EXPORT_COLUMNS.map((c) => [c.key, c]));
+
+// The sheet's options from a query string, anything unknown dropped:
+//   columns=key,key,...   which columns, in this order (default: the default set)
+//   label.<key>=Header    a header of your own for a column
+//   sort=<key>&dir=asc|desc
+//   status=done,failed    only rows with these statuses
+//   latest=1              one row per shipment: its newest run only
+export function parseExportOptions(q = {}) {
+  const list = (v) => String(v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  const columns = [...new Set(list(q.columns).filter((k) => COLUMN.has(k)))];
+  const labels = {};
+  for (const [k, v] of Object.entries(q)) {
+    if (!k.startsWith("label.")) continue;
+    const key = k.slice(6);
+    const text = String(v ?? "").trim().slice(0, 80);
+    if (COLUMN.has(key) && text) labels[key] = text;
   }
-  return out;
+  const sort = COLUMN.has(String(q.sort || "")) ? String(q.sort) : null;
+  return {
+    columns: columns.length ? columns : EXPORT_COLUMNS.filter((c) => c.on).map((c) => c.key),
+    labels,
+    sort,
+    dir: q.dir === "desc" ? "desc" : "asc",
+    statuses: list(q.status),
+    latest: q.latest === "1" || q.latest === "true",
+  };
+}
+
+// Runs → { headers, rows } for writeXlsx, shaped by the options.
+export function buildExport(runs, rowsByRun, opts = parseExportOptions()) {
+  let items = [];
+  for (const run of runs) for (const r of rowsByRun.get(run.id) || []) items.push({ r, run });
+  if (opts.statuses?.length) items = items.filter((x) => opts.statuses.includes(x.r.status));
+  if (opts.latest) {
+    const newest = new Map();
+    for (const x of items) {
+      const had = newest.get(x.r.shipment_id);
+      if (!had || Date.parse(x.run.requested_at) > Date.parse(had.run.requested_at)) newest.set(x.r.shipment_id, x);
+    }
+    items = items.filter((x) => newest.get(x.r.shipment_id) === x);
+  }
+  if (opts.sort) {
+    const get = COLUMN.get(opts.sort).get;
+    const sign = opts.dir === "desc" ? -1 : 1;
+    items = items.map((x, i) => ({ ...x, i, v: get(x.r, x.run) })).sort((a, b) => {
+      if (a.v == null && b.v == null) return a.i - b.i;
+      if (a.v == null) return 1; // blanks last either way
+      if (b.v == null) return -1;
+      const c = typeof a.v === "number" && typeof b.v === "number" ? a.v - b.v : String(a.v).localeCompare(String(b.v), undefined, { numeric: true });
+      return c ? c * sign : a.i - b.i;
+    });
+  }
+  const cols = opts.columns.map((k) => COLUMN.get(k));
+  // Two columns given the same header would overwrite each other: number the repeats.
+  const used = new Map();
+  const headers = cols.map((c) => {
+    const want = opts.labels?.[c.key] || c.label;
+    const n = (used.get(want) || 0) + 1;
+    used.set(want, n);
+    return n === 1 ? want : `${want} (${n})`;
+  });
+  const rows = items.map(({ r, run }) => Object.fromEntries(cols.map((c, i) => [headers[i], c.get(r, run) ?? null])));
+  return { headers, rows };
+}
+
+// Rows → Excel rows keyed by EXPORT_HEADERS (the default sheet).
+export function exportRows(runs, rowsByRun) {
+  return buildExport(runs, rowsByRun).rows;
 }
 
 // A name that is safe as one path segment inside a ZIP.

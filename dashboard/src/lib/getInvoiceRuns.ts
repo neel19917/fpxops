@@ -105,22 +105,78 @@ export async function fetchRun(scrapeNumber: number): Promise<RunDetail> {
   return res.json();
 }
 
+// ---------------------------------------------------------------------------
+// The Excel layout: which columns, in what order, with what headers, sorted
+// how and which rows. Kept in this browser; every Excel (and the one inside a
+// ZIP) is built with it.
+// ---------------------------------------------------------------------------
+export interface ExportColumn { key: string; label: string; default: boolean }
+export interface ExportLayout {
+  columns: { key: string; label: string }[]; // in order; label "" keeps the column's own header
+  sort: string; // column key, or "" for the run's own order
+  dir: "asc" | "desc";
+  statuses: string[]; // [] = every status
+  latest: boolean; // one row per shipment, its newest run
+}
+export const EXPORT_STATUSES: { key: string; label: string }[] = [
+  { key: "done", label: "Done" }, { key: "failed", label: "Failed" }, { key: "rerun", label: "Re-run later" },
+  { key: "not_reached", label: "Not reached" }, { key: "requested", label: "Waiting" },
+];
+
+/** The columns the server can put in the Excel. */
+export async function fetchExportColumns(): Promise<ExportColumn[]> {
+  const res = await call(`${BASE}/columns`);
+  const body = (await res.json()) as { columns?: ExportColumn[] };
+  return body.columns ?? [];
+}
+
+export function defaultLayout(cols: ExportColumn[]): ExportLayout {
+  return { columns: cols.filter((c) => c.default).map((c) => ({ key: c.key, label: "" })), sort: "", dir: "asc", statuses: [], latest: false };
+}
+
+const LAYOUT_KEY = "fpx.getInvoiceRuns.excelLayout.v1";
+export function loadLayout(): ExportLayout | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "null") as ExportLayout | null;
+    return v && Array.isArray(v.columns) ? v : null;
+  } catch { return null; }
+}
+export function saveLayout(layout: ExportLayout | null): void {
+  try {
+    if (layout) localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
+    else localStorage.removeItem(LAYOUT_KEY);
+  } catch { /* storage blocked: the layout lasts until the page is left */ }
+}
+
+/** The layout as the query string the export routes read ("" for none). */
+export function layoutQuery(layout: ExportLayout | null): string {
+  if (!layout) return "";
+  const p = new URLSearchParams();
+  if (layout.columns.length) p.set("columns", layout.columns.map((c) => c.key).join(","));
+  for (const c of layout.columns) if (c.label.trim()) p.set(`label.${c.key}`, c.label.trim());
+  if (layout.sort) { p.set("sort", layout.sort); p.set("dir", layout.dir); }
+  if (layout.statuses.length) p.set("status", layout.statuses.join(","));
+  if (layout.latest) p.set("latest", "1");
+  const q = p.toString();
+  return q ? `?${q}` : "";
+}
+
 /** One run's shipments as an Excel file. */
-export function downloadRunExcel(scrapeNumber: number): Promise<void> {
-  return download(`${BASE}/${encodeURIComponent(String(scrapeNumber))}/export.xlsx`, `GetInvoice-${scrapeNumber}.xlsx`);
+export function downloadRunExcel(scrapeNumber: number, layout: ExportLayout | null = null): Promise<void> {
+  return download(`${BASE}/${encodeURIComponent(String(scrapeNumber))}/export.xlsx${layoutQuery(layout)}`, `GetInvoice-${scrapeNumber}.xlsx`);
 }
 
 /** One run as a ZIP: a folder per shipment with its files, plus the Excel. */
-export function downloadRunZip(scrapeNumber: number): Promise<void> {
-  return download(`${BASE}/${encodeURIComponent(String(scrapeNumber))}/files.zip`, `GetInvoice-${scrapeNumber}.zip`, ZIP_TIMEOUT_MS);
+export function downloadRunZip(scrapeNumber: number, layout: ExportLayout | null = null): Promise<void> {
+  return download(`${BASE}/${encodeURIComponent(String(scrapeNumber))}/files.zip${layoutQuery(layout)}`, `GetInvoice-${scrapeNumber}.zip`, ZIP_TIMEOUT_MS);
 }
 
 /** Every run's shipments in one Excel file, scrape number first. */
-export function downloadAllRunsExcel(): Promise<void> {
-  return download(`${BASE}/export.xlsx`, "GetInvoice-all-runs.xlsx", ZIP_TIMEOUT_MS);
+export function downloadAllRunsExcel(layout: ExportLayout | null = null): Promise<void> {
+  return download(`${BASE}/export.xlsx${layoutQuery(layout)}`, "GetInvoice-all-runs.xlsx", ZIP_TIMEOUT_MS);
 }
 
 /** Every run's files in one ZIP: a folder per shipment, plus the Excel of all runs. */
-export function downloadAllRunsZip(): Promise<void> {
-  return download(`${BASE}/files.zip`, "GetInvoice-all-runs.zip", ZIP_TIMEOUT_MS);
+export function downloadAllRunsZip(layout: ExportLayout | null = null): Promise<void> {
+  return download(`${BASE}/files.zip${layoutQuery(layout)}`, "GetInvoice-all-runs.zip", ZIP_TIMEOUT_MS);
 }

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildRunRows, exportRows, summarizeRun, zipPlan, runShipmentIds, withHistory, EXPORT_HEADERS } from "../lib/getInvoiceRuns.js";
+import { buildRunRows, exportRows, summarizeRun, zipPlan, runShipmentIds, withHistory, EXPORT_HEADERS, buildExport, parseExportOptions } from "../lib/getInvoiceRuns.js";
 
 const A = "11111111-1111-4111-8111-111111111111";
 const r1 = { id: "run-1", scrape_number: 40, status: "done", requested_at: "2026-11-17T19:13:00Z", requested_by: "pat", tracking_numbers: ["100", "200", "100"], result_count: 1, note: "Stopped by user. 1 of 2 clicked" };
@@ -58,5 +58,31 @@ describe("Get Invoice runs", () => {
     const g = withHistory({ request_id: "b", status: "done", history: [{ request_id: "a", status: "failed" }, { request_id: "b", status: "failed" }] });
     assert.deepEqual(g.history.map((h) => [h.request_id, h.status]), [["a", "failed"], ["b", "done"]]);
     assert.equal(withHistory({ status: "done" }).history, undefined);
+  });
+});
+
+describe("Get Invoice export options", () => {
+  const rowsByRun = new Map([[r1.id, buildRunRows(r1, ctx)], [r2.id, buildRunRows(r2, ctx)]]);
+  it("picks, orders and renames columns", () => {
+    const opts = parseExportOptions({ columns: "shipment_id,scrape_number,nope,shipment_id", "label.shipment_id": "Shipment", "label.bad": "x" });
+    assert.deepEqual(opts.columns, ["shipment_id", "scrape_number"]);
+    const { headers, rows } = buildExport([r1, r2], rowsByRun, opts);
+    assert.deepEqual(headers, ["Shipment", "Scrape #"]);
+    assert.deepEqual(rows[0], { Shipment: "100", "Scrape #": 40 });
+  });
+  it("defaults to the default columns", () => {
+    assert.deepEqual(buildExport([r1], rowsByRun).headers, EXPORT_HEADERS);
+  });
+  it("filters by status, keeps the newest run per shipment, and sorts with blanks last", () => {
+    const only = buildExport([r1, r2], rowsByRun, parseExportOptions({ columns: "shipment_id,scrape_number", status: "done" }));
+    assert.deepEqual(only.rows.map((r) => [r["Shipment ID"], r["Scrape #"]]), [["100", 40], ["200", 41]]);
+    const latest = buildExport([r1, r2], rowsByRun, parseExportOptions({ columns: "shipment_id,scrape_number", latest: "1", sort: "scrape_number", dir: "desc" }));
+    assert.deepEqual(latest.rows.map((r) => [r["Shipment ID"], r["Scrape #"]]), [["200", 41], ["100", 40]]);
+    const byCharge = buildExport([r1, r2], rowsByRun, parseExportOptions({ columns: "shipment_id,charge", sort: "charge", dir: "desc" }));
+    assert.equal(byCharge.rows.at(-1).Charge, null);
+  });
+  it("numbers repeated headers", () => {
+    const { headers } = buildExport([r1], rowsByRun, parseExportOptions({ columns: "charge,cost", "label.cost": "Charge" }));
+    assert.deepEqual(headers, ["Charge", "Charge (2)"]);
   });
 });

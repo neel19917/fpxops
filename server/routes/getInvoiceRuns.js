@@ -1,7 +1,10 @@
 // Get Invoice runs, each with its scrape number, as a list, as Excel and as a
 // ZIP of the files saved for each shipment. Mounted at /api/get-invoice-runs
 // (auth is applied where it is mounted). Read only.
+//   GET /columns               the Excel columns there are (for the column picker)
 //   GET /                      runs, newest first, with counts
+// Every Excel (and the one inside a ZIP) takes the sheet options of
+// parseExportOptions: ?columns=&label.<key>=&sort=&dir=&status=&latest=
 //   GET /export.xlsx           every run's shipments in one sheet
 //   GET /files.zip             every run's files, one folder per shipment, + the sheet
 //   GET /:n                    one run (by scrape number) and its shipments
@@ -12,7 +15,7 @@ import { supabase } from "../lib/supabase.js";
 import { writeXlsx, zip } from "../lib/xlsxWrite.js";
 import { ERP_BUCKET } from "../lib/invoiceDocs.js";
 import {
-  EXPORT_HEADERS, buildRunRows, exportRows, runShipmentIds, summarizeRun, zipPlan,
+  EXPORT_COLUMNS, buildExport, buildRunRows, parseExportOptions, runShipmentIds, summarizeRun, zipPlan,
 } from "../lib/getInvoiceRuns.js";
 
 export const getInvoiceRunsRouter = Router();
@@ -67,15 +70,20 @@ async function load(only = null) {
 const fail = (res, e) => res.status(500).json({ error: e?.message || String(e) });
 const day = () => new Date().toISOString().slice(0, 10);
 
-function sendXlsx(res, runs, rowsByRun, name) {
-  const buf = writeXlsx(EXPORT_HEADERS, exportRows(runs, rowsByRun));
+const sheet = (runs, rowsByRun, query) => {
+  const { headers, rows } = buildExport(runs, rowsByRun, parseExportOptions(query));
+  return writeXlsx(headers, rows);
+};
+
+function sendXlsx(res, runs, rowsByRun, name, query) {
+  const buf = sheet(runs, rowsByRun, query);
   res.set({ "Content-Type": XLSX_TYPE, "Content-Disposition": `attachment; filename="${name}"`, "Content-Length": String(buf.length), "Cache-Control": "private, no-store" });
   res.send(buf);
 }
 
 // The ZIP: one folder per shipment with its files and data.json (what FPX
 // holds for it in Supabase), and the Excel sheet at the root.
-async function sendZip(res, runs, rowsByRun, base) {
+async function sendZip(res, runs, rowsByRun, base, query) {
   const rows = runs.flatMap((r) => rowsByRun.get(r.id) || []);
   const plan = zipPlan(rows);
   if (plan.length > MAX_ZIP_FILES) {
@@ -112,12 +120,17 @@ async function sendZip(res, runs, rowsByRun, base) {
     entries.push({ name: `${base}/${id.replace(/[^A-Za-z0-9_.-]+/g, "_")}/data.json`, data: Buffer.from(JSON.stringify(json, null, 2)) });
   }
   entries.sort((a, b) => a.name.localeCompare(b.name));
-  entries.unshift({ name: `${base}/${base}.xlsx`, data: writeXlsx(EXPORT_HEADERS, exportRows(runs, rowsByRun)) });
+  entries.unshift({ name: `${base}/${base}.xlsx`, data: sheet(runs, rowsByRun, query) });
   if (missing.length) entries.push({ name: `${base}/MISSING-FILES.txt`, data: Buffer.from(`These files could not be read from storage:\n${missing.join("\n")}\n`) });
   const buf = zip(entries);
   res.set({ "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="${base}.zip"`, "Content-Length": String(buf.length), "Cache-Control": "private, no-store" });
   res.send(buf);
 }
+
+// The columns the export can have, for the dashboard's column picker.
+getInvoiceRunsRouter.get("/columns", (_req, res) => {
+  res.json({ columns: EXPORT_COLUMNS.map(({ key, label, on }) => ({ key, label, default: on })) });
+});
 
 getInvoiceRunsRouter.get("/", async (_req, res) => {
   try {
@@ -126,17 +139,17 @@ getInvoiceRunsRouter.get("/", async (_req, res) => {
   } catch (e) { fail(res, e); }
 });
 
-getInvoiceRunsRouter.get("/export.xlsx", async (_req, res) => {
+getInvoiceRunsRouter.get("/export.xlsx", async (req, res) => {
   try {
     const { runs, rowsByRun } = await load();
-    sendXlsx(res, runs, rowsByRun, `GetInvoice-AllScrapes-${day()}.xlsx`);
+    sendXlsx(res, runs, rowsByRun, `GetInvoice-AllScrapes-${day()}.xlsx`, req.query);
   } catch (e) { fail(res, e); }
 });
 
-getInvoiceRunsRouter.get("/files.zip", async (_req, res) => {
+getInvoiceRunsRouter.get("/files.zip", async (req, res) => {
   try {
     const { runs, rowsByRun } = await load();
-    await sendZip(res, runs, rowsByRun, `GetInvoice-AllScrapes-${day()}`);
+    await sendZip(res, runs, rowsByRun, `GetInvoice-AllScrapes-${day()}`, req.query);
   } catch (e) { fail(res, e); }
 });
 
@@ -161,13 +174,13 @@ getInvoiceRunsRouter.get("/:n", async (req, res) => {
 getInvoiceRunsRouter.get("/:n/export.xlsx", async (req, res) => {
   try {
     const got = await oneRun(req, res);
-    if (got) sendXlsx(res, got.runs, got.rowsByRun, `GetInvoice-Scrape-${got.n}.xlsx`);
+    if (got) sendXlsx(res, got.runs, got.rowsByRun, `GetInvoice-Scrape-${got.n}.xlsx`, req.query);
   } catch (e) { fail(res, e); }
 });
 
 getInvoiceRunsRouter.get("/:n/files.zip", async (req, res) => {
   try {
     const got = await oneRun(req, res);
-    if (got) await sendZip(res, got.runs, got.rowsByRun, `GetInvoice-Scrape-${got.n}`);
+    if (got) await sendZip(res, got.runs, got.rowsByRun, `GetInvoice-Scrape-${got.n}`, req.query);
   } catch (e) { fail(res, e); }
 });
