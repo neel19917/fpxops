@@ -1,4 +1,7 @@
+import { useCallback } from "react";
 import { apiUrl, getAccessTokenOrWait } from "./api";
+import { cachedFetch, invalidateCache } from "./sessionCache";
+import { useCached, type Cached } from "./useCached";
 
 // Client calls and shared words for the Invoices page (/invoices): find any
 // invoice, and see where every invoice stands. Reads only, except
@@ -295,20 +298,70 @@ async function call(path: string, init?: RequestInit & { optional?: boolean }): 
   return res;
 }
 
-/** How much FPX holds from FreightPOP and when it last read it. */
-export async function fetchHubSummary(signal?: AbortSignal): Promise<HubSummary> {
-  return (await call("/api/audits/erp/summary", { signal })).json();
-}
+// ── Cache ──
+// The summary and every list page go through a stale-while-revalidate cache
+// (memory + sessionStorage, see sessionCache.ts). The page shows the last
+// numbers at once and asks again in the background; list pages and searches
+// reuse an answer younger than LIST_FRESH_MS. Anything that changes invoices
+// calls invalidateHubCache().
 
-/** One page of shipments (biggest charge first), with the count in each step. */
-export async function fetchHubList(f: HubListFilters, signal?: AbortSignal): Promise<HubList> {
+const CACHE_PREFIX = "hub.";
+/** A list page or search younger than this is reused without asking the server. */
+export const LIST_FRESH_MS = 60_000;
+
+export const hubSummaryKey = (): string => `${CACHE_PREFIX}summary`;
+
+function hubListParams(f: HubListFilters): URLSearchParams {
   const p = new URLSearchParams();
   if (f.q?.trim()) p.set("q", f.q.trim());
   if (f.step) p.set("bucket", f.step);
   if (f.approvedBy) p.set("approved_by_kind", f.approvedBy);
   p.set("limit", String(f.limit ?? 50));
   if (f.offset) p.set("offset", String(f.offset));
-  return (await call(`/api/audits/erp/invoicing?${p.toString()}`, { signal })).json();
+  return p;
+}
+
+/** The cache key of one list call: the same filters give the same key. */
+export const hubListKey = (f: HubListFilters): string => `${CACHE_PREFIX}list?${hubListParams(f).toString()}`;
+
+/**
+ * Something changed invoices (sent, approved, read): every cached count and
+ * list is marked stale. It keeps showing, and the next look asks the server.
+ * `except` leaves one key alone (the answer that just showed the change).
+ */
+export function invalidateHubCache(except?: string): void {
+  invalidateCache(CACHE_PREFIX, except);
+}
+
+async function loadHubSummary(signal: AbortSignal): Promise<HubSummary> {
+  return (await call("/api/audits/erp/summary", { signal })).json();
+}
+
+async function loadHubList(f: HubListFilters, signal: AbortSignal): Promise<HubList> {
+  return (await call(`/api/audits/erp/invoicing?${hubListParams(f).toString()}`, { signal })).json();
+}
+
+/** How much FPX holds from FreightPOP and when it last read it. Always asks the server (shared with a call in flight). */
+export function fetchHubSummary(signal?: AbortSignal): Promise<HubSummary> {
+  return cachedFetch(hubSummaryKey(), loadHubSummary, { signal });
+}
+
+/** One page of shipments (biggest charge first), with the count in each step. Reuses an answer younger than LIST_FRESH_MS. */
+export function fetchHubList(f: HubListFilters, signal?: AbortSignal, opts: { maxAgeMs?: number } = {}): Promise<HubList> {
+  return cachedFetch(hubListKey(f), (s) => loadHubList(f, s), { signal, maxAgeMs: opts.maxAgeMs ?? LIST_FRESH_MS });
+}
+
+/** The summary, shown from the cache at once and refreshed in the background. */
+export function useHubSummary(): Cached<HubSummary> {
+  return useCached(hubSummaryKey(), loadHubSummary);
+}
+
+/** One list call, shown from the cache at once and refreshed in the background. */
+export function useHubList(f: HubListFilters): Cached<HubList> {
+  const key = hubListKey(f);
+  // The key holds every filter, so a fetcher made for this key is right for it.
+  const fetcher = useCallback((s: AbortSignal) => loadHubList(f, s), [key]); // eslint-disable-line react-hooks/exhaustive-deps
+  return useCached(key, fetcher);
 }
 
 /** One shipment by its exact shipment number, or null when FPX does not know it. */
@@ -334,4 +387,5 @@ export async function fetchInvoiceDocs(shipmentId: string, signal?: AbortSignal)
 /** Ask FPX to read this shipment's saved documents now. */
 export async function processInvoiceDocs(shipmentId: string): Promise<void> {
   await call("/api/invoice-docs/process", { method: "POST", body: JSON.stringify({ shipment_id: shipmentId }) });
+  invalidateHubCache();
 }

@@ -37,7 +37,9 @@ async function inChunks(ids, read) {
 }
 
 // Every Get Invoice run with its shipments' rows. `only` limits it to one run.
-async function load(only = null) {
+// Documents of every status but skipped are read, so the flags can tell "not
+// read yet" and "could not be read" from "no invoice" (see flagsFor).
+export async function load(only = null) {
   const { data: all, error } = await supabase
     .from("fpx_scrape_requests")
     .select("id, scrape_number, status, requested_at, completed_at, requested_by, tracking_numbers, result_count, note")
@@ -52,7 +54,7 @@ async function load(only = null) {
     inChunks(ids, (c) => supabase.from("fpx_erp_transactions")
       .select("shipment_id, customer_name, carrier, tracking_number, billing_invoice_number, charge, cost, approved_invoice_amount, exported_to_erp").in("shipment_id", c)),
     inChunks(ids, (c) => supabase.from("fpx_invoice_documents")
-      .select("shipment_id, audit_id, file, doc_type, invoice_number, total, carrier").in("shipment_id", c).eq("status", "done")),
+      .select("shipment_id, audit_id, file, doc_type, status, invoice_number, total, carrier, confidence, warnings").in("shipment_id", c).neq("status", "skipped")),
   ]);
   const group = (list) => {
     const m = new Map();

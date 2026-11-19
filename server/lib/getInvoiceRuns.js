@@ -62,16 +62,132 @@ export function runEntry(run, rows, byId) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Flags: what a person should look at for one shipment of a run.
+// ---------------------------------------------------------------------------
+//
+// The file GET INVOICE saves ("<id>-invoice.pdf", doc_type "invoice") is the
+// invoice FreightPOP/FPXpress sends the *customer*, so its total is compared
+// with the charge (what the customer pays), and its number with FreightPOP's
+// billing invoice number. The cost and the approved amount are the carrier's
+// side: they are compared with the charge, never with the document's total.
+// The other files (BOL, rate confirmation, quote screenshot) are not invoices,
+// and a "-1.png" screenshot of an invoice row is typed "invoice" but holds
+// no number or total, so it does not count as the invoice read.
+
+const MONEY_TOLERANCE = 0.01;
+export const LOW_CONFIDENCE = 0.75;
+const money = (n) => `$${Math.abs(n).toFixed(2)}`;
+const cents = (n) => Math.round(n * 100) / 100;
+const short = (s, max = 90) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > max ? `${t.slice(0, max - 1)}…` : t; };
+const normInvoiceNo = (v) => String(v ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/^0+(?=.)/, "");
+const DOC_WORDS = { invoice: "invoice screenshot", bol: "BOL/labels", rate_confirmation: "rate confirmation", quote: "quote", shipment_details: "shipment page", accessorials: "accessorials", documents: "documents page", other: "other file" };
+
+// The reader adds a note to nearly every document (weight printed per piece,
+// dates printed with apostrophes, "issued by FreightPOP, not the carrier").
+// Only notes about money, a cut-off or unreadable page, or a page that is not
+// an invoice are worth a flag.
+const WARNING_MATTERS = /(total|amount|add(s)? up|cut off|cut-off|unreadable|illegible|blank|truncat|does not match|doesn't match|disagree|not an invoice)/i;
+const WARNING_NOISE = /(weight|breakdown|per piece|per-piece)/i;
+export const meaningfulWarnings = (warnings) => (Array.isArray(warnings) ? warnings : [])
+  .map((w) => String(w ?? "").trim()).filter((w) => w && WARNING_MATTERS.test(w) && !WARNING_NOISE.test(w));
+
+// The invoice document read for a shipment: a read invoice with a total or a
+// number, the one with both (and the PDF, and the surest) first.
+export function invoiceDocOf(docs) {
+  const score = (d) => (d.total != null ? 2 : 0) + (d.invoice_number ? 2 : 0) + (/\.pdf$/i.test(d.file || "") ? 1 : 0) + (num(d.confidence) ?? 0);
+  return (docs || [])
+    .filter((d) => (d.status ?? "done") === "done" && d.doc_type === "invoice" && (d.invoice_number || d.total != null))
+    .sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+// [{ code, level: "error" | "warn" | "info", text }] for one row of a run.
+//   row:  the row buildRunRows makes (status, note, files, charge, cost, approved_invoice_amount, later_run)
+//   docs: the shipment's fpx_invoice_documents rows (any status)
+//   tx:   its fpx_erp_transactions row, or null
+export function flagsFor(row, docs = [], tx = null) {
+  const out = [];
+  const add = (code, level, text) => out.push({ code, level, text });
+  const st = row?.status;
+  if (st === "rerun") {
+    add("rerun", "info", row.later_run != null ? `Clicked again in scrape #${row.later_run}` : "Clicked again in a later run");
+    return out;
+  }
+  if (st === "requested") return out;
+  if (st === "not_reached") { add("not_reached", "warn", "Not reached: the run stopped first"); return out; }
+  if (st === "not_started") { add("not_started", "warn", row.note ? `Not started: ${short(row.note)}` : "Not started"); return out; }
+  const pushed = giPushed(row);
+  if (st === "failed" && !pushed) { add("failed", "error", row.note ? `Get Invoice failed: ${short(row.note)}` : "Get Invoice failed"); return out; }
+  if (st === "failed") add("unchecked", "warn", "Clicked, but the result was not checked");
+
+  // Documents.
+  const files = Array.isArray(row.files) ? row.files : [];
+  const all = Array.isArray(docs) ? docs : [];
+  const inv = invoiceDocOf(all);
+  if (!files.length) {
+    if (st === "done") add("no_files", "error", "Done, but no file was saved");
+  } else if (!inv) {
+    const read = all.filter((d) => (d.status ?? "done") === "done");
+    const waiting = all.filter((d) => d.status === "pending" || d.status === "processing");
+    if (waiting.length) add("not_read", "info", "Invoice not read yet");
+    else if (all.some((d) => d.status === "failed")) add("read_failed", "warn", "The invoice file could not be read");
+    else if (read.length) {
+      const kinds = [...new Set(read.map((d) => DOC_WORDS[d.doc_type] || d.doc_type))];
+      add("no_invoice", "warn", `No invoice in the files (only ${kinds.join(", ")})`);
+    } else add("not_read", "warn", "No file has been read");
+  }
+  const charge = num(tx?.charge ?? row.charge);
+  const cost = num(tx?.cost ?? row.cost);
+  const approved = num(tx?.approved_invoice_amount ?? row.approved_invoice_amount);
+  const billing = tx?.billing_invoice_number ?? row.billing_invoice_number ?? null;
+  if (inv) {
+    const total = num(inv.total);
+    if (total == null) add("no_total", "warn", "Invoice total not read");
+    else if (charge != null && Math.abs(total - charge) > MONEY_TOLERANCE) {
+      const d = cents(total - charge);
+      add("total_mismatch", "error", `Invoice total ${money(total)} is ${money(d)} ${d > 0 ? "above" : "below"} the charge ${money(charge)}`);
+    }
+    if (!inv.invoice_number) add("no_invoice_number", "info", "Invoice # not read");
+    else if (billing && normInvoiceNo(inv.invoice_number) !== normInvoiceNo(billing)) {
+      add("invoice_number_mismatch", "warn", `Invoice # read ${short(inv.invoice_number, 30)}, FreightPOP has ${short(billing, 30)}`);
+    } else if (!billing && tx) add("no_billing_number", "info", "FreightPOP has no customer invoice #");
+    const conf = num(inv.confidence);
+    if (conf != null && conf < LOW_CONFIDENCE) add("low_confidence", "warn", `Low read confidence (${Math.round(conf * 100)}%)`);
+    const ws = meaningfulWarnings(inv.warnings);
+    if (ws.length) add("reader_warning", "warn", `Reader: ${short(ws[0])}${ws.length > 1 ? ` (+${ws.length - 1} more)` : ""}`);
+  }
+
+  // Money from FreightPOP.
+  if (!tx && row.charge == null && row.cost == null) add("no_transaction", "warn", "Not in FreightPOP's transactions pull");
+  else if (charge == null) add("no_charge", "warn", "No charge in FreightPOP");
+  if (charge != null && cost != null && charge < cost - MONEY_TOLERANCE) {
+    add("loss", "error", `Loss: charge ${money(charge)} is ${money(cents(cost - charge))} below cost ${money(cost)}`);
+  }
+  if (charge != null && approved != null && approved > charge + MONEY_TOLERANCE) {
+    add("approved_over_charge", "error", `Carrier approved ${money(approved)}, above the charge ${money(charge)}`);
+  } else if (cost != null && approved != null && approved > cost + MONEY_TOLERANCE) {
+    add("approved_over_cost", "info", `Carrier approved ${money(cents(approved - cost))} over cost`);
+  }
+  return out;
+}
+
+const LEVEL_RANK = { error: 3, warn: 2, info: 1 };
+// The worst level among the flags, or null when there are none.
+export const flagLevel = (flags) => (flags || []).reduce((top, f) => ((LEVEL_RANK[f.level] || 0) > (LEVEL_RANK[top] || 0) ? f.level : top), null);
+// A row needs a look: it has an error or a warning (info alone does not count).
+export const isFlagged = (r) => (r?.flags || []).some((f) => f.level === "error" || f.level === "warn");
+
 // One run → its rows (one per shipment asked for).
 //   ctx: { byId: Map<request id, run>, rowsByShipment: Map<id, row[]>, tx: Map<id, tx>, docs: Map<id, doc[]> }
+// docs may hold rows of any status (a row without one counts as read).
 export function buildRunRows(run, ctx) {
   return runShipmentIds(run).map((shipment_id) => {
     const e = runEntry(run, ctx.rowsByShipment.get(shipment_id) || [], ctx.byId);
-    const t = ctx.tx.get(shipment_id) || {};
+    const tRow = ctx.tx.get(shipment_id) || null;
+    const t = tRow || {};
     const docs = (ctx.docs.get(shipment_id) || []).filter((d) => !e.row || !d.audit_id || d.audit_id === e.row.audit_id);
-    const inv = docs.find((d) => d.doc_type === "invoice" && (d.invoice_number || d.total != null))
-      || docs.find((d) => d.invoice_number || d.total != null) || null;
-    return {
+    const inv = invoiceDocOf(docs);
+    const row = {
       scrape_number: run.scrape_number ?? null,
       shipment_id,
       status: e.status,
@@ -91,8 +207,11 @@ export function buildRunRows(run, ctx) {
       read_invoice_number: inv?.invoice_number ?? null,
       read_total: num(inv?.total),
       read_carrier: inv?.carrier ?? null,
+      read_confidence: num(inv?.confidence),
       later_run: e.later_run,
     };
+    const flags = flagsFor(row, docs, tRow);
+    return { ...row, flags, flag_level: flagLevel(flags) };
   });
 }
 
@@ -114,6 +233,9 @@ export function summarizeRun(run, rows) {
     failed: count("failed"),
     waiting: count("requested"),
     files: rows.reduce((n, r) => n + r.files.length, 0),
+    // Shipments with an error or a warning flag, and those with an error.
+    flagged: rows.filter(isFlagged).length,
+    flag_errors: rows.filter((r) => (r.flags || []).some((f) => f.level === "error")).length,
     note: /^audit=/.test(run.note || "") ? null : run.note ?? null,
     buttons: parsed ? parsed[1] : null,
   };
@@ -136,6 +258,11 @@ export const scrapeStatusLabel = (s) => STATUS_LABEL[s] || (s ? String(s) : null
 // Every column the Excel export can have: key (used in the URL), label (the
 // default header), whether it is in the default sheet, and how it is read.
 const fileNames = (r) => r.files.map((f) => String(f).replace(/^invoices\//, "")).join(", ") || null;
+// "Flags": the errors and warnings, worst first; "All flags": every flag with its level.
+const byLevel = (flags) => [...(flags || [])].sort((a, b) => (LEVEL_RANK[b.level] || 0) - (LEVEL_RANK[a.level] || 0));
+const flagSummary = (r) => byLevel(r.flags).filter((f) => f.level !== "info").map((f) => f.text).join("; ") || null;
+const LEVEL_WORD = { error: "Error", warn: "Check", info: "Note" };
+const flagText = (r) => byLevel(r.flags).map((f) => `${LEVEL_WORD[f.level] || f.level}: ${f.text}`).join("; ") || null;
 const diff = (r) => (r.read_total == null || r.charge == null ? null : Math.round((r.read_total - r.charge) * 100) / 100);
 export const EXPORT_COLUMNS = [
   { key: "scrape_number", label: "Scrape #", on: true, get: (r) => r.scrape_number },
@@ -153,6 +280,7 @@ export const EXPORT_COLUMNS = [
   { key: "approved", label: "Approved amount", on: true, get: (r) => r.approved_invoice_amount },
   { key: "read_total", label: "Invoice total (read from document)", on: true, get: (r) => r.read_total },
   { key: "total_matches", label: "Total matches charge", on: true, get: (r) => (diff(r) == null ? null : Math.abs(diff(r)) <= 0.01 ? "yes" : "no") },
+  { key: "flags", label: "Flags", on: true, get: flagSummary },
   { key: "exported", label: "Exported to ERP", on: true, get: (r) => r.exported_to_erp },
   { key: "files", label: "Files", on: true, get: (r) => r.files.length },
   { key: "file_names", label: "File names", on: true, get: fileNames },
@@ -164,6 +292,7 @@ export const EXPORT_COLUMNS = [
   { key: "read_carrier", label: "Carrier (read from document)", on: false, get: (r) => r.read_carrier },
   { key: "later_run", label: "Clicked again in scrape #", on: false, get: (r) => r.later_run },
   { key: "audit_id", label: "ERP pull id", on: false, get: (r) => r.audit_id },
+  { key: "flag_text", label: "All flags (with level)", on: false, get: flagText },
 ];
 export const EXPORT_HEADERS = EXPORT_COLUMNS.filter((c) => c.on).map((c) => c.label);
 const COLUMN = new Map(EXPORT_COLUMNS.map((c) => [c.key, c]));

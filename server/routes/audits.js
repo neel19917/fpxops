@@ -17,6 +17,7 @@ import {
 } from "../lib/invoicingSearch.js";
 import { historyItems, recordScrapeHistory, readBefore } from "../lib/scrapeHistory.js";
 import { queueInvoiceDocuments } from "../lib/invoiceDocs.js";
+import { ERP_HUB_TTL, cacheKey, erpHubCache, invalidateErpHub, setCacheHeaders } from "../lib/memoCache.js";
 
 // Hands the files of stored captures to the invoice reader (one row per file
 // in fpx_invoice_documents, read in the background). `captures` is
@@ -448,6 +449,7 @@ auditsRouter.post("/invoice/:id/get-invoice-results", async (req, res) => {
     else if (!failedShipments.has(id)) updated += 1;
   }
   if (failedShipments.size) console.warn(`[FPX] get-invoice results for ${run.id}: ${failedShipments.size} shipment(s) not saved`);
+  invalidateErpHub();
   // The saved files of the shipments that were stored get read into fpx_invoice_documents.
   queueSavedFiles([...byShipment.values()]
     .filter((r) => r.shots?.length && out.matched.has(r.shipment_id) && !failedShipments.has(r.shipment_id))
@@ -563,6 +565,8 @@ auditsRouter.post("/invoice/:id/approval-results", async (req, res) => {
   } catch (e) {
     console.warn(`[FPX] approval results for ${run.id}: approvals not stored: ${e?.message || e}`);
   }
+  // fpx_audit_approvals and the rows of the pull changed: the Invoices hub reloads.
+  invalidateErpHub();
 
   const now = summarizeApprovals(after)
     || { matched: 0, not_found: 0, by_edi: 0, by_unknown: 0, by_person: {}, by_source: { recently_approved: 0, history: 0 } };
@@ -617,6 +621,8 @@ auditsRouter.post("/erp/transactions", async (req, res) => {
   }
   // Every report row as it came (a parcel shipment has one per package).
   const pieces = await upsertPieceRows(supabase, transactionPieceRows(body.rows, (r) => transactionRow(r), { shipmentType: shipmentType || undefined }));
+  // fpx_erp_transactions changed (new shipments, exported_to_erp): the Invoices hub reloads.
+  invalidateErpHub();
   res.json({
     received: mapped.received,
     rows_stored: pieces.upserted,
@@ -909,8 +915,11 @@ auditsRouter.get("/erp/invoicing", async (req, res) => {
 
   if (q) {
     try {
-      const found = await searchErpInvoicing({ q, kind, bucket, limit, offset });
+      const key = cacheKey("erp:invoicing:search", { q, kind, bucket, limit, offset });
+      const got = await erpHubCache.get(key, () => searchErpInvoicing({ q, kind, bucket, limit, offset }), ERP_HUB_TTL.search);
+      const found = got.value;
       const all = ERP_BUCKETS.reduce((a, b) => a + found.counts[b], 0);
+      setCacheHeaders(res, got.status, got.ageMs);
       return res.json({
         data: found.data,
         counts: found.counts,
@@ -926,12 +935,18 @@ auditsRouter.get("/erp/invoicing", async (req, res) => {
     }
   }
 
-  let list = erpInvoicingFilters(supabase.from("fpx_erp_invoicing").select("*"), { kind });
-  if (bucket) list = list.eq("bucket", bucket);
-  list = list
-    .order("charge", { ascending: false, nullsFirst: false })
-    .order("shipment_id", { ascending: true })
-    .range(offset, offset + limit - 1);
+  // The four step counts depend only on approved_by_kind, so they are cached
+  // apart from the page: switching step or paging reuses them.
+  const loadPage = async () => {
+    let list = erpInvoicingFilters(supabase.from("fpx_erp_invoicing").select("*"), { kind });
+    if (bucket) list = list.eq("bucket", bucket);
+    const { data, error } = await list
+      .order("charge", { ascending: false, nullsFirst: false })
+      .order("shipment_id", { ascending: true })
+      .range(offset, offset + limit - 1);
+    if (error) throw new Error(error.message);
+    return data || [];
+  };
   const countOf = async (b) => {
     try {
       const { count, error } = await erpInvoicingFilters(
@@ -942,13 +957,33 @@ auditsRouter.get("/erp/invoicing", async (req, res) => {
       return null;
     }
   };
-  const [{ data, error }, ...bucketCounts] = await Promise.all([list, ...ERP_BUCKETS.map(countOf)]);
-  if (error) return res.status(500).json({ error: error.message });
-  const counts = Object.fromEntries(ERP_BUCKETS.map((b, i) => [b, bucketCounts[i]]));
+  const loadCounts = async () => {
+    const bucketCounts = await Promise.all(ERP_BUCKETS.map(countOf));
+    return Object.fromEntries(ERP_BUCKETS.map((b, i) => [b, bucketCounts[i]]));
+  };
+  let page;
+  let counted;
+  try {
+    [page, counted] = await Promise.all([
+      erpHubCache.get(cacheKey("erp:invoicing:page", { kind, bucket, limit, offset }), loadPage, ERP_HUB_TTL.list),
+      // A count that could not be read is not kept, so the next call tries again.
+      erpHubCache.get(cacheKey("erp:invoicing:counts", { kind }), loadCounts, {
+        ...ERP_HUB_TTL.counts,
+        shouldCache: (c) => Object.values(c).every((n) => n !== null),
+      }),
+    ]);
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+  const counts = counted.value;
+  const bucketCounts = ERP_BUCKETS.map((b) => counts[b]);
   const known = bucketCounts.every((c) => c !== null);
   const all = known ? bucketCounts.reduce((a, c) => a + c, 0) : null;
+  const status = [page.status, counted.status].includes("miss") ? "miss"
+    : [page.status, counted.status].includes("stale") ? "stale" : "hit";
+  setCacheHeaders(res, status, Math.max(page.ageMs, counted.ageMs));
   res.json({
-    data: data || [],
+    data: page.value,
     counts,
     totals: { all, matching: bucket ? counts[bucket] : all },
     limit,
@@ -968,11 +1003,15 @@ auditsRouter.get("/erp/summary", async (_req, res) => {
     return { rows: counted.count || 0, last_seen_at: latest.data?.[0]?.last_seen_at ?? null };
   };
   try {
-    const [transactions, approvals] = await Promise.all([
-      about("fpx_erp_transactions", "shipment_id"),
-      about("fpx_audit_approvals", "approval_key"),
-    ]);
-    res.json({ transactions, approvals });
+    const got = await erpHubCache.get("erp:summary", async () => {
+      const [transactions, approvals] = await Promise.all([
+        about("fpx_erp_transactions", "shipment_id"),
+        about("fpx_audit_approvals", "approval_key"),
+      ]);
+      return { transactions, approvals };
+    }, ERP_HUB_TTL.summary);
+    setCacheHeaders(res, got.status, got.ageMs);
+    res.json(got.value);
   } catch (e) {
     res.status(500).json({ error: e?.message || String(e) });
   }

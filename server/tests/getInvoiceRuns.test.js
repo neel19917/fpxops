@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildRunRows, exportRows, giPushed, scrapeStatusLabel, summarizeRun, zipPlan, runShipmentIds, withHistory, EXPORT_HEADERS, buildExport, parseExportOptions } from "../lib/getInvoiceRuns.js";
+import { buildRunRows, exportRows, flagsFor, flagLevel, isFlagged, invoiceDocOf, meaningfulWarnings, giPushed, scrapeStatusLabel, summarizeRun, zipPlan, runShipmentIds, withHistory, EXPORT_HEADERS, buildExport, parseExportOptions } from "../lib/getInvoiceRuns.js";
 
 const A = "11111111-1111-4111-8111-111111111111";
 const r1 = { id: "run-1", scrape_number: 40, status: "done", requested_at: "2026-11-17T19:13:00Z", requested_by: "pat", tracking_numbers: ["100", "200", "100"], result_count: 1, note: "Stopped by user. 1 of 2 clicked" };
@@ -126,5 +126,90 @@ describe("master-file Excel", async () => {
     const out = readXlsx(reshapeXlsx(book, { drop: masterFileDrop, add: { title: "Scrape #", value: () => 7 } }));
     assert.equal(out.headers.at(-1), "Scrape #");
     assert.deepEqual(out.rows.map((r) => r["Scrape #"]), ["7", "7", "7"]);
+  });
+});
+
+describe("Get Invoice flags", () => {
+  const codes = (flags) => flags.map((f) => f.code);
+  const done = { status: "done", note: null, files: ["invoices/100-invoice.pdf"], later_run: null };
+  const tx = { charge: 250, cost: 200, approved_invoice_amount: 200, billing_invoice_number: "INV-100" };
+  const inv = { status: "done", doc_type: "invoice", file: "invoices/100-invoice.pdf", invoice_number: "INV-100", total: 250, confidence: 0.9, warnings: ["weight could not be read as a number: \"9 Lbs(Per Piece)\"", "Date printed as 10'01'2026"] };
+
+  it("a clean shipment has no flags (the reader's routine notes do not count)", () => {
+    assert.deepEqual(flagsFor(done, [inv], tx), []);
+    assert.equal(flagLevel([]), null);
+  });
+
+  it("flags a total that is not the charge, by how much", () => {
+    const f = flagsFor(done, [{ ...inv, total: 262.5 }], tx);
+    assert.deepEqual(codes(f), ["total_mismatch"]);
+    assert.equal(f[0].level, "error");
+    assert.match(f[0].text, /\$262\.50 is \$12\.50 above the charge \$250\.00/);
+    assert.deepEqual(flagsFor(done, [{ ...inv, total: 250.005 }], tx), []); // within a cent
+    assert.match(flagsFor(done, [{ ...inv, total: 240 }], tx)[0].text, /\$10\.00 below/);
+  });
+
+  it("flags an invoice number that is not FreightPOP's, ignoring case, spaces and leading zeros", () => {
+    assert.deepEqual(codes(flagsFor(done, [{ ...inv, invoice_number: "INV-999" }], tx)), ["invoice_number_mismatch"]);
+    assert.deepEqual(flagsFor(done, [{ ...inv, invoice_number: "inv 100" }], tx), []);
+    assert.deepEqual(flagsFor(done, [{ ...inv, invoice_number: "0100" }], { ...tx, billing_invoice_number: "100" }), []);
+  });
+
+  it("flags low confidence and reader warnings about money or cut-off pages", () => {
+    const f = flagsFor(done, [{ ...inv, confidence: 0.6, warnings: ["Bottom row partially cut off.", "The parts add up to 10.00 but the total reads 12.00"] }], tx);
+    assert.deepEqual(codes(f), ["low_confidence", "reader_warning"]);
+    assert.match(f[0].text, /60%/);
+    assert.match(f[1].text, /\(\+1 more\)$/);
+    assert.deepEqual(meaningfulWarnings(["No charge breakdown printed", "Weight per piece; total weight not stated"]), []);
+  });
+
+  it("no files, nothing read yet, a file that failed, and files that hold no invoice", () => {
+    assert.deepEqual(codes(flagsFor({ ...done, files: [] }, [], tx)), ["no_files"]);
+    assert.deepEqual(flagsFor(done, [{ ...inv, status: "pending", total: null, invoice_number: null }], tx).map((f) => [f.code, f.level]), [["not_read", "info"]]);
+    assert.deepEqual(codes(flagsFor(done, [{ ...inv, status: "failed", total: null, invoice_number: null }], tx)), ["read_failed"]);
+    const only = flagsFor(done, [{ status: "done", doc_type: "bol", file: "invoices/100-view-print-shipping-labels-bol-1.pdf" }, { status: "done", doc_type: "invoice", file: "invoices/100-1.png", invoice_number: null, total: null }], tx);
+    assert.deepEqual(codes(only), ["no_invoice"]);
+    assert.match(only[0].text, /BOL\/labels, invoice screenshot/);
+    assert.deepEqual(codes(flagsFor(done, [], tx)), ["not_read"]);
+  });
+
+  it("reads the invoice PDF, not a screenshot of the grid or a rate confirmation's total", () => {
+    const shot = { ...inv, file: "invoices/100-1.png", invoice_number: null, total: null, confidence: 0.6 };
+    const rc = { status: "done", doc_type: "rate_confirmation", total: 200 };
+    assert.equal(invoiceDocOf([shot, rc, inv]), inv);
+    assert.equal(invoiceDocOf([shot, rc]), null);
+  });
+
+  it("money: a loss, an approved carrier amount above the charge or above the cost", () => {
+    assert.deepEqual(flagsFor(done, [{ ...inv, total: 150 }], { ...tx, charge: 150 }).map((f) => [f.code, f.level]),
+      [["loss", "error"], ["approved_over_charge", "error"]]);
+    const over = flagsFor(done, [inv], { ...tx, approved_invoice_amount: 205.42 });
+    assert.deepEqual(over.map((f) => [f.code, f.level, f.text]), [["approved_over_cost", "info", "Carrier approved $5.42 over cost"]]);
+    assert.equal(isFlagged({ flags: over }), false);
+    assert.deepEqual(codes(flagsFor(done, [inv], null)), ["no_transaction"]);
+  });
+
+  it("status flags: failed, clicked but not checked, not reached, re-run, waiting", () => {
+    const failed = flagsFor({ ...done, status: "failed", note: "No GET INVOICE button" }, [inv], tx);
+    assert.deepEqual(failed.map((f) => [f.code, f.level, f.text]), [["failed", "error", "Get Invoice failed: No GET INVOICE button"]]);
+    assert.deepEqual(codes(flagsFor({ ...done, status: "failed", note: "Stopped · the button was clicked" }, [inv], tx)), ["unchecked"]);
+    assert.deepEqual(codes(flagsFor({ ...done, status: "not_reached", files: [] }, [], tx)), ["not_reached"]);
+    assert.deepEqual(flagsFor({ ...done, status: "rerun", later_run: 41 }, [], tx).map((f) => [f.level, f.text]), [["info", "Clicked again in scrape #41"]]);
+    assert.deepEqual(flagsFor({ ...done, status: "requested", files: [] }, [], null), []);
+  });
+
+  it("puts flags on the rows, counts flagged shipments per run, and exports them", () => {
+    const docs2 = new Map([["100", [{ ...docs.get("100")[0], total: 260 }]]]);
+    const rows = buildRunRows(r1, { ...ctx, docs: docs2 });
+    assert.deepEqual(rows.map((r) => [r.shipment_id, r.flag_level, codes(r.flags)]), [["100", "error", ["total_mismatch"]], ["200", "info", ["rerun"]]]);
+    const s = summarizeRun(r1, rows);
+    assert.deepEqual([s.flagged, s.flag_errors], [1, 1]);
+    const { rows: out } = buildExport([r1], new Map([[r1.id, rows]]), parseExportOptions({ columns: "shipment_id,flags,flag_text" }));
+    assert.deepEqual(out.map((r) => [r.Flags, r["All flags (with level)"]]), [
+      ["Invoice total $260.00 is $10.00 above the charge $250.00", "Error: Invoice total $260.00 is $10.00 above the charge $250.00"],
+      [null, "Note: Clicked again in scrape #41"],
+    ]);
+    assert.ok(EXPORT_HEADERS.includes("Flags"));
+    assert.ok(!EXPORT_HEADERS.includes("All flags (with level)"));
   });
 });

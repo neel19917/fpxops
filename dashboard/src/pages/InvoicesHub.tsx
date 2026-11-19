@@ -1,15 +1,16 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ErrorBlock } from "../components/ErrorBlock";
 import { FindInvoice } from "../components/invoices/FindInvoice";
 import { InvoiceDetail } from "../components/invoices/InvoiceDetail";
 import { MoreSection } from "../components/invoices/MoreSection";
 import { ShipmentList } from "../components/invoices/ShipmentList";
-import { StepGuide, StepPath } from "../components/invoices/StepPath";
+import { StepGuide, StepHint, StepPath } from "../components/invoices/StepPath";
+import { UpdatedNote } from "../components/invoices/UpdatedNote";
 import { fmtRelative } from "../lib/format";
 import { hideFrame } from "../lib/freightpopFrame";
 import {
-  fetchHubList, fetchHubSummary, isAbort, isHubStep,
+  hubListKey, invalidateHubCache, isHubStep, useHubList, useHubSummary,
   type HubCounts, type HubRow, type HubStep, type HubSummary,
 } from "../lib/invoicesHub";
 
@@ -19,8 +20,6 @@ import {
 // (?q=, ?step=, ?shipment=), so a link can be shared and Back works.
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-type SummaryState = { status: "loading" } | { status: "ready"; data: HubSummary } | { status: "failed" };
 
 /** The later of the two times FPX last read FreightPOP, or null. */
 function lastRead(s: HubSummary): string | null {
@@ -78,58 +77,57 @@ export function InvoicesHubPage() {
   useEffect(() => () => { hideFrame(); }, []);
 
   // ── When FreightPOP was last read ──
+  // Both the summary and the counts come from the cache at once (the last
+  // answer this tab saw) and are asked for again in the background.
 
-  const [summary, setSummary] = useState<SummaryState>({ status: "loading" });
-  useEffect(() => {
-    const ctl = new AbortController();
-    fetchHubSummary(ctl.signal).then(
-      (data) => setSummary({ status: "ready", data }),
-      (e: unknown) => { if (!isAbort(e)) setSummary({ status: "failed" }); },
-    );
-    return () => ctl.abort();
-  }, []);
+  const summary = useHubSummary();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 60_000);
     return () => clearInterval(id);
   }, []);
-  const summaryData = summary.status === "ready" ? summary.data : null;
+  const summaryData = summary.data;
   const readAt = summaryData ? lastRead(summaryData) : null;
   const stale = !!readAt && now - Date.parse(readAt) > DAY_MS;
 
   // ── How many shipments are in each step ──
 
-  const [counts, setCounts] = useState<HubCounts | null>(null);
-  const [countsLoading, setCountsLoading] = useState(true);
-  const [countsError, setCountsError] = useState<string | null>(null);
-  const [attempt, setAttempt] = useState(0);
+  const countsFilters = { q, limit: 1 };
+  const countsKey = hubListKey(countsFilters);
+  const countsCall = useHubList(countsFilters);
+  const counts: HubCounts | null = countsCall.data?.counts ?? null;
+
+  // When fresh counts differ from the ones shown, the data changed since the
+  // last look: cached list pages are marked stale and the open list reloads.
+  const [listVersion, setListVersion] = useState(0);
+  const seenCounts = useRef<{ key: string; json: string } | null>(null);
   useEffect(() => {
-    const ctl = new AbortController();
-    setCountsLoading(true);
-    setCountsError(null);
-    fetchHubList({ q, limit: 1 }, ctl.signal).then(
-      (list) => { setCounts(list.counts); setCountsLoading(false); },
-      (e: unknown) => {
-        if (isAbort(e)) return;
-        setCounts(null);
-        setCountsError((e as Error)?.message || "The server did not answer.");
-        setCountsLoading(false);
-      },
-    );
-    return () => ctl.abort();
-  }, [q, attempt]);
+    if (!counts) return;
+    const json = JSON.stringify(counts);
+    const seen = seenCounts.current;
+    seenCounts.current = { key: countsKey, json };
+    if (seen && seen.key === countsKey && seen.json !== json) {
+      invalidateHubCache(countsKey);
+      setListVersion((v) => v + 1);
+    }
+  }, [counts, countsKey]);
+
+  const refreshAll = useCallback(() => {
+    invalidateHubCache(); // the summary and counts hooks ask again on their own
+    setListVersion((v) => v + 1);
+  }, []);
 
   const searching = q.trim();
   const quietLink = "text-sm text-slate-500 hover:text-slate-900 underline underline-offset-2 decoration-slate-300 rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500";
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <header>
         <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Invoices</h1>
         <p className="text-sm text-slate-600 mt-1 max-w-3xl">
           Find any invoice, and see where every shipment's invoice stands, from waiting on the carrier to pushed to the ERP.
         </p>
-        {summary.status === "loading" ? (
+        {!summaryData && summary.refreshing ? (
           <p className="text-xs text-slate-400 mt-2">Checking when FreightPOP was last read…</p>
         ) : readAt ? (
           <p className="text-xs text-slate-500 mt-2">
@@ -141,45 +139,48 @@ export function InvoicesHubPage() {
               </span>
             ) : null}
           </p>
-        ) : summary.status === "ready" ? (
+        ) : summaryData ? (
           <p className="text-xs text-slate-500 mt-2">Nothing has been read from FreightPOP yet.</p>
         ) : null}
       </header>
 
       <FindInvoice query={q} onQueryChange={setQ} onOpen={open} totalKnown={summaryData?.transactions?.rows ?? null} />
 
-      <section aria-labelledby="invoices-steps-title" className="space-y-4">
-        <div>
-          <h2 id="invoices-steps-title" className="text-lg font-semibold text-slate-900">Where every invoice stands</h2>
-          <p className="text-sm text-slate-600 mt-1">
-            Every shipment is in one of four steps. Pick a step to see its shipments and what to do next.
+      <section aria-labelledby="invoices-steps-title" className="space-y-3">
+        <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-1">
+          <div className="min-w-0">
+            <h2 id="invoices-steps-title" className="text-lg font-semibold text-slate-900">Where every invoice stands</h2>
             {searching ? (
-              <>
-                {" "}Counts show only shipments matching “{searching}”.{" "}
+              <p className="text-sm text-slate-600 mt-0.5">
+                Counts show only shipments matching “{searching}”.{" "}
                 <button type="button" onClick={() => setQ("")} className={quietLink}>Clear search</button>
-              </>
+              </p>
             ) : null}
-          </p>
+          </div>
+          <UpdatedNote
+            updatedAt={countsCall.updatedAt}
+            refreshing={countsCall.refreshing || summary.refreshing}
+            error={countsCall.data ? countsCall.error : null}
+            onRefresh={refreshAll}
+          />
         </div>
 
-        {countsError ? (
+        {countsCall.error && !countsCall.data ? (
           <ErrorBlock>
-            The step counts could not be loaded. {countsError}{" "}
-            <button type="button" onClick={() => setAttempt((n) => n + 1)} className="underline ml-1">Try again</button>
+            The step counts could not be loaded. {countsCall.error}{" "}
+            <button type="button" onClick={countsCall.refresh} className="underline ml-1">Try again</button>
           </ErrorBlock>
         ) : null}
 
-        <StepPath selected={step} counts={counts} loading={countsLoading} onSelect={selectStep} />
+        <StepPath selected={step} counts={counts} loading={countsCall.refreshing} onSelect={selectStep} />
 
         {step ? (
           <>
             <StepGuide step={step} count={counts?.[step] ?? null} />
-            <ShipmentList step={step} query={q} onOpen={open} />
+            <ShipmentList key={listVersion} step={step} query={q} onOpen={open} />
           </>
         ) : (
-          <div className="rounded-xl border border-dashed border-slate-300 px-6 py-8 text-center text-sm text-slate-500">
-            Pick a step above to see its shipments.
-          </div>
+          <StepHint counts={counts} onSelect={selectStep} />
         )}
       </section>
 

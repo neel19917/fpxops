@@ -4,10 +4,12 @@ import { ArrowLeft, ChevronDown, ChevronRight, Download, FileArchive, FileSpread
 import {
   downloadAllRunsExcel, downloadAllRunsMaster, downloadAllRunsZip, downloadRunExcel, downloadRunMaster, downloadRunZip, fetchRun, fetchRuns,
   loadLayout, saveLayout, type ExportLayout,
-  type Run, type RunDetail, type RunRow,
+  type Run,
 } from "../lib/getInvoiceRuns";
 import { fmtDateTime, fmtNum } from "../lib/format";
 import { ExcelLayoutModal } from "../components/invoices/ExcelLayoutModal";
+import { RunShipments, type DetailState } from "../components/invoices/RunShipments";
+import { Alert, Chip, PRIMARY_BTN, SECONDARY_BTN, SMALL_BTN, TH, errText } from "../components/invoices/runUi";
 
 // Get Invoice runs: every time the hosted browser clicks GET INVOICE in
 // FreightPOP for chosen shipments, the run gets a scrape number. Each run can
@@ -21,21 +23,7 @@ import { ExcelLayoutModal } from "../components/invoices/ExcelLayoutModal";
 
 const POLL_MS = 10_000;
 
-const PRIMARY_BTN = "px-4 py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2";
-const SECONDARY_BTN = "px-4 py-2 rounded-lg bg-white text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2";
-const SMALL_BTN = "px-2.5 py-1 rounded-md bg-white text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50 inline-flex items-center gap-1.5 text-xs font-medium whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500";
-const TH = "py-2 pr-3 font-medium whitespace-nowrap";
-
-function errText(e: unknown): string {
-  return e instanceof Error && e.message ? e.message : String(e);
-}
-
-const money = (n: number | null | undefined) => (n == null ? "—" : `$${Number(n).toFixed(2)}`);
 const isRunning = (r: Run) => r.status === "pending" || r.status === "claimed";
-
-function Alert({ children }: { children: string }) {
-  return <div role="alert" className="rounded-lg bg-rose-50 ring-1 ring-rose-200 text-rose-800 text-sm px-3 py-2">{children}</div>;
-}
 
 function runChip(r: Run): { label: string; cls: string; dot?: string } {
   if (isRunning(r)) return { label: "Running", cls: "bg-violet-50 text-violet-800 ring-violet-200", dot: "bg-violet-500 animate-pulse" };
@@ -44,25 +32,6 @@ function runChip(r: Run): { label: string; cls: string; dot?: string } {
   if (r.status === "done") return { label: "Done", cls: "bg-emerald-50 text-emerald-800 ring-emerald-200" };
   return { label: r.status || "—", cls: "bg-slate-100 text-slate-700 ring-slate-200" };
 }
-
-const ROW_STATUS: Record<string, { label: string; cls: string }> = {
-  done: { label: "Done", cls: "bg-emerald-50 text-emerald-800 ring-emerald-200" },
-  failed: { label: "Failed", cls: "bg-rose-50 text-rose-800 ring-rose-200" },
-  requested: { label: "Waiting", cls: "bg-violet-50 text-violet-800 ring-violet-200" },
-  not_started: { label: "Not started", cls: "bg-slate-100 text-slate-700 ring-slate-200" },
-  not_reached: { label: "Not reached", cls: "bg-amber-50 text-amber-800 ring-amber-200" },
-};
-
-function Chip({ label, cls, dot }: { label: string; cls: string; dot?: string }) {
-  return (
-    <span className={"inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium ring-1 whitespace-nowrap " + cls}>
-      {dot ? <span className={"h-1.5 w-1.5 rounded-full " + dot} aria-hidden="true" /> : null}
-      {label}
-    </span>
-  );
-}
-
-type DetailState = { loading: boolean; data?: RunDetail; error?: string };
 
 export function GetInvoiceRunsPage() {
   const alive = useRef(true);
@@ -219,6 +188,7 @@ export function GetInvoiceRunsPage() {
                   <th scope="col" className={TH + " text-right"}>Clicked</th>
                   <th scope="col" className={TH + " text-right"}>Failed</th>
                   <th scope="col" className={TH + " text-right"}>Files</th>
+                  <th scope="col" className={TH} title="Shipments with an error or something to check (open the run to see them)">Flags</th>
                   <th scope="col" className={TH}>Status</th>
                   <th scope="col" className={TH + " pr-0"}><span className="sr-only">Downloads</span></th>
                 </tr>
@@ -254,8 +224,9 @@ export function GetInvoiceRunsPage() {
                         <td className="py-2 pr-3 text-right">{fmtNum(r.clicked)}</td>
                         <td className={"py-2 pr-3 text-right " + (r.failed ? "text-rose-700 font-medium" : "")}>{fmtNum(r.failed)}</td>
                         <td className="py-2 pr-3 text-right">{fmtNum(r.files)}</td>
+                        <td className="py-2 pr-3"><FlaggedBadge run={r} /></td>
                         <td className="py-2 pr-3">
-                          <span title={r.note || undefined}><Chip {...chip} /></span>
+                          <Chip {...chip} title={r.note || undefined} />
                         </td>
                         <td className="py-2 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                           {n != null ? (
@@ -280,7 +251,7 @@ export function GetInvoiceRunsPage() {
                       </tr>
                       {open ? (
                         <tr className="bg-slate-50">
-                          <td colSpan={10} className="px-2 pb-3 pt-1">
+                          <td colSpan={11} className="px-2 pb-3 pt-1">
                             <RunShipments state={details[n]} onRetry={() => loadDetail(n)} />
                           </td>
                         </tr>
@@ -297,68 +268,16 @@ export function GetInvoiceRunsPage() {
   );
 }
 
-function RunShipments({ state, onRetry }: { state: DetailState | undefined; onRetry: () => void }) {
-  if (!state || (state.loading && !state.data)) return <p className="text-sm text-slate-500 px-2 py-2">Loading shipments…</p>;
-  if (state.error && !state.data) {
-    return (
-      <div className="space-y-2 px-2 py-2">
-        <Alert>{state.error}</Alert>
-        <button type="button" onClick={onRetry} className={SMALL_BTN}>Try again</button>
-      </div>
-    );
-  }
-  const rows = state.data?.rows ?? [];
-  if (!rows.length) return <p className="text-sm text-slate-500 px-2 py-2">No shipments in this run.</p>;
+// "N flagged" for a run: red when one has an error, amber otherwise.
+function FlaggedBadge({ run }: { run: Run }) {
+  if (run.flagged == null) return <span className="text-slate-400">—</span>;
+  if (!run.flagged) return <span className="text-xs text-slate-400">None</span>;
+  const err = (run.flag_errors ?? 0) > 0;
   return (
-    <div className="rounded-lg bg-white ring-1 ring-slate-200 overflow-x-auto">
-      <table className="w-full text-xs">
-        <thead className="text-[11px] uppercase tracking-wide text-slate-500 text-left bg-slate-50">
-          <tr>
-            <th scope="col" className={"pl-3 " + TH}>Shipment</th>
-            <th scope="col" className={TH}>Customer</th>
-            <th scope="col" className={TH}>Carrier</th>
-            <th scope="col" className={TH}>Customer invoice #</th>
-            <th scope="col" className={TH} title="The invoice number Claude read from the saved document">Invoice # read</th>
-            <th scope="col" className={TH + " text-right"}>Charge</th>
-            <th scope="col" className={TH + " text-right"} title="The total Claude read from the saved document">Total read</th>
-            <th scope="col" className={TH}>Status</th>
-            <th scope="col" className={TH} title="Whether the GET INVOICE button was pushed for this shipment in this run">Pushed</th>
-            <th scope="col" className={TH + " text-right"}>Files</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-100 tabular-nums">
-          {rows.map((row) => <ShipmentRow key={row.shipment_id} row={row} />)}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function ShipmentRow({ row }: { row: RunRow }) {
-  const grey = "bg-slate-100 text-slate-700 ring-slate-200";
-  const st = row.status === "rerun"
-    ? { label: row.later_run != null ? `Re-run in #${row.later_run}` : "Re-run", cls: grey }
-    : ROW_STATUS[row.status] ?? { label: row.status || "—", cls: grey };
-  return (
-    <tr className="align-top">
-      <td className="py-1.5 pl-3 pr-3 font-medium text-slate-900 whitespace-nowrap">
-        {row.shipment_id}
-        {row.later_run != null && row.status !== "rerun" ?<div className="text-[11px] font-normal text-amber-700">re-run in #{row.later_run}</div> : null}
-      </td>
-      <td className="py-1.5 pr-3 text-slate-700 max-w-[14rem] truncate" title={row.customer_name || undefined}>{row.customer_name || "—"}</td>
-      <td className="py-1.5 pr-3 text-slate-700 max-w-[12rem] truncate" title={row.carrier || undefined}>{row.carrier || "—"}</td>
-      <td className="py-1.5 pr-3 text-slate-700 whitespace-nowrap">{row.billing_invoice_number || "—"}</td>
-      <td className="py-1.5 pr-3 text-slate-700 whitespace-nowrap">{row.read_invoice_number || "—"}</td>
-      <td className="py-1.5 pr-3 text-right whitespace-nowrap">{money(row.charge)}</td>
-      <td className="py-1.5 pr-3 text-right whitespace-nowrap">{money(row.read_total)}</td>
-      <td className="py-1.5 pr-3">
-        <span title={row.note || undefined}><Chip label={st.label} cls={st.cls} /></span>
-        {row.note && row.status === "failed" ? <div className="mt-0.5 text-[11px] text-rose-700 max-w-[16rem] break-words">{row.note}</div> : null}
-      </td>
-      <td className="py-1.5 pr-3 whitespace-nowrap">
-        {row.pushed == null ? "—" : row.pushed ? <span className="text-emerald-700 font-medium">Yes</span> : <span className="text-slate-500">No</span>}
-      </td>
-      <td className="py-1.5 pr-3 text-right">{fmtNum(row.files.length)}</td>
-    </tr>
+    <Chip
+      label={`${fmtNum(run.flagged)} flagged`}
+      cls={err ? "bg-rose-50 text-rose-800 ring-rose-200" : "bg-amber-50 text-amber-800 ring-amber-200"}
+      title={err ? `${run.flag_errors} with an error` : "Something to check"}
+    />
   );
 }

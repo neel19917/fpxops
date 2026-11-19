@@ -26,8 +26,20 @@ export interface Run {
   waiting: number;
   /** Files saved for the run. */
   files: number;
+  /** Shipments with an error or a warning flag. Missing from an older server. */
+  flagged?: number;
+  /** Shipments with an error flag. Missing from an older server. */
+  flag_errors?: number;
   note: string | null;
   buttons: string | null;
+}
+
+export type FlagLevel = "error" | "warn" | "info";
+/** Something a person should look at for one shipment of a run (see flagsFor on the server). */
+export interface RunFlag {
+  code: string;
+  level: FlagLevel;
+  text: string;
 }
 
 export interface RunRow {
@@ -52,9 +64,17 @@ export interface RunRow {
   read_invoice_number: string | null;
   read_total: number | null;
   read_carrier: string | null;
+  read_confidence?: number | null;
+  /** Errors, warnings and notes for the shipment. Missing from an older server. */
+  flags?: RunFlag[];
+  /** The worst level among flags, or null. */
+  flag_level?: FlagLevel | null;
   /** A newer scrape number re-ran this shipment. */
   later_run: number | null;
 }
+
+/** The row has an error or a warning (a note alone does not count). */
+export const isFlagged = (r: RunRow): boolean => (r.flags ?? []).some((f) => f.level === "error" || f.level === "warn");
 
 export interface RunDetail {
   run: Run;
