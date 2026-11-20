@@ -98,6 +98,20 @@ export interface Status {
   backfill_done: boolean;
   message_count: number;
   last_error: string | null;
+  /** The signed-in user's mailbox access (admins always "draft"). Absent on an older server. */
+  access?: MailboxAccess;
+}
+
+/** Per-user Support Mailbox access. "view" reads only; "draft" can also write. */
+export type MailboxAccess = "none" | "view" | "draft";
+
+/** A mailbox call the server refused (403): the message is the server's own. */
+export class MailboxForbiddenError extends Error {
+  readonly status = 403;
+  constructor(message: string) {
+    super(message);
+    this.name = "MailboxForbiddenError";
+  }
 }
 
 export type ConnectionTest =
@@ -154,6 +168,18 @@ export interface ContextShipment {
   matched_text: string | null;
   source: string | null;
   link_id: string;
+  /** When the link was logged as a note on the FPX shipment (null = not logged; missing on older servers). */
+  logged_at?: string | null;
+  /** The fpx_shipment_notes row written for the log. */
+  note_id?: string | null;
+  /** fpx_shipments.id (uuid) of the linked shipment. */
+  fpx_id?: string | null;
+}
+
+/** A shipment-looking number found in the emails that does not match any FPX shipment. */
+export interface NotInFpx {
+  value: string;
+  kind: string;
 }
 
 export interface ContextTask {
@@ -181,6 +207,8 @@ export interface ThreadContext {
   shipments: ContextShipment[];
   tasks: ContextTask[];
   related_threads: RelatedThread[];
+  /** Missing on older servers: treat as []. */
+  not_in_fpx?: NotInFpx[];
 }
 
 export interface ConnectInput {
@@ -223,6 +251,7 @@ async function call<T>(
   }
   if (!res.ok) {
     const body = await res.json().catch(() => null);
+    if (res.status === 403) throw new MailboxForbiddenError(body?.error ? String(body.error) : "You don't have access to do that in the Support Mailbox.");
     if (body?.error) throw new Error(String(body.error));
     throw new Error(res.status === 404 ? "The server does not have the mailbox yet. It needs its next update." : `The server returned ${res.status}`);
   }

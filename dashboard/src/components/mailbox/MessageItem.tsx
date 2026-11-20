@@ -60,7 +60,8 @@ interface Props {
   mailbox: string | null;
   defaultOpen?: boolean;
   isReplyTarget: boolean;
-  onReplyTo: () => void;
+  /** Omitted when the user cannot draft replies: the reply button is hidden. */
+  onReplyTo?: () => void;
 }
 
 export function MessageItem({ message: m, mailbox, defaultOpen = false, isReplyTarget, onReplyTo }: Props) {
@@ -144,10 +145,12 @@ export function MessageItem({ message: m, mailbox, defaultOpen = false, isReplyT
                 <ExternalLink className="h-3.5 w-3.5" /> Open in Outlook
               </a>
             ) : null}
-            <button type="button" onClick={onReplyTo} disabled={isReplyTarget}
-              className="inline-flex items-center gap-1 text-slate-600 hover:text-slate-900 disabled:text-violet-700 disabled:cursor-default">
-              <CornerUpLeft className="h-3.5 w-3.5" /> {isReplyTarget ? "Replying to this message" : "Reply to this message"}
-            </button>
+            {onReplyTo ? (
+              <button type="button" onClick={onReplyTo} disabled={isReplyTarget}
+                className="inline-flex items-center gap-1 text-slate-600 hover:text-slate-900 disabled:text-violet-700 disabled:cursor-default">
+                <CornerUpLeft className="h-3.5 w-3.5" /> {isReplyTarget ? "Replying to this message" : "Reply to this message"}
+              </button>
+            ) : null}
           </div>
         </div>
       ) : null}

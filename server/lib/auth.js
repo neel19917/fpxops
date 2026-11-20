@@ -154,6 +154,25 @@ export function classifyGetUserError(error) {
 //   { ok: false, reason: "invalid_token" }   → 401, refreshing might help
 //   { ok: false, reason: "profile_missing" } → 403, refreshing cannot help
 //   { ok: false, reason: "upstream" }        → 503, retry, do NOT refresh
+// Support Mailbox access per user: none | view | draft. A missing or unknown
+// value (old DB without the column) means 'draft' so nobody gets locked out.
+export const MAILBOX_ACCESS_LEVELS = ["none", "view", "draft"];
+export function normalizeMailboxAccess(v) {
+  return MAILBOX_ACCESS_LEVELS.includes(v) ? v : "draft";
+}
+
+const PROFILE_COLS = "id, email, full_name, role, enabled, avatar_url";
+// Selects the auth profile with mailbox_access; if the column doesn't exist
+// yet (migration not applied), retries without it instead of failing auth.
+async function selectProfile(id) {
+  const r = await supabase.from("fpx_user_profiles")
+    .select(`${PROFILE_COLS}, mailbox_access`).eq("id", id).maybeSingle();
+  if (r.error && /mailbox_access/.test(r.error.message || "")) {
+    return supabase.from("fpx_user_profiles").select(PROFILE_COLS).eq("id", id).maybeSingle();
+  }
+  return r;
+}
+
 async function resolveJwt(token) {
   const cached = authCacheGet(token);
   if (cached && !cached.stale) {
@@ -195,11 +214,7 @@ async function resolveJwt(token) {
 
   // The profile error was previously discarded, which made an RLS hiccup or a
   // dropped connection indistinguishable from "this user has no profile row".
-  const { data: profile, error: profileError } = await supabase
-    .from("fpx_user_profiles")
-    .select("id, email, full_name, role, enabled, avatar_url")
-    .eq("id", data.user.id)
-    .maybeSingle();
+  const { data: profile, error: profileError } = await selectProfile(data.user.id);
   if (profileError) return upstream(`profile select: ${profileError.message}`);
   if (!profile) return { ok: false, reason: "profile_missing", detail: data.user.email || data.user.id };
 
@@ -211,6 +226,7 @@ async function resolveJwt(token) {
       avatarUrl: profile.avatar_url,
       role: profile.role,
       enabled: profile.enabled,
+      mailbox_access: normalizeMailboxAccess(profile.mailbox_access),
     },
   };
   authCacheSet(token, value);
@@ -232,11 +248,7 @@ async function resolveJwt(token) {
 // ============================================================
 async function resolveImpersonationTarget(targetId) {
   if (!targetId || typeof targetId !== "string") return null;
-  const { data, error } = await supabase
-    .from("fpx_user_profiles")
-    .select("id, email, full_name, role, enabled, avatar_url")
-    .eq("id", targetId)
-    .maybeSingle();
+  const { data, error } = await selectProfile(targetId);
   if (error || !data) return null;
   return {
     id: data.id,
@@ -245,6 +257,7 @@ async function resolveImpersonationTarget(targetId) {
     avatarUrl: data.avatar_url,
     role: data.role,
     enabled: data.enabled,
+    mailbox_access: normalizeMailboxAccess(data.mailbox_access),
   };
 }
 

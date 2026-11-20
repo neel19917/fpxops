@@ -343,6 +343,8 @@ describe("mailbox router over HTTP", () => {
       assert.equal(r.json.connected, true);
       assert.equal(r.json.mailbox, "freightsupport@freightpop.com");
       assert.equal(r.json.message_count, 2);
+      // No mailbox_access on the user (older DB) → full access.
+      assert.equal(r.json.access, "draft");
     });
   });
 });

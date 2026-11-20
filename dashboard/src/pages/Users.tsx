@@ -3,7 +3,7 @@ import { KeyRound, LogOut, Pencil, Shield, ShieldAlert, UserCheck, UserX, Users 
 import { hostedBrowser, type HostedLogin } from "../lib/hostedBrowser";
 import { api } from "../lib/api";
 import { fmtDateTime, fmtRelative } from "../lib/format";
-import type { UserProfileRow } from "../lib/types";
+import type { MailboxAccess, UserProfileRow } from "../lib/types";
 import { useAuth } from "../lib/auth";
 import { reloadPreferences } from "../lib/prefs";
 import { ErrorBlock } from "../components/ErrorBlock";
@@ -120,6 +120,17 @@ export function UsersPage() {
       setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
     } catch (e) { alert((e as Error).message); }
   }
+  async function setMailboxAccess(u: UserProfileRow, mailbox_access: MailboxAccess) {
+    const prev = u.mailbox_access;
+    setRows((rs) => rs.map((p) => p.id === u.id ? { ...p, mailbox_access } : p));
+    try {
+      const r = await api.users.update(u.id, { mailbox_access });
+      setRows((rs) => rs.map((p) => p.id === r.user.id ? { ...r.user, mailbox_access: r.user.mailbox_access ?? mailbox_access } : p));
+    } catch (e) {
+      setRows((rs) => rs.map((p) => p.id === u.id ? { ...p, mailbox_access: prev } : p));
+      alert((e as Error).message);
+    }
+  }
   async function setName(u: UserProfileRow, full_name: string | null) {
     const r = await api.users.update(u.id, { full_name });
     setRows((prev) => prev.map((p) => p.id === r.user.id ? r.user : p));
@@ -194,12 +205,16 @@ export function UsersPage() {
           </div>
         </div>
       ) : null}
+      <p className="px-5 pt-3 pb-2 text-xs text-slate-500">
+        Support Mailbox: View only can read the inbox; View + drafts can also link shipments and create Outlook drafts. Nothing is ever sent from FPX.
+      </p>
       <table className="w-full text-sm">
         <thead className="bg-slate-50">
           <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500">
             <th className="px-5 py-2.5 font-medium">User</th>
             <th className="px-5 py-2.5 font-medium">Email</th>
             <th className="px-5 py-2.5 font-medium">Role</th>
+            <th className="px-5 py-2.5 font-medium">Support Mailbox</th>
             {hostedBrowser.enabled ? <th className="px-5 py-2.5 font-medium" title="FreightPOP login inside the hosted browser (FPX's built-in FreightPOP pane)">Hosted FreightPOP</th> : null}
             {hostedBrowser.enabled ? <th className="px-5 py-2.5 font-medium" title="Hosted FreightPOP lookups also open the shipment's tracking details. Off = the grid is only filtered and the user clicks it (faster when moving between shipments). Users can also change it themselves in the FreightPOP pane.">Auto-open details</th> : null}
             <th className="px-5 py-2.5 font-medium">Last login</th>
@@ -208,8 +223,8 @@ export function UsersPage() {
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
-          {loading ? <LoadingState variant="row" colSpan={hostedBrowser.enabled ? 7 : 6} />
-          : rows.length === 0 ? <tr><td colSpan={hostedBrowser.enabled ? 7 : 6} className="p-8 text-center text-slate-500">No users yet.</td></tr>
+          {loading ? <LoadingState variant="row" colSpan={hostedBrowser.enabled ? 9 : 7} />
+          : rows.length === 0 ? <tr><td colSpan={hostedBrowser.enabled ? 9 : 7} className="p-8 text-center text-slate-500">No users yet.</td></tr>
           : rows.map((u) => {
             const isMe = profile?.id === u.id;
             return (
@@ -243,6 +258,23 @@ export function UsersPage() {
                   </select>
                   {u.role === "admin" ? <ShieldAlert className="inline-block ml-2 h-4 w-4 text-amber-500" />
                     : <Shield className="inline-block ml-2 h-4 w-4 text-slate-400" />}
+                </td>
+                <td className="px-5 py-3 whitespace-nowrap">
+                  {u.role === "admin" ? (
+                    <select disabled value="full" className="text-sm px-2 py-1 rounded-md border border-slate-300 disabled:opacity-60">
+                      <option value="full">Full (admin)</option>
+                    </select>
+                  ) : (
+                    <select
+                      value={u.mailbox_access ?? "draft"}
+                      onChange={(e) => setMailboxAccess(u, e.target.value as MailboxAccess)}
+                      className="text-sm px-2 py-1 rounded-md border border-slate-300"
+                    >
+                      <option value="none">No access</option>
+                      <option value="view">View only</option>
+                      <option value="draft">View + drafts</option>
+                    </select>
+                  )}
                 </td>
                 {hostedBrowser.enabled ? (
                   <td className="px-5 py-3 whitespace-nowrap">

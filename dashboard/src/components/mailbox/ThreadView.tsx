@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { ArrowLeft, ExternalLink, FileText, PanelRightClose, PanelRightOpen, RefreshCw, Sparkles } from "lucide-react";
+import { ArrowLeft, Eye, ExternalLink, FileText, PanelRightClose, PanelRightOpen, RefreshCw, Sparkles } from "lucide-react";
 import { getThread, type Draft, type Message } from "../../lib/mailboxApi";
 import { useCached } from "../../lib/useCached";
 import { cachedFetch, invalidateCache } from "../../lib/sessionCache";
@@ -32,12 +32,14 @@ interface Props {
   conversationId: string;
   mailbox: string | null;
   onBack: () => void;
+  /** The user may create reply drafts. False ("view" access) hides the composer. Default true. */
+  canDraft?: boolean;
   /** The details sidebar (party, shipments, tasks) is showing. */
   sidebarOpen?: boolean;
   onToggleSidebar?: () => void;
 }
 
-export function ThreadView({ conversationId, mailbox, onBack, sidebarOpen, onToggleSidebar }: Props) {
+export function ThreadView({ conversationId, mailbox, onBack, canDraft = true, sidebarOpen, onToggleSidebar }: Props) {
   const fetcher = useCallback((signal: AbortSignal) => getThread(conversationId, signal), [conversationId]);
   const { data, error, refreshing, refresh } = useCached(threadCacheKey(conversationId), fetcher);
   const [replyToId, setReplyToId] = useState<string | null>(null);
@@ -103,8 +105,8 @@ export function ThreadView({ conversationId, mailbox, onBack, sidebarOpen, onTog
             message={m}
             mailbox={mailbox}
             defaultOpen={i === messages.length - 1}
-            isReplyTarget={target?.id === m.id}
-            onReplyTo={() => setReplyToId(m.id)}
+            isReplyTarget={canDraft && target?.id === m.id}
+            onReplyTo={canDraft ? () => setReplyToId(m.id) : undefined}
           />
         )) : <div className="text-sm text-slate-500">No messages in this conversation.</div>}
       </div>
@@ -133,9 +135,15 @@ export function ThreadView({ conversationId, mailbox, onBack, sidebarOpen, onTog
         </div>
       ) : null}
 
-      <div className="sticky bottom-0 border-t border-slate-200 bg-white px-4 py-3">
-        <ReplyComposer key={conversationId} target={target} onCreated={onCreated} />
-      </div>
+      {canDraft ? (
+        <div className="sticky bottom-0 border-t border-slate-200 bg-white px-4 py-3">
+          <ReplyComposer key={conversationId} target={target} onCreated={onCreated} />
+        </div>
+      ) : (
+        <div className="sticky bottom-0 border-t border-slate-200 bg-slate-50 px-4 py-2 text-xs text-slate-500 flex items-center gap-1.5">
+          <Eye className="h-3.5 w-3.5 shrink-0" /> View only — ask an admin for draft access to reply
+        </div>
+      )}
 
       {toast ? (
         <Toast onClose={closeToast}>

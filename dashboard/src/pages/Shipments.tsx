@@ -1770,6 +1770,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                   key={drawerData.shipment.shipment_id || taskWalk?.taskId || drawerData.shipment.id}
                   shipmentId={drawerData.shipment.shipment_id}
                   taskId={drawerData.shipment.shipment_id ? null : taskWalk?.taskId ?? null}
+                  inline
                 />
               </Section>
             )}

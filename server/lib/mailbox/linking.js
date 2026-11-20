@@ -22,12 +22,16 @@ import { callClaude as realCallClaude } from "../anthropic.js";
 import { getSettings as realGetSettings } from "../settings.js";
 import { emailModelExtras } from "../emailDraft.js";
 import { htmlToText } from "./drafts.js";
+import { logLinksToShipments as realLogLinks } from "./shipmentLog.js";
+
+export { logLinksToShipments, logUnlink, buildLinkNote } from "./shipmentLog.js";
 
 // Swappable for tests.
 export const _deps = {
   supabase: realSupabase,
   callClaude: realCallClaude,
   getSettings: realGetSettings,
+  logLinksToShipments: realLogLinks,
 };
 
 export const PARTIES = ["customer", "carrier", "internal", "other"];
@@ -159,8 +163,7 @@ const SHIPMENT_SELECT = ["shipment_id", "customer_name", "company_name", "carrie
 const pgList = (vals) => vals.map((v) => `"${String(v).replace(/["\\]/g, "")}"`).join(",");
 
 // values -> Map(value -> [{ shipment_id, matched_on, customer_name, company_name, carrier_name }])
-export async function lookupValues(values) {
-  const db = _deps.supabase;
+export async function lookupValues(values, db = _deps.supabase) {
   const uniq = [...new Set((values || []).map(normalizeValue).filter(Boolean))];
   const byValue = new Map();
   for (const part of chunk(uniq, VALUE_CHUNK)) {
@@ -214,8 +217,8 @@ export function bestMatches(candidates, byValue) {
 }
 
 // candidates -> [{ shipment_id, matched_on, matched_text }]
-export async function matchShipments(candidates) {
-  const byValue = await lookupValues((candidates || []).map((c) => c?.value ?? c));
+export async function matchShipments(candidates, db = _deps.supabase) {
+  const byValue = await lookupValues((candidates || []).map((c) => c?.value ?? c), db);
   return bestMatches(candidates, byValue).map(({ shipment_id, matched_on, matched_text }) => ({ shipment_id, matched_on, matched_text }));
 }
 
@@ -575,7 +578,7 @@ async function loadDomains(domains) {
 
 const msgAt = (m) => m?.received_at || m?.sent_at || "";
 
-function threadText(messages, bodies) {
+export function threadText(messages, bodies = new Map()) {
   const parts = [];
   const subjects = new Set();
   for (const m of messages) {
@@ -592,6 +595,61 @@ function newestInbound(messages) {
   for (const m of messages) if (m.direction === "in" && (!best || String(msgAt(m)) > String(msgAt(best)))) best = m;
   return best;
 }
+
+// ---------------------------------------------------------------------------
+// "Not in FPX": shipment-looking numbers in a thread that match no shipment
+
+export const MAX_NOT_IN_FPX = 10;
+export const BARE_KIND = "number"; // extractCandidates' kind for a number with no keyword
+
+// Keyword-qualified candidates only (never BARE_KIND), minus values equal to a
+// linked shipment's shipment_id / tracking_number. -> [{ kind, value }]
+export function notInFpxCandidates(text, linked = []) {
+  const known = new Set();
+  for (const s of linked || []) {
+    for (const v of [s?.shipment_id, s?.tracking_number]) if (v != null && String(v).trim()) known.add(normalizeValue(String(v).trim()));
+  }
+  return extractCandidates(text).filter((c) => c.kind !== BARE_KIND && !known.has(c.value));
+}
+
+// messages: thread messages (subject, body_preview, direction, received_at/sent_at, id)
+// bodies: Map(message id -> body_html) for the newest inbound message, if cached
+// linked: [{ shipment_id, tracking_number }]
+// -> [{ value, kind }] (max 10). Values that match any shipment column are dropped.
+export async function notInFpx({ messages = [], bodies = new Map(), linked = [], db = _deps.supabase } = {}) {
+  const cands = notInFpxCandidates(threadText(messages, bodies), linked);
+  if (!cands.length) return [];
+  const inFpx = await valuesInFpx(cands.map((c) => c.value), db);
+  const seen = new Set();
+  const out = [];
+  for (const c of cands) {
+    if (inFpx.has(c.value) || seen.has(c.value)) continue;
+    seen.add(c.value);
+    out.push({ value: c.value, kind: c.kind });
+    if (out.length >= MAX_NOT_IN_FPX) break;
+  }
+  return out;
+}
+
+// Values found in ANY shipment match column (same columns and exact match as
+// lookupValues, but a value many shipments share still counts as "in FPX").
+export async function valuesInFpx(values, db = _deps.supabase) {
+  const out = new Set();
+  if (!values.length) return out;
+  for (const part of chunk(values, VALUE_CHUNK)) {
+    const filter = MATCH_COLUMNS.map(([c]) => `${c}.in.(${pgList(part)})`).join(",");
+    const { data, error } = await db.from("fpx_shipments").select(MATCH_COLUMNS.map(([c]) => c).join(", ")).or(filter).limit(1000);
+    if (error) throw new Error(`shipments not read: ${error.message}`);
+    const set = new Set(part);
+    for (const row of data || []) for (const [c] of MATCH_COLUMNS) {
+      const v = row?.[c] == null ? "" : String(row[c]).trim();
+      if (set.has(v)) out.add(v);
+    }
+  }
+  return out;
+}
+
+export { newestInbound };
 
 // ---------------------------------------------------------------------------
 // Processing
@@ -802,15 +860,18 @@ export async function linkerTick({ limit = LINKER_TICK_LIMIT } = {}) {
   state.running = (async () => {
     try {
       const recent = await linkThreads({ sinceDays: RECENT_DAYS, limit });
-      const out = { recent, older: null };
-      if (recent.error || !recent.exhausted || recent.processed >= limit || state.olderDone) return out;
-      const before = state.olderCursor || new Date(Date.now() - RECENT_DAYS * 86_400_000).toISOString();
-      const older = await linkThreads({ sinceDays: null, before, limit: limit - recent.processed });
-      out.older = older;
-      if (!older.error) {
-        if (older.cursor) state.olderCursor = older.cursor;
-        if (older.exhausted) state.olderDone = true;
+      const out = { recent, older: null, log: null };
+      if (!(recent.error || !recent.exhausted || recent.processed >= limit || state.olderDone)) {
+        const before = state.olderCursor || new Date(Date.now() - RECENT_DAYS * 86_400_000).toISOString();
+        const older = await linkThreads({ sinceDays: null, before, limit: limit - recent.processed });
+        out.older = older;
+        if (!older.error) {
+          if (older.cursor) state.olderCursor = older.cursor;
+          if (older.exhausted) state.olderDone = true;
+        }
       }
+      // Log new links on their shipments (notes). Never throws.
+      try { out.log = await _deps.logLinksToShipments({ limit }); } catch (e) { out.log = { logged: 0, error: e?.message || String(e) }; }
       return out;
     } catch (e) {
       warnOnce("tick", e?.message || String(e));

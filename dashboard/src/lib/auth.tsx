@@ -3,6 +3,7 @@ import { sb } from "./supabase";
 import type { Session } from "@supabase/supabase-js";
 import { getImpersonate, setImpersonate, subscribeImpersonate, type ImpersonateState } from "./impersonate";
 import { api, type ClientConfig } from "./api";
+import type { MailboxAccess } from "./types";
 import { swrClear } from "./swrCache";
 import { logAuth } from "./authLog";
 
@@ -20,6 +21,8 @@ export interface UserProfile {
   avatarUrl: string | null;
   role: "viewer" | "member" | "admin";
   enabled: boolean;
+  // Support Mailbox access. Missing = "draft". Admins always have full access.
+  mailbox_access?: MailboxAccess;
 }
 
 interface AuthState {
@@ -72,11 +75,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const loadProfile = useCallback(async (sess: Session | null) => {
     if (!sess?.user) { setProfile(null); return; }
-    const { data, error } = await sb
+    const fetchProfile = (cols: string) => sb
       .from("fpx_user_profiles")
-      .select("id, email, full_name, avatar_url, role, enabled")
+      .select(cols)
       .eq("id", sess.user.id)
-      .maybeSingle();
+      .maybeSingle<{ id: string; email: string; full_name: string | null; avatar_url: string | null; role: string; enabled: boolean; mailbox_access?: MailboxAccess }>();
+    let { data, error } = await fetchProfile("id, email, full_name, avatar_url, role, enabled, mailbox_access");
+    // Fall back if the mailbox_access column isn't there yet (older database).
+    if (error && /mailbox_access/.test(error.message)) {
+      ({ data, error } = await fetchProfile("id, email, full_name, avatar_url, role, enabled"));
+    }
     if (error) {
       setError(error.message);
       setProfile(null);
@@ -105,6 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       avatarUrl: data.avatar_url,
       role: data.role as UserProfile["role"],
       enabled: data.enabled,
+      mailbox_access: data.mailbox_access,
     });
     // Fetch server-supplied feature flags (FreightPOP embed, etc.) once
     // we know the user is enabled. Failure here is non-fatal — the rest
@@ -249,6 +258,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     avatarUrl: impersonate.target.avatar_url,
     role: impersonate.target.role,
     enabled: impersonate.target.enabled,
+    mailbox_access: impersonate.target.mailbox_access,
   } : profile;
 
   function startImpersonate(s: ImpersonateState) { setImpersonate(s); }

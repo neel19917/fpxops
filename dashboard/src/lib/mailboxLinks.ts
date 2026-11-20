@@ -26,6 +26,14 @@ export class MailboxLinksUnavailableError extends Error {
   }
 }
 
+/** Thrown when the signed-in user has no Support Mailbox access (403). */
+export class MailboxLinksForbiddenError extends Error {
+  constructor(message?: string) {
+    super(message || "You don't have access to the Support Mailbox.");
+    this.name = "MailboxLinksForbiddenError";
+  }
+}
+
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   const token = await getAccessTokenOrWait();
   let res: Response;
@@ -42,6 +50,7 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   if (res.status === 404) throw new MailboxLinksUnavailableError();
   if (!res.ok) {
     const body = await res.json().catch(() => null);
+    if (res.status === 403) throw new MailboxLinksForbiddenError(body?.error ? String(body.error) : undefined);
     throw new Error(body?.error ? String(body.error) : `The server returned ${res.status}`);
   }
   return res.json() as Promise<T>;

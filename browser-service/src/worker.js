@@ -1,4 +1,4 @@
-import { acquireUserBrowser, hasProfile, saveCookiesNow, getServiceWorker, openWindowPage, ExtensionContexts, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
+import { acquireUserBrowser, hasProfile, saveCookiesNow, getServiceWorker, openWindowPage, ExtensionContexts, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired, isWedged, restartUserBrowser, probeUserBrowser, closeTargets } from "./browser.js";
 import { config } from "./config.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -822,11 +822,31 @@ async function runJob(lane, job) {
 }
 
 async function runRefreshAll(lane, email, modes = null) {
-  const lease = await acquireUserBrowser(email, { busy: true });
-  try {
-    return await runIn(lane, lease.browser, dashboardUrlFor(email), email, modes);
-  } finally {
-    lease.release();
+  return withJobBrowser(lane, email, (browser) => runIn(lane, browser, dashboardUrlFor(email), email, modes));
+}
+
+// Run a job in the person's browser (held busy). A browser that no longer
+// opens windows (openWindowPage → BROWSER_WEDGED, always before the job has
+// clicked anything) is restarted and the job tried once more. Any failure
+// ends with a check that the browser left behind still opens windows, so a
+// job that hung (and timed out) does not leave every later run failing.
+async function withJobBrowser(lane, email, fn) {
+  for (let attempt = 0; ; attempt++) {
+    const lease = await acquireUserBrowser(email, { busy: true });
+    let failed = false;
+    try {
+      return await fn(lease.browser);
+    } catch (e) {
+      failed = true;
+      if (!isWedged(e) || attempt || lane.stopFlag) throw e;
+      lease.release();
+      if (!(await restartUserBrowser(email, { reason: e.message }))) throw e; // another job still holds it
+      failed = false;
+      logLine(lane, "The hosted browser stopped opening windows — restarted it, trying again", "warn");
+    } finally {
+      lease.release();
+      if (failed) await probeUserBrowser(email).catch(() => {});
+    }
   }
 }
 
@@ -1012,7 +1032,7 @@ async function runIn(lane, browser, url, who, modes = null) {
   } finally {
     offAuth();
     if (lane.page === page) { lane.page = null; lane.ext = null; }
-    await page.close().catch(() => {});
+    await closeJobWindows(browser, page);
   }
 }
 
@@ -1024,12 +1044,7 @@ async function runIn(lane, browser, url, who, modes = null) {
 // the window (so the read-only live view shows it, like a scrape), relays its
 // log lines, and passes stop / pause on.
 async function runErpAudit(lane, email, months, shipmentType, opts) {
-  const lease = await acquireUserBrowser(email, { busy: true });
-  try {
-    return await runErpIn(lane, lease.browser, dashboardUrlFor(email), email, months, shipmentType, opts);
-  } finally {
-    lease.release();
-  }
+  return withJobBrowser(lane, email, (browser) => runErpIn(lane, browser, dashboardUrlFor(email), email, months, shipmentType, opts));
 }
 
 const ERP_LIMIT_MS = 45 * 60_000; // whole pull, not counting paused time
@@ -1147,8 +1162,25 @@ async function runPageJob(lane, browser, url, who, job) {
     if (cleanup) await Promise.resolve().then(cleanup).catch(() => {});
     offAuth();
     if (lane.page === page) { lane.page = null; lane.ext = null; }
-    await page.close().catch(() => {});
+    await closeJobWindows(browser, page);
   }
+}
+
+// End of a job: close its window and every window it opened (a FreightPOP
+// click can open one that hangs, or that sits on a browser prompt), at the
+// browser level so a page that no longer answers is closed too.
+async function closeJobWindows(browser, page) {
+  let ids = [];
+  try {
+    const own = page.target();
+    ids = browser.targets().filter((t) => t.type() === "page" && t.opener() === own).map((t) => t._targetId);
+    ids.push(own._targetId);
+  } catch { /* browser gone */ }
+  let timer;
+  // page.close() waits on the page; bounded, then closed from the browser side.
+  await Promise.race([page.close().catch(() => {}), new Promise((r) => { timer = setTimeout(r, 15_000); })]);
+  clearTimeout(timer);
+  await closeTargets(browser, ids);
 }
 
 async function runErpIn(lane, browser, url, who, months, shipmentType, opts) {
@@ -1299,12 +1331,7 @@ async function runErpIn(lane, browser, url, who, months, shipmentType, opts) {
 const GET_INVOICE_LIMIT_MS = 90 * 60_000; // whole job, not counting paused time
 
 async function runGetInvoices(lane, email, gi) {
-  const lease = await acquireUserBrowser(email, { busy: true });
-  try {
-    return await runGetInvoicesIn(lane, lease.browser, dashboardUrlFor(email), email, gi);
-  } finally {
-    lease.release();
-  }
+  return withJobBrowser(lane, email, (browser) => runGetInvoicesIn(lane, browser, dashboardUrlFor(email), email, gi));
 }
 
 async function runGetInvoicesIn(lane, browser, url, who, gi) {
@@ -1516,6 +1543,14 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
             child = { t, shot: false };
             children.push(child);
             tell({ kind: "window" });
+            // A prompt in this window would freeze it (and, same-site, the
+            // job page with it): nobody answers it otherwise. OK on an alert,
+            // Cancel / stay on anything else — never a "yes".
+            t.page().then((cp) => cp?.on("dialog", (d) => {
+              const text = String(d.message() || "").replace(/\s+/g, " ").trim().slice(0, 200);
+              (d.type() === "alert" ? d.accept() : d.dismiss()).catch(() => {});
+              logLine(lane, `Get Invoice · a new window showed a browser ${d.type()} ("${text}") — ${d.type() === "alert" ? "OK" : "cancelled"}`, "warn");
+            })).catch(() => {});
             await sleep(8000);
             for (let i = 0; i < 44 && !ended && (shooting || (pageShoots && !child.shot)); i++) await sleep(500);
             while (shooting && !ended) await sleep(250); // never closed in the middle of its picture
@@ -1523,6 +1558,7 @@ async function runGetInvoicesIn(lane, browser, url, who, gi) {
             try { const u = new URL(t.url()); where = u.protocol.startsWith("http") ? u.host + u.pathname : u.protocol; } catch { /* blank */ }
             const p = await t.page().catch(() => null);
             if (p && !p.isClosed()) await p.close().catch(() => {});
+            else if (!p) await closeTargets(browser, [t._targetId]); // never answered: closed from the browser side
             logLine(lane, `Get Invoice · the new window${where ? ` (${where.slice(0, 120)})` : ""} was closed`);
           } catch { /* the window went away by itself */ }
           finally {
@@ -1633,12 +1669,7 @@ const HISTORY_EXTRA_DAYS = 60;    // History starts this long before the pull's 
 const HISTORY_FALLBACK_DAYS = 150; // … or this long before today when the pull's dates can't be read
 
 async function runApprovalCheck(lane, email, auditId, hist) {
-  const lease = await acquireUserBrowser(email, { busy: true });
-  try {
-    return await runApprovalCheckIn(lane, lease.browser, dashboardUrlFor(email), email, auditId, hist);
-  } finally {
-    lease.release();
-  }
+  return withJobBrowser(lane, email, (browser) => runApprovalCheckIn(lane, browser, dashboardUrlFor(email), email, auditId, hist));
 }
 
 // MM/DD/YYYY, the format FreightPOP's date fields take.

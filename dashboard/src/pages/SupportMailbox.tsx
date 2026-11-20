@@ -7,11 +7,17 @@
 // so a link opens it. ?shipment= shows only conversations linked to that shipment.
 // An open conversation gets a details sidebar (party, shipments, tasks,
 // related conversations) beside it on wide screens and under it otherwise.
+// Access is per user ("none" | "view" | "draft", admins always draft): "none"
+// shows only a message (no requests beyond status), "view" hides the composer
+// and makes the sidebar read-only.
 import { useCallback, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { AlertTriangle, ChevronLeft, ChevronRight, Inbox, Loader2, Mail, MailX, Package, RefreshCw, Search, X } from "lucide-react";
-import { getMailboxStatus, listThreads, type PartyFilter, type RangeDays, type ThreadFilter, type ThreadList as ThreadListData } from "../lib/mailboxApi";
-import { useCached } from "../lib/useCached";
+import { AlertTriangle, ChevronLeft, ChevronRight, Inbox, Loader2, Lock, Mail, MailX, Package, RefreshCw, Search, X } from "lucide-react";
+import {
+  getMailboxStatus, listThreads, MailboxForbiddenError,
+  type MailboxAccess, type PartyFilter, type RangeDays, type Status, type ThreadFilter, type ThreadList as ThreadListData,
+} from "../lib/mailboxApi";
+import { useCached, type Cached } from "../lib/useCached";
 import { useAuth } from "../lib/auth";
 import { fmtDateTime, fmtNum, fmtRelative } from "../lib/format";
 import { ErrorBlock } from "../components/ErrorBlock";
@@ -51,9 +57,46 @@ function useMediaQuery(query: string): boolean {
   return match;
 }
 
+const ACCESS_VALUES: readonly MailboxAccess[] = ["none", "view", "draft"];
+const asAccess = (v: unknown): MailboxAccess | null =>
+  ACCESS_VALUES.includes(v as MailboxAccess) ? (v as MailboxAccess) : null;
+
+/** Status, with a 403 read as "no access" so the page can show its message. */
+async function fetchStatus(signal: AbortSignal): Promise<Status> {
+  try {
+    return await getMailboxStatus(signal);
+  } catch (e) {
+    if (e instanceof MailboxForbiddenError) {
+      return { connected: false, mailbox: null, status: null, last_sync_at: null, backfill_done: false, message_count: 0, last_error: null, access: "none" };
+    }
+    throw e;
+  }
+}
+
 export default function SupportMailbox() {
   const { profile } = useAuth();
   const isAdmin = profile?.role === "admin";
+  const status = useCached("mailbox:status", fetchStatus);
+  // The server's answer wins; the profile covers the moment before it arrives.
+  const profileAccess = asAccess((profile as { mailbox_access?: string } | null)?.mailbox_access);
+  const access: MailboxAccess = isAdmin ? "draft" : asAccess(status.data?.access) ?? profileAccess ?? "draft";
+
+  if (access === "none") {
+    return (
+      <div className="space-y-4">
+        <h1 className="text-xl font-semibold flex items-center gap-2"><Mail className="h-5 w-5 text-violet-600" /> Support Mailbox</h1>
+        <div className="rounded-xl ring-1 ring-slate-200 bg-white p-10 text-center max-w-xl mx-auto">
+          <Lock className="h-10 w-10 text-slate-300 mx-auto" />
+          <h2 className="mt-3 text-base font-semibold text-slate-900">You don't have access to the Support Mailbox.</h2>
+          <p className="mt-1 text-sm text-slate-500">Ask an admin to turn it on for you on the Users page.</p>
+        </div>
+      </div>
+    );
+  }
+  return <MailboxBody status={status} canDraft={access === "draft"} isAdmin={isAdmin} />;
+}
+
+function MailboxBody({ status, canDraft, isAdmin }: { status: Cached<Status>; canDraft: boolean; isAdmin: boolean }) {
   const [params, setParams] = useSearchParams();
   const selected = params.get("c");
   const filter: ThreadFilter = FILTERS.find((f) => f.id === params.get("f"))?.id ?? "awaiting_reply";
@@ -98,7 +141,6 @@ export default function SupportMailbox() {
     return () => clearTimeout(t);
   }, [qInput, q, setParam]);
 
-  const status = useCached("mailbox:status", getMailboxStatus);
   const connected = !!status.data?.connected;
 
   const threadsKey = `mailbox:threads:${filter}|${q}|${page}|${days}|${party}|${shipment}`;
@@ -315,7 +357,7 @@ export default function SupportMailbox() {
             <>
               <div className="2xl:flex-1 2xl:min-w-0 2xl:overflow-y-auto">
                 <ThreadView key={selected} conversationId={selected} mailbox={st?.mailbox ?? null} onBack={() => select(null)}
-                  sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} />
+                  canDraft={canDraft} sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} />
               </div>
               {sidebarOpen ? (
                 <aside aria-label="Conversation details"
@@ -324,7 +366,7 @@ export default function SupportMailbox() {
                     "lg:absolute lg:inset-y-0 lg:right-0 lg:z-20 lg:w-[340px] lg:max-w-full lg:border-t-0 lg:border-l lg:bg-slate-50 lg:shadow-[-8px_0_24px_-8px_rgba(15,23,42,0.18)] lg:overflow-y-auto " +
                     // >= 1536px: inline column.
                     "2xl:static 2xl:z-auto 2xl:w-80 2xl:shrink-0 2xl:shadow-none 2xl:bg-slate-50/60"}>
-                  <ThreadSidebar key={selected} conversationId={selected} onOpenThread={(c) => select(c)}
+                  <ThreadSidebar key={selected} conversationId={selected} readOnly={!canDraft} onOpenThread={(c) => select(c)}
                     onClose={() => setSidebarOpen(false)} />
                 </aside>
               ) : null}
@@ -332,7 +374,7 @@ export default function SupportMailbox() {
           ) : (
             <div className="h-full w-full flex flex-col items-center justify-center text-center p-10 text-slate-500">
               <Inbox className="h-10 w-10 text-slate-300" />
-              <p className="mt-2 text-sm">Pick a conversation to read it and draft a reply.</p>
+              <p className="mt-2 text-sm">{canDraft ? "Pick a conversation to read it and draft a reply." : "Pick a conversation to read it."}</p>
               {counts?.awaiting_reply ? (
                 <p className="mt-1 text-xs inline-flex items-center gap-1 text-amber-700">
                   <AlertTriangle className="h-3.5 w-3.5" /> {fmtNum(counts.awaiting_reply)} waiting on a reply
