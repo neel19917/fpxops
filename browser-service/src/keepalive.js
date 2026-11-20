@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { config } from "./config.js";
-import { acquireUserBrowser, writeState } from "./browser.js";
+import { acquireUserBrowser, openWindowPage, writeState } from "./browser.js";
 
 // FreightPOP logins last 12 hours. FreightPOP's newer app renews its token
 // before then (POST appbe /token, grant_type=refresh_token); the Broker
@@ -52,7 +52,10 @@ export async function renewLogin(email, { force = false } = {}) {
   const lease = await acquireUserBrowser(email);
   let page;
   try {
-    page = await lease.browser.newPage();
+    // openWindowPage, not newPage(): a browser that no longer opens windows
+    // is then restarted instead of kept alive by this renewal every 20 min
+    // (each renewal counts as use, so the idle reaper never closed it).
+    page = await openWindowPage(lease.browser, null);
     await page.goto(ORIGIN_PAGE, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
     const r = await page.evaluate(renewInPage, force ? Infinity : RENEW_LEFT_MS);
     const now = new Date().toISOString();

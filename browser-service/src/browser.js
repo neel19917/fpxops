@@ -343,6 +343,65 @@ async function restoreCookies(entry, dir) {
   }
 }
 
+// ── A browser that no longer opens windows ──
+// Thrown by openWindowPage when Chromium does not bring a new window up.
+export const BROWSER_WEDGED = "BROWSER_WEDGED";
+function wedgedError(cause) {
+  return Object.assign(new Error(`The hosted browser did not open a new window — ${cause?.message || cause}`), { code: BROWSER_WEDGED, cause });
+}
+export const isWedged = (e) => e?.code === BROWSER_WEDGED;
+const entryFor = (browser) => [...pool.values()].find((e) => e.browser === browser) || null;
+
+// Close a browser for good, even a hung one: save the login (bounded by
+// rootSend's own timeout), ask Chromium to close, and kill it if it doesn't.
+// The pool entry is dropped first, so the next acquire launches a fresh one.
+async function restartEntry(entry, reason) {
+  if (pool.get(entry.key) !== entry) return false; // already replaced
+  pool.delete(entry.key);
+  clearInterval(entry.saveTimer);
+  console.warn(`[browser] restarting Chromium for ${entry.email}${entry.variant ? ` (${entry.variant})` : ""}: ${reason}`);
+  try { await saveCookies(entry); } catch (e) { console.warn(`[browser] cookie save for ${entry.email} failed:`, e.message); }
+  const proc = entry.browser?.process?.();
+  let timer;
+  await Promise.race([
+    entry.browser?.close().catch(() => {}),
+    new Promise((r) => { timer = setTimeout(r, 10_000); }),
+  ]);
+  clearTimeout(timer);
+  if (proc && proc.exitCode == null && proc.signalCode == null) { try { proc.kill("SIGKILL"); } catch {} }
+  return true;
+}
+
+// Recycle a person's browser that has stopped working. Refused (false) while
+// a worker job still holds it — killing it would fail that job too; the job's
+// own time limit ends it, and the next one recovers.
+export async function restartUserBrowser(email, { variant = "", reason = "it stopped responding" } = {}) {
+  const entry = pool.get(profileKey(email, variant));
+  if (!entry) return true; // nothing running: the next acquire launches a fresh one
+  if (entry.busy) return false;
+  try { await entry.promise; } catch { return true; }
+  return restartEntry(entry, reason);
+}
+
+// After a job fails: make sure the browser it leaves behind still opens
+// windows. If it doesn't, openWindowPage recycles it (nobody holds it now).
+export async function probeUserBrowser(email, variant = "") {
+  const entry = pool.get(profileKey(email, variant));
+  if (!entry?.browser?.connected || entry.busy) return;
+  try {
+    const p = await openWindowPage(entry.browser, null);
+    await p.close().catch(() => {});
+  } catch (e) {
+    if (!isWedged(e)) console.warn(`[browser] health check for ${email} failed:`, e.message);
+  }
+}
+
+// Close windows by target id at the browser level (works even when the page
+// itself no longer answers).
+export async function closeTargets(browser, targetIds) {
+  await Promise.all(targetIds.map((targetId) => rootSend(browser, "Target.closeTarget", { targetId }).catch(() => {})));
+}
+
 async function closeEntry(entry) {
   pool.delete(entry.key);
   clearInterval(entry.saveTimer);
@@ -495,7 +554,20 @@ export async function openWindowPage(browser, url) {
   // rootSend, not browser.target().createCDPSession(): the latter
   // intermittently throws "Browser target is not found".
   const { targetId } = await rootSend(browser, "Target.createTarget", { url: "about:blank", newWindow: true });
-  const target = await browser.waitForTarget((t) => t._targetId === targetId, { timeout: 10_000 });
+  let target;
+  try {
+    target = await browser.waitForTarget((t) => t._targetId === targetId, { timeout: 10_000 });
+  } catch (e) {
+    // Chromium made the window but it never got as far as about:blank: this
+    // browser no longer opens windows (seen after a get-invoices job hung on
+    // a FreightPOP click — every later job and view failed here, for hours).
+    // Don't leave the dead window behind, and recycle the browser when no job
+    // holds it; a job that holds it restarts it itself (see restartUserBrowser).
+    await rootSend(browser, "Target.closeTarget", { targetId }).catch(() => {});
+    const entry = entryFor(browser);
+    if (entry && !entry.busy) restartEntry(entry, `a new window did not open (${e.message})`).catch(() => {});
+    throw wedgedError(e);
+  }
   const page = await target.page();
   await blockTrackers(page);
   if (url) await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch((e) => console.warn("[browser] goto:", e.message));
