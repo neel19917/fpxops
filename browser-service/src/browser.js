@@ -15,12 +15,18 @@ import { config } from "./config.js";
 // ones, which Chrome drops on exit) are snapshotted to the profile and
 // restored on relaunch so the rep doesn't have to log in again every time.
 
+// `busy` is a count of the worker jobs holding the browser (the scrape lane
+// and the invoicing lane can each run one for the same user): the browser is
+// only free for the idle reaper, eviction and a login reset at 0.
 const pool = new Map(); // key -> { email, promise, browser, extensionId, refs, busy, lastUsed, saveTimer }
 
-export function profileKey(email) {
-  return crypto.createHash("sha256").update(String(email).trim().toLowerCase()).digest("hex").slice(0, 24);
+// variant: a second, separate Chromium for the same person ("details": the
+// read-only shipment details job). It has its own profile folder and process;
+// the person's FreightPOP login is copied into it when it starts.
+export function profileKey(email, variant = "") {
+  return crypto.createHash("sha256").update(String(email).trim().toLowerCase() + (variant ? `#${variant}` : "")).digest("hex").slice(0, 24);
 }
-function profileDirFor(email) { return path.join(config.profileRoot, profileKey(email)); }
+function profileDirFor(email, variant = "") { return path.join(config.profileRoot, profileKey(email, variant)); }
 const cookieFile = (dir) => path.join(dir, "fpx-cookies.json");
 
 export function hasProfile(email) {
@@ -135,7 +141,8 @@ function entryStats(e) {
   return {
     user: e.email,
     tabs: e.refs,
-    busy: e.busy,
+    busy: e.busy > 0,
+    jobs: e.busy, // worker jobs holding this browser (0-2: one per lane)
     startedAt: e.startedAt ? new Date(e.startedAt).toISOString() : null,
     lastUsed: new Date(e.lastUsed).toISOString(),
     memoryMb: treeRssMb(e.browser?.process()?.pid),
@@ -150,16 +157,18 @@ export function userStatus(email) {
   const e = pool.get(profileKey(email));
   return {
     running: !!e?.browser,
-    ...(e ? entryStats(e) : { user: email, tabs: 0, busy: false, memoryMb: null }),
+    ...(e ? entryStats(e) : { user: email, tabs: 0, busy: false, jobs: 0, memoryMb: null }),
     hasProfile: hasProfile(email),
     freightpop: readState(email),
   };
 }
 
 // Acquire the user's browser (launching it if needed). Callers must release().
-export async function acquireUserBrowser(email, { busy = false } = {}) {
+// busy: a worker job holds it — counted, so the first of two jobs to finish
+// does not hand the browser to the reaper while the other is still running.
+export async function acquireUserBrowser(email, { busy = false, variant = "" } = {}) {
   if (!email) throw new Error("No user identity");
-  const key = profileKey(email);
+  const key = profileKey(email, variant);
   let entry = pool.get(key);
   if (!entry) {
     const running = [...pool.values()];
@@ -169,17 +178,18 @@ export async function acquireUserBrowser(email, { busy = false } = {}) {
       if (!idle) { const err = new Error("Hosted browser capacity reached — try again shortly"); err.code = "CAPACITY"; throw err; }
       await closeEntry(idle);
     }
-    entry = { email, key, refs: 0, busy: false, lastUsed: Date.now(), browser: null, extensionId: null };
+    entry = { email, key, variant, refs: 0, busy: 0, lastUsed: Date.now(), browser: null, extensionId: null };
     entry.promise = launch(entry).catch((e) => { pool.delete(key); throw e; });
     pool.set(key, entry);
   }
   entry.refs++;
-  if (busy) entry.busy = true;
+  if (busy) entry.busy++;
   entry.lastUsed = Date.now();
   try {
     await entry.promise;
   } catch (e) {
     entry.refs--;
+    if (busy) entry.busy = Math.max(0, entry.busy - 1);
     throw e;
   }
   let released = false;
@@ -192,7 +202,7 @@ export async function acquireUserBrowser(email, { busy = false } = {}) {
       if (released) return;
       released = true;
       entry.refs = Math.max(0, entry.refs - 1);
-      if (busy) entry.busy = false;
+      if (busy) entry.busy = Math.max(0, entry.busy - 1);
       entry.lastUsed = Date.now();
       saveCookies(entry).catch((e) => console.warn(`[browser] cookie save for ${entry.email} failed:`, e.message));
     },
@@ -200,9 +210,9 @@ export async function acquireUserBrowser(email, { busy = false } = {}) {
 }
 
 async function launch(entry) {
-  const dir = profileDirFor(entry.email);
+  const dir = profileDirFor(entry.email, entry.variant);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "fpx-owner.json"), JSON.stringify({ email: entry.email }));
+  fs.writeFileSync(path.join(dir, "fpx-owner.json"), JSON.stringify({ email: entry.email, ...(entry.variant ? { variant: entry.variant } : {}) }));
   // A crashed container leaves Chrome's singleton lock behind and the next
   // launch refuses the profile. Safe to drop: one process per profile here.
   for (const f of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
@@ -247,7 +257,8 @@ async function launch(entry) {
   });
 
   try {
-    await restoreCookies(entry, dir);
+    // A second browser starts from the person's own saved login, never from its own.
+    await restoreCookies(entry, entry.variant ? profileDirFor(entry.email) : dir);
     await finishLaunch(entry, browser);
   } catch (e) {
     // Don't leave an orphaned Chromium holding the profile lock.
@@ -283,8 +294,19 @@ async function finishLaunch(entry, browser) {
   return browser;
 }
 
+// Write this user's login to disk now, if their browser is running. A fresh
+// sign-in is otherwise only saved by the 5-minute timer, and until then a job
+// would be told the user "hasn't logged in yet".
+export async function saveCookiesNow(email) {
+  const entry = pool.get(profileKey(email));
+  if (!entry?.browser?.connected) return false;
+  try { await saveCookies(entry); return true; } catch (e) { console.warn(`[browser] cookie save for ${email} failed:`, e.message); return false; }
+}
+
 async function saveCookies(entry) {
   if (!entry.browser?.connected) return;
+  // Only the person's own browser holds the login worth keeping.
+  if (entry.variant) return;
   // Browser-level CDP call on the root connection. (browser.target()
   // .createCDPSession() intermittently fails with "Browser target is not found".)
   const { cookies } = await rootSend(entry.browser, "Storage.getCookies");
@@ -332,11 +354,21 @@ async function closeEntry(entry) {
 // Sign the user out of the hosted browser completely: close their Chromium
 // WITHOUT saving cookies, then delete their whole profile (cookies, FreightPOP
 // session, saved page). Their next view starts fresh on the FreightPOP login.
-// Refused while their browser is running a scrape.
+// Refused while their browser is running a scrape or an invoicing job.
+// Close a person's second browser (see `variant`) once its job is done: it
+// holds ~300 MB and nothing in it needs keeping.
+export async function closeUserBrowser(email, variant) {
+  if (!variant) return false;
+  const entry = pool.get(profileKey(email, variant));
+  if (!entry || entry.busy || entry.refs) return false;
+  await closeEntry(entry);
+  return true;
+}
+
 export async function resetUserProfile(email) {
   const key = profileKey(email);
   const entry = pool.get(key);
-  if (entry?.busy) throw Object.assign(new Error("A scrape is running in this browser — stop it first"), { status: 409 });
+  if (entry?.busy) throw Object.assign(new Error("A scrape or an invoicing job is running in this browser — stop it first"), { status: 409 });
   if (entry) {
     pool.delete(key);
     clearInterval(entry.saveTimer);
@@ -344,6 +376,7 @@ export async function resetUserProfile(email) {
     try { await entry.browser?.close(); } catch {}
   }
   await fs.promises.rm(profileDirFor(email), { recursive: true, force: true });
+  await fs.promises.rm(profileDirFor(email, "details"), { recursive: true, force: true }).catch(() => {});
   console.log(`[browser] reset hosted login for ${email}`);
 }
 

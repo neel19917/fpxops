@@ -23,9 +23,31 @@ export interface HostedWorkerState {
   enabled: boolean;
   reason: string | null;
   pollSeconds: number;
+  /** The scrape lane is paused. Absent on an older service. */
+  paused?: boolean;
   current: { requestId: string; user: string; scope: string; source?: "manual" | "schedule"; scheduleName?: string | null; startedAt: string; status: string; statusAt: string; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null; total?: number | null;
-    fpCounts?: Record<string, number> | null; fpCountsAt?: string | null } | null;
+    fpCounts?: Record<string, number> | null; fpCountsAt?: string | null;
+    /** The run is paused (a pause resumes by itself after 30 minutes). Absent on an older service. */
+    paused?: boolean } | null;
   lastResult: { requestId: string; user: string; ok: boolean; note: string; finishedAt: string; durationMs: number; log?: ScrapeLogLine[]; logTotal?: number; counts?: ScrapeCounts | null } | null;
+}
+
+// The service's second session ("lane"): the three invoicing jobs run here, in
+// their own window with their own queue, log, pause and stop. The top-level
+// worker fields describe the scrape lane only.
+export type HostedLane = "scrape" | "invoicing";
+export type HostedInvoicingKind = "erp_audit" | "get_invoice" | "approval_check";
+export interface HostedInvoicingLane {
+  enabled: boolean;
+  busy: boolean;
+  kind: HostedInvoicingKind | null;
+  paused: boolean;
+  current: (NonNullable<HostedWorkerState["current"]> & { kind?: HostedInvoicingKind; paused?: boolean }) | null;
+  lastResult: (NonNullable<HostedWorkerState["lastResult"]> & { kind?: HostedInvoicingKind; result?: unknown }) | null;
+  result: unknown;
+  queued: { id?: string; requestId?: string; user?: string; kind?: string; queuedAt?: string }[];
+  reason?: string | null;
+  pollSeconds?: number;
 }
 
 export interface HostedUsageUser {
@@ -79,8 +101,17 @@ export interface FpTotalsPoint {
   tasksBefore?: TaskSnapshot | null; tasksAfter?: TaskSnapshot | null;
 }
 
+// What a schedule runs. Absent on an older service or schedule: "tracking".
+export type ScheduleJob = "tracking" | "erp_lookback" | "shipment_details";
+export type ScheduleShipmentType = "non-parcel" | "parcel" | "both";
+
 export interface ScrapeSchedule {
   id: string;
+  job?: ScheduleJob;
+  months?: number | null;                       // erp_lookback: how many months back (1-12)
+  shipmentType?: ScheduleShipmentType | null;   // erp_lookback
+  /** The last time the schedule fired, whether or not the run has finished. */
+  lastFired?: { at: string; requestId: string | null; queued: boolean; coalesced?: boolean; reason?: string | null } | null;
   owner: string;
   name: string;
   enabled: boolean;
@@ -94,7 +125,10 @@ export interface ScrapeSchedule {
   lastRun: { id: string; ok: boolean; finishedAt: string; durationMs: number; note: string; counts: ScrapeCounts | null } | null;
 }
 
-export type ScheduleInput = Pick<ScrapeSchedule, "name" | "days" | "times" | "tz"> & { enabled?: boolean; modes?: string[] | null };
+export type ScheduleInput = Pick<ScrapeSchedule, "name" | "days" | "times" | "tz"> & {
+  enabled?: boolean; modes?: string[] | null;
+  job?: ScheduleJob; months?: number | null; shipmentType?: ScheduleShipmentType | null;
+};
 
 export interface HostedStats {
   bootedAt: string;
@@ -110,7 +144,7 @@ export interface HostedStats {
   isAdmin?: boolean;
   runs?: ScrapeRun[];
   schedules?: ScrapeSchedule[];
-  worker: HostedWorkerState & { queued?: { id: string; user: string; source: string; scheduleId: string; scheduleName: string | null; queuedAt: string }[] };
+  worker: HostedWorkerState & { queued?: { id: string; user: string; source: string; scheduleId: string; scheduleName: string | null; queuedAt: string }[]; invoicing?: HostedInvoicingLane };
   usage: {
     days: number;
     users: HostedUsageUser[];
@@ -127,26 +161,75 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    if (body?.error) throw new Error(`Hosted browser: ${body.error}`);
+    if (body?.error) throw new HostedBrowserError(`Hosted browser: ${body.error}`, res.status);
     // A bare 404 means the hosted browser is running an older version that
     // doesn't have this endpoint yet (e.g. mid-rollout).
-    if (res.status === 404) throw new Error("The hosted browser hasn't been updated with this feature yet — try again after its next deploy.");
-    throw new Error(`Hosted browser returned ${res.status}`);
+    if (res.status === 404) throw new HostedBrowserError("The hosted browser hasn't been updated with this feature yet — try again after its next deploy.", res.status);
+    throw new HostedBrowserError(`Hosted browser returned ${res.status}`, res.status);
   }
   return res.json() as Promise<T>;
 }
 
+/** A failed call to the hosted browser, with the HTTP status it answered with. */
+export class HostedBrowserError extends Error {
+  status: number;
+  constructor(message: string, status: number) { super(message); this.name = "HostedBrowserError"; this.status = status; }
+}
+
+// Pause / resume the running scrape. An older service has no such endpoint and
+// answers 404 or 405.
+export const PAUSE_NEEDS_UPDATE = "Pause needs the next hosted browser update";
+async function setScrapePaused(action: "pause" | "resume") {
+  try {
+    return await call<{ ok: boolean; paused: boolean; lane: HostedLane }>(`/scrape/${action}?lane=scrape`, { method: "POST" });
+  } catch (e) {
+    if (e instanceof HostedBrowserError && (e.status === 404 || e.status === 405)) throw new Error(PAUSE_NEEDS_UPDATE);
+    throw e;
+  }
+}
+
+// The details job: a read-only job that runs in its own separate Chrome, apart
+// from the scrape and invoicing windows. For each tracked shipment it opens
+// FreightPOP's Shipment Details page and reads it; it changes nothing there.
+// A sweep is one run over every tracked shipment.
+export interface DetailsLogLine { t: string; level: "info" | "warn" | "error" | "done"; text: string }
+export interface DetailsCounts { total: number; done: number; stored: number; failed: number }
+export interface DetailsState {
+  state: "idle" | "busy";
+  current: null | { requestId: string; user: string; startedAt: string; sweep: boolean; counts: DetailsCounts; shipment: string | null; stopping: boolean; log: DetailsLogLine[] }; // log = last 500 lines
+  last: null | { requestId: string; user: string; ok: boolean; note: string; finishedAt: string; counts: DetailsCounts; log: DetailsLogLine[] };
+}
+
+// An older service has no /details endpoints and answers 404.
+export const DETAILS_NEEDS_UPDATE = "The hosted browser needs its next update before this page works.";
+async function detailsCall<T>(path: string, init?: RequestInit): Promise<T> {
+  try {
+    return await call<T>(path, init);
+  } catch (e) {
+    if (e instanceof HostedBrowserError && e.status === 404) throw new HostedBrowserError(DETAILS_NEEDS_UPDATE, 404);
+    throw e;
+  }
+}
+
 // "Ask FPX" assistant (browser-service/src/assistant.js).
+const STREAM_IDLE_MS = 60_000;
 export type AssistantAction =
-  | { type: "open_shipment"; id: string; label?: string }
+  | { type: "open_shipment"; id: string; label?: string; tab?: string }
   | { type: "open_task"; task_id: string; label?: string }
   | { type: "filter_shipments"; query?: string; action?: "YES" | "NO" | "ERROR"; customer?: string }
-  | { type: "navigate"; page: string };
+  | { type: "navigate"; page: string }
+  /** Invoices page, with that shipment's panel open. */
+  | { type: "open_invoice"; shipment_id: string }
+  /** FreightPOP's own Shipment Details page, in the hosted FreightPOP window. */
+  | { type: "open_in_freightpop"; shipment_id: string; quote_id: string; charge?: number | null; cost?: number | null; customer?: string | null }
+  /** A source behind an answer is older than its threshold. Shown as a chip; never performed automatically. */
+  | { type: "stale_data"; shipment_id?: string; age_hours: number; sources: string[]; label?: string; page: string };
 
 export type AssistantStreamEvent =
   | { type: "text"; delta: string }
   | { type: "status"; text: string }
-  | { type: "reset" };
+  | { type: "reset" }
+  | { type: "ping" };
 
 export interface AssistantChatSummary { id: string; title: string; turn_count: number; updated_at: string }
 export interface AssistantChat {
@@ -202,10 +285,20 @@ export const hostedBrowser = {
   ): Promise<AssistantReply> => {
     if (!HOSTED_BROWSER_URL) throw new Error("Hosted browser not configured (VITE_FPX_BROWSER_URL)");
     const token = await getAccessTokenOrWait();
+    // The service sends a line at least every 10 s ("ping" while a lookup
+    // runs). A minute of silence means the stream is stuck: give up rather
+    // than show "Searching…" forever.
+    const ctrl = new AbortController();
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    let stalled = false;
+    const arm = () => { clearTimeout(idle); idle = setTimeout(() => { stalled = true; ctrl.abort(); }, STREAM_IDLE_MS); };
+    arm();
+    try {
     const res = await fetch(`${HOSTED_BROWSER_URL}/assistant/chat/stream`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify(body),
+      signal: ctrl.signal,
     });
     if (res.status === 404 || res.status === 405) return hostedBrowser.assistantChat(body);
     if (!res.ok || !res.body) {
@@ -218,6 +311,7 @@ export const hostedBrowser = {
     let final: AssistantReply | null = null;
     for (;;) {
       const { done, value } = await reader.read();
+      arm();
       if (value) buf += dec.decode(value, { stream: true });
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
@@ -231,12 +325,18 @@ export const hostedBrowser = {
         try { ev = JSON.parse(line) as Wire; } catch { continue; }
         if (ev.type === "done") final = { messages: ev.messages || [], reply: ev.reply || "", actions: ev.actions || [] };
         else if (ev.type === "error") throw new Error(ev.error || "Assistant error");
-        else onEvent(ev);
+        else if (ev.type !== "ping") onEvent(ev);
       }
       if (done) break;
     }
-    if (!final) throw new Error("The answer was cut off — try again");
+    if (!final) throw new Error("The connection closed before an answer arrived — try again");
     return final;
+    } catch (e) {
+      if (stalled) throw new Error("No answer for a minute — the lookup may be stuck. Try again.");
+      throw e;
+    } finally {
+      clearTimeout(idle);
+    }
   },
   /** Ask FPX history — the signed-in person's own conversations. */
   listChats: () => call<{ chats: AssistantChatSummary[] }>("/assistant/chats"),
@@ -245,6 +345,13 @@ export const hostedBrowser = {
   enabled: !!HOSTED_BROWSER_URL,
   stats: (days = 30) => call<HostedStats>(`/stats?days=${days}`),
   stopScrape: () => call<{ stopping: boolean }>("/scrape/stop", { method: "POST" }),
+  /** Pause the running scrape; it resumes by itself after 30 minutes. */
+  pauseScrape: () => setScrapePaused("pause"),
+  resumeScrape: () => setScrapePaused("resume"),
+  /** The details job: what it is reading now, and how its last run ended. */
+  detailsState: () => detailsCall<DetailsState>("/details/state"),
+  /** Stop the running details job after the shipment it is on. */
+  stopDetails: () => detailsCall<{ stopping: boolean }>("/details/stop", { method: "POST" }),
   pipeline: () => call<{
     scrape: { running: boolean | null; lastRun: { startedAt: string; finishedAt: string; ok: boolean; saved: number | null; note: string } | null };
     assistant: { index: { at: number; ok: boolean; rows: number; ms: number }; embeddings: { running: boolean; at: number; embedded: number; lastError: string | null } } | null;
@@ -260,7 +367,7 @@ export const hostedBrowser = {
   updateSchedule: (id: string, input: Partial<ScheduleInput>) =>
     call<{ schedule: ScrapeSchedule }>(`/schedules/${id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(input) }),
   deleteSchedule: (id: string) => call<{ deleted: boolean }>(`/schedules/${id}`, { method: "DELETE" }),
-  runScheduleNow: (id: string) => call<{ queued: boolean; reason?: string }>(`/schedules/${id}/run`, { method: "POST" }),
+  runScheduleNow: (id: string) => call<{ queued: boolean; reason?: string; coalesced?: boolean }>(`/schedules/${id}/run`, { method: "POST" }),
   // A run's saved log as text (admins: any run; others: their own).
   async runLogText(runId: string): Promise<string> {
     const token = await getAccessTokenOrWait();

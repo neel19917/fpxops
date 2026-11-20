@@ -338,6 +338,22 @@ export function FreightPopOverlay() {
     sendBridgeRef.current({ type: "fpxOpenTracking", trackingNumber: frame.trackingNumber });
   }, [bridgeReady, frame.trackingNumber, frame.openTrackingTick]);
 
+  // A page asked for with openInFreightPop: sent to the hosted window once per
+  // request, as soon as FreightPOP is ready in it (or after 8 s regardless: a
+  // page the extension does not report on must not block the next request).
+  const lastGotoRef = useRef(0);
+  useEffect(() => {
+    if (!hosted || !frame.visible || !frame.gotoUrl || frame.gotoTick === lastGotoRef.current) return;
+    const go = () => {
+      if (frame.gotoTick === lastGotoRef.current || !frame.gotoUrl) return;
+      lastGotoRef.current = frame.gotoTick;
+      hostedRef.current?.navigate(frame.gotoUrl);
+    };
+    if (bridgeReady) { go(); return; }
+    const timer = setTimeout(go, 8000);
+    return () => clearTimeout(timer);
+  }, [hosted, frame.visible, frame.gotoUrl, frame.gotoTick, bridgeReady]);
+
   // If the embed is disabled OR the iframe has never been asked to load,
   // render nothing. Once it's loaded once we keep it in the DOM (just
   // hide it via display:none) so the FreightPOP session survives.
@@ -374,7 +390,7 @@ export function FreightPopOverlay() {
       // Position: fills the viewport area to the LEFT of the 720px drawer
       // when the drawer is open, otherwise off-screen via display:none.
       // We never unmount.
-      className={"fixed top-0 left-0 right-0 bottom-0 bg-slate-100 flex flex-col " + (paneFull ? "z-40" : "sm:right-[720px] z-20")}
+      className={"fixed top-0 left-0 right-0 bottom-0 bg-slate-100 flex flex-col " + (paneFull || frame.wide ? "z-40" : "sm:right-[720px] z-20")}
       style={{ display: frame.visible ? "flex" : "none" }}
     >
       <div className="flex items-center gap-3 px-3 py-2 bg-white border-b border-slate-200 shadow-sm">

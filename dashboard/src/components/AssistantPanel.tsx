@@ -1,8 +1,9 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ArrowLeft, CornerDownLeft, ExternalLink, Filter, History, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Search, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, CornerDownLeft, ExternalLink, FileText, Filter, History, Loader2, MessageCircle, Navigation, PackageOpen, RotateCcw, Search, Trash2 } from "lucide-react";
 import { hostedBrowser, type AssistantAction, type AssistantChatSummary } from "../lib/hostedBrowser";
 import { fmtRelative } from "../lib/format";
+import { openInFreightPop } from "../lib/freightpopFrame";
 
 // "Ask FPX" — one search box for the whole dashboard. Type a tracking number,
 // a name or a plain-English question; Claude (via the hosted browser service)
@@ -39,11 +40,35 @@ export function AskSearchTrigger() {
 }
 
 const PAGE_PATHS: Record<string, string> = {
-  tracking: "/tracking", tasks: "/tasks/v2", ops: "/ops", scraping: "/scraping",
+  tracking: "/tracking", shipment_details: "/tracking/details", tasks: "/tasks/v2", ops: "/ops", scraping: "/scraping",
   notes: "/notes", analyses: "/analyses", gp: "/audits/gp", invoice: "/audits/invoice",
+  invoices: "/invoices", invoice_reading: "/invoices/reading", pushed: "/invoicing/pushed", send_invoices: "/invoicing",
+};
+const PAGE_NAMES: Record<string, string> = {
+  shipment_details: "Shipment details", invoices: "Invoices", invoice_reading: "Invoice reading",
+  pushed: "Pushed to ERP", send_invoices: "Send invoices", scraping: "Scraping",
 };
 
-interface Turn { role: "user" | "assistant"; text: string; actions?: AssistantAction[]; error?: boolean }
+/** FreightPOP's own Shipment Details page, by quote id (as PushedRecordModal builds it). */
+function freightPopShipmentUrl(a: { quote_id: string; charge?: number | null; cost?: number | null }): string {
+  const p = new URLSearchParams({ FromHistory: "true", QuoteID: a.quote_id, FromEmailLink: "false", IsFromIframe: "false", bh: "true" });
+  if (a.charge != null) p.set("Amount", String(a.charge));
+  if (a.cost != null) p.set("co", String(a.cost));
+  if (a.charge != null && a.cost != null) p.set("pr", (Math.round((a.charge - a.cost) * 100) / 100).toString());
+  return `https://app.freightpop.com/ShipmentDetail.html?${p.toString()}`;
+}
+
+function ageText(hours: number): string {
+  if (hours < 48) { const h = Math.max(1, Math.round(hours)); return `${h} hour${h === 1 ? "" : "s"}`; }
+  const d = Math.round(hours / 24);
+  return `${d} day${d === 1 ? "" : "s"}`;
+}
+
+// Actions the panel does by itself after an answer. A stale-data flag is only
+// ever a chip the rep clicks.
+const autoPerform = (a: AssistantAction) => a.type !== "stale_data";
+
+interface Turn { role: "user" | "assistant"; text: string; actions?: AssistantAction[]; error?: boolean; retry?: string }
 interface Stored { id: string; turns: Turn[]; history: unknown[] }
 
 const newId = () => (crypto.randomUUID ? crypto.randomUUID() : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) => (Number(c) ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (Number(c) / 4)))).toString(16)));
@@ -58,7 +83,10 @@ function actionLabel(a: AssistantAction): string {
   switch (a.type) {
     case "open_shipment": return `Opened shipment ${a.label || ""}`.trim();
     case "open_task": return `Opened task ${a.label || ""}`.trim();
-    case "navigate": return `Went to ${a.page}`;
+    case "navigate": return `Went to ${PAGE_NAMES[a.page] || a.page}`;
+    case "open_invoice": return `Opened invoice ${a.shipment_id}`;
+    case "open_in_freightpop": return `Opened ${a.shipment_id} in FreightPOP`;
+    case "stale_data": return `${a.label || "Data"} is ${ageText(a.age_hours)} old — open ${PAGE_NAMES[a.page] || a.page}`;
     case "filter_shipments": {
       const bits = [a.customer, a.action === "YES" ? "action needed" : a.action === "NO" ? "on track" : a.action, a.query && `"${a.query}"`].filter(Boolean);
       return `Filtered Tracking: ${bits.join(" · ") || "all"}`;
@@ -70,6 +98,9 @@ function ActionIcon({ a }: { a: AssistantAction }) {
   const cls = "h-3 w-3";
   if (a.type === "filter_shipments") return <Filter className={cls} />;
   if (a.type === "navigate") return <Navigation className={cls} />;
+  if (a.type === "open_invoice") return <FileText className={cls} />;
+  if (a.type === "open_in_freightpop") return <ExternalLink className={cls} />;
+  if (a.type === "stale_data") return <AlertTriangle className={cls} />;
   return <PackageOpen className={cls} />;
 }
 
@@ -183,9 +214,18 @@ export function AssistantPanel() {
   }, []);
 
   function perform(a: AssistantAction) {
-    if (a.type === "open_shipment") navigate(`/tracking/${a.id}`);
+    if (a.type === "open_shipment") navigate(a.tab && a.tab !== "overview" ? `/tracking/${a.id}/${a.tab}` : `/tracking/${a.id}`);
     else if (a.type === "open_task") navigate(`/tasks/v2/${a.task_id}`);
     else if (a.type === "navigate") navigate(PAGE_PATHS[a.page] || "/tracking");
+    else if (a.type === "open_invoice") navigate(`/invoices?shipment=${encodeURIComponent(a.shipment_id)}`);
+    else if (a.type === "open_in_freightpop") {
+      if (a.quote_id) openInFreightPop({ url: freightPopShipmentUrl(a), label: `Shipment ${a.shipment_id}`, customerName: a.customer ?? null });
+    }
+    else if (a.type === "stale_data") {
+      // ERP data refreshes from the Invoices page — open it on this shipment.
+      if (a.page === "invoices" && a.shipment_id) navigate(`/invoices?shipment=${encodeURIComponent(a.shipment_id)}`);
+      else navigate(PAGE_PATHS[a.page] || "/invoices");
+    }
     else if (a.type === "filter_shipments") {
       const p = new URLSearchParams({ reset: "1" });
       if (a.query) p.set("q", a.query);
@@ -195,12 +235,14 @@ export function AssistantPanel() {
     }
   }
 
-  async function send(text: string) {
+  function send(text: string) { return sendWith(text, state.turns); }
+
+  async function sendWith(text: string, before: Turn[]) {
     const message = text.trim();
     if (!message || busy) return;
     setInput("");
     setBusy(true);
-    const turns: Turn[] = [...state.turns, { role: "user", text: message }];
+    const turns: Turn[] = [...before, { role: "user", text: message }];
     setState((s) => ({ ...s, turns }));
     setDraft(""); setStatus(null);
     try {
@@ -212,20 +254,41 @@ export function AssistantPanel() {
       setState((s) => ({ id: s.id, turns: [...turns, { role: "assistant", text: r.reply || "(no answer)", actions: r.actions }], history: r.messages }));
       // Do what it said, in order (the last navigation wins), and get out of
       // the way so the page it opened is visible.
-      for (const a of r.actions) perform(a);
-      if (r.actions.length) setOpen(false);
+      const auto = r.actions.filter(autoPerform);
+      for (const a of auto) perform(a);
+      if (auto.length) setOpen(false);
     } catch (e) {
-      setState((s) => ({ ...s, turns: [...turns, { role: "assistant", text: (e as Error).message, error: true }] }));
+      setState((s) => ({ ...s, turns: [...turns, { role: "assistant", text: (e as Error).message || "Something went wrong", error: true, retry: message }] }));
     } finally {
       setBusy(false); setDraft(""); setStatus(null);
     }
   }
 
-  if (!hostedBrowser.enabled || !open) return null;
+  // Drop the failed answer and its question, then ask again with the same history.
+  function retry(i: number) {
+    const t = state.turns[i];
+    if (!t?.retry || busy) return;
+    const question = t.retry;
+    const kept = state.turns.slice(0, Math.max(0, i - 1));
+    setState((s) => ({ ...s, turns: kept }));
+    sendWith(question, kept);
+  }
+
+  if (!hostedBrowser.enabled) return null;
+  // Always on screen, above full-screen views that cover the header's search box.
+  if (!open) {
+    return (
+      <button type="button" onClick={() => setOpen(true)} title="Ask FPX (Ctrl/⌘ K)" aria-label="Ask FPX"
+        className="fixed bottom-4 right-4 z-[70] inline-flex items-center gap-2 rounded-full bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium pl-3 pr-4 py-2.5 shadow-lg ring-1 ring-violet-700/30">
+        <Search className="h-4 w-4" />
+        Ask FPX
+      </button>
+    );
+  }
 
   const empty = state.turns.length === 0 && !busy;
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-start justify-center p-4 pt-[10vh]" onClick={() => setOpen(false)}>
+    <div className="fixed inset-0 z-[80] bg-slate-900/40 flex items-start justify-center p-4 pt-[10vh]" onClick={() => setOpen(false)}>
       <div className="w-full max-w-2xl max-h-[78vh] rounded-2xl bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Search FPX">
         {/* The search box */}
         <form onSubmit={(e) => { e.preventDefault(); setShowHistory(false); send(input); }} className="flex items-center gap-3 px-4 py-3 border-b border-slate-100">
@@ -290,12 +353,20 @@ export function AssistantPanel() {
               <div key={i} className="space-y-2">
                 <div className={"text-sm leading-relaxed " + (t.error ? "rounded-lg px-3 py-2 bg-rose-50 text-rose-800 ring-1 ring-rose-200" : "text-slate-700")}>
                   {t.error ? t.text : <Rich text={t.text} onInternal={(href) => { navigate(href); setOpen(false); }} />}
+                  {t.error && t.retry && i === state.turns.length - 1 ? (
+                    <button onClick={() => retry(i)} disabled={busy}
+                      className="mt-2 inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-white text-rose-800 ring-1 ring-rose-300 hover:bg-rose-100 disabled:opacity-50">
+                      <RotateCcw className="h-3 w-3" /> Try again
+                    </button>
+                  ) : null}
                 </div>
                 {t.actions?.length ? (
                   <div className="flex flex-wrap gap-1.5">
                     {t.actions.map((a, j) => (
-                      <button key={j} onClick={() => { perform(a); setOpen(false); }} title="Go there again"
-                        className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-violet-50 text-violet-800 ring-1 ring-violet-200 hover:bg-violet-100">
+                      <button key={j} onClick={() => { perform(a); setOpen(false); }} title={a.type === "stale_data" ? `Last read ${ageText(a.age_hours)} ago — may be out of date` : "Go there again"}
+                        className={"inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full ring-1 " + (a.type === "stale_data"
+                          ? "bg-amber-50 text-amber-800 ring-amber-300 hover:bg-amber-100"
+                          : "bg-violet-50 text-violet-800 ring-violet-200 hover:bg-violet-100")}>
                         <ActionIcon a={a} /> {actionLabel(a)}
                       </button>
                     ))}

@@ -25,6 +25,11 @@ const ExtLoginPage    = lazy(() => import("./pages/ExtLogin").then((m) => ({ def
 const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
 const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
 const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
+const InvoicesPushedPage = lazy(() => import("./pages/InvoicesPushed").then((m) => ({ default: m.InvoicesPushedPage })));
+const InvoiceReadingPage = lazy(() => import("./pages/InvoiceReading").then((m) => ({ default: m.InvoiceReadingPage })));
+const GetInvoiceRunsPage = lazy(() => import("./pages/GetInvoiceRuns").then((m) => ({ default: m.GetInvoiceRunsPage })));
+const InvoicesHubPage = lazy(() => import("./pages/InvoicesHub").then((m) => ({ default: m.InvoicesHubPage })));
+const InvoicingPage   = lazy(() => import("./pages/Invoicing").then((m) => ({ default: m.InvoicingPage })));
 const ApiKeysPage     = lazy(() => import("./pages/ApiKeys").then((m) => ({ default: m.ApiKeysPage })));
 const UsersPage       = lazy(() => import("./pages/Users").then((m) => ({ default: m.UsersPage })));
 const ShareLinksPage  = lazy(() => import("./pages/ShareLinks").then((m) => ({ default: m.ShareLinksPage })));
@@ -44,6 +49,9 @@ const ScrapeLogsPage  = lazy(() => import("./pages/ScrapeLogs").then((m) => ({ d
 const FreightPopLoginPage = lazy(() => import("./pages/FreightPopLogin").then((m) => ({ default: m.FreightPopLoginPage })));
 const ScrapingPage    = lazy(() => import("./pages/Scraping").then((m) => ({ default: m.ScrapingPage })));
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
+const SupportMailboxPage = lazy(() => import("./pages/SupportMailbox"));
+const SupportMailboxAdminPage = lazy(() => import("./pages/SupportMailboxAdmin").then((m) => ({ default: m.SupportMailboxAdminPage })));
+const ShipmentDetailsMonitorPage = lazy(() => import("./pages/ShipmentDetailsMonitor").then((m) => ({ default: m.ShipmentDetailsMonitorPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
@@ -51,11 +59,13 @@ const TAB_PATH: Record<TabId, string> = {
   tasks: "/tasks",
   ops: "/ops",
   scraping: "/scraping",
+  shipment_details: "/tracking/details",
   freightpop: "/freightpop",
   notes: "/notes",
   analyses: "/analyses",
   gp: "/audits/gp",
   invoice: "/audits/invoice",
+  invoicing: "/invoices",
   shares: "/shares",
   feedback: "/feedback",
   install: "/install",
@@ -70,10 +80,12 @@ const TAB_PATH: Record<TabId, string> = {
   emails: "/email-studio",
   ai_governance: "/admin/ai-governance",
   data_flow: "/admin/data-flow",
+  mailbox: "/mailbox",
+  mailbox_admin: "/admin/support-mailbox",
   claude: "/claude",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "ai_governance", "data_flow"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "ai_governance", "data_flow", "mailbox_admin"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -89,9 +101,12 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/email-studio")) return "emails"; // old prompts URL, redirects below
   if (pathname.startsWith("/admin/ai-governance")) return "ai_governance";
   if (pathname.startsWith("/admin/data-flow")) return "data_flow";
+  if (pathname.startsWith("/admin/support-mailbox")) return "mailbox_admin";
+  if (pathname.startsWith("/mailbox")) return "mailbox";
   if (pathname.startsWith("/claude")) return "claude";
   if (pathname.startsWith("/audits/gp")) return "gp";
-  if (pathname.startsWith("/audits/invoice")) return "invoice";
+  // One nav entry, Invoices, covers the guided page and the screens it leads to.
+  if (pathname.startsWith("/audits/invoice") || pathname.startsWith("/invoicing") || pathname.startsWith("/invoices")) return "invoicing";
   if (pathname.startsWith("/email-studio")) return "emails";
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/ops")) return "ops";
@@ -102,6 +117,8 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/shares")) return "shares";
   if (pathname.startsWith("/feedback")) return "feedback";
   if (pathname.startsWith("/install")) return "install";
+  // Exact match only: /tracking/details123 is a shipment id, not this page.
+  if (pathname === "/tracking/details" || pathname === "/tracking/details/") return "shipment_details";
   return "tracking";
 }
 
@@ -251,6 +268,9 @@ function AuthedApp() {
           <Routes>
             <Route path="/" element={<Navigate to="/tasks" replace />} />
             <Route path="/tracking" element={<ShipmentsRoute />} />
+            {/* The shipment details monitor, not a shipment whose id is "details". */}
+            <Route path="/tracking/details" element={<ShipmentDetailsMonitorPage />} />
+            <Route path="/tracking/details/*" element={<Navigate to="/tracking/details" replace />} />
             <Route path="/tracking/:id" element={<ShipmentsRoute />} />
             <Route path="/tracking/:id/:section" element={<ShipmentsRoute />} />
             {/* /tasks opens whichever view the user last chose (v2 by
@@ -275,10 +295,16 @@ function AuthedApp() {
             <Route path="/freightpop" element={<FreightPopLoginPage />} />
             <Route path="/email-studio" element={<EmailQueuePage />} />
             <Route path="/admin/email-studio" element={<EmailPromptsRedirect />} />
+            <Route path="/mailbox" element={<SupportMailboxPage />} />
             <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
             <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
+            <Route path="/invoices" element={<InvoicesHubPage />} />
+            <Route path="/invoices/reading" element={<InvoiceReadingPage />} />
+            <Route path="/invoices/get-invoice-runs" element={<GetInvoiceRunsPage />} />
+            <Route path="/invoicing/pushed" element={<InvoicesPushedPage />} />
+            <Route path="/invoicing" element={<InvoicingPage />} />
             <Route path="/shares" element={<ShareLinksPage />} />
             <Route path="/feedback" element={<FeedbackPage />} />
             <Route path="/install" element={<InstallPage />} />
@@ -297,6 +323,7 @@ function AuthedApp() {
                 <Route path="/admin/hosted-browser" element={<HostedBrowserSettingsPage />} />
                 <Route path="/admin/ai-governance" element={<AIGovernancePage />} />
                 <Route path="/admin/data-flow" element={<DataFlowPage />} />
+                <Route path="/admin/support-mailbox" element={<SupportMailboxAdminPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tasks" replace />} />

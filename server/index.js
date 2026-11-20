@@ -12,6 +12,7 @@ process.on("unhandledRejection", (e) => {
 });
 import { ChatAnthropic } from "@langchain/anthropic";
 import { buildGraph } from "./graph.js";
+import { shipmentDetailsRouter } from "./routes/shipmentDetails.js";
 import { requireAuth, bootstrapAdminKey, bootstrapAdminEmail } from "./lib/auth.js";
 import { isDbReady, supabase } from "./lib/supabase.js";
 import { getSettings } from "./lib/settings.js";
@@ -33,6 +34,14 @@ import { feedbackRouter } from "./routes/feedback.js";
 import { auditLogRouter } from "./routes/auditLog.js";
 import { settingsRouter } from "./routes/settings.js";
 import { opsRouter } from "./routes/ops.js";
+import { invoiceDocsRouter } from "./routes/invoiceDocs.js";
+import { startInvoiceDocWorker, backfillFromRecords } from "./lib/invoiceDocs.js";
+import { erpPushedRouter } from "./routes/erpPushed.js";
+import { lookbackRouter } from "./routes/lookback.js";
+import { scrapeHistoryRouter } from "./routes/scrapeHistory.js";
+import { getInvoiceRunsRouter } from "./routes/getInvoiceRuns.js";
+import { mailboxRouter } from "./routes/mailbox.js";
+import { startMailboxSyncWorker } from "./lib/mailbox/sync.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -66,6 +75,8 @@ const DEFAULT_CORS_ORIGINS = [
 const rawOrigins = (process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS)
   .split(",").map((s) => s.trim()).filter(Boolean);
 app.use(cors({
+  // Lets the dashboard read the filename of a downloaded file.
+  exposedHeaders: ["Content-Disposition"],
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // curl / server-to-server
     const ok = rawOrigins.some((o) => {
@@ -133,12 +144,21 @@ api.use(requireAuth());
 api.use("/shipments", shipmentsRouter);
 api.use("/analyses", analysesRouter);
 api.use("/analyze", analyzeRouter);
+api.use("/audits/erp/pushed", erpPushedRouter);
 api.use("/audits", auditsRouter);
 api.use("/share-links", shareLinksRouter);
 api.use("/tasks", tasksRouter);
 api.use("/feedback", feedbackRouter);
 api.use("/audit-log", auditLogRouter);
+api.use("/ops/lookback", lookbackRouter);
 api.use("/ops", opsRouter);
+api.use("/scrape-history", scrapeHistoryRouter);
+api.use("/get-invoice-runs", getInvoiceRunsRouter);
+api.use("/invoice-docs", invoiceDocsRouter);
+api.use("/shipment-details", shipmentDetailsRouter);
+// Support Mailbox (freightsupport@): threads, Outlook reply drafts. Admin-only
+// routes inside check the role themselves.
+api.use("/mailbox", mailboxRouter);
 app.use("/api", api);
 
 // Admin routes (admin scope OR admin role).
@@ -224,6 +244,14 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`[FPX] API server listening on ${HOST}:${PORT}`);
   console.log(`[FPX] CORS origins: ${rawOrigins.join(", ") || "(none)"}`);
   if (!isDbReady()) console.warn("[FPX] ⚠️  Supabase env vars missing — reads/writes will fail");
+  // Reads every saved invoice and document into fpx_invoice_documents; at
+  // start it also queues any saved file that has not been read yet.
+  if (startInvoiceDocWorker()) {
+    backfillFromRecords(supabase).catch((e) => console.warn(`[FPX] invoice documents: could not queue saved files (${e?.message || e})`));
+  }
+  // Syncs the connected support mailbox every 2 minutes. Never allowed to
+  // take the server down.
+  try { startMailboxSyncWorker(); } catch (e) { console.warn("[FPX] support mailbox worker failed to start:", e?.message || e); }
 });
 server.on("error", (e) => {
   console.error("[FPX] server.listen error:", e.stack || e);

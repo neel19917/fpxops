@@ -1,6 +1,7 @@
 import { acquireUserBrowser, openWindowPage, ExtensionContexts, noteUrl, dashboardUrlFor, watchAuth, isAuthExpired, clearAuthExpired } from "./browser.js";
 import { recordSession } from "./usage.js";
-import { scrapePageFor } from "./worker.js";
+import { lanePageFor } from "./worker.js";
+import { detailsPageFor } from "./details.js";
 import { get as setting, onChange as onSettingsChange } from "./settings.js";
 
 // Live-view data sent, in 1-minute buckets for the last hour (admin cost view).
@@ -106,13 +107,17 @@ function takeParked(email) {
 // 4010 idle, 4012 the view's window closed (the dashboard reconnects, as it
 // does for any code it has no special case for).
 export class ViewerSession {
-  // target "scrape": attach read-only to the user's running scrape window
-  // instead of opening a new one. Input and viewport changes are ignored so a
-  // viewer can't disturb the grid the extension is scraping.
+  // target "scrape" / "invoicing": attach read-only to the window of the
+  // user's running job in that worker lane (a scrape; an ERP audit pull, get
+  // invoices or approval check) instead of opening a new one. Input and
+  // viewport changes are ignored so a viewer can't disturb the page the
+  // extension is working on.
   constructor(ws, who, { target = "tab" } = {}) {
     this.ws = ws;
     this.who = who;
-    this.watchOnly = target === "scrape";
+    // "details": the read-only shipment details job, in its own browser.
+    this.watchLane = target === "scrape" || target === "invoicing" || target === "details" ? target : null;
+    this.watchOnly = !!this.watchLane;
     this.ownsPage = !this.watchOnly;
     this.page = null;
     this.cdp = null;
@@ -318,9 +323,10 @@ export class ViewerSession {
   async open() {
     this.startedAt = Date.now();
     if (this.watchOnly) {
-      this.page = scrapePageFor(this.who.email);
-      if (!this.page) { this.send({ type: "ended", reason: "No scrape is running in your browser" }); this.ws.close(4004, "no scrape"); return; }
-      this.onPageClose = () => { this.send({ type: "ended", reason: "Scrape finished" }); try { this.ws.close(4004, "scrape ended"); } catch {} };
+      const what = this.watchLane === "invoicing" ? "invoicing job" : this.watchLane === "details" ? "shipment details read" : "scrape";
+      this.page = this.watchLane === "details" ? detailsPageFor(this.who.email) : lanePageFor(this.watchLane, this.who.email);
+      if (!this.page) { this.send({ type: "ended", reason: `No ${what} is running in your browser` }); this.ws.close(4004, `no ${what}`); return; }
+      this.onPageClose = () => { this.send({ type: "ended", reason: this.watchLane === "invoicing" ? "Invoicing job finished" : this.watchLane === "details" ? "Shipment details read finished" : "Scrape finished" }); try { this.ws.close(4004, `${what} ended`); } catch {} };
       // on(), not once(): puppeteer's once() wraps the handler, and close()
       // could then not remove it.
       this.page.on("close", this.onPageClose);

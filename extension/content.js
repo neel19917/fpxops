@@ -57,10 +57,28 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Random delay between min and max ms — prevents robotic timing patterns
-function humanDelay(minMs, maxMs) {
+// ---------------------------------------------------------------------
+// Pause (hosted browser only). The browser service sets self.__fpxPaused in
+// this content-script world when someone presses Pause on the Scraping page,
+// and clears it on Resume. Nothing sets it in a rep's own Chrome, so there
+// the gate is a no-op. A stop always gets through a pause.
+// ---------------------------------------------------------------------
+function fpxIsPaused() {
+  try { return self.__fpxPaused === true; } catch { return false; }
+}
+
+async function fpxPauseGate() {
+  while (fpxIsPaused() && !stopRequested) await sleep(500);
+}
+
+// Random delay between min and max ms — prevents robotic timing patterns.
+// Holds while paused (before and after the wait), so every flow built on it
+// stops at its next step.
+async function humanDelay(minMs, maxMs) {
+  if (fpxIsPaused()) await fpxPauseGate();
   const jitter = minMs + Math.random() * (maxMs - minMs);
-  return sleep(Math.round(jitter));
+  await sleep(Math.round(jitter));
+  if (fpxIsPaused()) await fpxPauseGate();
 }
 
 // Yield to the browser so it can paint/reflow — prevents "page unresponsive"
@@ -1039,6 +1057,7 @@ async function processPage() {
 
   let failures = 0;
   for (let i = 0; i < total; i++) {
+    await fpxPauseGate(); // paused: wait here, between shipments
     if (stopRequested) {
       sendComplete(`Stopped by user. ${logRows.length} row(s) logged.`);
       return;
@@ -1289,6 +1308,7 @@ async function run(filterCol, filterVal) {
   // "running" forever.
   try {
   while (true) {
+    await fpxPauseGate(); // paused: wait here, between pages
     if (stopRequested) {
       await flushAndDropLogRows("stopped");
       sendComplete(`Stopped by user. ${totalScraped} row(s) scraped, ${confirmedRows} confirmed.`);
@@ -1585,7 +1605,11 @@ function mergeKendoRow(modalData, kendoRow) {
   }
 }
 
-function getKendoGridAllRows() {
+// `timeoutMs` — how long to wait for the page-world reader (3s suits the
+// shipment grid; a multi-thousand-row history report needs longer).
+// `meta` — optional object filled with { total, fieldMap, skipped, error }
+// so a caller can tell "0 rows" from "could not read" and spot a paged grid.
+function getKendoGridAllRows(timeoutMs = 3000, meta = null) {
   return new Promise((resolve) => {
     let settled = false;
 
@@ -1600,6 +1624,12 @@ function getKendoGridAllRows() {
       try {
         const result = event.data.payload;
         if (!result || typeof result !== "object") { resolve(null); return; }
+        if (meta) {
+          meta.total = typeof result.total === "number" ? result.total : null;
+          meta.fieldMap = result.fieldMap || null;
+          meta.skipped = result.skipped || 0;
+          meta.error = result.error || null;
+        }
 
         if (result.error) {
           dlog("[FPX-GP] Kendo inject error:", result.error);
@@ -1630,6 +1660,7 @@ function getKendoGridAllRows() {
     script.onerror = () => {
       dlog("[FPX-GP] Failed to load inject-kendo.js");
       script.remove();
+      if (meta) meta.error = "inject-kendo.js failed to load";
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
@@ -1642,10 +1673,11 @@ function getKendoGridAllRows() {
       if (!settled) {
         window.removeEventListener("message", onMessage);
         settled = true;
-        dlog("[FPX-GP] Kendo inject timed out after 3s");
+        dlog("[FPX-GP] Kendo inject timed out after", timeoutMs, "ms");
+        if (meta) meta.error = `no answer from the grid after ${Math.round(timeoutMs / 1000)}s`;
         resolve(null);
       }
-    }, 3000);
+    }, timeoutMs);
   });
 }
 
@@ -1714,14 +1746,18 @@ function getNearbyLabelText(input) {
   return "";
 }
 
-function findDateInputs() {
-  const result = { from: null, to: null };
-  const candidates = [];
+// root: look only inside this element (default: the whole page).
+// skip(input): optional, true for an input that must not be considered.
+// → { from, to, all } — `all` is every date-like input found, in page order.
+function findDateInputs(root = document, skip = null) {
+  const result = { from: null, to: null, all: [] };
+  const candidates = result.all;
 
-  const allInputs = document.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='submit']):not([type='button'])");
+  const allInputs = root.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='submit']):not([type='button'])");
 
   for (const input of allInputs) {
     if (!isVisibleForClick(input)) continue;
+    if (skip && skip(input)) continue;
 
     const ph = (input.placeholder || "").toLowerCase();
     const name = (input.name || "").toLowerCase();
@@ -2791,18 +2827,29 @@ function invoiceMatchFromGrid(ship, gridMap) {
   return result;
 }
 
-async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFilter) {
+// Drives Transactions → Generate History Report → CONTINUE and waits for the
+// results grid. Shared by the invoice audit (4 arguments, unchanged) and the
+// ERP audit pull, which passes `opts`:
+//   status(text) / fail(text)  where progress and the failure reason go
+//   openDialog                 click "Generate History Report" if the dialog isn't already open
+//   beforeContinue()           runs once the dates and customer are set; return a string to abort with it
+//   gridWaitSec                how long to wait for the results grid (default 15)
+//   onGridWait(sec)            called about once a second while waiting
+//   stoppable                  give up waiting when a stop is requested
+async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFilter, opts = {}) {
+  const status = opts.status || sendInvStatus;
+  const fail = opts.fail || sendInvComplete;
   const currentUrl = window.location.href;
   const onTransactions = currentUrl.includes("Transactions");
   if (!onTransactions) {
-    sendInvStatus("Navigating to Transactions page...");
+    status("Navigating to Transactions page...");
     window.location.hash = "#!/Transactions";
     await humanDelay(2500, 4000);
   } else {
-    sendInvStatus("Already on Transactions page.");
+    status("Already on Transactions page.");
   }
 
-  sendInvStatus("Waiting for Generate History Report dialog...");
+  status("Waiting for Generate History Report dialog...");
   let dialogFound = false;
   for (let wait = 0; wait < 20000; wait += 500) {
     const allText = document.body.innerText.toUpperCase();
@@ -2819,7 +2866,7 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
 
   if (!dialogFound) {
-    sendInvStatus("Looking for Generate Report button...");
+    status("Looking for Generate Report button...");
     const allBtns = document.querySelectorAll("button, a.btn, input[type='button']");
     for (const b of allBtns) {
       if (/generate\s*report/i.test(b.textContent || b.value || "")) {
@@ -2833,23 +2880,36 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   await humanDelay(800, 1500);
 
   const dateLabel = fromDate === toDate ? fromDate : `${fromDate} — ${toDate}`;
-  sendInvStatus("Filling date fields: " + dateLabel + "...");
+  status("Filling date fields: " + dateLabel + "...");
 
-  const dateFields = findDateInputs();
+  let dateFields = findDateInputs();
+  if (opts.openDialog && !dateFields.from && !dateFields.to) {
+    // The dialog did not open by itself: press the page's own button for it.
+    const openers = document.querySelectorAll("button, a, input[type='button'], [role='button']");
+    for (const b of openers) {
+      if (!isVisibleForClick(b)) continue;
+      const txt = (b.textContent || b.value || "").replace(/\s+/g, " ").trim();
+      if (/^generate\s+(history\s+)?report$/i.test(txt)) { simulateClick(b); break; }
+    }
+    for (let wait = 0; wait < 10 && !dateFields.from && !dateFields.to; wait++) {
+      await humanDelay(800, 1200);
+      dateFields = findDateInputs();
+    }
+  }
   if (!dateFields.from && !dateFields.to) {
-    sendInvComplete("Failed — no date inputs found.");
+    fail("Failed — no date inputs found.");
     return false;
   }
 
   if (dateFields.from) {
     setDateInput(dateFields.from, fromDate);
-    sendInvStatus("Set FROM DATE to " + fromDate);
+    status("Set FROM DATE to " + fromDate);
   }
   await humanDelay(400, 800);
 
   if (dateFields.to) {
     setDateInput(dateFields.to, toDate);
-    sendInvStatus("Set TO DATE to " + toDate);
+    status("Set TO DATE to " + toDate);
   }
   await humanDelay(400, 800);
 
@@ -2882,7 +2942,7 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   const custTarget = customerFilter || "";
   const useAllCustomers = !custTarget || /^all(\s*customers)?$/i.test(custTarget);
 
-  sendInvStatus(useAllCustomers ? "Setting All Customers..." : `Setting customer to "${custTarget}"...`);
+  status(useAllCustomers ? "Setting All Customers..." : `Setting customer to "${custTarget}"...`);
   const selects = document.querySelectorAll("select");
   for (const sel of selects) {
     const row = sel.closest("tr, div, .form-group");
@@ -2941,7 +3001,12 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
   await humanDelay(400, 800);
 
-  sendInvStatus("Clicking CONTINUE...");
+  if (opts.beforeContinue) {
+    const abort = await opts.beforeContinue(dateFields);
+    if (abort) { fail(abort); return false; }
+  }
+
+  status("Clicking CONTINUE...");
   let continueClicked = false;
   const buttons = document.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn, .btn");
   for (const btn of buttons) {
@@ -2954,15 +3019,18 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
 
   if (!continueClicked) {
-    sendInvComplete("ERROR: Could not find CONTINUE button.");
+    fail("ERROR: Could not find CONTINUE button.");
     return false;
   }
 
-  sendInvStatus("Waiting for results grid to load...");
+  status("Waiting for results grid to load...");
   await humanDelay(2500, 4000);
 
   let gridReady = false;
-  for (let wait = 0; wait < 15000; wait += 1000) {
+  const gridWaitMs = (opts.gridWaitSec || 15) * 1000;
+  for (let wait = 0; wait < gridWaitMs; wait += 1000) {
+    if (opts.stoppable && stopRequested) return false;
+    if (opts.onGridWait) opts.onGridWait(wait / 1000);
     const gridRows = document.querySelectorAll(".k-grid-content tbody tr, .k-grid tbody tr");
     const visibleRows = [...gridRows].filter(
       (r) => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row")
@@ -2972,19 +3040,19 @@ async function invoiceGenerateReport(fromDate, toDate, shipmentType, customerFil
   }
 
   if (!gridReady) {
-    sendInvComplete("No grid data loaded. Report may not have generated.");
+    fail("No grid data loaded. Report may not have generated.");
     return false;
   }
 
   const typeToClick = shipmentType || "non-parcel";
   if (typeToClick !== "all") {
-    sendInvStatus("Selecting " + (typeToClick === "parcel" ? "Parcel" : "Non-Parcel") + " tab...");
+    status("Selecting " + (typeToClick === "parcel" ? "Parcel" : "Non-Parcel") + " tab...");
     clickShipmentTypeTab(typeToClick);
     await humanDelay(1500, 2500);
     await waitForGridReady(5000);
   }
 
-  sendInvStatus("Report generated. Ready to process shipments.");
+  status("Report generated. Ready to process shipments.");
   return true;
 }
 
@@ -3510,6 +3578,2323 @@ async function invoiceFinalize(results, skippedRows, dateLabel, aiLevel) {
   sendInvComplete(
     `Invoice Audit done — ${results.length} shipment(s), ${discrepancies.length} discrepancy(ies), ${matches.length} match(es), ${errors.length} error(s).`
   );
+}
+
+// =====================================================================
+// ERP AUDIT PULL (hosted browser job)
+//
+// Transactions → Generate History Report for the last N months, all
+// customers, all carriers → read both result tabs (Non-Parcel + Parcel) →
+// keep the rows whose "Exported to ERP" is false → upload them for an
+// invoice audit (POST /api/audits/invoice/from-history via the background).
+//
+// Started by the browser service with erpAuditPull(months, runBy); it polls
+// fpxErpPoll() for log lines and the outcome. Every wait has a limit and
+// every failure ends the run with a sentence that names the step.
+// Pause: every step passes erpCheckpoint() / humanDelay(), which hold while
+// self.__fpxPaused is set. Stop: `stopRequested`, as for a scrape.
+// =====================================================================
+let fpxErp = null; // { lines: [{ level, text }], counts, done: null | { ok, note, result, stopped } }
+
+const ERP_UPLOAD_MAX_BYTES = 12 * 1024 * 1024; // per POST; the API's limit is 20 MB
+
+function fpxErpPoll() {
+  if (!fpxErp) return { started: false };
+  return {
+    started: true, lines: fpxErp.lines.splice(0), counts: fpxErp.counts, done: fpxErp.done,
+    upload: fpxErp.outbox ? { rows: fpxErp.outbox.rows.length } : null,
+    download: fpxErp.wantDownload || null,
+    // Get-invoices job only: finished shipments (emptied when read, like
+    // `lines`) and a request to pause the job ({ id, text }).
+    job: fpxErp.job || "erp_audit",
+    // Approval check only: "history" once Recently Approved is dealt with.
+    phase: fpxErp.phase || null,
+    results: fpxErp.results ? fpxErp.results.splice(0) : [],
+    pause: fpxErp.wantPause || null,
+    // Get-invoices job only: a screenshot is wanted now ({ shipment_id }).
+    shot: fpxErp.wantShot || null,
+    // Every click since the last poll (emptied when read).
+    clicks: fpxErp.clicks ? fpxErp.clicks.splice(0) : [],
+  };
+}
+
+// ── FreightPOP's own Excel export ──
+// The browser service captures the file: it sees `download` in the poll,
+// points Chromium's downloads at a folder, calls fpxErpClickExport(), reads
+// the .xlsx and answers with fpxErpDownloadDone().
+function erpExportCandidates() {
+  // The approval check has its own, narrower search (see apExportCandidates).
+  if (fpxErp && fpxErp.job === "approval_check") return apExportCandidates();
+  const out = [];
+  const seen = new Set();
+  for (const el of document.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button], .k-button, .k-grid-excel, [ng-click], [data-ng-click], i, span, img")) {
+    const target = el.closest("a, button, [role=button], .k-button, [ng-click], [data-ng-click]") || el;
+    if (seen.has(target) || !isVisibleForClick(target)) continue;
+    const text = (target.textContent || target.value || "").replace(/\s+/g, " ").trim();
+    if (text.length > 60) continue;
+    const hay = [text, target.title, target.getAttribute("aria-label"), target.getAttribute("data-original-title"),
+      target.getAttribute("uib-tooltip"), target.getAttribute("tooltip"), target.className && String(target.className),
+      target.getAttribute("ng-click"), target.getAttribute("data-ng-click"), target.id, el.className && String(el.className), el.getAttribute("src"), el.getAttribute("alt"), el.title,
+    ].filter(Boolean).join(" | ").toLowerCase();
+    // Never click anything that could act on shipments: "Export to ERP"
+    // style buttons push data out of FreightPOP. Only a button that says
+    // Excel, or a bare Export / Download, is a file export.
+    if (/\berp\b|quickbooks|netsuite|accounting|invoice|send|e-?mail|\bedi\b|delete|void|cancel|approve|import|upload|template|pdf|print/.test(hay)) continue;
+    let score = 0;
+    if (/k-grid-excel/.test(hay)) score += 10;
+    if (/excel|xlsx?\b|\.xls/.test(hay)) score += 8;
+    if (/^(export|download)( (data|report|results|all|to file))?$/i.test(text)) score += 5;
+    if (score <= 0) continue;
+    seen.add(target);
+    out.push({ el: target, score, desc: (text || target.title || target.getAttribute("aria-label") || String(target.className || target.tagName)).slice(0, 60) });
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+function fpxErpClickExport() {
+  const c = erpExportCandidates();
+  if (!c.length) {
+    const near = [...document.querySelectorAll("a, button, .k-button")].filter(isVisibleForClick)
+      .map((e) => (e.textContent || e.title || "").replace(/\s+/g, " ").trim()).filter((t) => t && t.length < 40);
+    return JSON.stringify({ error: "No Excel / Export button found on the report", buttons: [...new Set(near)].slice(0, 40) });
+  }
+  simulateClick(c[0].el);
+  return JSON.stringify({ clicked: c[0].desc, others: c.slice(1, 5).map((x) => x.desc) });
+}
+function fpxErpDownloadDone(resp) {
+  if (!fpxErp) return "no job";
+  fpxErp.wantDownload = null;
+  fpxErp.downloadResult = resp || { ok: false, error: "empty answer" };
+  return "ok";
+}
+// Ask the browser service to capture the export for the tab on screen.
+async function erpHandOffDownload(label) {
+  fpxErp.downloadResult = null;
+  fpxErp.wantDownload = { label };
+  const until = Date.now() + 4 * 60 * 1000;
+  while (Date.now() < until) {
+    if (fpxErp.downloadResult) { const r = fpxErp.downloadResult; fpxErp.downloadResult = null; return r; }
+    if (stopRequested) { fpxErp.wantDownload = null; return { ok: false, error: "stopped" }; }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  fpxErp.wantDownload = null;
+  return { ok: false, error: "no answer from the browser service after 4 min" };
+}
+
+// The upload itself is done by the browser service, not from this page: it
+// collects the waiting body in slices with these, posts it to the API with
+// its own key, and hands the answer back. (Sending it through the extension's
+// background script failed with "message port closed".)
+function fpxErpTakeMeta() {
+  if (!fpxErp || !fpxErp.outbox) return "null";
+  const { rows, ...meta } = fpxErp.outbox;
+  return JSON.stringify({ ...meta, rowCount: rows.length });
+}
+function fpxErpTake(start, count) {
+  if (!fpxErp || !fpxErp.outbox) return "[]";
+  return JSON.stringify(fpxErp.outbox.rows.slice(start, start + count));
+}
+function fpxErpDeliver(resp) {
+  if (!fpxErp) return "no job";
+  fpxErp.outbox = null;
+  fpxErp.inbox = resp || { ok: false, error: "empty answer" };
+  return "ok";
+}
+// Park one upload body for the browser service and wait for its answer.
+async function erpHandOff(payload) {
+  fpxErp.inbox = null;
+  fpxErp.outbox = payload;
+  const until = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < until) {
+    if (fpxErp.inbox) { const r = fpxErp.inbox; fpxErp.inbox = null; return r; }
+    if (stopRequested) { fpxErp.outbox = null; return { ok: false, error: "stopped before the upload finished" }; }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  fpxErp.outbox = null;
+  return { ok: false, error: "no answer from the browser service after 5 min" };
+}
+
+function erpLog(text, level = "info") {
+  dlog("[FPX-ERP]", level, text);
+  if (fpxErp) fpxErp.lines.push({ level, text: String(text) });
+}
+
+// ── Click monitor ──
+// Every click made on a FreightPOP page while a job is running is written to
+// the job's log and handed to the browser service, which keeps it in
+// fpx_click_log. A click on a control that sends, cancels or deletes is
+// stopped before FreightPOP sees it, whatever part of FPX made it.
+const CLICK_NEVER = /cancel shipment|request pickup|generate return|e-?mail|\bresend\b|file a claim|non-?conformance|\bdelete\b|\bvoid\b|\bdispute\b/i;
+// A control that removes a file or a row: an "x" in an upload or attachment
+// list, or anything titled Remove / Delete. Never pressed.
+function fpxRemovesSomething(el) {
+  if (!el || !el.closest) return false;
+  if (el.closest(".k-upload, .k-upload-files, .k-file, .k-upload-action, .k-delete, .k-grid-delete")) {
+    // Inside a file list only plain links (to open the file) are safe.
+    const link = el.closest("a[href]");
+    if (!link || /delete|remove/i.test(link.className + " " + (link.getAttribute("title") || "") + " " + (link.textContent || ""))) return true;
+  }
+  // An "X" beside a row or a list entry removes that entry (FreightPOP's
+  // document list asks "Are you sure you want to delete this document?").
+  // Only an X in a window's own title bar or header closes something.
+  const btn = el.closest("button, a, [role='button'], span, i") || el;
+  const text = String(btn.tagName === "INPUT" ? btn.value : btn.textContent || "").replace(/\s+/g, "").toLowerCase();
+  if (/^(x|×|✕|✖)$/.test(text) && btn.closest("tr, li, td, .k-file, .list-group-item") && !btn.closest(".modal-header, .k-window-titlebar, .ui-dialog-titlebar, .popover-title, .panel-heading")) return true;
+  for (let n = el, i = 0; n && n.getAttribute && i < 4; n = n.parentElement, i++) {
+    const says = `${n.getAttribute("title") || ""} ${n.getAttribute("aria-label") || ""} ${n.getAttribute("ng-click") || ""} ${n.getAttribute("onclick") || ""} ${typeof n.className === "string" ? n.className : ""}`;
+    if (/\b(remove|delete|trash)/i.test(says) || /k-i-delete|k-i-trash|fa-trash|glyphicon-trash|glyphicon-remove/i.test(says)) return true;
+  }
+  return false;
+}
+function fpxClickTarget(e) {
+  const t = e.target && e.target.closest ? e.target : null;
+  if (!t) return null;
+  const el = t.closest("button, a, input, select, [role='button'], [role='tab'], .btn, [ng-click], [onclick], label, li, th") || t;
+  let label = el.tagName === "INPUT" ? (el.type === "checkbox" || el.type === "radio" ? `${el.type} ${el.name || el.id || ""}` : el.value || el.placeholder || el.name || el.id) : (el.innerText || el.textContent || "");
+  label = String(label || "").replace(/\s+/g, " ").trim() || el.getAttribute("title") || el.getAttribute("aria-label") || "";
+  if (!label) label = `<${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${typeof el.className === "string" && el.className ? `.${el.className.trim().split(/\s+/).slice(0, 2).join(".")}` : ""}>`;
+  return { el, raw: t, label: label.slice(0, 80) };
+}
+// Kept here, not on the document: a frame's own copy of this script shares the
+// frame's document with this one, and its copy has no job to report to.
+const fpxWatchedDocs = new WeakSet();
+function fpxWatchClicks(doc) {
+  if (!doc || fpxWatchedDocs.has(doc)) return;
+  fpxWatchedDocs.add(doc);
+  const running = () => fpxErp && !fpxErp.done;
+  const never = (hit) => (hit.label.length <= 60 && CLICK_NEVER.test(hit.label)) || fpxRemovesSomething(hit.raw);
+  for (const type of ["mousedown", "mouseup", "pointerdown", "pointerup"]) {
+    doc.addEventListener(type, (e) => {
+      if (!running()) return;
+      const hit = fpxClickTarget(e);
+      if (hit && never(hit)) { e.stopImmediatePropagation(); e.preventDefault(); }
+    }, true);
+  }
+  doc.addEventListener("click", (e) => {
+    if (!running()) return;
+    const hit = fpxClickTarget(e);
+    if (!hit) return;
+    const blocked = never(hit);
+    if (blocked) { e.stopImmediatePropagation(); e.preventDefault(); }
+    const state = fpxErp;
+    state.clickN = (state.clickN || 0) + 1;
+    let page = "";
+    try { const w = doc.defaultView || window; page = (w.location.pathname + w.location.hash).slice(0, 160); } catch { /* unknown */ }
+    (state.clicks = state.clicks || []).push({
+      n: state.clickN, at: new Date().toISOString(), label: hit.label, tag: hit.el.tagName.toLowerCase(),
+      page, blocked, shipment_id: state.shipment || null, by_person: e.isTrusted === true,
+    });
+    if (blocked) erpLog(`Click ${state.clickN} BLOCKED · "${hit.label}" — FPX never presses this`, "warn");
+    else erpLog(`Click ${state.clickN} · ${hit.label}${state.shipment ? ` · shipment ${state.shipment}` : ""}`);
+  }, true);
+}
+fpxWatchClicks(document);
+
+function erpNum(n) { return Number(n || 0).toLocaleString("en-US"); }
+
+// MM/DD/YYYY — the format the report dialog's date fields take (see setDateInput).
+function erpDate(d) {
+  return `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
+}
+
+// Same day N months back; a day that doesn't exist there (May 31 → Feb 31)
+// becomes that month's last day.
+function erpMonthsAgo(d, months) {
+  const out = new Date(d.getFullYear(), d.getMonth() - months, 1);
+  const lastDay = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
+  out.setDate(Math.min(d.getDate(), lastDay));
+  return out;
+}
+
+// Holds while paused; throws (caught in erpAuditPull) once a stop is asked for.
+async function erpCheckpoint() {
+  await fpxPauseGate();
+  if (stopRequested) throw Object.assign(new Error("Stopped by user"), { fpxStop: true });
+}
+
+function erpLoginExpired() {
+  return /[#/]login\b/i.test(window.location.pathname + window.location.hash);
+}
+
+// Why invoiceGenerateReport() gave up, as a sentence that names the step.
+function erpReportFailure(failNote) {
+  const where = window.location.hash || window.location.pathname;
+  if (/no date inputs/i.test(failNote || "")) return `Generate History Report dialog not found on the Transactions page (no date fields appeared; page is ${where})`;
+  if (/CONTINUE/.test(failNote || "")) return "Generate History Report dialog: CONTINUE button not found";
+  if (/No grid data/i.test(failNote || "")) return "Report grid never loaded — no rows appeared within 7 min of pressing Continue (FreightPOP is still loading, or there are no transactions in this range)";
+  return failNote || "Generate History Report failed";
+}
+
+// "Exported to ERP" false / 0 / No / blank → not exported. Anything else
+// (true, 1, Yes, a date…) counts as exported.
+function erpIsNotExported(v) {
+  if (v === null || v === undefined || v === false || v === 0) return true;
+  const t = String(v).trim().toLowerCase();
+  return t === "" || t === "0" || t === "false" || t === "no";
+}
+
+// The report's "Exported to ERP" column, as the rows are keyed. Rows omit
+// blank cells, so the grid's own column list is checked too.
+// → { key } or { error }
+function erpFindExportedKey(rows, fieldMap) {
+  const norm = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const seen = new Map(); // key → rows that carry it
+  for (const r of rows) for (const k of Object.keys(r)) seen.set(k, (seen.get(k) || 0) + 1);
+  for (const [field, title] of Object.entries(fieldMap || {})) {
+    const k = title || field;
+    if (!seen.has(k)) seen.set(k, 0);
+  }
+  const keys = [...seen.keys()];
+  const exact = ["exportedtoerp", "isexportedtoerp", "exportedtoerpflag", "erpexported", "isexportedtoerpflag"];
+  for (const want of exact) {
+    const hit = keys.find((k) => norm(k) === want);
+    if (hit) return { key: hit };
+  }
+  const loose = keys.filter((k) => { const n = norm(k); return n.includes("export") && n.includes("erp"); });
+  if (loose.length === 1) return { key: loose[0] };
+  if (loose.length > 1) return { error: `Could not tell which column is "Exported to ERP" — the report has ${loose.map((k) => `"${k}"`).join(", ")}` };
+  return { error: `The report has no "Exported to ERP" column (columns: ${keys.slice(0, 60).join(", ") || "none"})` };
+}
+
+// A <select> of the report dialog by what it filters ("customer" / "carrier"):
+// by its own name / id / ng-model first, then by a label right next to it.
+function erpFindDialogSelect(word, exclude = null) {
+  const w = word.toLowerCase();
+  const selects = [...document.querySelectorAll("select")].filter((s) => s !== exclude);
+  for (const sel of selects) {
+    const own = `${sel.name || ""} ${sel.id || ""} ${sel.getAttribute("ng-model") || ""} ${sel.getAttribute("data-ng-model") || ""}`.toLowerCase();
+    if (own.includes(w)) return sel;
+  }
+  for (const sel of selects) {
+    const box = sel.closest("tr, .form-group, .control-group, label");
+    const text = box ? box.textContent.replace(/\s+/g, " ").trim().toLowerCase() : "";
+    // A short label only: a whole-dialog container mentions every filter.
+    const labelOnly = [...(box ? box.childNodes : [])]
+      .filter((n) => !(n.nodeType === 1 && n.contains(sel)))
+      .map((n) => n.textContent || "").join(" ").toLowerCase();
+    if (text && labelOnly.length < 120 && labelOnly.includes(w)) return sel;
+  }
+  return null;
+}
+
+const ERP_ALL_OPTION = /^[\s\-–—]*(all|any|select all)(\s+(customers?|carriers?))?[\s\-–—]*$/i;
+
+// → { label, select, error?, note? }
+function erpCheckCustomer() {
+  const sel = erpFindDialogSelect("customer");
+  if (!sel) return { label: "all customers", select: null, note: "No customer dropdown found in the dialog — FreightPOP's own default applies" };
+  const opt = sel.options[sel.selectedIndex];
+  const text = opt ? opt.text.replace(/\s+/g, " ").trim() : "";
+  if (!opt || ERP_ALL_OPTION.test(text) || /all\s*customers/i.test(text)) return { label: "all customers", select: sel };
+  return { label: text, select: sel, error: `Could not set the customer to All Customers (the dialog shows "${text}")` };
+}
+
+// Makes sure no carrier is filtered out. → { label, note?, level? }
+function erpSetAllCarriers(customerSelect) {
+  const sel = erpFindDialogSelect("carrier", customerSelect);
+  if (!sel) return { label: "all carriers", note: "No carrier filter in the dialog — FreightPOP's default (all carriers) applies" };
+  if (sel.multiple) {
+    const picked = [...sel.selectedOptions];
+    if (!picked.length) return { label: "all carriers" };
+    for (const o of picked) o.selected = false;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return { label: "all carriers", level: "warn", note: `Carrier filter had ${picked.length} carrier(s) picked — cleared them so every carrier is included` };
+  }
+  const cur = sel.options[sel.selectedIndex];
+  const curText = cur ? cur.text.replace(/\s+/g, " ").trim() : "";
+  if (!cur || ERP_ALL_OPTION.test(curText) || (cur.value === "" && sel.selectedIndex === 0)) return { label: "all carriers" };
+  for (const opt of sel.options) {
+    if (ERP_ALL_OPTION.test(opt.text)) {
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      return { label: "all carriers", note: `Carrier filter was "${curText}" — set to "${opt.text.trim()}"` };
+    }
+  }
+  // No "All" choice. A placeholder such as "Select Carrier" means no carrier
+  // is picked, which FreightPOP treats as every carrier. Either way the
+  // filter is left exactly as FreightPOP shows it; the pull never fails here.
+  if (/^(select|choose|pick|--|—|none)\b/i.test(curText) || /^select\s/i.test(curText)) return { label: "all carriers" };
+  return { label: `carrier filter left as "${curText}"`, level: "warn", note: `The carrier filter shows "${curText}" and was left as is — if that is one carrier, only its shipments are in the report` };
+}
+
+function erpGridSig() {
+  const grid = document.querySelector(".k-grid");
+  if (!grid) return "";
+  const pager = (grid.querySelector(".k-pager-info") || {}).textContent || "";
+  const first = (grid.querySelector(".k-grid-content tbody tr, tbody tr") || {}).textContent || "";
+  return pager.trim() + "|" + first.replace(/\s+/g, " ").slice(0, 200);
+}
+
+// After a tab click: wait until the grid has finished loading. True once the
+// loading mask has come and gone or the rows changed, or after ~8 quiet
+// seconds with nothing changing (the tab was already the one on screen).
+// False if it is still loading after `maxSec`. Counts steps, not wall time,
+// so a pause doesn't use the limit up.
+async function erpWaitGridSettled(prevSig, maxSec = 60) {
+  let calm = 0;
+  let sawLoading = false;
+  for (let i = 0; i < maxSec * 2; i++) {
+    await erpCheckpoint();
+    if (document.querySelector(".k-loading-mask, .k-loading-image")) { sawLoading = true; calm = 0; }
+    else calm++;
+    if (calm >= 3 && (sawLoading || erpGridSig() !== prevSig)) return true;
+    if (calm >= 16) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// Every row of the grid on screen, through the grid's own data (not the
+// visible page). Throws with the reason when it can't be read in full.
+async function erpReadGrid(label) {
+  const read = async () => {
+    let rows = null;
+    let meta = {};
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await erpCheckpoint();
+      meta = {};
+      rows = await getKendoGridAllRows(30000, meta);
+      // An empty answer is checked once more before it is believed.
+      if (rows && (rows.length > 0 || attempt >= 2)) break;
+      await humanDelay(2500, 3500);
+    }
+    return { rows, meta };
+  };
+  let { rows, meta } = await read();
+  if (!rows) throw new Error(`Could not read the ${label} rows from the report grid (${meta.error || "grid data not reachable"})`);
+  const short = () => meta.total != null && meta.total > rows.length + (meta.skipped || 0);
+  if (short()) {
+    // The grid holds one page at a time: ask it for everything, then re-read.
+    erpLog(`${label} · grid holds ${erpNum(rows.length)} of ${erpNum(meta.total)} rows — asking it for all of them`, "warn");
+    const before = erpGridSig();
+    try { await setGridPageSize(meta.total, () => {}); } catch { /* reported below if it didn't help */ }
+    await erpWaitGridSettled(before, 60);
+    ({ rows, meta } = await read());
+    if (!rows || short()) {
+      throw new Error(`${label}: the report has ${erpNum(meta.total)} rows but only ${erpNum(rows ? rows.length : 0)} could be read (the grid loads one page at a time)`);
+    }
+  }
+  if (meta.skipped) erpLog(`${label} · ${erpNum(meta.skipped)} unreadable row(s) skipped`, "warn");
+  return rows;
+}
+
+function erpUploadChunk(payload, retry) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } };
+    const timer = setTimeout(() => finish({ ok: false, error: "no answer from the API after 4 min" }), 240000);
+    try {
+      chrome.runtime.sendMessage({ type: "uploadErpAudit", payload, retry }, (resp) => {
+        if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
+        else finish(resp || { ok: false, error: "empty reply from the extension" });
+      });
+    } catch (e) {
+      finish({ ok: false, error: e?.message || String(e) });
+    }
+  });
+}
+
+// shipmentType: "non-parcel" (default) | "parcel" | "both"
+// opts: { from, to } (YYYY-MM-DD) — a fixed range instead of the last N months;
+//       backfill: true — hand EVERY report row to the browser service for the
+//       Supabase copy and stop there (no audit is made).
+async function erpAuditPull(months, runBy, shipmentType, opts) {
+  const erpOpts = opts && typeof opts === "object" ? opts : {};
+  const erpIsoToMdy = (v) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || "")); return m ? `${m[2]}/${m[3]}/${m[1]}` : null; };
+  const erpType = shipmentType === "parcel" || shipmentType === "both" ? shipmentType : "non-parcel";
+  const erpTabs = [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"]].filter(([t]) => erpType === "both" || t === erpType);
+  if (fpxErp && !fpxErp.done) return; // already running in this page
+  stopRequested = false;
+  const state = { lines: [], counts: { reportRows: 0, notExported: 0, uploaded: 0 }, done: null };
+  fpxErp = state;
+  let lastResult = null;
+
+  try {
+    const n = Math.min(12, Math.max(1, Math.round(Number(months)) || 3));
+    const today = new Date();
+    const fixed = erpIsoToMdy(erpOpts.from) && erpIsoToMdy(erpOpts.to);
+    const fromStr = fixed ? erpIsoToMdy(erpOpts.from) : erpDate(erpMonthsAgo(today, n));
+    const toStr = fixed ? erpIsoToMdy(erpOpts.to) : erpDate(today);
+
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
+
+    erpLog("Opening Transactions");
+    let failNote = null;
+    const generated = await invoiceGenerateReport(fromStr, toStr, erpTabs[0][0], "", {
+      status: (t) => dlog("[FPX-ERP]", t),
+      fail: (t) => { failNote = t; },
+      openDialog: true,
+      stoppable: true,
+      gridWaitSec: 420,
+      beforeContinue: async (dateFields) => {
+        await erpCheckpoint();
+        const f = dateFields.from ? dateFields.from.value : "";
+        const t = dateFields.to ? dateFields.to.value : "";
+        if (!f || !t) return `Could not fill the report dates (From "${f}", To "${t}")`;
+        const cust = erpCheckCustomer();
+        if (cust.error) return cust.error;
+        const carr = erpSetAllCarriers(cust.select);
+        if (carr.error) return carr.error;
+        erpLog(`Generate History Report · ${fromStr} to ${toStr} · ${cust.label} · ${carr.label} · ${erpTabs.map((t) => t[1]).join(" + ")}`);
+        if (cust.note) erpLog(cust.note, "warn");
+        if (carr.note) erpLog(carr.note, carr.level || "info");
+        await humanDelay(300, 600);
+        return null;
+      },
+      onGridWait: (sec) => {
+        if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 7 min)");
+        else if (sec % 15 === 0) erpLog(`Still loading the report · ${sec}s`);
+      },
+    });
+
+    if (!generated) {
+      await erpCheckpoint(); // a stop ends here as "stopped", not as a failure
+      if (erpLoginExpired()) throw new Error("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
+      throw new Error(erpReportFailure(failNote));
+    }
+
+    // One result tab per shipment type asked for.
+    const parts = [];
+    for (const [type, label] of erpTabs) {
+      await erpCheckpoint();
+      const before = erpGridSig();
+      if (!clickShipmentTypeTab(type)) { parts.push({ label, rows: null }); continue; }
+      erpLog(`Reading the ${label} tab`);
+      await humanDelay(800, 1400);
+      if (!(await erpWaitGridSettled(before, 60))) throw new Error(`The ${label} tab was still loading after 60s`);
+      parts.push({ label, rows: await erpReadGrid(label) });
+      await erpCheckpoint();
+      erpLog(`Downloading FreightPOP's Excel export · ${label}`);
+      const dl = await erpHandOffDownload(label);
+      if (!dl.ok) erpLog(`Excel export not captured (${dl.error}) — using the rows read from the report on screen`, "warn");
+    }
+    if (parts.every((p) => p.rows === null)) {
+      erpLog("Parcel / Non-Parcel tabs not found — reading the report as shown", "warn");
+      parts.length = 0;
+      parts.push({ label: "All", rows: await erpReadGrid("report") });
+    } else {
+      for (const p of parts) if (p.rows === null) erpLog(`${p.label} tab not found — its rows are not included`, "warn");
+    }
+    const got = parts.filter((p) => p.rows !== null);
+    if (got.length === 2 && got[0].rows.length > 0 && got[0].rows.length === got[1].rows.length) {
+      const a = got[0].rows, b = got[1].rows;
+      if (JSON.stringify(a[0]) === JSON.stringify(b[0]) && JSON.stringify(a[a.length - 1]) === JSON.stringify(b[b.length - 1])) {
+        erpLog(`${got[1].label} tab gave the same rows as ${got[0].label} — counted once; check the ${got[1].label} tab by hand`, "warn");
+        got.pop();
+      }
+    }
+
+    const allRows = [];
+    for (const p of got) for (const r of p.rows) allRows.push(normalizeRowKeys(r));
+    state.counts.reportRows = allRows.length;
+    erpLog(`Report loaded · ${erpNum(allRows.length)} rows (${got.map((p) => `${p.label} ${erpNum(p.rows.length)}`).join(", ")})`);
+    if (!allRows.length) {
+      state.done = { ok: true, note: `No transactions in the report for ${fromStr} to ${toStr} — nothing to audit`, result: null };
+      return;
+    }
+
+    // Backfill: every row goes to the Supabase copy; no audit is made.
+    if (erpOpts.backfill) {
+      const parts = [[]];
+      let bytes = 0;
+      for (const r of allRows) {
+        const b = JSON.stringify(r).length * 1.1 + 1;
+        if (bytes + b > ERP_UPLOAD_MAX_BYTES && parts[parts.length - 1].length) { parts.push([]); bytes = 0; }
+        parts[parts.length - 1].push(r);
+        bytes += b;
+      }
+      erpLog(`Backfill · handing ${erpNum(allRows.length)} rows over for Supabase` + (parts.length > 1 ? ` in ${parts.length} parts` : ""));
+      let last = null;
+      for (let c = 0; c < parts.length; c++) {
+        await erpCheckpoint();
+        last = await erpHandOff({ backfill: true, from: isoDateFromMmDdYyyy(fromStr), to: isoDateFromMmDdYyyy(toStr), final: c === parts.length - 1, rows: parts[c] });
+        if (!last || !last.ok) throw new Error(`Backfill copy failed${parts.length > 1 ? ` on part ${c + 1} of ${parts.length}` : ""}: ${(last && last.error) || "no reply"}`);
+        state.counts.uploaded += parts[c].length;
+      }
+      state.done = {
+        ok: true,
+        note: `Backfill ${fromStr} to ${toStr} · ${erpNum(allRows.length)} report rows · ${erpNum(last.stored)} shipments stored in Supabase` + (last.failed ? ` · ${erpNum(last.failed)} not stored` : ""),
+        result: null,
+      };
+      return;
+    }
+
+    // The column list of whichever tab is on screen (rows drop blank cells).
+    const colMeta = {};
+    await getKendoGridAllRows(30000, colMeta).catch(() => null);
+    const found = erpFindExportedKey(allRows, colMeta.fieldMap);
+    if (found.error) throw new Error(found.error);
+    const seenValues = new Map();
+    const pending = [];
+    for (const r of allRows) {
+      const v = r[found.key];
+      const shown = v === null || v === undefined || String(v).trim() === "" ? "blank" : String(v).trim();
+      seenValues.set(shown, (seenValues.get(shown) || 0) + 1);
+      if (!erpIsNotExported(v)) continue;
+      if (found.key !== "Exported to ERP" && v !== undefined) { r["Exported to ERP"] = v; delete r[found.key]; }
+      pending.push(r);
+    }
+    state.counts.notExported = pending.length;
+    const valueList = [...seenValues].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([v, c]) => `${v} ${erpNum(c)}`).join(", ");
+    erpLog(`Not exported to ERP · ${erpNum(pending.length)} rows · column "${found.key}" (${valueList})`, seenValues.size === 1 && allRows.length > 20 ? "warn" : "info");
+    if (!pending.length) {
+      state.done = { ok: true, note: `All ${erpNum(allRows.length)} rows are already exported to ERP — nothing to audit`, result: null };
+      return;
+    }
+
+    const run = {
+      date_from: isoDateFromMmDdYyyy(fromStr),
+      date_to: isoDateFromMmDdYyyy(toStr),
+      run_by: runBy || null,
+      total_report_rows: allRows.length,
+    };
+    // Biggest invoices first (the server keeps this order).
+    const rate = (r) => {
+      const v = r["Shipment Marked-Up Rate"];
+      if (v === null || v === undefined || v === "") return null;
+      const x = parseFloat(String(v).replace(/[^0-9.\-]/g, ""));
+      return Number.isFinite(x) ? x : null;
+    };
+    pending.sort((x, y) => {
+      const a = rate(x), b = rate(y);
+      if (a === null && b === null) return 0;
+      if (a === null) return 1;
+      if (b === null) return -1;
+      return b - a;
+    });
+
+    // One POST when it fits (the API takes 20 MB); otherwise parts of at most
+    // ~12 MB, the last one marked final so the AI summary runs once.
+    const posts = [[]];
+    let size = 0;
+    for (const r of pending) {
+      const bytes = JSON.stringify(r).length * 1.1 + 1;
+      if (size + bytes > ERP_UPLOAD_MAX_BYTES && posts[posts.length - 1].length) { posts.push([]); size = 0; }
+      posts[posts.length - 1].push(r);
+      size += bytes;
+    }
+    const chunks = posts.length;
+    erpLog(`Uploading · ${erpNum(pending.length)} rows` + (chunks > 1 ? ` in ${chunks} parts` : ""));
+    let auditId = null;
+    for (let c = 0; c < chunks; c++) {
+      await erpCheckpoint();
+      const rows = posts[c];
+      const payload = c === 0 ? { run, rows, ai_level: "summary" } : { audit_id: auditId, rows };
+      if (chunks > 1) payload.final = c === chunks - 1;
+      // Never retried: a repeat could leave a second audit or double the rows.
+      const resp = await erpHandOff(payload);
+      if (!resp || !resp.ok) {
+        const msg = `Upload failed${chunks > 1 ? ` on part ${c + 1} of ${chunks}` : ""}: ${(resp && resp.error) || "no reply"}` +
+          (auditId ? ` — audit ${String(auditId).slice(0, 8)} holds ${erpNum(state.counts.uploaded)} of ${erpNum(pending.length)} rows` : "");
+        erpLog(msg, "error");
+        throw new Error(msg);
+      }
+      if (!resp.audit_id) throw new Error("The API took the upload but returned no audit id");
+      auditId = resp.audit_id;
+      // total = every row the report had; pending = the not-exported rows stored.
+      lastResult = { audit_id: resp.audit_id, total: state.counts.reportRows || resp.total || null, pending: resp.pending ?? null };
+      // The API says how many rows it could read each money column from. A
+      // zero means FreightPOP's column title differs from what we expect.
+      if (resp.fields && c === chunks - 1) {
+        const f = resp.fields;
+        erpLog(`Columns read · charge ${erpNum(f.charge)} · cost ${erpNum(f.cost)} · invoice amount ${erpNum(f.invoice)} · of ${erpNum(f.rows)} rows`);
+        if (f.rows && (!f.charge || !f.cost || !f.shipment_id)) {
+          erpLog(`Some columns could not be read (charge ${f.charge}, cost ${f.cost}, shipment id ${f.shipment_id}). The audit is saved but its numbers are incomplete — the report's column titles need checking.`, "warn");
+        }
+      }
+      state.counts.uploaded += rows.length;
+      if (chunks > 1) erpLog(`Uploaded ${erpNum(state.counts.uploaded)} of ${erpNum(pending.length)} rows`);
+    }
+    const id8 = String(auditId).slice(0, 8);
+    erpLog(`Uploaded · audit ${id8} · ${erpNum(state.counts.uploaded)} rows` + (lastResult.pending != null ? ` · ${erpNum(lastResult.pending)} waiting for review` : ""), "done");
+    state.done = {
+      ok: true,
+      note: `${erpNum(pending.length)} of ${erpNum(allRows.length)} report rows not exported to ERP · audit ${id8}`,
+      result: lastResult,
+    };
+  } catch (e) {
+    if (e && e.fpxStop) {
+      state.done = {
+        ok: true, stopped: true, result: lastResult,
+        note: lastResult
+          ? `${erpNum(state.counts.uploaded)} of ${erpNum(state.counts.notExported)} rows uploaded before the stop · audit ${String(lastResult.audit_id).slice(0, 8)}`
+          : "Nothing was uploaded.",
+      };
+    } else {
+      console.warn("[FPX-ERP] failed:", e?.message || e);
+      state.done = { ok: false, note: String(e?.message || e), result: lastResult };
+    }
+  }
+}
+
+// =====================================================================
+// APPROVAL CHECK (hosted browser job)
+//
+// Audit page → "Recently Approved" → hand the grid's Excel export to the
+// browser service, which matches it against an ERP audit's shipments (who
+// approved each one: the EDI or a person). Then the same for the "History"
+// tab, over a date range the browser service gives (60 days before the
+// pull's start date … today), because Recently Approved only reaches back a
+// short while.
+//
+// Started by the browser service with erpApprovalCheck(runBy, resumed, opts);
+// it polls fpxErpPoll() like the ERP audit pull. Pause / stop work the same way.
+//   opts: { historyFrom, historyTo } (MM/DD/YYYY), skipApproved (Recently
+//         Approved was already read before the page reloaded)
+//
+// HARD RULE — this job is read-only. On the Audit page it clicks exactly:
+// the AUDIT item in the top navigation, the "Recently Approved" tab, the
+// "History" tab, and on the History tab one control that applies the date
+// range (text exactly one of AP_APPLY_WORDS), after typing the range into
+// that tab's from / to date fields. (Plus, only when the browser service asks
+// through fpxErpClickExport() for Recently Approved, an Excel export button.)
+// It never clicks approve / reject / un-approve / dispute / pay / edit /
+// delete / reprocess controls, checkboxes or anything inside a grid row. On
+// Recently Approved the date range and page size are read and logged as shown.
+// A failure in the History part never fails the job: it ends as a warning.
+// =====================================================================
+const AP_GRID_MARK = "data-fpx-export-grid"; // on the grid being exported, for the browser service
+const AP_TAB_RE = /^recently\s+approved(\s*[(\[]?\s*[\d,]+\s*[)\]]?)?$/i;
+const AP_HISTORY_RE = /^history(\s*[(\[]?\s*[\d,]+\s*[)\]]?)?$/i;
+// The only controls the History tab may press to apply its date range, best first.
+const AP_APPLY_WORDS = ["search", "go", "apply", "filter", "submit", "generate", "view", "refresh", "load", "show", "get history"];
+// A control whose handler says it does one of these is never pressed, whatever its text.
+const AP_APPLY_NEVER_RE = /approv|reject|dispute|delete|remove|void|reprocess|process|save|update|edit|pay(?!load)|send|e-?mail|import|upload|erp|edi(?![a-z])|export/i;
+const AP_EXPIRED = "FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run";
+const AP_TABLIKE = "[role=tab], .nav-tabs li, .nav-tabs a, .nav-pills li, .nav-pills a, .k-tabstrip-items .k-item, .k-tabstrip-items .k-link, md-tab-item, .md-tab";
+const AP_DANGER_RE = /\b(approve|reject|dispute|pay|delete|void|cancel|send|e-?mail|import|upload|erp|edi|accounting|template|quickbooks|netsuite|pdf|print)\b/i;
+
+function apText(el) { return ((el && (el.textContent || el.value)) || "").replace(/\s+/g, " ").trim(); }
+function apUniq(list, max = 30) { return [...new Set(list.filter(Boolean))].slice(0, max); }
+function apInRow(el) { return !!el.closest("tbody tr, .k-grid-content, .k-grid-header, .k-window, .modal, .k-animation-container"); }
+
+// The top-nav item whose text is exactly AUDIT. → { el } or { labels } (what the nav shows).
+function apFindAuditNav() {
+  const NAV = "nav, header, .navbar, .nav, [role=navigation], [role=menubar], .menu, .top-menu, .main-menu, .header";
+  const hits = [];
+  for (const el of document.querySelectorAll("a, button, li, span, div, [role=menuitem], [role=tab]")) {
+    if (!/^audit$/i.test(apText(el)) || !isVisibleForClick(el) || apInRow(el)) continue;
+    const r = el.getBoundingClientRect();
+    hits.push({ el, nav: el.closest(NAV) ? 1 : 0, top: r.top, depth: el.querySelectorAll("*").length });
+  }
+  if (hits.length) {
+    // In the navigation first, then the highest on the page, then the innermost element.
+    hits.sort((a, b) => b.nav - a.nav || a.top - b.top || a.depth - b.depth);
+    const inner = hits[0].el;
+    // Click the link itself: the <a>/<button> around the text, or the one inside an <li>.
+    const link = inner.closest("a, button, [role=menuitem], [ui-sref]");
+    const target = (link && /^audit$/i.test(apText(link)) ? link : null) ||
+      [...inner.querySelectorAll("a, button")].find(isVisibleForClick) || inner;
+    // Outside a recognised navigation bar only a real link in the top strip
+    // of the page counts: any other "Audit" text is not clicked.
+    const linkLike = target.matches("a, button, [role=menuitem], [ui-sref]");
+    if (hits[0].nav || (linkLike && hits[0].top < 140)) return { el: target, inNav: !!hits[0].nav };
+  }
+  const labels = [];
+  for (const el of document.querySelectorAll(`${NAV}`)) {
+    for (const a of el.querySelectorAll("a, button, [role=menuitem]")) {
+      const t = apText(a);
+      if (t && t.length <= 30 && isVisibleForClick(a)) labels.push(t);
+    }
+  }
+  // No recognised navigation bar: the links across the top of the page.
+  if (!labels.length) {
+    for (const a of document.querySelectorAll("a, button, [role=menuitem]")) {
+      const t = apText(a);
+      if (t && t.length <= 30 && isVisibleForClick(a) && a.getBoundingClientRect().top < 140) labels.push(t);
+    }
+  }
+  return { labels: apUniq(labels) };
+}
+
+function apTabIsActive(el) {
+  for (const n of [el, el.closest("li, .k-item, md-tab-item, [role=tab]"), el.parentElement]) {
+    if (!n) continue;
+    if (n.getAttribute("aria-selected") === "true") return true;
+    if (/(^|\s)(active|k-state-active|k-active|md-active|selected|current)(\s|$)/.test(String(n.className || ""))) return true;
+  }
+  return false;
+}
+
+// Everything on the page whose text is the tab's name (`re`), best first:
+// [{ el, kind: "tab" | "heading", score, label }]. A tab is clicked; a section
+// heading (the grid simply sits under it) is not.
+function apTabHits(re) {
+  const hits = [];
+  for (const el of document.querySelectorAll(`${AP_TABLIKE}, a, button, h1, h2, h3, h4, h5, legend, .panel-heading, .panel-title, .card-header, span, div, li, label`)) {
+    const text = apText(el);
+    if (text.length > 40 || !re.test(text) || !isVisibleForClick(el) || apInRow(el)) continue;
+    const tabby = el.matches(AP_TABLIKE) ? el : el.closest(AP_TABLIKE);
+    let score, kind = "tab", target = el;
+    if (tabby && re.test(apText(tabby))) { score = 10; target = tabby; }
+    else if (el.matches("a, button") || (el.closest("a, button") && re.test(apText(el.closest("a, button"))))) { score = 5; target = el.closest("a, button") || el; }
+    else if (el.matches("h1, h2, h3, h4, h5, legend, .panel-heading, .panel-title, .card-header")) { score = 3; kind = "heading"; }
+    else {
+      const clickable = el.hasAttribute("ng-click") || el.hasAttribute("data-ng-click") || el.hasAttribute("onclick") || window.getComputedStyle(el).cursor === "pointer";
+      score = clickable ? 2 : 1;
+      if (!clickable) kind = "heading";
+    }
+    hits.push({ el: target, kind, score, label: text, len: el.querySelectorAll("*").length });
+  }
+  hits.sort((a, b) => b.score - a.score || a.label.length - b.label.length || a.len - b.len);
+  return hits;
+}
+
+// → { el, kind: "tab" | "heading", score, label } or null.
+function apFindTab(re) { return apTabHits(re)[0] || null; }
+
+// The History tab. Only a real tab is taken, and when Recently Approved is a
+// tab too, only one in the same strip (so a "History" link elsewhere on the
+// page is never clicked). → { tab, approved, others: labels not taken }
+function apFindHistoryTab() {
+  const approved = apFindTab(AP_TAB_RE);
+  const hits = apTabHits(AP_HISTORY_RE).filter((h) => h.kind === "tab" && h.score >= 5);
+  const sameStrip = (h) => {
+    let up = approved.el;
+    for (let i = 0; i <= 4 && up && up !== document.body; i++) {
+      if (up.contains(h.el)) return i;
+      up = up.parentElement;
+    }
+    return -1;
+  };
+  let ok;
+  if (approved && approved.kind === "tab") {
+    ok = hits.map((h) => ({ ...h, level: sameStrip(h) })).filter((h) => h.level >= 0).sort((a, b) => a.level - b.level || b.score - a.score);
+  } else {
+    ok = hits.filter((h) => h.score >= 10);
+  }
+  const others = hits.filter((h) => !ok.some((o) => o.el === h.el)).map((h) => `<${h.el.tagName.toLowerCase()}> "${h.label}"`);
+  return { tab: ok[0] || null, approved, others: apUniq(others, 5) };
+}
+
+// The pane a tab names (aria-controls / href="#id"), or null.
+function apTabPane(tab) {
+  if (!tab || tab.kind !== "tab") return null;
+  const link = tab.el.matches("a") ? tab.el : tab.el.querySelector("a");
+  const id = tab.el.getAttribute("aria-controls") || (link && (link.getAttribute("aria-controls") || (/^#[\w-]+$/.test(link.getAttribute("href") || "") ? link.getAttribute("href").slice(1) : "")));
+  return id ? document.getElementById(id) : null;
+}
+
+function apTabLabels() {
+  const seen = [];
+  for (const el of document.querySelectorAll("[role=tab], .nav-tabs > li, .nav-pills > li, .k-tabstrip-items .k-item, md-tab-item, .md-tab")) {
+    const t = apText(el);
+    if (t && t.length <= 40 && isVisibleForClick(el)) seen.push(t);
+  }
+  if (seen.length) return apUniq(seen);
+  for (const el of document.querySelectorAll("h1, h2, h3, h4, .panel-heading, .panel-title, .card-header")) {
+    const t = apText(el);
+    if (t && t.length <= 40 && isVisibleForClick(el) && !apInRow(el)) seen.push(t);
+  }
+  return apUniq(seen);
+}
+
+// A tab's grid (Recently Approved, History): inside the tab's pane when the tab names one,
+// the first grid after a section heading, else the biggest visible grid.
+function apFindGrid(tab) {
+  const grids = [...document.querySelectorAll(".k-grid")].filter(isVisibleForClick);
+  if (!grids.length) return null;
+  if (tab && tab.kind === "tab") {
+    const pane = apTabPane(tab);
+    const inPane = pane ? grids.filter((g) => pane.contains(g)) : [];
+    if (inPane.length) return inPane[0];
+  }
+  if (tab && tab.kind === "heading") {
+    const after = grids.filter((g) => tab.el.compareDocumentPosition(g) & Node.DOCUMENT_POSITION_FOLLOWING);
+    if (after.length) return after[0];
+  }
+  const area = (g) => { const r = g.getBoundingClientRect(); return r.width * r.height; };
+  return grids.sort((a, b) => area(b) - area(a))[0];
+}
+
+function apGridRows(grid) {
+  return [...grid.querySelectorAll(".k-grid-content tbody tr, .k-grid-content-locked tbody tr, :scope > table > tbody > tr")]
+    .filter((tr) => !/k-grouping-row|k-group-footer|k-no-data|k-detail-row/.test(String(tr.className || ""))).length;
+}
+
+function apGridSig(grid) {
+  const pager = apText(grid.querySelector(".k-pager-info"));
+  const first = apText(grid.querySelector(".k-grid-content tbody tr, tbody tr")).slice(0, 200);
+  return `${pager}|${apGridRows(grid)}|${first}`;
+}
+
+function apLoading(grid) {
+  const scope = grid ? [grid, grid.parentElement].filter(Boolean) : [document];
+  return scope.some((s) => [...s.querySelectorAll(".k-loading-mask, .k-loading-image")].some(isVisibleForClick));
+}
+
+// The nearest container that holds the grid, its toolbar and its filters but
+// no other grid.
+function apGridScope(grid) {
+  const pane = grid.closest(".tab-pane, [role=tabpanel], .k-tabstrip > .k-content, md-tab-content");
+  if (pane) return pane;
+  let scope = grid;
+  for (let i = 0; i < 4 && scope.parentElement && scope.parentElement !== document.body; i++) {
+    const up = scope.parentElement;
+    if ([...up.querySelectorAll(".k-grid")].filter(isVisibleForClick).some((g) => g !== grid && !grid.contains(g))) break;
+    scope = up;
+  }
+  return scope;
+}
+
+// What the grid is showing — read only, nothing is changed.
+function apDescribeView(grid) {
+  const parts = [];
+  const scope = apGridScope(grid);
+  const dates = [];
+  for (const inp of scope.querySelectorAll("input")) {
+    if (!isVisibleForClick(inp) || apInRow(inp)) continue;
+    const v = String(inp.value || "").trim();
+    if (/^\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}$|^\d{4}-\d{2}-\d{2}$/.test(v)) dates.push(v);
+    else if (/\d{1,2}\/\d{1,2}\/\d{2,4}\s*(-|–|to)\s*\d{1,2}\/\d{1,2}\/\d{2,4}/i.test(v)) dates.push(v);
+  }
+  if (dates.length === 1) parts.push(`showing ${dates[0]}`);
+  else if (dates.length >= 2) parts.push(`showing ${dates[0]} to ${dates[1]}`);
+  for (const sel of scope.querySelectorAll("select")) {
+    if (!isVisibleForClick(sel) || apInRow(sel) || sel.closest(".k-pager-sizes, .k-pager-wrap, .k-pager")) continue;
+    const t = apText(sel.options[sel.selectedIndex]);
+    if (t && t.length <= 40 && /day|week|month|year|quarter|range|last|today|all/i.test(t)) parts.push(`range "${t}"`);
+  }
+  const sizes = grid.querySelector(".k-pager-sizes");
+  if (sizes) {
+    const sel = sizes.querySelector("select");
+    const size = (sel && sel.value) || apText(sizes.querySelector(".k-input, .k-input-value-text, .k-input-inner"));
+    if (size) parts.push(`page size ${String(size).slice(0, 12)}`);
+  }
+  const info = apText(grid.querySelector(".k-pager-info"));
+  if (info) parts.push(info.slice(0, 60));
+  return parts;
+}
+
+// Excel export button for the approval check: only inside the Recently
+// Approved section, never a row control, judged by what the button itself
+// says (text / title / tooltip), not by class names or handlers.
+function apExportCandidates() {
+  const grid = document.querySelector(`[${AP_GRID_MARK}]`);
+  if (!grid) return []; // no Recently Approved grid in hand: click nothing
+  // History: FreightPOP's own "Export To Excel" button of that tab, by its id.
+  if (fpxErp && fpxErp.phase === "history") {
+    const btn = document.getElementById("ExportExcelHistory");
+    return btn && isVisibleForClick(btn) ? [{ el: btn, score: 20, desc: (btn.value || apText(btn) || "Export To Excel").slice(0, 60) }] : [];
+  }
+  const scope = apGridScope(grid);
+  const out = [];
+  const seen = new Set();
+  for (const el of scope.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button], .k-button, .k-grid-excel, i, span, img")) {
+    const target = el.closest("a, button, input[type=button], input[type=submit], [role=button], .k-button") || el;
+    if (seen.has(target) || !scope.contains(target) || !isVisibleForClick(target)) continue;
+    if (target.closest("tbody tr, .k-grid-content, .k-pager-wrap, .k-pager, .k-grid-header")) continue; // never a row, pager or column control
+    const text = apText(target);
+    if (text.length > 60) continue;
+    const said = [text, target.title, target.getAttribute("aria-label"), target.getAttribute("data-original-title"),
+      target.getAttribute("uib-tooltip"), target.getAttribute("tooltip"), el.title, el.getAttribute("alt"), el.getAttribute("aria-label"),
+    ].filter(Boolean).join(" | ");
+    if (AP_DANGER_RE.test(said)) continue;
+    // What the button does when its handler says so: never one that pushes
+    // data out or acts on invoices. ("Approved" in a handler name is the
+    // section's name, so approve is judged by the visible text above.)
+    const does = [target.getAttribute("ng-click"), target.getAttribute("data-ng-click"), target.getAttribute("onclick"), target.id].filter(Boolean).join(" | ");
+    if (/erp|quickbooks|netsuite|accounting|edi(?![a-z])|send|e-?mail|delete|void|reject|dispute|import|upload|submit|pay(?!load)/i.test(does)) continue;
+    // Only a button that is an Excel export: a bare "Export" could be anything.
+    let score = 0;
+    if (/(^|\s)k-grid-excel(\s|$)/.test(String(target.className || ""))) score += 10;
+    if (/excel|xlsx?\b|\.xls/i.test(said)) score += 8;
+    if (score <= 0) continue;
+    seen.add(target);
+    out.push({ el: target, score, desc: (text || target.title || target.getAttribute("aria-label") || String(target.className || target.tagName)).slice(0, 60) });
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
+// A tab's grid, loaded and quiet. Counts steps (half a second each), so a
+// pause doesn't use the limit up. → { grid, settled, sawLoading }
+//   find()     the grid, or null while it isn't there
+//   changed(sig)  true when the grid no longer shows what it did before
+//   need({ rows, sawLoading, changed })  quiet steps wanted before it counts as loaded
+// What the page is showing while a grid is awaited (for the log only).
+function apPageState() {
+  try {
+    const vis = (sel) => [...document.querySelectorAll(sel)].filter(isVisibleForClick);
+    const grids = vis(".k-grid").map((g) => `${g.id || g.className.split(" ").slice(0, 2).join(".")}(${g.querySelectorAll("tbody tr").length} rows, in ${(g.closest(".tab-pane") || {}).id || "no pane"})`);
+    const tables = vis("table").filter((t) => !t.closest(".k-grid")).map((t) => `${t.id || "table"}(${t.querySelectorAll("tbody tr").length} rows)`);
+    const loaders = vis(".k-loading-mask, .k-loading-image, .loading, .loader, .spinner, [class*=spinner], [class*=loading]").length;
+    const msgs = vis(".alert, .toast, .toast-message, .k-notification, .modal.in .modal-body, .swal2-popup, .sweet-alert, .validation-summary-errors, .text-danger, .error")
+      .map((e) => apText(e).slice(0, 100)).filter(Boolean);
+    const pane = document.querySelector(".tab-pane.active") ;
+    const paneText = pane ? apText(pane).replace(/Export To Excel|Search/g, "").slice(0, 160) : "";
+    return `grids: ${grids.slice(0, 4).join(", ") || "none"} · tables: ${tables.slice(0, 3).join(", ") || "none"} · loading indicators: ${loaders} · messages: ${apUniq(msgs).slice(0, 3).join(" / ") || "none"} · pane text: "${paneText}"`;
+  } catch (e) { return `state unreadable (${e.message})`; }
+}
+
+async function apWaitGrid({ find, label, steps, changed, need }) {
+  let grid = null, calm = 0, sawLoading = false, lastSig = null;
+  for (let i = 0; i < steps; i++) {
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error(AP_EXPIRED);
+    grid = find();
+    if (!grid) { calm = 0; }
+    else if (apLoading(grid)) { sawLoading = true; calm = 0; }
+    else {
+      const sig = apGridSig(grid);
+      calm = sig === lastSig ? calm + 1 : 0;
+      lastSig = sig;
+      if (calm >= need({ rows: apGridRows(grid), sawLoading, changed: changed(sig) })) return { grid, settled: true, sawLoading };
+    }
+    if (i > 0 && i % 30 === 0) erpLog(`Still loading ${label} · ${i / 2}s${grid ? "" : ` · ${apPageState()}`}`);
+    await sleep(500);
+  }
+  return { grid, settled: false, sawLoading };
+}
+
+// ── History tab ──
+// Inside a grid (rows, header, filter row, pager) or a popup: never touched.
+function apInGrid(el) {
+  if (el.closest(".k-grid-toolbar")) return false;
+  return !!el.closest(".k-grid, .k-grid-content, .k-grid-header, .k-pager-wrap, .k-pager, .k-filter-row, .k-window, .modal, .k-animation-container");
+}
+
+function apDescribeEl(el) {
+  if (!el) return "?";
+  const cls = String(el.className || "").replace(/\s+/g, ".").slice(0, 60);
+  return `<${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${cls ? `.${cls}` : ""}>`;
+}
+
+// The part of the page that belongs to the open tab: the pane the tab names,
+// else the grid's surroundings, else the open tab pane, else the smallest
+// block around the tab strip that also holds fields or a grid.
+function apTabPanel(tab, grid) {
+  const pane = apTabPane(tab);
+  if (pane && isVisibleForClick(pane)) return pane;
+  if (grid) return apGridScope(grid);
+  const open = [...document.querySelectorAll(".tab-pane.active, [role=tabpanel], .k-tabstrip > .k-content, md-tab-content.md-active")].filter(isVisibleForClick);
+  if (open.length === 1) return open[0];
+  const strip = tab.el.closest("ul, [role=tablist], .nav-tabs, .k-tabstrip-items, md-tabs-wrapper") || tab.el.parentElement;
+  let up = strip ? strip.parentElement : null;
+  for (let i = 0; i < 4 && up && up !== document.body; i++) {
+    const holds = [...up.querySelectorAll("input:not([type=hidden]), select, .k-grid")].some((e) => isVisibleForClick(e) && !strip.contains(e));
+    if (holds) return up;
+    up = up.parentElement;
+  }
+  return null;
+}
+
+// "input[placeholder="…" ng-model=… name=…]=value" for every visible field of the tab.
+function apPanelFields(panel) {
+  return [...panel.querySelectorAll("input:not([type=hidden]), select, textarea")]
+    .filter((e) => isVisibleForClick(e) && !apInGrid(e))
+    .map((e) => {
+      const about = [
+        e.getAttribute("placeholder") ? `placeholder="${e.getAttribute("placeholder").slice(0, 30)}"` : "",
+        (e.getAttribute("ng-model") || e.getAttribute("data-ng-model") || e.getAttribute("k-ng-model")) ? `ng-model=${(e.getAttribute("ng-model") || e.getAttribute("data-ng-model") || e.getAttribute("k-ng-model")).slice(0, 40)}` : "",
+        e.name ? `name=${String(e.name).slice(0, 30)}` : "",
+        !e.getAttribute("placeholder") && !e.name && e.id ? `id=${String(e.id).slice(0, 30)}` : "",
+        e.tagName === "INPUT" && e.type && e.type !== "text" ? `type=${e.type}` : "",
+      ].filter(Boolean).join(" ");
+      const value = e.tagName === "SELECT" ? apText(e.options[e.selectedIndex]) : (e.type === "checkbox" || e.type === "radio") ? (e.checked ? "on" : "off") : e.value;
+      return `${e.tagName.toLowerCase()}[${about}]=${String(value || "").slice(0, 30)}`;
+    });
+}
+
+function apPanelButtons(panel) {
+  const out = [];
+  for (const e of panel.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button], .k-button")) {
+    if (!isVisibleForClick(e) || apInGrid(e)) continue;
+    const t = apText(e) || e.title || e.getAttribute("aria-label") || "";
+    if (t && t.length <= 30) out.push(t);
+  }
+  return apUniq(out, 40);
+}
+
+// The controls that may be pressed to apply the History date range: visible,
+// in the tab's panel, outside any grid, text exactly one of AP_APPLY_WORDS.
+// → { ok: [{ el, text }] best first, refused: [text (why)] }
+function apApplyControls(panel) {
+  const ok = [], refused = [];
+  const seen = new Set();
+  for (const e of panel.querySelectorAll("button, input[type=button], input[type=submit], a, [role=button], .k-button")) {
+    if (seen.has(e) || !isVisibleForClick(e) || apInGrid(e)) continue;
+    const text = apText(e);
+    const rank = AP_APPLY_WORDS.indexOf(text.toLowerCase());
+    if (rank < 0) continue;
+    seen.add(e);
+    const does = [e.getAttribute("ng-click"), e.getAttribute("data-ng-click"), e.getAttribute("onclick")].filter(Boolean).join(" | ");
+    if (e.disabled || e.getAttribute("aria-disabled") === "true") { refused.push(`"${text}" (disabled)`); continue; }
+    if (AP_APPLY_NEVER_RE.test(does)) { refused.push(`"${text}" (its handler is ${does.slice(0, 60)})`); continue; }
+    ok.push({ el: e, text, rank });
+  }
+  ok.sort((a, b) => a.rank - b.rank);
+  return { ok, refused };
+}
+
+// Does a date field show this MM/DD/YYYY day (in whatever format it uses)?
+function apShowsDay(input, mdy) {
+  const v = String((input && input.value) || "").trim();
+  const [mm, dd, yyyy] = mdy.split("/").map(Number);
+  let m = v.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})/);
+  if (m) return +m[1] === mm && +m[2] === dd && (+m[3] === yyyy || +m[3] === yyyy % 100);
+  m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return +m[1] === yyyy && +m[2] === mm && +m[3] === dd;
+  return false;
+}
+
+function apFieldName(input) {
+  return (input.getAttribute("ng-model") || input.getAttribute("k-ng-model") || input.name || input.id || input.getAttribute("placeholder") || input.type || "field").slice(0, 40);
+}
+
+// Open History, set its date range, wait for the grid and hand it over for
+// the Excel capture. → { rows, note }. Throws with the reason when History
+// could not be read; the caller turns that into a warning.
+//   mark(grid)  puts the export mark on the grid (and takes it off any other)
+async function apHistoryPhase(from, to, mark) {
+  const where = () => window.location.hash || window.location.pathname;
+  const controls = (panel) => `fields: ${panel ? apPanelFields(panel).slice(0, 12).join(" | ") || "none" : "?"} · buttons: ${panel ? apPanelButtons(panel).join(" | ") || "none" : "?"}`;
+
+  // a. The History tab, in the same strip as Recently Approved.
+  let found = null;
+  for (let i = 0; i < 20; i++) { // 10 s
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error(AP_EXPIRED);
+    found = apFindHistoryTab();
+    if (found.tab) break;
+    await sleep(500);
+  }
+  if (!found.tab) {
+    throw new Error(`"History" tab not found on the Audit page — tabs seen: ${apTabLabels().join(", ") || "none"}` +
+      `${found.others.length ? ` ("History" elsewhere on the page was not clicked: ${found.others.join(", ")})` : ""} (waited 10s; page is ${where()})`);
+  }
+  let tab = found.tab;
+
+  // b. Open it. It must be the open tab — and Recently Approved must not be —
+  // before anything is read or typed.
+  const isOpen = () => {
+    const f = apFindHistoryTab();
+    if (f.tab) tab = f.tab;
+    const other = f.approved && f.approved.kind === "tab" && f.approved.el !== tab.el && apTabIsActive(f.approved.el);
+    return apTabIsActive(tab.el) && !other;
+  };
+  if (isOpen()) {
+    erpLog(`"${tab.label}" tab is already open`);
+  } else {
+    erpLog(`Opening the "${tab.label}" tab`);
+    simulateClick(tab.el.matches("li") ? ([...tab.el.querySelectorAll("a, .k-link")].find(isVisibleForClick) || tab.el) : tab.el);
+    await humanDelay(800, 1400);
+    let open = false;
+    for (let i = 0; i < 30 && !open; i++) { // 15 s
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw new Error(AP_EXPIRED);
+      open = isOpen();
+      if (!open) await sleep(500);
+    }
+    if (!open) {
+      const li = tab.el.closest("li, .k-item, md-tab-item, [role=tab]") || tab.el;
+      const f = apFindHistoryTab();
+      throw new Error(`clicked the "${tab.label}" tab but it did not become the open tab within 15s — nothing was read or typed ` +
+        `(tab is <${tab.el.tagName.toLowerCase()} class="${String(li.className || "").slice(0, 80)}" aria-selected="${li.getAttribute("aria-selected") || ""}">` +
+        `${f.approved && f.approved.kind === "tab" && apTabIsActive(f.approved.el) ? "; Recently Approved still reads as the open tab" : ""})`);
+    }
+  }
+  await humanDelay(1200, 1800); // let the tab's content render
+
+  // c. Its part of the page. A grid counts only inside the pane the tab names.
+  const findGrid = () => {
+    const g = apFindGrid(tab);
+    const pane = apTabPane(tab);
+    return g && pane && isVisibleForClick(pane) && !pane.contains(g) ? null : g;
+  };
+  let grid = null, panel = null;
+  for (let i = 0; i < 20; i++) { // 10 s
+    await erpCheckpoint();
+    grid = findGrid();
+    panel = apTabPanel(tab, grid);
+    if (panel && (grid || apPanelFields(panel).length)) break;
+    await sleep(500);
+  }
+  if (!panel) throw new Error(`the History tab is open but nothing under it could be read after 10s (no grid, no fields; page is ${where()})`);
+  erpLog(`History tab open · reading ${apDescribeEl(panel)} · ${grid ? `grid on screen with ${erpNum(apGridRows(grid))} row(s)` : "no grid on screen yet"}`);
+  erpLog(`History tab fields: ${apPanelFields(panel).slice(0, 25).join(" | ") || "none"}`.slice(0, 900));
+  erpLog(`History tab buttons: ${apPanelButtons(panel).join(" | ") || "none"}`.slice(0, 900));
+
+  // d. The date range.
+  const found2 = findDateInputs(panel, apInGrid);
+  let fromInput = found2.from, toInput = found2.to;
+  if (found2.all.length >= 2 && (!fromInput || !toInput || fromInput === toInput)) { fromInput = found2.all[0]; toInput = found2.all[1]; }
+  const sigBefore = grid ? apGridSig(grid) : "";
+  let applied = false;
+  if (found2.all.length < 2 || !fromInput || !toInput || fromInput === toInput) {
+    const shown = grid ? apDescribeView(grid) : [];
+    erpLog(`History has ${found2.all.length === 1 ? "one date field, not a from / to pair" : "no date fields"} — left as it is` +
+      ` (wanted ${from} to ${to}) · ${shown.length ? shown.join(" · ") : "no date range or pager could be read"}`, "warn");
+  } else {
+    await erpCheckpoint();
+    erpLog(`History · setting the range ${from} to ${to} (from field ${apFieldName(fromInput)}, was "${String(fromInput.value).slice(0, 20)}" · to field ${apFieldName(toInput)}, was "${String(toInput.value).slice(0, 20)}")`);
+    setDateInput(fromInput, from);
+    await humanDelay(300, 600);
+    setDateInput(toInput, to);
+    await humanDelay(400, 800);
+    const fromOk = apShowsDay(fromInput, from), toOk = apShowsDay(toInput, to);
+    erpLog(`History dates · from shows "${String(fromInput.value).slice(0, 20)}"${fromOk ? "" : ` (wanted ${from})`} · to shows "${String(toInput.value).slice(0, 20)}"${toOk ? "" : ` (wanted ${to})`}`, fromOk && toOk ? "info" : "warn");
+
+    // e. Apply it: one of the allowed controls, else Enter on the To field.
+    await erpCheckpoint();
+    const apply = apApplyControls(panel);
+    if (apply.refused.length) erpLog(`History · not pressed: ${apply.refused.join(", ")}`, "warn");
+    if (apply.ok.length) {
+      erpLog(`History · applying the range · clicking "${apply.ok[0].text}"${apply.ok.length > 1 ? ` (also there: ${apply.ok.slice(1).map((c) => `"${c.text}"`).join(", ")})` : ""}`);
+      simulateClick(apply.ok[0].el);
+      applied = true;
+      await humanDelay(600, 1000);
+    } else {
+      erpLog(`History · no Search-type button on the tab (allowed: ${AP_APPLY_WORDS.join(", ")}) — pressing Enter in the To date field`);
+      toInput.focus();
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        toInput.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+      }
+      toInput.dispatchEvent(new Event("change", { bubbles: true }));
+      toInput.blur();
+      let reacted = false;
+      for (let i = 0; i < 20 && !reacted; i++) { // 10 s
+        await erpCheckpoint();
+        const g = findGrid();
+        reacted = !!g && (apLoading(g) || apGridSig(g) !== sigBefore);
+        if (!reacted) await sleep(500);
+      }
+      const g = findGrid();
+      if (reacted) {
+        erpLog("History · the grid reloaded after Enter in the To date field");
+        applied = true;
+      } else if (!g || apGridRows(g) === 0) {
+        // Nothing loads without a control that is not on the list: stop here.
+        throw new Error(`the dates were typed but nothing loads them: no button named ${AP_APPLY_WORDS.join(" / ")}, and Enter did nothing in 10s — on the tab: ${controls(panel)}`.slice(0, 900));
+      } else {
+        erpLog(`History · the grid did not reload after Enter (10s) — reading what it shows, which may not be ${from} to ${to} · on the tab: ${controls(panel)}`.slice(0, 900), "warn");
+      }
+    }
+  }
+
+  // f. The grid, loaded. A long range can take a while: up to 3 minutes.
+  // After the range was applied, rows that look the same as before must stay
+  // quiet for 20s (a slow search with no loading mask), an empty grid 30s.
+  // Rows already on screen from an earlier search are not the answer to this
+  // one: unless the grid visibly reloads, wait 5 min before reading it.
+  const hadRows = !!grid && apGridRows(grid) > 0;
+  const waited = await apWaitGrid({
+    find: findGrid, label: "History", steps: 840, // 7 min: the search alone has taken 95 s to over 3 min
+    changed: (sig) => sig !== sigBefore,
+    need: ({ rows, sawLoading, changed }) => (rows > 0
+      ? ((sawLoading || changed) ? 4 : (applied ? (hadRows ? 600 : 40) : 10))
+      : (sawLoading ? 16 : (applied ? 60 : 16))),
+  });
+  grid = waited.grid;
+  if (!grid) throw new Error(`the History grid never appeared (waited 7 min; page is ${where()}) — on the tab: ${controls(apTabPanel(tab, null) || panel)}`.slice(0, 900));
+  if (!waited.settled) throw new Error("the History grid was still loading after 3 min");
+
+  // g. What it shows.
+  const rowsOnScreen = apGridRows(grid);
+  const view = apDescribeView(grid);
+  erpLog(`History · ${view.length ? view.join(" · ") : "no date range or pager could be read"} · ${erpNum(rowsOnScreen)} row(s) on screen`);
+  if (rowsOnScreen === 0 || /no items to display/i.test(apText(grid.querySelector(".k-pager-info")))) {
+    return { rows: 0, note: `History is empty for ${from} to ${to}` };
+  }
+
+  // h. The browser service takes the grid's Excel export (all pages).
+  await erpCheckpoint();
+  mark(grid);
+  erpLog("Taking FreightPOP's Excel export · History");
+  const dl = await erpHandOffDownload("History");
+  await erpCheckpoint(); // a stop during the hand-off ends as "stopped"
+  if (!dl || !dl.ok) throw new Error(`export not captured: ${(dl && dl.error) || "no reply"}`);
+  return { rows: Number(dl.rows) || 0, note: `History export captured · ${erpNum(dl.rows)} rows (${from} to ${to})` };
+}
+
+async function erpApprovalCheck(runBy, resumed = false, opts = null) {
+  if (fpxErp && !fpxErp.done) return; // already running in this page
+  stopRequested = false;
+  opts = opts && typeof opts === "object" ? opts : {};
+  const state = { job: "approval_check", lines: [], counts: { approvedRows: 0, historyRows: 0 }, done: null, phase: null };
+  fpxErp = state;
+  const where = () => window.location.hash || window.location.pathname;
+  const expired = AP_EXPIRED;
+  let marked = null;
+  const mark = (grid) => {
+    for (const g of document.querySelectorAll(`[${AP_GRID_MARK}]`)) g.removeAttribute(AP_GRID_MARK);
+    grid.setAttribute(AP_GRID_MARK, "1");
+    marked = grid;
+  };
+  let approvedNote = null; // set once Recently Approved is dealt with
+
+  try {
+    await erpCheckpoint();
+    if (erpLoginExpired()) throw new Error(expired);
+    if (!resumed) erpLog(`Approval check${runBy ? ` for ${runBy}` : ""} · read-only: nothing on the Audit page is approved, rejected or edited`);
+
+    // 1. The AUDIT item in the top navigation (it can take a moment to render).
+    // AUDIT can be a separate page: the click then reloads everything and the
+    // browser service starts this again on the new page with resumed = true,
+    // which goes straight to waiting for the page instead of clicking again.
+    const before = where();
+    if (resumed) {
+      erpLog(`On the Audit page (${before})`);
+    } else {
+      let nav = null;
+      for (let i = 0; i < 40; i++) { // 20 s
+        nav = apFindAuditNav();
+        if (nav.el) break;
+        await erpCheckpoint();
+        await sleep(500);
+      }
+      if (!nav.el) throw new Error(`AUDIT was not found in FreightPOP's top navigation after 20s (page is ${where()}) — navigation shows: ${nav.labels.join(", ") || "nothing readable"}`);
+      erpLog(`Opening Audit · clicking "${apText(nav.el) || "AUDIT"}" in the ${nav.inNav ? "top navigation" : "page header"} (page is ${before})`);
+      simulateClick(nav.el);
+      await humanDelay(800, 1400);
+    }
+
+    // 2. The Audit page is up once its "Recently Approved" tab is there.
+    let tab = null;
+    for (let i = 0; i < 60; i++) { // 30 s
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw new Error(expired);
+      tab = apFindTab(AP_TAB_RE);
+      if (tab) break;
+      await sleep(500);
+    }
+    const after = where();
+    erpLog(after !== before ? `Audit page open · ${after}` : `The page address did not change after clicking AUDIT (still ${after})`, after !== before ? "info" : "warn");
+    if (!tab) {
+      const tabs = apTabLabels();
+      erpLog(`Tabs on the page: ${tabs.join(", ") || "none found"}`, "warn");
+      throw new Error(`"Recently Approved" tab not found on the Audit page — tabs seen: ${tabs.join(", ") || "none"} (waited 30s; page is ${after})`);
+    }
+
+    if (opts.skipApproved) {
+      // The page reloaded after Recently Approved was handed over.
+      erpLog("Recently Approved was already read — going on to History");
+      approvedNote = "Recently Approved export captured";
+    } else {
+      // 3. Show Recently Approved.
+      await erpCheckpoint();
+      const sigBefore = (() => { const g = apFindGrid(tab); return g ? apGridSig(g) : ""; })();
+      let clicked = false;
+      if (tab.kind === "heading") {
+        erpLog(`"${tab.label}" is a section on the page, not a tab — nothing to click`);
+      } else if (apTabIsActive(tab.el)) {
+        erpLog(`"${tab.label}" tab is already open`);
+      } else {
+        erpLog(`Opening the "${tab.label}" tab`);
+        simulateClick(tab.el.matches("li") ? ([...tab.el.querySelectorAll("a, .k-link")].find(isVisibleForClick) || tab.el) : tab.el);
+        clicked = true;
+        await humanDelay(800, 1400);
+        // The tab must be the open one before any grid is read: otherwise the
+        // grid on screen is another tab's and its rows are not approvals.
+        let open = false, seenTab = tab;
+        for (let i = 0; i < 30 && !open; i++) { // 15 s
+          await erpCheckpoint();
+          seenTab = apFindTab(AP_TAB_RE) || seenTab;
+          open = seenTab.kind === "tab" && apTabIsActive(seenTab.el);
+          if (!open) await sleep(500);
+        }
+        if (!open) {
+          const li = seenTab.el.closest("li, .k-item, md-tab-item, [role=tab]") || seenTab.el;
+          throw new Error(`Clicked the "${tab.label}" tab but it did not become the open tab within 15s — nothing was read ` +
+            `(tab is <${seenTab.el.tagName.toLowerCase()} class="${String(li.className || "").slice(0, 80)}" aria-selected="${li.getAttribute("aria-selected") || ""}">)`);
+        }
+      }
+
+      // 4. Its grid, loaded (90 s). Rows on screen: 2 quiet seconds after a
+      // load or a change, else 5. No rows: 8 quiet seconds before calling it empty.
+      const waited = await apWaitGrid({
+        find: () => apFindGrid(apFindTab(AP_TAB_RE) || tab), label: "Recently Approved", steps: 180,
+        changed: (sig) => clicked && sig !== sigBefore,
+        need: ({ rows, sawLoading, changed }) => (rows > 0 ? ((sawLoading || changed) ? 4 : 10) : 16),
+      });
+      const grid = waited.grid;
+      if (!grid) throw new Error(`The Recently Approved grid never appeared (waited 90s; page is ${where()}; tabs seen: ${apTabLabels().join(", ") || "none"})`);
+      if (!waited.settled) throw new Error("The Recently Approved grid was still loading after 90s");
+
+      mark(grid);
+
+      // 5. What it shows. Date range and page size are left exactly as they are.
+      const rowsOnScreen = apGridRows(grid);
+      const view = apDescribeView(grid);
+      erpLog(`Recently Approved · ${view.length ? view.join(" · ") : "no date range or pager could be read"} · ${erpNum(rowsOnScreen)} row(s) on screen`);
+      erpLog(`Audit page tabs: ${apTabLabels().join(" | ") || "none found"}`);
+      const pagerInfo = apText(grid.querySelector(".k-pager-info"));
+      if (rowsOnScreen === 0 || /no items to display/i.test(pagerInfo)) {
+        erpLog("Recently Approved is empty — going on to History");
+        approvedNote = "Recently Approved is empty";
+      } else {
+        // 6. The browser service takes the grid's Excel export.
+        await erpCheckpoint();
+        erpLog("Taking FreightPOP's Excel export · Recently Approved");
+        const dl = await erpHandOffDownload("Recently Approved");
+        await erpCheckpoint(); // a stop during the hand-off ends as "stopped"
+        if (!dl || !dl.ok) throw new Error(`Recently Approved export not captured: ${(dl && dl.error) || "no reply"}`);
+        state.counts.approvedRows = Number(dl.rows) || 0;
+        approvedNote = `Recently Approved export captured · ${erpNum(state.counts.approvedRows)} rows`;
+      }
+    }
+
+    // 7. History, for the range the browser service asked for. Nothing in
+    // here can fail the job: Recently Approved stands whatever happens.
+    state.phase = "history";
+    if (marked) { marked.removeAttribute(AP_GRID_MARK); marked = null; }
+    let historyNote;
+    try {
+      if (!opts.historyFrom || !opts.historyTo) throw new Error("the browser service sent no date range (it needs redeploying)");
+      // FreightPOP's History search fails on ranges over about 3 months, so a
+      // long range comes as several windows, searched one after another.
+      const windows = Array.isArray(opts.historyRanges) && opts.historyRanges.length
+        ? opts.historyRanges : [[opts.historyFrom, opts.historyTo]];
+      const notes = [];
+      let total = 0;
+      for (let w = 0; w < windows.length; w++) {
+        if (w > 0) {
+          erpLog(`History · window ${w + 1} of ${windows.length} · waiting 20s so FreightPOP isn't asked too fast`);
+          for (let i = 0; i < 40; i++) { await erpCheckpoint(); await sleep(500); }
+        }
+        const h = await apHistoryPhase(String(windows[w][0]), String(windows[w][1]), mark);
+        total += Number(h.rows) || 0;
+        notes.push(h.note);
+        state.counts.historyRows = total;
+      }
+      historyNote = notes.join(" · ");
+    } catch (e) {
+      if (e && e.fpxStop) throw e;
+      console.warn("[FPX-ERP] approval check, History:", e?.message || e);
+      historyNote = `History not read: ${String(e?.message || e)}`;
+      erpLog(historyNote.slice(0, 900), "warn");
+    }
+    state.done = { ok: true, note: `${approvedNote} · ${historyNote}`.slice(0, 480) };
+  } catch (e) {
+    if (e && e.fpxStop) {
+      state.done = { ok: true, stopped: true, note: approvedNote ? `${approvedNote}; History was not read.` : "Nothing was checked." };
+    } else {
+      console.warn("[FPX-ERP] approval check failed:", e?.message || e);
+      state.done = { ok: false, note: String(e?.message || e) };
+    }
+  } finally {
+    if (marked) marked.removeAttribute(AP_GRID_MARK);
+  }
+}
+
+// =====================================================================
+// GET INVOICES (hosted browser job)
+//
+// After a person has reviewed an ERP audit and picked shipments: generate the
+// same History Report, then for each picked shipment find its row and click
+// that row's GET INVOICE button. One shipment at a time, one click each.
+//
+// Started by the browser service with erpGetInvoices(optsJson); it polls
+// fpxErpPoll() for log lines, finished shipments (`results`), pause
+// requests (`pause`) and screenshot requests (`shot`), and tells this page
+// about things only it can see (a new window, a file download, a browser
+// prompt) with fpxErpNote().
+//
+// What FreightPOP does after the click is not known, so the job watches for
+// ~15 s, writes down what it saw in plain words, and only ever puts a dialog
+// away with a passive control (GI_PASSIVE, a close icon, or a lone OK on a
+// message). It never clicks anything else. A dialog that wants an answer is
+// left open and the job pauses for a person.
+// Pause / stop: as for the ERP audit pull (erpCheckpoint / humanDelay).
+// =====================================================================
+const GI_OBSERVE_STEPS = 50; // × 300 ms ≈ 15 s. Steps, not wall time: a browser prompt freezes the page.
+const GI_DIALOG_SELECTOR = ".modal.in, .modal.show, .k-window, [role='dialog'], [role='alertdialog'], .bootbox, .sweet-alert, .swal2-popup, .swal-modal, .ui-dialog, md-dialog";
+const GI_MESSAGE_SELECTOR = "#toast-container > *, .toast, .k-notification, .noty_bar, .ui-pnotify, .growl, .snackbar, .alert, [role='alert']";
+// The only button texts that are ever clicked inside a dialog.
+const GI_PASSIVE = /^(close|x|×|✕|✖|cancel|done|dismiss)$/i;
+// Clicked only when it is the one button of a plain message (no Cancel beside
+// it, no fields, no question mark).
+const GI_OK = /^(ok|okay|got it)$/i;
+const GI_ERROR_TEXT = /\b(error|failed|failure|unable to|could not|couldn't|cannot|can't|not found|invalid|denied|not authorized|unauthorized|exception|went wrong|try again)\b/i;
+const GI_BUSY_TEXT = /please wait|loading|generating|processing|in progress/i;
+// Field names the report grid may use for the shipment id. Not "Id": that is
+// an internal key and would match some other row.
+const GI_SHIPMENT_ID_FIELDS = ["ShipmentID", "ShipmentId", "shipmentId", "Shipment_ID", "Shipment_Id", "shipment_id", "ShipmentNumber", "ShipmentNo", "ShipId"];
+
+// The browser service reports what the page can't see for itself:
+// { kind: "window" } · { kind: "download", file } · { kind: "alert", text } · { kind: "confirm", text }
+function fpxErpNote(note) {
+  if (!fpxErp || fpxErp.done || !fpxErp.notes || !note) return "no job";
+  fpxErp.notes.push(note);
+  return "ok";
+}
+
+function giFatal(message) {
+  return Object.assign(new Error(message), { fpxFatal: true });
+}
+
+function giText(el) {
+  return String((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim();
+}
+
+// Visible matches, outermost only.
+function giVisible(selector) {
+  const all = [...document.querySelectorAll(selector)].filter(isVisibleForClick);
+  return all.filter((el) => !all.some((o) => o !== el && o.contains(el)));
+}
+
+function giStillOpen(el) {
+  return !!(el && el.isConnected && isVisibleForClick(el));
+}
+
+async function giWaitGone(el, ms) {
+  for (let i = 0; i < ms / 250; i++) {
+    if (!giStillOpen(el)) return true;
+    await sleep(250);
+  }
+  return !giStillOpen(el);
+}
+
+// ── Screenshot of what FreightPOP shows after the click ──
+// Only the browser service can take one: it sees `shot` in the poll, saves
+// the picture(s) and answers with fpxErpShotDone({ ok, shots: [...], error? }).
+function fpxErpShotDone(resp) {
+  if (!fpxErp) return "no job";
+  fpxErp.wantShot = null;
+  fpxErp.shotResult = resp || { ok: false, error: "empty answer" };
+  return "ok";
+}
+// ~45 s, counted in steps like GI_OBSERVE_STEPS: a browser prompt freezes the
+// page (and the browser service's polling), which must not look like "no answer".
+const GI_SHOT_STEPS = 150;
+// What a dialog says, in a form that can be stored and searched: its text,
+// its fields (label → value), its tables and its tab names. Read only.
+// The whole window a dialog element belongs to, and the documents of any
+// frames inside it that can be read (the content is often in one).
+function giDialogRoots(d) {
+  const root = d.closest(".modal, .k-window, [role='dialog'], .modal-dialog, .ui-dialog") || d;
+  const roots = [root];
+  for (const f of root.querySelectorAll("iframe")) {
+    try { if (f.contentDocument && f.contentDocument.body) { fpxWatchClicks(f.contentDocument); roots.push(f.contentDocument.body); } } catch { /* another site: not readable */ }
+  }
+  return roots;
+}
+const giDialogChars = (d) => giDialogRoots(d).reduce((n, r) => n + String(r.innerText || "").length, 0);
+
+function giReadDialog(dIn) {
+  const roots = giDialogRoots(dIn);
+  const frames = [...roots[0].querySelectorAll("iframe")].map((f) => String(f.src || "").slice(0, 300)).filter(Boolean);
+  // One reader over the window and its frames.
+  const d = {
+    querySelectorAll: (sel) => roots.flatMap((r) => [...r.querySelectorAll(sel)]),
+    querySelector: (sel) => { for (const r of roots) { const hit = r.querySelector(sel); if (hit) return hit; } return null; },
+    get innerText() { return roots.map((r) => r.innerText || "").join("\n"); },
+  };
+  const clean = (t) => String(t || "").replace(/[ \t\u00a0]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+  const fields = {};
+  for (const el of d.querySelectorAll("input, select, textarea")) {
+    if (["hidden", "button", "submit", "password", "file"].includes(el.type)) continue;
+    let label = "";
+    if (el.id) { const l = d.querySelector(`label[for="${CSS.escape(el.id)}"]`); if (l) label = clean(l.textContent); }
+    if (!label) { const box = el.closest(".form-group, .control-group, td, .row"); const l = el.closest("label") || (box ? box.querySelector("label") : null); if (l) label = clean(l.textContent); }
+    if (!label) label = el.getAttribute("placeholder") || el.getAttribute("ng-model") || el.name || el.id || "";
+    label = clean(label).slice(0, 80);
+    if (!label) continue;
+    let value = el.tagName === "SELECT" ? clean((el.options[el.selectedIndex] || {}).text) : el.type === "checkbox" || el.type === "radio" ? (el.checked ? "yes" : "no") : clean(el.value);
+    if (value === "" || (el.type === "radio" && !el.checked)) continue;
+    let key = label;
+    for (let n = 2; key in fields; n++) key = `${label} (${n})`;
+    fields[key] = value.slice(0, 2000);
+  }
+  const tables = [];
+  for (const t of d.querySelectorAll("table").slice(0, 40)) {
+    const rows = [...t.rows].slice(0, 300).map((r) => [...r.cells].map((c) => clean(c.innerText).slice(0, 500))).filter((r) => r.some(Boolean));
+    if (rows.length) tables.push(rows);
+  }
+  const tabs = [...new Set(d.querySelectorAll("[role='tab'], .nav-tabs a, .k-tabstrip-items .k-item, .k-tabstrip-items li").map((x) => clean(x.textContent)).filter(Boolean))].slice(0, 30);
+  return { url: window.location.href.slice(0, 300), frames, text: clean(d.innerText).slice(0, 300000), fields, tables, tabs };
+}
+// ── Every button inside View Shipment that only shows something ──
+// Each is opened, read, photographed and closed again, for the audit record.
+// A button that sends, creates or changes anything is never clicked: it is
+// listed in the record as left alone.
+const VB_NEVER = /e-?mail|send|generate|request|edit|save|delete|remove|cancel|void|\badd\b|submit|update|create|approve|reject|upload|\bbook\b|duplicate|\bcopy\b|return|non-?conformance|claim|dispute|pay\b|re-?rate|reship|\bship\b(?! ?date)/i;
+const VB_SHOW = /^(print\b.*|view\b.*|download\b.*|show\b.*|see\b.*|change log|(.+ )?details|documents?|(.+ )?notes?|history|track(ing)?\b.*|pod|bol|labels?|invoice|attachments?)$/i;
+// The buttons VB_SHOW allows, as the families a person can choose from when
+// starting a run. The first row that matches a label names its key. Same keys
+// and order as GET_INVOICE_BUTTONS in server/lib/getInvoice.js (a server test
+// compares the two). A choice only ever narrows what is pressed: VB_NEVER and
+// VB_SHOW are checked first, whatever was chosen.
+const VB_KEYS = [
+  ["labels_bol", "Print Shipping Labels / BOL", /^(print\b.*\b(labels?|bol)\b.*|bol|labels?)$/i],
+  ["print_docs", "Print Documents", /^print\b.*documents?\b/i],
+  ["rate_conf", "Print Rate Confirmation", /^print\b.*rate\s*conf/i],
+  ["print_other", "Other Print buttons", /^print\b/i],
+  ["view", "View buttons", /^view\b/i],
+  ["download", "Download buttons", /^download\b/i],
+  ["show", "See / Show buttons", /^(show|see)\b/i],
+  ["change_log", "Change Log", /^change log$/i],
+  ["details", "Details buttons", /details$/i],
+  ["documents", "Documents", /^documents?$/i],
+  ["notes", "Notes", /notes?$/i],
+  ["history", "History", /^history$/i],
+  ["tracking", "Tracking", /^track(ing)?\b/i],
+  ["pod", "POD", /^pod$/i],
+  ["invoice", "Invoice", /^invoice$/i],
+  ["attachments", "Attachments", /^attachments?$/i],
+];
+// The key of a button label, or null when no family covers it.
+function vbKey(label) {
+  const row = VB_KEYS.find((k) => k[2].test(label));
+  return row ? row[0] : null;
+}
+// What the job was asked to press → null for all of them, else a Set of keys
+// (empty: none). Anything that is not a list means all, as before the choice existed.
+function vbChoice(buttons) {
+  if (!Array.isArray(buttons)) return null;
+  const known = new Set(VB_KEYS.map((k) => k[0]));
+  return new Set(buttons.map((k) => String(k ?? "").trim()).filter((k) => known.has(k)));
+}
+function vbChoiceText(choice) {
+  if (!choice) return "all";
+  if (!choice.size) return "none (invoice only)";
+  return VB_KEYS.filter((k) => choice.has(k[0])).map((k) => k[1]).join(", ");
+}
+const VB_BUTTONS = "button, a, input[type='button'], [role='button'], [role='tab'], .btn, [ng-click], [onclick], .nav-tabs li, .k-tabstrip-items li";
+const VB_DIALOGS = ".modal.in, .modal.show, .k-window, [role='dialog'], [role='alertdialog'], .bootbox, .ui-dialog, .popover, .k-animation-container";
+const vbClean = (t) => String(t || "").replace(/\s+/g, " ").trim();
+const vbSeen = (el) => {
+  try {
+    if (!el.getClientRects().length) return false;
+    const st = (el.ownerDocument.defaultView || window).getComputedStyle(el);
+    return st.display !== "none" && st.visibility !== "hidden";
+  } catch { return false; }
+};
+const vbLabel = (el) => vbClean(el.tagName === "INPUT" ? el.value : (el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label"))).slice(0, 60);
+const vbSlug = (label) => label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 28) || "button";
+// The view's own buttons, innermost element per label, in page order.
+function vbFind(d) {
+  const out = [];
+  for (const root of giDialogRoots(d)) {
+    for (const el of root.querySelectorAll(VB_BUTTONS)) {
+      if (!vbSeen(el)) continue;
+      const label = vbLabel(el);
+      if (!label || label.length > 45) continue;
+      if ([...el.querySelectorAll(VB_BUTTONS)].some((k) => vbSeen(k) && vbLabel(k) === label)) continue; // its child is the button
+      if (out.some((b) => b.label.toLowerCase() === label.toLowerCase())) continue;
+      out.push({ el, label });
+    }
+  }
+  return out;
+}
+const vbOpenDialogs = (d) => giDialogRoots(d).flatMap((r) => [...r.querySelectorAll(VB_DIALOGS)]).filter(vbSeen);
+function vbReadEl(el) {
+  const clean = (t) => String(t || "").replace(/[ \t ]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+  const tables = [];
+  for (const t of [...el.querySelectorAll("table")].slice(0, 20)) {
+    const rows = [...t.rows].slice(0, 300).map((r) => [...r.cells].map((c) => clean(c.innerText).slice(0, 500))).filter((r) => r.some(Boolean));
+    if (rows.length) tables.push(rows);
+  }
+  const links = [...el.querySelectorAll("a[href]")].map((a) => ({ text: clean(a.textContent).slice(0, 80), href: String(a.href || "").slice(0, 400) })).filter((l) => /^https?:/i.test(l.href)).slice(0, 40);
+  return { text: clean(el.innerText).slice(0, 100000), tables, links };
+}
+// → [{ label, did, opened?, text?, tables?, links?, files? }] — one entry per button found.
+// choice: null presses every view-only button; a Set of VB_KEYS keys presses
+// only those. A button that was not chosen is listed and never clicked.
+async function vbRun(id, d, state, shots, choice = null) {
+  const list = [];
+  const found = vbFind(d);
+  const skipped = [];
+  let slots = 0; // a button's place among the view-only ones, chosen or not: the cap below is on the place
+  for (const b of found) {
+    if (/^(close|x|×)$/i.test(b.label)) continue;
+    if (VB_NEVER.test(b.label)) list.push({ label: b.label, did: "left alone: it sends or changes something" });
+    else if (!VB_SHOW.test(b.label)) list.push({ label: b.label, did: "left alone: not known to be view-only" });
+    else if (choice && !choice.has(vbKey(b.label))) { list.push({ label: b.label, did: "left alone: not chosen for this run", slot: slots++ }); skipped.push(b.label); }
+    else list.push({ label: b.label, did: "todo", slot: slots++ });
+  }
+  if (skipped.length) erpLog(`View Shipment · ${id} · skipped by choice: ${skipped.join(", ").slice(0, 400)}`);
+  let n = 0, stuck = 0;
+  for (const item of list) {
+    if (item.did !== "todo") continue;
+    if (stopRequested || n >= 14 || item.slot >= 14) { item.did = "not reached"; continue; }
+    // Found again each time: an earlier button may have redrawn the view.
+    const now = vbFind(d).find((x) => x.label === item.label);
+    if (!now) { item.did = "no longer on screen"; continue; }
+    n++;
+    await erpCheckpoint();
+    const had = new Set(vbOpenDialogs(d));
+    const textBefore = giDialogRoots(d).map((r) => r.innerText || "").join("\n");
+    state.notes.length = 0;
+    try { now.el.scrollIntoView({ block: "center", inline: "nearest" }); } catch { /* not needed for the click */ }
+    simulateClick(now.el);
+    let box = null, win = false, dl = false, changed = false;
+    for (let i = 0; i < 24 && !stopRequested; i++) {
+      await sleep(400);
+      for (const note of state.notes.splice(0)) { if (note.kind === "window") win = true; if (note.kind === "download") dl = true; }
+      box = vbOpenDialogs(d).filter((x) => !had.has(x)).pop() || null;
+      changed = giDialogRoots(d).map((r) => r.innerText || "").join("\n") !== textBefore;
+      if ((box || win || dl || changed) && i >= 4) break;
+    }
+    if (box) {
+      // Let it fill in before it is read.
+      let last = -1;
+      let calm = 0;
+      for (let i = 0; i < 16 && calm < 3 && !stopRequested; i++) { const len = (box.innerText || "").length; calm = len === last && len > 0 ? calm + 1 : 0; last = len; await sleep(500); }
+      Object.assign(item, vbReadEl(box));
+    } else if (changed && !win) {
+      const after = giDialogRoots(d).map((r) => r.innerText || "").join("\n");
+      const was = new Set(textBefore.split("\n").map((l) => l.trim()));
+      item.text = after.split("\n").map((l) => l.trim()).filter((l) => l && !was.has(l)).join("\n").slice(0, 100000);
+    }
+    item.opened = [win && "a new window", dl && "a file download", box && "a panel", !box && changed && "the view changed"].filter(Boolean).join(" + ") || "nothing visible";
+    item.did = "opened";
+    if (win || dl || box || changed) {
+      const r = await erpHandOffShot(id, `view-${vbSlug(item.label)}`);
+      if (r && r.ok && Array.isArray(r.shots)) { item.files = r.shots.map(String); shots.push(...item.files); }
+    }
+    erpLog(`View Shipment · ${id} · ${item.label} → ${item.opened}${item.files ? ` · ${item.files.length} file(s) saved` : ""}`);
+    if (box && vbSeen(box)) {
+      // A panel that lists files is closed only by a button that says Close or Cancel.
+      const filePanel = /document|attach|file|upload/i.test(item.label) || !!box.querySelector(".k-upload, .k-file, input[type='file']");
+      // Only a control that says Close / Cancel, or the window's own corner button.
+      // Never an icon inside a list of files: there the same "x" removes the file.
+      const closer = [...box.querySelectorAll("button, a, [role='button'], .close, .k-window-action")].filter(vbSeen)
+        .filter((x) => !fpxRemovesSomething(x))
+        .find((x) => (filePanel ? /^(close|cancel|done|dismiss)$/i.test(vbLabel(x)) : GI_PASSIVE.test(vbLabel(x))) || (!filePanel && (/(^|\s)close(\s|$)|k-window-action/i.test(String(x.className || "")) || /^close$/i.test(x.getAttribute("aria-label") || ""))));
+      const gone = async () => { for (let i = 0; i < 8 && vbSeen(box); i++) await sleep(300); return !vbSeen(box); };
+      let shut = false;
+      if (closer) { simulateClick(closer); shut = await gone(); }
+      // No Close of its own: its dismiss control, then Escape, then the button that opened it.
+      if (!shut && !filePanel) {
+        const x = [...box.querySelectorAll("[data-dismiss], [data-bs-dismiss], [aria-label='Close']")].filter(vbSeen).filter((el) => !fpxRemovesSomething(el))[0];
+        if (x) { simulateClick(x); shut = await gone(); }
+      }
+      if (!shut) {
+        for (const type of ["keydown", "keyup"]) {
+          const ev = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
+          try { box.dispatchEvent(new KeyboardEvent(type, ev)); box.ownerDocument.dispatchEvent(new KeyboardEvent(type, ev)); } catch { /* next way */ }
+        }
+        shut = await gone();
+      }
+      if (!shut) {
+        const again = vbFind(d).find((x) => x.label === item.label);
+        if (again && !box.contains(again.el)) { simulateClick(again.el); shut = await gone(); }
+      }
+      if (!shut) {
+        stuck++;
+        item.did = "opened (its panel stayed open until the view was closed)";
+        if (stuck >= 3) {
+          for (const rest of list) if (rest.did === "todo") rest.did = "not reached";
+          break;
+        }
+      }
+    }
+  }
+  return list;
+}
+
+function fpxErpTakeView() {
+  const v = fpxErp && fpxErp.viewDetail;
+  if (fpxErp) fpxErp.viewDetail = null;
+  return JSON.stringify(v || null);
+}
+
+async function erpHandOffShot(shipmentId, tag) {
+  const state = fpxErp;
+  state.shotResult = null;
+  state.wantShot = { shipment_id: String(shipmentId), ...(tag ? { tag } : {}) };
+  for (let step = 0; step < GI_SHOT_STEPS; step++) {
+    if (state.shotResult) { const r = state.shotResult; state.shotResult = null; return r; }
+    if (stopRequested) { state.wantShot = null; return { ok: false, error: "stopped" }; }
+    await sleep(300);
+  }
+  state.wantShot = null;
+  return { ok: false, noAnswer: true, error: "no answer from the browser service after 45s" };
+}
+
+// Asks the browser service to pause the job exactly as if Pause had been
+// pressed (it logs `text`), then holds here until Resume. Throws on a stop.
+// If the pause never arrives the job stops: carrying on unattended is the
+// wrong default for this job.
+async function erpAskPause(text) {
+  const state = fpxErp;
+  state.pauseSeq = (state.pauseSeq || 0) + 1;
+  state.wantPause = { id: state.pauseSeq, text: String(text) };
+  const until = Date.now() + 30000;
+  while (!fpxIsPaused()) {
+    if (stopRequested) { state.wantPause = null; throw Object.assign(new Error("Stopped by user"), { fpxStop: true }); }
+    if (Date.now() > until) {
+      state.wantPause = null;
+      throw giFatal("Asked the browser service to pause the job and it did not within 30s — stopped here rather than carry on unattended");
+    }
+    await sleep(300);
+  }
+  state.wantPause = null;
+  await erpCheckpoint();
+}
+
+// The report grid on screen: rows as { buttonRow, dataRow } (locked ↔
+// scrollable by index, as in the invoice audit), and where the Shipment ID
+// column sits in each half (-1 when its header can't be found).
+function giGrid() {
+  const grids = [...document.querySelectorAll(".k-grid")].filter(isVisibleForClick);
+  const grid = grids.find((g) => g.querySelector(".k-grid-content")) || grids[0];
+  if (!grid) return null;
+  const real = (r) => !r.classList.contains("k-no-data") && !r.classList.contains("k-grouping-row") && !r.classList.contains("k-detail-row");
+  const locked = [...grid.querySelectorAll(".k-grid-content-locked tbody tr")].filter(real);
+  const scroll = [...grid.querySelectorAll(grid.querySelector(".k-grid-content") ? ".k-grid-content tbody tr" : "tbody tr")].filter(real);
+  const pairs = locked.length
+    ? scroll.slice(0, Math.min(locked.length, scroll.length)).map((r, i) => ({ buttonRow: locked[i], dataRow: r }))
+    : scroll.map((r) => ({ buttonRow: r, dataRow: r }));
+  const colOf = (sel) => {
+    const ths = [...grid.querySelectorAll(sel)];
+    return ths.findIndex((th) => /^shipment\s*(id|#|no\.?|number)$/i.test(giText(th.querySelector("a.k-link") || th)));
+  };
+  return {
+    pairs,
+    col: colOf(grid.querySelector(".k-grid-header-wrap") ? ".k-grid-header-wrap thead tr:last-child th" : "thead tr:last-child th"),
+    lockedCol: colOf(".k-grid-header-locked thead tr:last-child th"),
+  };
+}
+
+function giReportOnScreen() {
+  return /Transactions/i.test(window.location.href) && !!giGrid();
+}
+
+// Rows on screen that are this shipment. The Shipment ID cell must read
+// exactly `id`. A match in some other cell only counts when the grid's own
+// filter has already narrowed it to this shipment (`filtered`), or when the
+// Shipment ID column could not be located and exactly one row has it.
+function giRowsFor(id, filtered) {
+  const g = giGrid();
+  if (!g) return { rows: [], onScreen: 0 };
+  const want = String(id).replace(/\s+/g, "");
+  const cellIs = (td) => !!td && td.textContent.replace(/\s+/g, "") === want;
+  const byCol = g.pairs.filter((p) =>
+    (g.col >= 0 && cellIs(p.dataRow.children[g.col])) ||
+    (g.lockedCol >= 0 && p.buttonRow !== p.dataRow && cellIs(p.buttonRow.children[g.lockedCol])));
+  if (byCol.length) return { rows: byCol, onScreen: g.pairs.length };
+  const any = g.pairs.filter((p) => [...p.dataRow.children, ...(p.buttonRow !== p.dataRow ? p.buttonRow.children : [])].some(cellIs));
+  if (filtered || (g.col < 0 && g.lockedCol < 0 && any.length === 1)) return { rows: any, onScreen: g.pairs.length };
+  return { rows: [], onScreen: g.pairs.length };
+}
+
+async function giClearFilter(st) {
+  try { await fpxFilterViaKendoApi("", [], { mode: "clear" }); } catch { /* the next lookup starts with another clear */ }
+  if (st.uiFilter) {
+    st.uiFilter = false;
+    try { await clearShipmentIdFilter(); } catch { /* same */ }
+  }
+}
+
+// Narrow the grid on screen to one shipment and return its rows.
+// → { rows, why } (rows empty when it isn't in this tab; `why` says what was tried)
+async function giFilterTo(id, st) {
+  await giClearFilter(st); // start clean: a miss must not leave the previous shipment's row
+  fpxLastInjectDetail = "";
+  let confirmed = false; // the grid itself said it now holds only this shipment
+  let filtered = false;
+  let why = "";
+  if (await fpxFilterViaKendoApi(id, GI_SHIPMENT_ID_FIELDS, { titleRe: FPX_SHIPMENT_ID_TITLE_RE })) {
+    confirmed = true;
+    filtered = true;
+  } else {
+    why = fpxLastInjectDetail || "the grid's data did not answer";
+    // "→ 0 row(s)" = the grid answered and has no such shipment. Anything
+    // else = the grid's data could not be reached: use the column's own
+    // filter box instead.
+    if (!/→ 0 row/.test(why)) {
+      await erpCheckpoint();
+      st.uiFilter = true;
+      try { filtered = (await filterGridByShipmentId(id)) === true; } catch (e) { why += ` | column filter: ${e?.message || e}`; }
+    }
+  }
+  let got = { rows: [], onScreen: 0 };
+  for (let k = 0; k < (filtered ? 12 : 3); k++) {
+    got = giRowsFor(id, confirmed);
+    if (got.rows.length) return { rows: got.rows };
+    await sleep(500);
+  }
+  if (filtered) why = `the filter ran but none of the ${got.onScreen} row(s) on screen shows this shipment id`;
+  return { rows: [], why: String(why).slice(0, 200) };
+}
+
+// The row for one shipment: the tab on screen first, then the other one.
+// → { rows } or { error }
+async function giFindRow(id, st) {
+  const tabs = [["non-parcel", "Non-Parcel"], ["parcel", "Parcel"]];
+  const order = [...tabs.filter((t) => t[0] === st.tab), ...tabs.filter((t) => t[0] !== st.tab)];
+  const tried = [];
+  for (const [type, label] of order) {
+    await erpCheckpoint();
+    if (type !== st.tab) {
+      await giClearFilter(st);
+      const before = erpGridSig();
+      if (!clickShipmentTypeTab(type)) { tried.push(`${label}: tab not found`); continue; }
+      st.tab = type;
+      await humanDelay(800, 1400);
+      if (!(await erpWaitGridSettled(before, 60))) { tried.push(`${label}: still loading after 60s`); continue; }
+    }
+    const r = await giFilterTo(id, st);
+    if (r.rows.length) return { rows: r.rows };
+    tried.push(`${label}: ${r.why}`);
+  }
+  return { error: `Not found in the report (${tried.join("; ")})` };
+}
+
+// The GET INVOICE control of a row. → { el } or { error }
+// `want` / `name`: which button (GET INVOICE unless told otherwise).
+function giFindButton(pair, want = /^getinvoices?$/, name = "Get Invoice") {
+  const rows = pair.buttonRow === pair.dataRow ? [pair.dataRow] : [pair.buttonRow, pair.dataRow];
+  const label = (b) => String(b.textContent || b.value || b.title || b.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+  const all = [];
+  for (const row of rows) for (const b of row.querySelectorAll("a, button, input[type='button'], input[type='submit'], [role='button']")) all.push(b);
+  const hit = all.find((b) => want.test(label(b).toLowerCase().replace(/[^a-z]/g, "")));
+  if (!hit) {
+    const texts = [...new Set(all.map(label).filter(Boolean))].slice(0, 8);
+    return { error: `No ${name} button on this row (buttons: ${texts.join(", ") || "none"})` };
+  }
+  if (hit.disabled || hit.hasAttribute("disabled") || hit.getAttribute("aria-disabled") === "true" || /(^|\s)(disabled|k-state-disabled)(\s|$)/.test(String(hit.className || ""))) {
+    return { error: `The ${name} button is disabled on this row` };
+  }
+  if (!isVisibleForClick(hit)) return { error: `The ${name} button is hidden on this row` };
+  return { el: hit, text: label(hit) };
+}
+
+// What a dialog says and which of its buttons may be clicked.
+function giDescribeDialog(d) {
+  const full = giText(d);
+  const controls = [];
+  for (const el of d.querySelectorAll("button, input[type='button'], input[type='submit'], a.btn, a.k-button, .btn, .k-button, [role='button'], a.k-window-action, .close, [data-dismiss]")) {
+    if (!isVisibleForClick(el) || controls.some((c) => c.el.contains(el))) continue;
+    const text = String(el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").replace(/\s+/g, " ").trim();
+    const windowAction = el.matches(".k-window-action");
+    const closeIcon = windowAction
+      ? !!el.querySelector(".k-i-close, .k-i-x, .k-svg-i-x") || /^close$/i.test(el.getAttribute("aria-label") || "")
+      : el.matches(".close, [data-dismiss]") && (text.length <= 1 || GI_PASSIVE.test(text));
+    if (windowAction && !closeIcon) continue; // minimise / maximise
+    const kind = closeIcon || GI_PASSIVE.test(text) ? "passive" : GI_OK.test(text) ? "ok" : "other";
+    controls.push({ el, kind, icon: closeIcon && !GI_PASSIVE.test(text), label: closeIcon && text.length <= 1 ? "X" : text || "(unlabelled button)" });
+  }
+  const passives = controls.filter((c) => c.kind === "passive");
+  const oks = controls.filter((c) => c.kind === "ok");
+  const others = controls.filter((c) => c.kind === "other");
+  const fields = [...d.querySelectorAll("input, select, textarea")].filter((el) =>
+    isVisibleForClick(el) && !el.disabled && !el.readOnly && !/^(hidden|button|submit|image|reset)$/i.test(el.type || ""));
+  const hasCancel = passives.some((c) => /^cancel$/i.test(c.label));
+  // A button that isn't purely "put this away" means a person has to choose.
+  const decision = others.length > 0 || oks.length > 1 || (oks.length === 1 && (hasCancel || fields.length > 0 || full.includes("?")));
+  const rank = (c) => (/^(close|done|dismiss)$/i.test(c.label) ? 0 : c.icon || /^(x|×|✕|✖)$/i.test(c.label) ? 1 : 2); // Cancel last
+  const passive = passives.slice().sort((a, b) => rank(a) - rank(b))[0] || null;
+  const errorMark = [...d.querySelectorAll(".text-danger, .alert-danger, .k-i-error, .swal2-error, .sa-error, .fa-exclamation-triangle, .fa-times-circle")].some(isVisibleForClick);
+  return {
+    text: full.slice(0, 120),
+    buttons: controls.map((c) => c.label),
+    decision,
+    passive,                                   // Close / X / Cancel / Done — never OK
+    closer: decision ? null : passive || oks[0] || null,
+    busy: !decision && !oks.length && (GI_BUSY_TEXT.test(full) || !!d.querySelector(".progress, .k-progressbar, .spinner, .fa-spinner, .k-loading-image")),
+    error: /(^|[\s-])(error|danger)($|[\s-])/i.test(String(d.className || "")) || errorMark || GI_ERROR_TEXT.test(full.slice(0, 300)),
+  };
+}
+
+function giSnapshot() {
+  return {
+    href: window.location.href,
+    dialogs: new Set(giVisible(GI_DIALOG_SELECTOR)),
+    messages: new Map(giVisible(GI_MESSAGE_SELECTOR).map((el) => [el, giText(el)])),
+  };
+}
+
+// Watch the page after the click. Ends ~3 s after the first thing seen, or
+// after the whole ~15 s when nothing shows.
+// → { messages: Map(el → { text, error }), dialogs: Map(el → text), loading, href }
+async function giObserve(before, state) {
+  const seen = { messages: new Map(), dialogs: new Map(), loading: false, href: null };
+  let firstAt = -1;
+  for (let step = 0; step < GI_OBSERVE_STEPS; step++) {
+    if (stopRequested) break;
+    const dialogs = giVisible(GI_DIALOG_SELECTOR).filter((d) => !before.dialogs.has(d));
+    for (const d of dialogs) seen.dialogs.set(d, giText(d).slice(0, 120) || seen.dialogs.get(d) || "");
+    for (const el of giVisible(GI_MESSAGE_SELECTOR)) {
+      if (dialogs.some((d) => d.contains(el))) continue;
+      const text = giText(el);
+      if (!text || before.messages.get(el) === text) continue; // was already there, unchanged
+      const had = seen.messages.get(el);
+      if (!had || text.length > had.text.length) {
+        seen.messages.set(el, { text, error: /error|danger|fail/i.test(String(el.className || "")) || GI_ERROR_TEXT.test(text) });
+      }
+    }
+    const loading = !!document.querySelector(".k-loading-mask, .k-loading-image");
+    if (loading) seen.loading = true;
+    if (window.location.href !== before.href) seen.href = window.location.href;
+    const something = seen.dialogs.size > 0 || seen.messages.size > 0 || seen.href || state.notes.length > 0;
+    if (something && firstAt < 0) firstAt = step;
+    if (firstAt >= 0 && step - firstAt >= 10 && !loading) break;
+    await sleep(300);
+  }
+  return seen;
+}
+
+// Put away every dialog the click opened. `out`: { parts, fail(text), emit(), paused, shoot() }.
+// A dialog that wants an answer, or that has no passive control, is left
+// open: the shipment is recorded as failed, the job pauses, and after Resume
+// it is closed with Close / X / Cancel if it has one — otherwise the job stops.
+async function giSettleDialogs(id, before, out) {
+  for (let round = 0; round < 4; round++) {
+    const open = giVisible(GI_DIALOG_SELECTOR).filter((d) => !before.dialogs.has(d));
+    if (!open.length) return;
+    const d = open[open.length - 1]; // the one on top
+    let info = giDescribeDialog(d);
+    if (info.busy) {
+      // A progress message: let it finish by itself (up to 45 s more).
+      for (let i = 0; i < 90 && !stopRequested && giStillOpen(d) && giDescribeDialog(d).busy; i++) await sleep(500);
+      if (!giStillOpen(d)) { out.parts.push(`"${info.text}" was shown, then went away`); continue; }
+      info = giDescribeDialog(d);
+      if (info.busy) out.fail(`Still showing "${info.text}" after a minute`);
+    }
+    if (info.error) out.fail(`Error shown: "${info.text}"`);
+    // The dialog has its final content and nothing has been closed yet.
+    if (out.shoot) await out.shoot();
+
+    let closedWith = null;
+    if (info.closer) {
+      await erpCheckpoint();
+      simulateClick(info.closer.el);
+      if (await giWaitGone(d, 5000)) closedWith = info.closer.label;
+    }
+    if (closedWith) { out.parts.push(info.error ? `closed with ${closedWith}` : `Dialog opened: "${info.text}" · closed with ${closedWith}`); continue; }
+
+    const buttons = info.buttons.join(", ") || "none";
+    out.fail(info.decision
+      ? `Needs a decision: ${info.text} — buttons: ${buttons}`
+      : `A dialog could not be closed: ${info.text} — buttons: ${buttons}`);
+    out.emit();
+    await erpAskPause(`Get Invoice · ${id} · FreightPOP is showing "${info.text}" — buttons: ${buttons}. Nothing was chosen. Press Resume to carry on: it is closed with Close or Cancel if it has one, otherwise the job stops`);
+    out.paused = true;
+    if (!giStillOpen(d)) continue; // someone dealt with it during the pause
+    const again = giDescribeDialog(d);
+    if (again.passive) {
+      simulateClick(again.passive.el);
+      if (await giWaitGone(d, 5000)) continue;
+    }
+    throw giFatal(`Stopped: FreightPOP is still showing "${again.text}" for shipment ${id} and it has no Close or Cancel button that works (buttons: ${again.buttons.join(", ") || "none"}). Close it in FreightPOP, then run the remaining shipments again`);
+  }
+  if (giVisible(GI_DIALOG_SELECTOR).some((d) => !before.dialogs.has(d))) {
+    throw giFatal(`Stopped: dialogs kept opening for shipment ${id} — look at FreightPOP, then run the remaining shipments again`);
+  }
+}
+
+// optsJson: { from, to, shipmentIds, pauseFirst, runBy, buttons } — from / to are YYYY-MM-DD.
+// buttons: the View Shipment buttons to press, as VB_KEYS keys; left out = all, [] = none.
+async function erpGetInvoices(optsJson) {
+  if (fpxErp && !fpxErp.done) return; // already running in this page
+  let opts = {};
+  try { opts = (typeof optsJson === "string" ? JSON.parse(optsJson) : optsJson) || {}; } catch { opts = {}; }
+  stopRequested = false;
+  const ids = [...new Set((Array.isArray(opts.shipmentIds) ? opts.shipmentIds : []).map((v) => String(v ?? "").trim()).filter(Boolean))];
+  const state = {
+    job: "get_invoice", lines: [], results: [], notes: [], wantPause: null, pauseSeq: 0,
+    counts: { total: ids.length, done: 0, ok: 0, failed: 0 }, done: null,
+  };
+  fpxErp = state;
+  const st = { tab: "non-parcel", uiFilter: false };
+  let shotsOn = true; // off after the browser service did not answer one screenshot request
+  const choice = vbChoice(opts.buttons); // null: every view-only button
+  const summary = () => `${erpNum(state.counts.ok)} of ${erpNum(state.counts.total)} invoice(s) clicked` +
+    (state.counts.failed ? ` · ${erpNum(state.counts.failed)} failed` : "") +
+    (state.counts.done < state.counts.total ? ` · ${erpNum(state.counts.total - state.counts.done)} not reached` : "") +
+    (choice ? ` · View Shipment buttons: ${vbChoiceText(choice).slice(0, 160)}` : "");
+
+  const record = (id, ok, note, shots) => {
+    state.results.push({ shipment_id: id, ok: !!ok, note: String(note).slice(0, 480), at: new Date().toISOString(), shots: shots || [] });
+    state.counts.done++;
+    if (ok) state.counts.ok++; else state.counts.failed++;
+    erpLog(`Get Invoice · ${id} · ${note}`, ok ? "info" : "warn");
+  };
+
+  try {
+    const mmddyyyy = (iso) => {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || "").trim());
+      return m ? `${m[2]}/${m[3]}/${m[1]}` : null;
+    };
+    const fromStr = mmddyyyy(opts.from);
+    const toStr = mmddyyyy(opts.to);
+    if (!ids.length) throw new Error("No shipments were given to get invoices for");
+    if (!fromStr || !toStr) throw new Error(`The report dates could not be read (from "${opts.from}", to "${opts.to}") — expected YYYY-MM-DD`);
+
+    const loginGone = () => giFatal("FreightPOP login expired — sign in to FreightPOP again in the hosted browser, then re-run");
+    const openReport = async () => {
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw loginGone();
+      erpLog("Opening Transactions");
+      let failNote = null;
+      const generated = await invoiceGenerateReport(fromStr, toStr, "non-parcel", "", {
+        status: (t) => dlog("[FPX-ERP]", t),
+        fail: (t) => { failNote = t; },
+        openDialog: true,
+        stoppable: true,
+        gridWaitSec: 420,
+        beforeContinue: async (dateFields) => {
+          await erpCheckpoint();
+          const f = dateFields.from ? dateFields.from.value : "";
+          const t = dateFields.to ? dateFields.to.value : "";
+          if (!f || !t) return `Could not fill the report dates (From "${f}", To "${t}")`;
+          const cust = erpCheckCustomer();
+          if (cust.error) return cust.error;
+          // The carrier filter is left exactly as FreightPOP shows it.
+          const carrier = erpFindDialogSelect("carrier", cust.select);
+          const shown = carrier ? [...carrier.selectedOptions].map((o) => o.text.replace(/\s+/g, " ").trim()).filter(Boolean).join(", ") : "";
+          erpLog(`Generate History Report · ${fromStr} to ${toStr} · ${cust.label} · carrier filter untouched${shown ? ` ("${shown}")` : ""}`);
+          if (cust.note) erpLog(cust.note, "warn");
+          await humanDelay(300, 600);
+          return null;
+        },
+        onGridWait: (sec) => {
+          if (sec === 0) erpLog("Continue pressed · waiting for the report (up to 7 min)");
+          else if (sec % 15 === 0) erpLog(`Still loading the report · ${sec}s`);
+        },
+      });
+      if (!generated) {
+        await erpCheckpoint(); // a stop ends here as "stopped", not as a failure
+        if (erpLoginExpired()) throw loginGone();
+        throw giFatal(erpReportFailure(failNote));
+      }
+      st.tab = "non-parcel";
+      st.uiFilter = false;
+    };
+
+    // One shipment. → true when the job paused for a person along the way.
+    // A second record for the shipment: the same row's VIEW SHIPMENT, opened,
+    // photographed, and closed again. Nothing here is the shipment's failure;
+    // what happened is added to its note.
+    const viewShipment = async (id, out) => {
+      if (!shotsOn || stopRequested) return;
+      const said = [];
+      try {
+        const row = giReportOnScreen() ? giRowsFor(id, true).rows[0] : null;
+        if (!row) { out.parts.push("View Shipment: the row is no longer in the list"); return; }
+        const vb = giFindButton(row, /^viewshipments?$/, "View Shipment");
+        if (vb.error) { out.parts.push(`View Shipment: ${vb.error}`); return; }
+        await erpCheckpoint();
+        const before = giSnapshot();
+        state.notes.length = 0;
+        try { vb.el.scrollIntoView({ block: "center", inline: "nearest" }); } catch { /* not needed for the click */ }
+        simulateClick(vb.el);
+        const seen = await giObserve(before, state);
+        let shot = false;
+        const sub = {
+          parts: said, paused: false,
+          fail(text) { said.push(text); },
+          emit() {},
+          async shoot() {
+            if (shot || stopRequested) return;
+            shot = true;
+            // What the shipment view says, for the browser service to store.
+            try {
+              const d = giVisible(GI_DIALOG_SELECTOR).filter((x) => !before.dialogs.has(x)).pop();
+              if (d) {
+                // The view fills in after it opens: wait until its text has stopped growing (12 s at most).
+                let last = -1, calm = 0;
+                for (let i = 0; i < 24 && calm < 3 && !stopRequested; i++) {
+                  const n = giDialogChars(d);
+                  calm = n === last && n > 40 ? calm + 1 : 0;
+                  last = n;
+                  await sleep(500);
+                }
+                const detail = giReadDialog(d);
+                // Then every view-only button inside it, each kept with what it showed.
+                try {
+                  const extra = [];
+                  detail.buttons = await vbRun(id, d, state, extra, choice);
+                  if (extra.length) out.shots = [...out.shots, ...extra].slice(0, 40);
+                } catch (e) {
+                  if (e && (e.fpxStop || e.fpxFatal)) throw e;
+                  erpLog(`View Shipment · ${id} · its buttons could not all be opened (${String(e?.message || e).slice(0, 120)})`, "warn");
+                }
+                state.viewDetail = detail;
+              }
+            } catch (e) { if (e && (e.fpxStop || e.fpxFatal)) throw e; erpLog(`View Shipment · ${id} · could not read the view (${String(e?.message || e).slice(0, 120)})`, "warn"); }
+            const r = await erpHandOffShot(id, "view");
+            if (r && r.ok && Array.isArray(r.shots) && r.shots.length) out.shots = [...out.shots, ...r.shots.map(String)].slice(0, 40);
+            else erpLog(`View Shipment · ${id} · no screenshot (${String((r && r.error) || "nothing was captured").slice(0, 200)})`, "warn");
+          },
+        };
+        // A window or a new page gets a moment to draw before the picture.
+        if (!giVisible(GI_DIALOG_SELECTOR).some((d) => !before.dialogs.has(d))) { await sleep(2500); await sub.shoot(); }
+        for (const n of state.notes.splice(0)) if (n.kind === "window") said.push("a new window opened");
+        await giSettleDialogs(id, before, sub);
+        await sub.shoot();
+        if (seen.href) {
+          said.push(`the page went to ${(window.location.hash || window.location.pathname).slice(0, 80)}`);
+          if (erpLoginExpired()) throw loginGone();
+          if (!giReportOnScreen()) {
+            history.back();
+            for (let i = 0; i < 20 && !giReportOnScreen(); i++) await sleep(500);
+          }
+        }
+        if (!giReportOnScreen()) {
+          erpLog("View Shipment left the report — generating it again", "warn");
+          await openReport();
+        }
+        if (sub.paused) out.paused = true;
+        out.parts.push(`View Shipment: ${said.join(" · ") || "captured"}`);
+      } catch (e) {
+        if (e && (e.fpxStop || e.fpxFatal)) throw e;
+        out.parts.push(`View Shipment: ${String(e?.message || e).slice(0, 160)}`);
+      }
+    };
+
+    const one = async (id) => {
+      state.shipment = String(id);
+      let clicked = false;
+      let emitted = false;
+      let shot = false;
+      const out = {
+        parts: [], failure: null, paused: false, shots: [],
+        fail(text) { if (!this.failure) this.failure = text; },
+        // One screenshot per shipment, kept with its result. Never this
+        // shipment's failure: no picture is a warning line, nothing more.
+        async shoot() {
+          if (shot || !shotsOn || stopRequested) return;
+          shot = true;
+          try {
+            const r = await erpHandOffShot(id);
+            if (r && r.ok && Array.isArray(r.shots) && r.shots.length) {
+              this.shots = r.shots.map(String).slice(0, 40);
+            } else if (r && r.noAnswer) {
+              // A browser service from before screenshots: wait for it once only.
+              shotsOn = false;
+              erpLog(`Get Invoice · ${id} · no screenshot (${r.error}) — carrying on without screenshots for the rest of this job`, "warn");
+            } else if (!r || r.error !== "stopped") {
+              erpLog(`Get Invoice · ${id} · no screenshot (${String((r && r.error) || "nothing was captured").slice(0, 200)})`, "warn");
+            }
+          } catch (e) {
+            erpLog(`Get Invoice · ${id} · no screenshot (${String(e?.message || e).slice(0, 200)})`, "warn");
+          }
+        },
+        emit() {
+          if (emitted) return;
+          emitted = true;
+          // A failure after the click says so: running it again would click twice.
+          const tail = this.failure && clicked ? "the button was clicked" : null;
+          record(id, !this.failure, [this.failure, ...this.parts, tail].filter(Boolean).join(" · ") || "Nothing visible changed", this.shots);
+        },
+      };
+      try {
+        let found = await giFindRow(id, st);
+        if (found.error) { out.fail(found.error); return false; }
+        let btn = giFindButton(found.rows[0]);
+        if (btn.error) { out.fail(btn.error); return false; }
+        await erpCheckpoint();
+        if (!btn.el.isConnected) {
+          // The grid redrew (a long pause): look the row up again.
+          found = await giFindRow(id, st);
+          if (found.error) { out.fail(found.error); return false; }
+          btn = giFindButton(found.rows[0]);
+          if (btn.error) { out.fail(btn.error); return false; }
+          await erpCheckpoint();
+        }
+        if (found.rows.length > 1) out.parts.push(`${found.rows.length} rows for this shipment — clicked the first`);
+
+        const before = giSnapshot();
+        state.notes.length = 0;
+        try { btn.el.scrollIntoView({ block: "center", inline: "nearest" }); } catch { /* not needed for the click */ }
+        // The one click of this shipment. Never repeated.
+        simulateClick(btn.el);
+        clicked = true;
+        const seen = await giObserve(before, state);
+
+        // The record of what FreightPOP showed. With a dialog open it is taken
+        // in giSettleDialogs, once a progress message has become the result and
+        // before anything is closed; with none, now, while a message is still up.
+        if (!giVisible(GI_DIALOG_SELECTOR).some((d) => !before.dialogs.has(d))) await out.shoot();
+
+        // What the browser service saw.
+        for (const n of state.notes.splice(0)) {
+          if (n.kind === "window") out.parts.push("A new window opened");
+          else if (n.kind === "download") out.parts.push(`A file downloaded${n.file ? `: ${n.file}` : ""}`);
+          else if (n.kind === "alert") {
+            out.parts.push(`Message: "${String(n.text || "").slice(0, 120)}"`);
+            if (GI_ERROR_TEXT.test(String(n.text || ""))) out.fail(`Error shown: "${String(n.text || "").slice(0, 120)}"`);
+          } else if (n.kind === "confirm") {
+            out.fail(`Needs a decision: ${String(n.text || "").slice(0, 120)} — buttons: OK, Cancel (a browser prompt; cancelled after Resume)`);
+            out.paused = true;
+          }
+        }
+        for (const m of seen.messages.values()) {
+          if (m.error) out.fail(`Error shown: "${m.text.slice(0, 120)}"`);
+          else out.parts.push(`Message: "${m.text.slice(0, 120)}"`);
+        }
+
+        for (const [d, text] of seen.dialogs) if (!giStillOpen(d)) out.parts.push(`"${text}" was shown, then went away`);
+        await giSettleDialogs(id, before, out);
+        // Only progress messages that went away by themselves: the page as it is now.
+        await out.shoot();
+
+        if (seen.href) {
+          out.parts.push(`The page went to ${(window.location.hash || window.location.pathname).slice(0, 80)}`);
+          if (erpLoginExpired()) throw loginGone();
+          if (!giReportOnScreen()) {
+            history.back();
+            for (let i = 0; i < 20 && !giReportOnScreen(); i++) await sleep(500);
+          }
+        }
+        if (!giReportOnScreen()) {
+          // Back at the grid is part of "ok". Getting the report again is the
+          // only way back; if that fails the job ends (report not loading).
+          out.fail("The page did not come back to the report by itself");
+          out.emit();
+          erpLog("The report is no longer on screen — generating it again", "warn");
+          await openReport();
+        } else if (!out.parts.length && !out.failure) {
+          // Nothing appeared: say whether the row itself changed.
+          const now = giRowsFor(id, true).rows[0];
+          const nowBtn = now ? giFindButton(now) : null;
+          if (!now) out.parts.push(seen.loading ? "The list reloaded and the row is no longer in it" : "The row is no longer in the list");
+          else if (nowBtn.error) out.parts.push("The row no longer has a Get Invoice button");
+          else if (nowBtn.text !== btn.text) out.parts.push(`The button now reads "${nowBtn.text}"`);
+          else if (seen.loading) out.parts.push("The list reloaded");
+        }
+        if (!out.failure) await viewShipment(id, out);
+        return out.paused;
+      } catch (e) {
+        if (e && (e.fpxStop || e.fpxFatal)) {
+          if (clicked) out.fail(e.fpxStop ? "Stopped before the result could be checked" : String(e.message));
+          throw e;
+        }
+        // Anything else is this shipment's failure, not the job's.
+        out.fail(`${clicked ? "Clicked, then: " : ""}${e?.message || e}`);
+        return out.paused;
+      } finally {
+        // A shipment that was clicked always gets its line, stop or not.
+        if (clicked || out.failure) out.emit();
+      }
+    };
+
+    erpLog(`View Shipment buttons chosen: ${vbChoiceText(choice)}`);
+    await openReport();
+    erpLog(`Report on screen · ${erpNum(ids.length)} shipment(s) to do, one at a time`);
+
+    for (let i = 0; i < ids.length; i++) {
+      await erpCheckpoint();
+      if (erpLoginExpired()) throw loginGone();
+      if (!giReportOnScreen()) {
+        erpLog("The report is no longer on screen — generating it again", "warn");
+        await openReport();
+      }
+      const failedBefore = state.counts.failed;
+      const paused = await one(ids[i]);
+      const left = ids.length - i - 1;
+      if (i === 0 && opts.pauseFirst && left > 0 && !paused) {
+        await erpAskPause(state.counts.failed > failedBefore
+          ? `First shipment could not be done — check it in FreightPOP, then press Resume to continue with the other ${left}`
+          : `First invoice done — check it in FreightPOP, then press Resume to continue with the other ${left}`);
+      }
+      if (left > 0) await humanDelay(1500, 3000);
+    }
+
+    await giClearFilter(st);
+    erpLog(summary(), "done");
+    state.done = { ok: true, note: summary(), result: null };
+  } catch (e) {
+    if (e && e.fpxStop) {
+      state.done = { ok: true, stopped: true, result: null, note: summary() };
+    } else {
+      console.warn("[FPX-ERP] get invoices failed:", e?.message || e);
+      state.done = { ok: false, note: `${String(e?.message || e)}${state.counts.done ? ` — ${summary()}` : ""}`, result: null };
+    }
+  }
 }
 
 // =====================================================================

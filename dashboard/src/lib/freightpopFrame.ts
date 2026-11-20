@@ -37,6 +37,13 @@ export interface FrameState {
   // for the current trackingNumber. Same keying pattern: overlay fires
   // exactly once per (trackingNumber, openTrackingTick) pair.
   openTrackingTick: number;
+  // A FreightPOP page the hosted browser should go to (the user's own hosted
+  // window, never a job's), and a tick that bumps on every request so the
+  // same page can be asked for twice.
+  gotoUrl: string | null;
+  gotoTick: number;
+  // The pane takes the whole screen (no drawer beside it).
+  wide: boolean;
 }
 
 const INITIAL: FrameState = {
@@ -48,6 +55,9 @@ const INITIAL: FrameState = {
   url: null,
   autoFilterTick: 0,
   openTrackingTick: 0,
+  gotoUrl: null,
+  gotoTick: 0,
+  wide: false,
 };
 
 let state: FrameState = INITIAL;
@@ -91,6 +101,29 @@ export function showFrame(input: {
     url: state.url === input.url ? state.url : input.url,
     autoFilterTick: state.autoFilterTick,
     openTrackingTick: state.openTrackingTick,
+    gotoUrl: state.gotoUrl,
+    gotoTick: state.gotoTick,
+    wide: false,
+  };
+  publish();
+}
+
+// Opens one FreightPOP page in the user's own hosted browser window, full
+// screen. That window is separate from the scraping and invoicing job
+// windows, so a running job is never disturbed.
+export function openInFreightPop(input: { url: string; label: string; customerName?: string | null }) {
+  state = {
+    ...state,
+    visible: true,
+    // No tracking number: the overlay must not start a grid lookup on this page.
+    trackingNumber: null,
+    shipmentLabel: input.label,
+    shipmentId: null,
+    customerName: input.customerName ?? null,
+    url: state.url ?? "https://app.freightpop.com/",
+    gotoUrl: input.url,
+    gotoTick: state.gotoTick + 1,
+    wide: true,
   };
   publish();
 }

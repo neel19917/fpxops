@@ -66,13 +66,16 @@ function rowClass(r: Row): string {
   return "border-transparent text-slate-300";
 }
 
-export function ScrapeLog({ lines, total, live = false, tall = false }: {
+export function ScrapeLog({ lines, total, live = false, tall = false, onDownload, downloadLabel = "Download full log" }: {
   lines: ScrapeLogLine[];
   /** Lines in the whole run. The page only gets the latest few hundred. */
   total?: number;
   live?: boolean;
   /** Fill the parent's height (full-screen view). */
   tall?: boolean;
+  /** Fetch the full log. Default: the scrape session's running / last run. */
+  onDownload?: () => void | Promise<void>;
+  downloadLabel?: string;
 }) {
   const [query, setQuery] = useState("");
   const [showShipments, setShowShipments] = useState(false);
@@ -185,11 +188,14 @@ export function ScrapeLog({ lines, total, live = false, tall = false }: {
           {err ? <span className="text-rose-600"> · {err}</span> : null}
         </span>
         <button
-          onClick={() => { setErr(null); hostedBrowser.downloadLog().catch((e) => setErr((e as Error).message)); }}
+          onClick={() => {
+            setErr(null);
+            Promise.resolve().then(() => (onDownload ? onDownload() : hostedBrowser.downloadLog())).catch((e) => setErr((e as Error).message));
+          }}
           className="underline hover:text-slate-800"
           title="Every line of the run, unfiltered"
         >
-          Download full log
+          {downloadLabel}
         </button>
       </div>
     </div>

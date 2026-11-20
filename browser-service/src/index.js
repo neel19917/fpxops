@@ -6,7 +6,7 @@ import { poolStats, closeAll, userStatus, selfTest, resetUserProfile } from "./b
 import { summary as usageSummary, flush as flushUsage } from "./usage.js";
 import { ViewerSession, egressStats, dropAllParked } from "./session.js";
 import { startSettings, list as listSettings, update as updateSettings } from "./settings.js";
-import { startScrapeWorker, workerBusy, workerState, requestStop, fullLog } from "./worker.js";
+import { startScrapeWorker, workerBusy, workerState, requestStop, requestPause, requestResume, fullLog, LANES, startInvoicingMirror } from "./worker.js";
 import { listRuns, readRunLog, initRuns, supabaseEnabled } from "./runs.js";
 import { chat, assistantEnabled, startAssistantIndexer, assistantIndexStatus, saveChatTurn, listChats, getChat, deleteChat } from "./assistant.js";
 
@@ -20,6 +20,7 @@ function allowChat(email) {
   return true;
 }
 import { startLoginKeepAlive } from "./keepalive.js";
+import { startDetailsWorker, detailsWorkerState, detailsState, requestDetailsStop } from "./details.js";
 import { listSchedules, createSchedule, updateSchedule, deleteSchedule, runScheduleNow, startScheduler } from "./schedules.js";
 
 const sessions = new Set();
@@ -64,7 +65,11 @@ const server = http.createServer(async (req, res) => {
       sessions: sessions.size,
       // Count only — never list whose browsers are running on an unauthenticated endpoint.
       browsers: poolStats().length,
-      scrapeWorker: config.scrapeWorker ? (workerBusy() ? "busy" : "idle") : "off",
+      // One per lane: a deploy is only safe when BOTH are idle.
+      scrapeWorker: config.scrapeWorker ? (workerBusy("scrape") ? "busy" : "idle") : "off",
+      invoicingWorker: config.scrapeWorker ? (workerBusy("invoicing") ? "busy" : "idle") : "off",
+      // The read-only shipment details job, in its own browser.
+      detailsWorker: config.scrapeWorker ? detailsWorkerState() : "off",
       selfTest: selfTestResult,
       runHistory: supabaseEnabled ? "supabase" : "local",
       assistant: assistantEnabled,
@@ -74,7 +79,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404).end();
 });
 
-const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/log|runs|schedules|assistant|admin)(\/|$)/;
+const API_PATH = /^\/(stats|me|scrape\/stop|scrape\/pause|scrape\/resume|scrape\/log|details\/state|details\/stop|runs|schedules|assistant|admin)(\/|$)/;
 
 async function readJson(req, maxBytes = 64 * 1024) {
   let body = "";
@@ -114,7 +119,7 @@ async function handleApi(req, res, url, who) {
     if (resetting.has(email)) return json(res, 409, { error: "Already resetting" });
     resetting.add(email);
     try {
-      if (userStatus(email).busy) return json(res, 409, { error: "A scrape is running in this browser — stop it first" });
+      if (userStatus(email).busy) return json(res, 409, { error: "A scrape or an invoicing job is running in this browser — stop it first" });
       for (const s of [...sessions]) {
         if (s.who.email.toLowerCase() !== email) continue;
         try { s.ws.close(4011, "login reset"); } catch {}
@@ -134,6 +139,10 @@ async function handleApi(req, res, url, who) {
   if (p === "/me" && m === "GET") {
     return json(res, 200, { user: who.email, isAdmin: who.isAdmin, browser: userStatus(who.email) });
   }
+  // The read-only shipment details job (its own browser): state, progress and
+  // the last 500 log lines of the running job and of the last one; and stop.
+  if (p === "/details/state" && m === "GET") return json(res, 200, detailsState(who));
+  if (p === "/details/stop" && m === "POST") return json(res, 200, { stopping: requestDetailsStop(who) });
   if (p === "/stats" && m === "GET") {
     const days = Math.min(30, Math.max(1, Number(url.searchParams.get("days")) || 30));
     const browsers = poolStats();
@@ -156,10 +165,24 @@ async function handleApi(req, res, url, who) {
       schedules: listSchedules(who),
     });
   }
+  // Stop / pause / resume / log act on one lane: ?lane=scrape (default) or
+  // ?lane=invoicing (ERP audit pull, get invoices, approval check). The rule
+  // is the same for both, applied to that lane's running job.
+  const laneParam = url.searchParams.get("lane") || "scrape";
+  const lane = LANES.includes(laneParam) ? laneParam : null;
+  const laneCurrent = () => { const w = workerState(); return lane === "invoicing" ? w.invoicing.current : w.current; };
+  if (/^\/scrape\/(stop|pause|resume|log)$/.test(p) && !lane) return json(res, 400, { error: `Unknown lane "${laneParam}" — use ${LANES.join(" or ")}` });
   if (p === "/scrape/stop" && m === "POST") {
-    const cur = workerState().current;
+    const cur = laneCurrent();
     if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can stop this scrape" });
-    return json(res, 200, { stopping: requestStop(who.email) });
+    return json(res, 200, { stopping: requestStop(who.email, lane), lane });
+  }
+  // Pause / resume that lane's running job. Same rule as stop. The other lane is not touched.
+  if ((p === "/scrape/pause" || p === "/scrape/resume") && m === "POST") {
+    const cur = laneCurrent();
+    if (cur && cur.user !== who.email && !who.isAdmin) return json(res, 403, { error: "Only the person running it (or an admin) can pause this run" });
+    const paused = p === "/scrape/pause" ? requestPause(who.email, lane) : requestResume(who.email, lane);
+    return json(res, 200, { ok: true, paused, lane });
   }
   if (p === "/scrape/log" && m === "GET") {
     const runId = url.searchParams.get("run");
@@ -169,10 +192,10 @@ async function handleApi(req, res, url, who) {
       if (got.run.user !== who.email && !who.isAdmin) return json(res, 403, { error: "not your run" });
       return sendLog(res, `scrape-${runId.slice(0, 12)}.log`, got.text);
     }
-    const job = fullLog();
-    if (!job) return json(res, 404, { error: "no scrape log yet" });
+    const job = fullLog(lane);
+    if (!job) return json(res, 404, { error: lane === "invoicing" ? "no invoicing log yet" : "no scrape log yet" });
     if (job.user !== who.email && !who.isAdmin) return json(res, 403, { error: "not your run" });
-    return sendLog(res, `scrape-${String(job.requestId).slice(0, 12)}.log`, job.log.map((l) => `${l.t}\t${l.level}\t${l.text}`).join("\n"));
+    return sendLog(res, `${lane === "invoicing" ? "invoicing" : "scrape"}-${String(job.requestId).slice(0, 12)}.log`, job.log.map((l) => `${l.t}\t${l.level}\t${l.text}`).join("\n"));
   }
   // FreightPOP dashboard totals at the start / end of every run — company-wide
   // numbers, so everyone sees the trend (only the totals, not run details).
@@ -239,17 +262,26 @@ async function handleApi(req, res, url, who) {
     if (!message) return json(res, 400, { error: "message required" });
     const history = Array.isArray(body.history) ? body.history.slice(-60) : [];
     res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-store", "x-accel-buffering": "no" });
-    const emit = (ev) => { if (!res.writableEnded) res.write(JSON.stringify(ev) + "\n"); };
+    const emit = (ev) => { if (!res.writableEnded && !res.destroyed) { try { res.write(JSON.stringify(ev) + "\n"); } catch { /* socket gone */ } } };
     const t0 = Date.now();
+    // Stop the model call when the browser goes away (closed panel, reload).
+    const abort = new AbortController();
+    res.on("close", () => { if (!res.writableFinished) abort.abort(); });
+    // Keep-alive: a line every 10 s so proxies don't drop a quiet stream while
+    // a slow lookup runs. The dashboard ignores "ping".
+    const ping = setInterval(() => emit({ type: "ping" }), 10_000);
     try {
-      const out = await chat({ history, message, who, context: body.context || null, onEvent: emit });
+      const out = await chat({ history, message, who, context: body.context || null, onEvent: emit, signal: abort.signal });
       console.log(`[assistant] ${who.email} (stream): ${out.usage.steps} step(s) [${out.usage.tools.join(",")}], ${out.usage.input}+${out.usage.output} tok (${out.usage.cache_read} cached), cost ${(out.usage.cost_usd || 0).toFixed(4)} USD, ${Date.now() - t0}ms`);
       emit({ type: "done", ...out });
       if (body.chatId) saveChatTurn({ chatId: body.chatId, email: who.email, message, reply: out.reply, actions: out.actions, messages: out.messages })
         .catch((e) => console.warn("[assistant] history save failed:", e.message));
     } catch (e) {
-      console.warn("[assistant] stream error:", e.status || "", e.message);
+      console.warn("[assistant] stream error:", e.status || "", e.message, `${Date.now() - t0}ms`);
+      // Always a final event, so the panel never waits forever.
       emit({ type: "error", error: e.status === 429 ? "Claude is rate-limited right now — try again in a moment" : `Assistant error: ${e.message}` });
+    } finally {
+      clearInterval(ping);
     }
     return res.end();
   }
@@ -277,7 +309,7 @@ async function handleApi(req, res, url, who) {
   const sm = /^\/schedules\/([0-9a-f-]{36})(\/run)?$/.exec(p);
   if (sm) {
     const [, id, run] = sm;
-    if (run && m === "POST") return json(res, 200, runScheduleNow(who, id));
+    if (run && m === "POST") return json(res, 200, await runScheduleNow(who, id));
     if (!run && m === "PUT") return json(res, 200, { schedule: updateSchedule(who, id, await readJson(req)) });
     if (!run && m === "DELETE") { deleteSchedule(who, id); return json(res, 200, { deleted: true }); }
   }
@@ -429,7 +461,8 @@ wss.on("connection", (ws, req) => {
           if (!who) { ws.close(4001, "unauthorized"); return; }
           // Mid login-reset: have the client retry in a moment (normal backoff).
           if (resetting.has(who.email.toLowerCase())) { ws.close(1013, "login reset in progress"); return; }
-          const target = msg.target === "scrape" ? "scrape" : "tab";
+          // "scrape" / "invoicing": watch that lane's job window, read-only.
+          const target = LANES.includes(msg.target) || msg.target === "details" ? msg.target : "tab";
           // Per-user cap, server limit and registration: see admit().
           session = await withUserLock(who.email.toLowerCase(), () => admit(ws, who, target));
         } finally {
@@ -465,7 +498,7 @@ server.listen(config.port, async () => {
   console.log(`[fpx-browser] listening on :${config.port}${config.devNoAuth ? " (DEV: auth disabled)" : ""}`);
   startSettings();
   initRuns().catch((e) => console.warn("[runs] init failed:", e.message));
-  if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); }
+  if (config.scrapeWorker) { startScrapeWorker(); startScheduler(); startInvoicingMirror(); startDetailsWorker(); }
   startLoginKeepAlive();
   startAssistantIndexer();
   selfTest().then((r) => {

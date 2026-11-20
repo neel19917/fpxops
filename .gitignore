@@ -29,3 +29,6 @@ FPXpress-*.zip
 # browser-service: local Chrome profile (holds the shared FreightPOP session)
 browser-service/.profile/
 browser-service/.profiles/
+
+# Personal Claude Code settings
+.claude/settings.local.json

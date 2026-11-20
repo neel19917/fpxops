@@ -1,12 +1,43 @@
 import { useState } from "react";
 import { ModePicker, ALL_MODES, modesText } from "./ModePicker";
 import { CalendarClock, CheckCircle2, Pencil, Play, Plus, Trash2, X, XCircle } from "lucide-react";
-import { hostedBrowser, type ScheduleInput, type ScrapeSchedule } from "../lib/hostedBrowser";
+import { hostedBrowser, type ScheduleInput, type ScheduleJob, type ScheduleShipmentType, type ScrapeSchedule } from "../lib/hostedBrowser";
 import { fmtRelative } from "../lib/format";
 
-// Scheduled Refresh All runs. Each schedule runs in its owner's hosted
-// browser with their FreightPOP login; the service runs one scrape at a time,
-// so a schedule that fires during another scrape waits its turn.
+// Scheduled runs. Each schedule has a job: the tracking scrape (Refresh All),
+// an ERP lookback, or a shipment details sweep. All run in the hosted browser
+// with the owner's FreightPOP login; the service runs one tracking scrape at a
+// time, and the other two jobs run in their own lane beside it.
+
+const JOBS: { value: ScheduleJob; label: string; hint: string }[] = [
+  { value: "tracking", label: "Tracking scrape", hint: "Runs Refresh All to update tracking for your shipments." },
+  { value: "erp_lookback", label: "ERP lookback", hint: "Pulls FreightPOP's Transactions History Report for the last few months into FPX." },
+  { value: "shipment_details", label: "Shipment details", hint: "Reads the Shipment Details page of every tracked shipment." },
+];
+const SHIPMENT_TYPES: { value: ScheduleShipmentType; label: string }[] = [
+  { value: "non-parcel", label: "Non-parcel" },
+  { value: "parcel", label: "Parcel" },
+  { value: "both", label: "Both" },
+];
+const jobOf = (s: ScrapeSchedule): ScheduleJob => s.job || "tracking";
+const clampMonths = (n: unknown) => Math.min(12, Math.max(1, Math.round(Number(n)) || 1));
+
+// The chip beside a non-tracking schedule, e.g. "ERP lookback · 3 mo · Non-parcel".
+function jobChip(s: ScrapeSchedule): string | null {
+  const job = jobOf(s);
+  if (job === "shipment_details") return "Shipment details";
+  if (job !== "erp_lookback") return null;
+  const type = SHIPMENT_TYPES.find((t) => t.value === (s.shipmentType || "non-parcel"))?.label || "Non-parcel";
+  return `ERP lookback · ${clampMonths(s.months)} mo · ${type}`;
+}
+
+// " · N saved" / " · N rows" after a successful run, when the run reported it.
+function lastRunSuffix(s: ScrapeSchedule): string {
+  if (!s.lastRun?.ok || !s.lastRun.counts) return "";
+  const counts = s.lastRun.counts as unknown as Record<string, unknown>;
+  if (jobOf(s) === "erp_lookback") return typeof counts.uploaded === "number" ? ` · ${counts.uploaded.toLocaleString()} rows` : "";
+  return typeof counts.saved === "number" ? ` · ${counts.saved} saved` : "";
+}
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const WEEKDAYS = [1, 2, 3, 4, 5];
@@ -60,6 +91,22 @@ export function SchedulesPane({ schedules, me, isAdmin, onChanged }: {
     finally { setBusyId(null); }
   }
 
+  async function runNow(s: ScrapeSchedule) {
+    setBusyId(s.id); setMsg(null);
+    try {
+      const r = await hostedBrowser.runScheduleNow(s.id);
+      if (!r.queued && !r.coalesced) throw new Error(`Not queued: ${r.reason}`);
+      const text = jobOf(s) === "tracking"
+        ? "Queued — it starts as soon as nothing else is scraping."
+        : r.coalesced
+          ? "Already queued or running in the hosted browser."
+          : "Queued for the hosted browser.";
+      setMsg({ tone: "ok", text });
+      onChanged();
+    } catch (e) { setMsg({ tone: "err", text: (e as Error).message }); }
+    finally { setBusyId(null); }
+  }
+
   const mine = schedules.filter((s) => s.owner === me);
   const others = schedules.filter((s) => s.owner !== me);
 
@@ -76,7 +123,8 @@ export function SchedulesPane({ schedules, me, isAdmin, onChanged }: {
         )}
       </div>
       <p className="text-xs text-slate-500">
-        Runs Refresh All automatically, using your FreightPOP login. One scrape runs at a time — if another is running, yours starts right after.
+        Runs a job automatically, using your FreightPOP login: a tracking scrape (Refresh All), an ERP lookback, or a shipment details sweep.
+        One tracking scrape runs at a time — if another is running, yours starts right after. The other two jobs run alongside it.
       </p>
 
       {msg ? (
@@ -99,6 +147,8 @@ export function SchedulesPane({ schedules, me, isAdmin, onChanged }: {
         <ul className="divide-y divide-slate-100">
           {[...mine, ...(isAdmin ? others : [])].map((s) => {
             const own = s.owner === me;
+            const job = jobOf(s);
+            const chip = jobChip(s);
             return (
               <li key={s.id} className="py-3 flex items-start gap-3">
                 <button
@@ -115,7 +165,8 @@ export function SchedulesPane({ schedules, me, isAdmin, onChanged }: {
                   <div className="text-sm text-slate-900">
                     {s.name ? <span className="font-medium">{s.name} · </span> : null}
                     {fmtDays(s.days)} at {s.times.map(fmtTime).join(", ")} <span className="text-slate-500">({tzShort(s.tz)})</span>
-                    {s.modes?.length ? <span className="ml-1 text-[11px] px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 ring-1 ring-violet-200">{modesText(s.modes)}</span> : null}
+                    {chip ? <span className="ml-1 text-[11px] px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 ring-1 ring-sky-200">{chip}</span> : null}
+                    {job === "tracking" && s.modes?.length ? <span className="ml-1 text-[11px] px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 ring-1 ring-violet-200">{modesText(s.modes)}</span> : null}
                   </div>
                   <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap gap-x-3">
                     {!own ? <span className="text-slate-700">{s.owner}</span> : null}
@@ -124,17 +175,18 @@ export function SchedulesPane({ schedules, me, isAdmin, onChanged }: {
                       <span className={"inline-flex items-center gap-1 " + (s.lastRun.ok ? "text-emerald-700" : "text-rose-700")} title={s.lastRun.note}>
                         {s.lastRun.ok ? <CheckCircle2 className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
                         Last {s.lastRun.ok ? "ran" : "failed"} {fmtRelative(s.lastRun.finishedAt)}
-                        {s.lastRun.ok && s.lastRun.counts ? ` · ${s.lastRun.counts.saved} saved` : ""}
+                        {lastRunSuffix(s)}
                       </span>
+                    ) : s.lastFired ? (
+                      s.lastFired.queued
+                        ? <span>Queued {fmtRelative(s.lastFired.at)}</span>
+                        : <span className="text-rose-700">Not queued {fmtRelative(s.lastFired.at)}{s.lastFired.reason ? `: ${s.lastFired.reason}` : ""}</span>
                     ) : <span>Never run</span>}
                   </div>
                 </div>
                 <div className="shrink-0 flex items-center gap-1">
                   <IconBtn title="Run now" disabled={busyId === s.id}
-                    onClick={() => act(s.id, async () => {
-                      const r = await hostedBrowser.runScheduleNow(s.id);
-                      if (!r.queued) throw new Error(`Not queued: ${r.reason}`);
-                    }, "Queued — it starts as soon as nothing else is scraping.")}>
+                    onClick={() => runNow(s)}>
                     <Play className="h-3.5 w-3.5" />
                   </IconBtn>
                   {own || isAdmin ? (
@@ -175,6 +227,9 @@ function ScheduleEditor({ initial, onCancel, onSaved }: {
   const [times, setTimes] = useState<string[]>(initial?.times || ["07:00"]);
   const [tz, setTz] = useState(initial?.tz || LOCAL_TZ);
   const [modes, setModes] = useState<string[]>(initial?.modes?.length ? initial.modes : ALL_MODES);
+  const [job, setJob] = useState<ScheduleJob>(initial ? jobOf(initial) : "tracking");
+  const [months, setMonths] = useState<number>(clampMonths(initial?.months));
+  const [shipmentType, setShipmentType] = useState<ScheduleShipmentType>(initial?.shipmentType || "non-parcel");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -182,7 +237,11 @@ function ScheduleEditor({ initial, onCancel, onSaved }: {
 
   async function save() {
     setSaving(true); setErr(null);
-    const input: ScheduleInput = { name: name.trim(), days, times: times.filter(Boolean), tz, modes: modes.length === ALL_MODES.length ? null : modes };
+    const input: ScheduleInput = {
+      name: name.trim(), days, times: times.filter(Boolean), tz, job,
+      modes: job === "tracking" && modes.length !== ALL_MODES.length ? modes : null,
+      ...(job === "erp_lookback" ? { months: clampMonths(months), shipmentType } : {}),
+    };
     try {
       if (initial) await hostedBrowser.updateSchedule(initial.id, input);
       else await hostedBrowser.createSchedule(input);
@@ -195,6 +254,19 @@ function ScheduleEditor({ initial, onCancel, onSaved }: {
 
   return (
     <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 p-4 space-y-3">
+      <div>
+        <label className="text-[11px] uppercase font-semibold text-slate-500">Job</label>
+        <div className="mt-1 flex flex-wrap gap-1" role="radiogroup" aria-label="Job">
+          {JOBS.map((j) => (
+            <button key={j.value} onClick={() => setJob(j.value)} role="radio" aria-checked={job === j.value}
+              className={"text-xs px-2.5 py-1 rounded-md ring-1 " + (job === j.value ? "bg-violet-600 text-white ring-violet-600" : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50")}>
+              {j.label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-xs text-slate-500">{JOBS.find((j) => j.value === job)?.hint}</p>
+      </div>
+
       <div>
         <label className="text-[11px] uppercase font-semibold text-slate-500">Name (optional)</label>
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Morning refresh" maxLength={80}
@@ -240,13 +312,34 @@ function ScheduleEditor({ initial, onCancel, onSaved }: {
         </div>
       </div>
 
-      <div>
-        <label className="text-[11px] uppercase font-semibold text-slate-500">Shipment modes</label>
-        <div className="mt-1 flex items-center gap-2">
-          <ModePicker value={modes} onChange={setModes} size="sm" />
-          <span className="text-xs text-slate-500">{modes.length === ALL_MODES.length ? "Every mode" : `Only ${modesText(modes)}`}</span>
+      {job === "tracking" ? (
+        <div>
+          <label className="text-[11px] uppercase font-semibold text-slate-500">Shipment modes</label>
+          <div className="mt-1 flex items-center gap-2">
+            <ModePicker value={modes} onChange={setModes} size="sm" />
+            <span className="text-xs text-slate-500">{modes.length === ALL_MODES.length ? "Every mode" : `Only ${modesText(modes)}`}</span>
+          </div>
         </div>
-      </div>
+      ) : null}
+
+      {job === "erp_lookback" ? (
+        <div className="flex flex-wrap gap-4">
+          <div>
+            <label className="text-[11px] uppercase font-semibold text-slate-500">Months back</label>
+            <select value={months} onChange={(e) => setMonths(clampMonths(e.target.value))} className="mt-1 block text-sm px-2 py-1.5 rounded border border-slate-200 bg-white">
+              {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => (
+                <option key={n} value={n}>{n === 1 ? "Last month" : `Last ${n} months`}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-[11px] uppercase font-semibold text-slate-500">Shipment type</label>
+            <select value={shipmentType} onChange={(e) => setShipmentType(e.target.value as ScheduleShipmentType)} className="mt-1 block text-sm px-2 py-1.5 rounded border border-slate-200 bg-white">
+              {SHIPMENT_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+            </select>
+          </div>
+        </div>
+      ) : null}
 
       <div>
         <label className="text-[11px] uppercase font-semibold text-slate-500">Time zone</label>

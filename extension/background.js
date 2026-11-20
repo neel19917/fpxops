@@ -998,6 +998,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         : { ok: true, run_id: result.run?.id, row_count: result.row_count });
     })();
     return true;
+  } else if (msg.type === "uploadErpAudit") {
+    // ERP audit pull (hosted browser): rows of the history report that are
+    // not exported to ERP. First call carries { run, rows, ai_level }; later
+    // calls { audit_id, rows } append to the same audit.
+    (async () => {
+      const result = await callApi("/api/audits/invoice/from-history", msg.payload, msg.retry === false ? { retry: false } : {});
+      sendResponse(!result || result.error
+        ? { ok: false, error: (result && result.error) || "no response" }
+        : { ok: true, audit_id: result.audit_id, total: result.total, pending: result.pending, fields: result.fields });
+    })();
+    return true;
   } else if (msg.type === "gpAuditAiSummary") {
     (async () => {
       const stored = await chrome.storage.local.get("gpPrompts");

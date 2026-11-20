@@ -1,4 +1,4 @@
-import { Package, Sparkles, TrendingUp, ReceiptText, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail } from "lucide-react";
+import { Package, Sparkles, TrendingUp, KeyRound, LogOut, Users, Link2, ListChecks, MessageSquare, ScrollText, Settings as SettingsIcon, ShieldAlert, AlertTriangle, Activity, ChevronDown, MoreHorizontal, Database, NotebookPen, BarChart3, Puzzle, MonitorPlay, LogIn, Mail, FileCheck2, ScanSearch, Inbox } from "lucide-react";
 import { AskSearchTrigger } from "./AssistantPanel";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../lib/auth";
@@ -6,7 +6,7 @@ import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "freightpop" | "notes" | "analyses" | "gp" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude";
+export type TabId = "tracking" | "tasks" | "ops" | "scraping" | "shipment_details" | "freightpop" | "notes" | "analyses" | "gp" | "invoicing" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude" | "mailbox" | "mailbox_admin";
 
 interface TabDef {
   id: TabId;
@@ -25,14 +25,16 @@ interface TabDef {
 const ALL_TABS: TabDef[] = [
   { id: "tasks",    label: "Tasks",          Icon: ListChecks,   group: "primary" },
   { id: "emails",   label: "Email Studio",   Icon: Mail,         group: "primary" },
+  { id: "mailbox",  label: "Support Mailbox", Icon: Inbox,       group: "primary" },
   { id: "scraping", label: "Scraping",       Icon: MonitorPlay,  group: "primary" },
+  { id: "shipment_details", label: "Shipment details", Icon: ScanSearch, group: "primary" },
   { id: "ops",      label: "Ops",            Icon: Activity,     group: "primary" },
   // Tracking is out of the main row (Tasks is the landing page); it stays
   // reachable under More, and shipment links still open it.
   { id: "tracking", label: "Tracking",       Icon: Package,      group: "more" },
   { id: "freightpop", label: "FreightPOP login", Icon: LogIn,     group: "more" },
   { id: "gp",       label: "GP Audits",      Icon: TrendingUp,   group: "primary" },
-  { id: "invoice",  label: "Invoice Audits", Icon: ReceiptText,  group: "primary" },
+  { id: "invoicing", label: "Invoices",      Icon: FileCheck2,   group: "primary" },
   { id: "notes",    label: "Notes",          Icon: NotebookPen,  group: "more" },
   { id: "analyses", label: "AI Analyses",    Icon: Sparkles,     group: "more" },
   { id: "shares",   label: "Share Links",    Icon: Link2,        group: "more" },
@@ -49,6 +51,7 @@ const ALL_TABS: TabDef[] = [
   { id: "ai_export", label: "AI Export",      Icon: BarChart3,    group: "admin" },
   { id: "scrape_logs", label: "Scrape Logs",  Icon: ScrollText,   group: "admin" },
   { id: "hosted_browser", label: "Hosted Browser", Icon: MonitorPlay, group: "admin" },
+  { id: "mailbox_admin", label: "Support Mailbox", Icon: Inbox, group: "admin" },
 ];
 
 interface Props {
@@ -208,7 +211,8 @@ export function Layout({ tab, onTab, children }: Props) {
         </div>
       ) : null}
 
-      <main className="flex-1 max-w-[1500px] w-full mx-auto p-6">{children}</main>
+      {/* Shipment details is a monitor: it takes the whole viewport width. */}
+      <main className={tab === "shipment_details" ? "flex-1 w-full min-w-0 p-3 flex flex-col" : "flex-1 max-w-[1500px] w-full mx-auto p-6"}>{children}</main>
 
       {pickerOpen ? <ImpersonateModal onClose={() => setPickerOpen(false)} /> : null}
 
