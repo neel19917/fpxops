@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { CheckCircle2, Clock, Send, X } from "lucide-react";
 import type { ReactNode } from "react";
-import type { Message, Recipient, ThreadFilter, ThreadStatus } from "../../lib/mailboxApi";
+import type { Message, Party, PartyFilter, RangeDays, Recipient, ThreadFilter, ThreadStatus } from "../../lib/mailboxApi";
 
 export const FILTERS: { id: ThreadFilter; label: string }[] = [
   { id: "awaiting_reply", label: "Awaiting reply" },
@@ -9,6 +9,56 @@ export const FILTERS: { id: ThreadFilter; label: string }[] = [
   { id: "all", label: "All" },
   { id: "outbound_only", label: "Sent only" },
 ];
+
+export const RANGES: { id: RangeDays; label: string }[] = [
+  { id: "7", label: "Last 7 days" },
+  { id: "30", label: "Last 30 days" },
+  { id: "90", label: "Last 90 days" },
+  { id: "all", label: "All time" },
+];
+
+export const PARTY_FILTERS: { id: PartyFilter; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "customer", label: "Customers" },
+  { id: "carrier", label: "Carriers" },
+  { id: "internal", label: "Internal" },
+  { id: "other", label: "Other" },
+  { id: "unknown", label: "Unknown" },
+];
+
+/** Parties a person can pick (not "unknown"). */
+export const PARTY_CHOICES: { id: Exclude<Party, "unknown">; label: string }[] = [
+  { id: "customer", label: "Customer" },
+  { id: "carrier", label: "Carrier" },
+  { id: "internal", label: "Internal" },
+  { id: "other", label: "Other" },
+];
+
+export const PARTY_LABEL: Record<Party, string> = {
+  customer: "Customer", carrier: "Carrier", internal: "Internal", other: "Other", unknown: "Unknown",
+};
+
+// customer = blue, carrier = violet, internal = grey, other = slate, unknown = dashed outline.
+export const PARTY_CLASS: Record<Party, string> = {
+  customer: "bg-blue-100 text-blue-800 ring-1 ring-blue-200",
+  carrier: "bg-violet-100 text-violet-800 ring-1 ring-violet-200",
+  internal: "bg-gray-100 text-gray-700 ring-1 ring-gray-300",
+  other: "bg-slate-200 text-slate-700 ring-1 ring-slate-300",
+  unknown: "bg-transparent text-slate-500 border border-dashed border-slate-400",
+};
+
+export function asParty(p: string | null | undefined): Party {
+  return p && p in PARTY_LABEL ? (p as Party) : "unknown";
+}
+
+export function PartyTag({ party, className = "" }: { party: string | null | undefined; className?: string }) {
+  const p = asParty(party);
+  return (
+    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${PARTY_CLASS[p]} ${className}`}>
+      {PARTY_LABEL[p]}
+    </span>
+  );
+}
 
 export function ThreadStatusBadge({ status }: { status: ThreadStatus }) {
   const base = "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1 whitespace-nowrap";

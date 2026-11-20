@@ -24,12 +24,9 @@ const SharedViewPage  = lazy(() => import("./pages/SharedView").then((m) => ({ d
 const ExtLoginPage    = lazy(() => import("./pages/ExtLogin").then((m) => ({ default: m.ExtLoginPage })));
 const AnalysesPage    = lazy(() => import("./pages/Analyses").then((m) => ({ default: m.AnalysesPage })));
 const GpAuditsPage    = lazy(() => import("./pages/Audits").then((m) => ({ default: m.GpAuditsPage })));
-const InvoiceAuditsPage = lazy(() => import("./pages/Audits").then((m) => ({ default: m.InvoiceAuditsPage })));
 const InvoicesPushedPage = lazy(() => import("./pages/InvoicesPushed").then((m) => ({ default: m.InvoicesPushedPage })));
 const InvoiceReadingPage = lazy(() => import("./pages/InvoiceReading").then((m) => ({ default: m.InvoiceReadingPage })));
-const GetInvoiceRunsPage = lazy(() => import("./pages/GetInvoiceRuns").then((m) => ({ default: m.GetInvoiceRunsPage })));
-const InvoicesHubPage = lazy(() => import("./pages/InvoicesHub").then((m) => ({ default: m.InvoicesHubPage })));
-const InvoicingPage   = lazy(() => import("./pages/Invoicing").then((m) => ({ default: m.InvoicingPage })));
+const InvoicesFlowPage = lazy(() => import("./pages/InvoicesFlow").then((m) => ({ default: m.InvoicesFlowPage })));
 const ApiKeysPage     = lazy(() => import("./pages/ApiKeys").then((m) => ({ default: m.ApiKeysPage })));
 const UsersPage       = lazy(() => import("./pages/Users").then((m) => ({ default: m.UsersPage })));
 const ShareLinksPage  = lazy(() => import("./pages/ShareLinks").then((m) => ({ default: m.ShareLinksPage })));
@@ -64,7 +61,7 @@ const TAB_PATH: Record<TabId, string> = {
   notes: "/notes",
   analyses: "/analyses",
   gp: "/audits/gp",
-  invoice: "/audits/invoice",
+  invoice: "/invoices",
   invoicing: "/invoices",
   shares: "/shares",
   feedback: "/feedback",
@@ -299,12 +296,12 @@ function AuthedApp() {
             <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
-            <Route path="/audits/invoice" element={<InvoiceAuditsPage />} />
-            <Route path="/invoices" element={<InvoicesHubPage />} />
+            <Route path="/audits/invoice/*" element={<Navigate to="/invoices" replace />} />
+            <Route path="/invoices" element={<InvoicesFlowPage />} />
             <Route path="/invoices/reading" element={<InvoiceReadingPage />} />
-            <Route path="/invoices/get-invoice-runs" element={<GetInvoiceRunsPage />} />
+            <Route path="/invoices/get-invoice-runs" element={<Navigate to="/invoices" replace />} />
             <Route path="/invoicing/pushed" element={<InvoicesPushedPage />} />
-            <Route path="/invoicing" element={<InvoicingPage />} />
+            <Route path="/invoicing" element={<Navigate to="/invoices" replace />} />
             <Route path="/shares" element={<ShareLinksPage />} />
             <Route path="/feedback" element={<FeedbackPage />} />
             <Route path="/install" element={<InstallPage />} />

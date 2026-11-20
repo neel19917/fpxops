@@ -42,6 +42,8 @@ import { scrapeHistoryRouter } from "./routes/scrapeHistory.js";
 import { getInvoiceRunsRouter } from "./routes/getInvoiceRuns.js";
 import { mailboxRouter } from "./routes/mailbox.js";
 import { startMailboxSyncWorker } from "./lib/mailbox/sync.js";
+import { invoiceFlowRouter } from "./routes/invoiceFlow.js";
+import { startInvoicePipeline } from "./lib/invoicePipeline.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -154,6 +156,8 @@ api.use("/ops/lookback", lookbackRouter);
 api.use("/ops", opsRouter);
 api.use("/scrape-history", scrapeHistoryRouter);
 api.use("/get-invoice-runs", getInvoiceRunsRouter);
+// The one Invoices workflow: pull → runs → not exported → report → push.
+api.use("/invoice-flow", invoiceFlowRouter);
 api.use("/invoice-docs", invoiceDocsRouter);
 api.use("/shipment-details", shipmentDetailsRouter);
 // Support Mailbox (freightsupport@): threads, Outlook reply drafts. Admin-only
@@ -252,6 +256,16 @@ const server = app.listen(PORT, HOST, () => {
   // Syncs the connected support mailbox every 2 minutes. Never allowed to
   // take the server down.
   try { startMailboxSyncWorker(); } catch (e) { console.warn("[FPX] support mailbox worker failed to start:", e?.message || e); }
+  // Thread → shipment linker + party classifier. Lazy import so a missing or
+  // broken linker module can never take the API down.
+  try {
+    import("./lib/mailbox/linking.js")
+      .then((m) => m.startMailboxLinker())
+      .catch((e) => console.warn("[FPX] support mailbox linker failed to start:", e?.message || e));
+  } catch (e) { console.warn("[FPX] support mailbox linker failed to start:", e?.message || e); }
+  // Moves each ERP pull on to its approval check, report email and saved
+  // documents (every 2 minutes, and on each request's completion).
+  try { startInvoicePipeline(); } catch (e) { console.warn("[FPX] invoice pipeline failed to start:", e?.message || e); }
 });
 server.on("error", (e) => {
   console.error("[FPX] server.listen error:", e.stack || e);

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, FileText, Sparkles, Radar, Truck } from "lucide-react";
+import { Search, ListChecks, X, Mail, Copy, Check, Plus, CircleCheck, Circle, Trash2, Download, ChevronLeft, ChevronRight, Keyboard, ThumbsUp, ThumbsDown, NotebookPen, RefreshCw, FileText, Sparkles, Radar, Truck, Inbox } from "lucide-react";
 import { api, type ShipmentRecentDiff } from "../lib/api";
 import { fmtDateTime, fmtRelative, fmtUsd } from "../lib/format";
 import type { AiAnalysis, EmailDraft, PlainSummaryResult, Shipment, ShipmentNote, ShipmentTask, TaskStatus } from "../lib/types";
@@ -10,6 +10,7 @@ import { DrawerTabs } from "../components/shipmentDrawer/DrawerTabs";
 import { DrawerToolbar } from "../components/shipmentDrawer/DrawerToolbar";
 import { TaskBanner } from "../components/shipmentDrawer/TaskBanner";
 import { IntelTab, type SimilarBy } from "../components/shipmentDrawer/IntelTab";
+import { EmailThreadsPanel } from "../components/EmailThreadsPanel";
 import { FreightPopDetailsTab } from "../components/shipmentDrawer/FreightPopDetailsTab";
 import { ShareButton } from "../components/ShareButton";
 import { ReanalyzeModal } from "../components/ReanalyzeModal";
@@ -110,7 +111,7 @@ interface ShipmentsPageProps {
 // history as a collapsible section. Existing /tracking/:id/drafts and
 // /tracking/:id/raw URLs still resolve — asDrawerTab() rewrites them
 // to their new homes so old bookmarks don't dead-end.
-const DRAWER_TABS = ["overview", "tasks", "email", "history", "intel", "freightpop"] as const;
+const DRAWER_TABS = ["overview", "tasks", "email", "history", "intel", "freightpop", "mailbox"] as const;
 type DrawerTabId = typeof DRAWER_TABS[number];
 function asDrawerTab(s: string | null | undefined): DrawerTabId {
   // Map removed tabs to their new homes so legacy URLs / nav from
@@ -856,6 +857,7 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
         "4": "history",
         "5": "intel",
         "6": "freightpop",
+        "7": "mailbox",
       };
       if (tabMap[e.key]) {
         e.preventDefault();
@@ -1481,6 +1483,8 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
                 { id: "history", label: "Analysis", icon: Sparkles, hotkey: "4", count: drawerData.analyses.filter((a) => a.kind === "per_shipment" || a.kind === "summary").length },
                 { id: "intel", label: "Intel", icon: Radar, hotkey: "5" },
                 { id: "freightpop", label: "FreightPOP details", icon: Truck, hotkey: "6" },
+                // Support Mailbox threads linked to this shipment (loads when opened).
+                { id: "mailbox", label: "Support emails", icon: Inbox, hotkey: "7" },
               ]}
             />
           </>
@@ -1758,6 +1762,16 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
 
             {drawerTab === "freightpop" && (
               <FreightPopDetailsTab shipmentId={drawerData.shipment.shipment_id} />
+            )}
+
+            {drawerTab === "mailbox" && (
+              <Section title="Support Mailbox">
+                <EmailThreadsPanel
+                  key={drawerData.shipment.shipment_id || taskWalk?.taskId || drawerData.shipment.id}
+                  shipmentId={drawerData.shipment.shipment_id}
+                  taskId={drawerData.shipment.shipment_id ? null : taskWalk?.taskId ?? null}
+                />
+              </Section>
             )}
 
             {drawerTab === "history" && (() => {
