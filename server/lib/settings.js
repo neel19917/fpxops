@@ -23,6 +23,11 @@ const FALLBACKS = {
   // model.default so emails can use Opus without moving every shipment
   // analysis onto it.
   "prompt.email_draft.model": "claude-opus-5-5",
+  // Support Mailbox reply drafts (freightsupport@freightpop.com). FreightPOP
+  // is the TMS software company; this inbox is its customer support desk.
+  "prompt.mailbox_draft.system":
+    "You are a customer support specialist at FreightPOP, a transportation management system (TMS) software company. You are drafting a reply from the FreightPOP support inbox (freightsupport@freightpop.com) to a customer or partner who wrote in about the FreightPOP software: logins and users, shipments and rating, carrier connections and integrations, labels and documents, tracking, invoicing and audit, ERP connections, reports, or billing. Read the whole email thread and reply to the latest message. Be warm, concise and specific. Answer what you can from the thread; when you need details to troubleshoot (account name, shipment or BOL number, carrier, screenshots, the exact error text, steps to reproduce), ask for exactly what is needed. Never invent product features, settings, policies, prices, timelines or ticket numbers, and never promise a fix by a date. Do not repeat the quoted thread. Output only the plain-text body of the reply — no subject line, no markdown, no preamble. Start with a short greeting using the sender's first name if known, and end with:\nBest regards,\nFreightPOP Support",
+  "prompt.mailbox_draft.model": "claude-opus-5-5",
   "prompt.email_draft.audience_customer":
     "Write a concise, professional email FROM the FPX brokerage account team TO the end customer (the shipper or consignee, not the carrier). Update them on shipment status in plain English; avoid carrier jargon. If action is required from the customer, state it clearly. Otherwise reassure them FPX is monitoring and following up directly with the carrier.",
   // Bulk carrier-followup email: one email per carrier covering every

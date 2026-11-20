@@ -40,6 +40,8 @@ import { erpPushedRouter } from "./routes/erpPushed.js";
 import { lookbackRouter } from "./routes/lookback.js";
 import { scrapeHistoryRouter } from "./routes/scrapeHistory.js";
 import { getInvoiceRunsRouter } from "./routes/getInvoiceRuns.js";
+import { mailboxRouter } from "./routes/mailbox.js";
+import { startMailboxSyncWorker } from "./lib/mailbox/sync.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -154,6 +156,9 @@ api.use("/scrape-history", scrapeHistoryRouter);
 api.use("/get-invoice-runs", getInvoiceRunsRouter);
 api.use("/invoice-docs", invoiceDocsRouter);
 api.use("/shipment-details", shipmentDetailsRouter);
+// Support Mailbox (freightsupport@): threads, Outlook reply drafts. Admin-only
+// routes inside check the role themselves.
+api.use("/mailbox", mailboxRouter);
 app.use("/api", api);
 
 // Admin routes (admin scope OR admin role).
@@ -244,6 +249,9 @@ const server = app.listen(PORT, HOST, () => {
   if (startInvoiceDocWorker()) {
     backfillFromRecords(supabase).catch((e) => console.warn(`[FPX] invoice documents: could not queue saved files (${e?.message || e})`));
   }
+  // Syncs the connected support mailbox every 2 minutes. Never allowed to
+  // take the server down.
+  try { startMailboxSyncWorker(); } catch (e) { console.warn("[FPX] support mailbox worker failed to start:", e?.message || e); }
 });
 server.on("error", (e) => {
   console.error("[FPX] server.listen error:", e.stack || e);

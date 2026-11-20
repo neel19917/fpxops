@@ -49,6 +49,8 @@ const ScrapeLogsPage  = lazy(() => import("./pages/ScrapeLogs").then((m) => ({ d
 const FreightPopLoginPage = lazy(() => import("./pages/FreightPopLogin").then((m) => ({ default: m.FreightPopLoginPage })));
 const ScrapingPage    = lazy(() => import("./pages/Scraping").then((m) => ({ default: m.ScrapingPage })));
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
+const SupportMailboxPage = lazy(() => import("./pages/SupportMailbox"));
+const SupportMailboxAdminPage = lazy(() => import("./pages/SupportMailboxAdmin").then((m) => ({ default: m.SupportMailboxAdminPage })));
 const ShipmentDetailsMonitorPage = lazy(() => import("./pages/ShipmentDetailsMonitor").then((m) => ({ default: m.ShipmentDetailsMonitorPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
@@ -78,10 +80,12 @@ const TAB_PATH: Record<TabId, string> = {
   emails: "/email-studio",
   ai_governance: "/admin/ai-governance",
   data_flow: "/admin/data-flow",
+  mailbox: "/mailbox",
+  mailbox_admin: "/admin/support-mailbox",
   claude: "/claude",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "ai_governance", "data_flow"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "ai_governance", "data_flow", "mailbox_admin"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -97,6 +101,8 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/email-studio")) return "emails"; // old prompts URL, redirects below
   if (pathname.startsWith("/admin/ai-governance")) return "ai_governance";
   if (pathname.startsWith("/admin/data-flow")) return "data_flow";
+  if (pathname.startsWith("/admin/support-mailbox")) return "mailbox_admin";
+  if (pathname.startsWith("/mailbox")) return "mailbox";
   if (pathname.startsWith("/claude")) return "claude";
   if (pathname.startsWith("/audits/gp")) return "gp";
   // One nav entry, Invoices, covers the guided page and the screens it leads to.
@@ -289,6 +295,7 @@ function AuthedApp() {
             <Route path="/freightpop" element={<FreightPopLoginPage />} />
             <Route path="/email-studio" element={<EmailQueuePage />} />
             <Route path="/admin/email-studio" element={<EmailPromptsRedirect />} />
+            <Route path="/mailbox" element={<SupportMailboxPage />} />
             <Route path="/notes" element={<NotesRoute />} />
             <Route path="/analyses" element={<AnalysesPage />} />
             <Route path="/audits/gp" element={<GpAuditsPage />} />
@@ -316,6 +323,7 @@ function AuthedApp() {
                 <Route path="/admin/hosted-browser" element={<HostedBrowserSettingsPage />} />
                 <Route path="/admin/ai-governance" element={<AIGovernancePage />} />
                 <Route path="/admin/data-flow" element={<DataFlowPage />} />
+                <Route path="/admin/support-mailbox" element={<SupportMailboxAdminPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tasks" replace />} />
