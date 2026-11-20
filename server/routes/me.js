@@ -5,6 +5,7 @@ import { supabase } from "../lib/supabase.js";
 import { logAudit } from "../lib/audit.js";
 import { decidePendingApiKey } from "../lib/pendingApiKey.js";
 import { getSettings } from "../lib/settings.js";
+import { mailboxAccess } from "./mailbox.js";
 
 export const meRouter = Router();
 
@@ -78,6 +79,9 @@ meRouter.get("/", requireAuth({ requireEnabled: false }), async (req, res) => {
         ? { mode: req.impersonating.mode, target: req.impersonating.target }
         : null,
       pending_api_key,
+      // Effective Support Mailbox level (none | view | draft) for req.user —
+      // admins are always draft. user.mailbox_access is the stored value.
+      mailbox_access: mailboxAccess(req),
       client_config: await loadClientConfig(),
     });
   }
@@ -85,6 +89,7 @@ meRouter.get("/", requireAuth({ requireEnabled: false }), async (req, res) => {
     return res.json({
       kind: "api_key",
       apiKey: { id: req.apiKey.id, name: req.apiKey.name, scopes: req.apiKey.scopes },
+      mailbox_access: mailboxAccess(req),
     });
   }
   res.status(401).json({ error: "No identity" });

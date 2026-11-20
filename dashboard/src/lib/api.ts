@@ -1,6 +1,6 @@
 import type {
   AiAnalysis, ApiKey, AuditLogEntry, CarrierFollowupShipment, EmailDraft, Feedback, GpAudit, GpAuditRow,
-  InvoiceAudit, InvoiceAuditRow, ReanalyzeCurrent, ReanalyzePreview, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow,
+  InvoiceAudit, InvoiceAuditRow, ReanalyzeCurrent, ReanalyzePreview, Shipment, ShareLink, ShareLinkView, ShipmentNote, ShipmentTask, UserProfileRow, MailboxAccess,
   TaskBoard, TaskTriageResult, DailyDigest, DailySummaryResult, PlainSummaryResult, AnalysesStats,
 } from "./types";
 import { sb } from "./supabase";
@@ -212,7 +212,7 @@ export const api = {
   me: {
     get: () => request<{
       kind: string;
-      user?: { id: string; email: string; role: string; enabled: boolean };
+      user?: { id: string; email: string; role: string; enabled: boolean; mailbox_access?: MailboxAccess };
       pending_api_key?: string | null;
       client_config?: ClientConfig;
     }>("/api/me"),
@@ -368,7 +368,7 @@ export const api = {
   },
   users: {
     list: () => request<{ data: UserProfileRow[] }>("/api/users"),
-    update: (id: string, body: { enabled?: boolean; role?: string; full_name?: string | null; auto_open_tracking?: boolean }) =>
+    update: (id: string, body: { enabled?: boolean; role?: string; full_name?: string | null; auto_open_tracking?: boolean; mailbox_access?: MailboxAccess }) =>
       request<{ user: UserProfileRow }>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
     issueKey: (id: string) =>
       request<{

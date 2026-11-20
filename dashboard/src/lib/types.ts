@@ -319,7 +319,11 @@ export interface UserProfileRow {
   created_at: string;
   // Hosted FreightPOP lookups also open the tracking popup (false = the user clicks).
   auto_open_tracking?: boolean;
+  // Support Mailbox access. Missing (older API) = "draft". Admins always have full access.
+  mailbox_access?: MailboxAccess;
 }
+
+export type MailboxAccess = "none" | "view" | "draft";
 
 export interface ShareLink {
   id: string;

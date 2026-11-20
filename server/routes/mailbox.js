@@ -54,6 +54,40 @@ export function requireAdmin(req, res, next) {
   return res.status(403).json({ error: "Admins only" });
 }
 
+// Support Mailbox access for the caller: 'none' | 'view' | 'draft'.
+// Admins (role or admin-scope key) always draft; other API keys view; a
+// signed-in user gets their profile's mailbox_access (missing → draft, so an
+// old DB without the column never locks anyone out).
+export const MAILBOX_ACCESS_LEVELS = ["none", "view", "draft"];
+export const NO_ACCESS_ERROR = "You don't have access to the Support Mailbox. Ask an admin.";
+export const VIEW_ONLY_ERROR = "Your Support Mailbox access is view only. Ask an admin to allow drafts.";
+
+export function mailboxAccess(req) {
+  if (isAdminReq(req)) return "draft";
+  if (req?.user) {
+    const v = req.user.mailbox_access;
+    return MAILBOX_ACCESS_LEVELS.includes(v) ? v : "draft";
+  }
+  if (req?.apiKey) return "view";
+  return "none";
+}
+
+// Admin-only routes keep their own requireAdmin check; /status answers every
+// caller (with { access }) so the nav can hide itself.
+const ACCESS_EXEMPT_PATHS = new Set(["/status", "/connection", "/connection/test", "/connection/disconnect", "/sync"]);
+const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+// Router-wide guard: any route needs view or draft; any write needs draft.
+export function requireMailboxAccess(req, res, next) {
+  if (ACCESS_EXEMPT_PATHS.has(req.path)) return next();
+  const access = mailboxAccess(req);
+  if (access === "none") return res.status(403).json({ error: NO_ACCESS_ERROR, code: "mailbox_no_access" });
+  if (!READ_METHODS.has(req.method) && access !== "draft") {
+    return res.status(403).json({ error: VIEW_ONLY_ERROR, code: "mailbox_view_only" });
+  }
+  return next();
+}
+
 // Graph conversation ids contain / + = . Accept them as a URL-encoded path
 // segment (/threads/<encodeURIComponent(id)>, which Express has already
 // decoded once) or as ?id=. A query string decodes "+" to a space and
@@ -228,12 +262,17 @@ export function buildMailboxRouter(deps = {}) {
     return sortOldestFirst(data);
   }
 
-  // GET /status — any user
-  router.get("/status", async (_req, res) => {
+  router.use(requireMailboxAccess);
+
+  // GET /status — any user. `access` is the caller's level; with 'none' only
+  // connected comes back so the dashboard can hide the mailbox.
+  router.get("/status", async (req, res) => {
     try {
+      const access = mailboxAccess(req);
       const conn = await activeConnectionRow();
+      if (access === "none") return res.json({ connected: conn?.status === "connected", access });
       if (!conn) {
-        return res.json({ connected: false, mailbox: DEFAULT_MAILBOX, status: "not_connected", last_sync_at: null, backfill_done: false, message_count: 0, last_error: null });
+        return res.json({ connected: false, mailbox: DEFAULT_MAILBOX, status: "not_connected", last_sync_at: null, backfill_done: false, message_count: 0, last_error: null, access });
       }
       const { count } = await db().from("fpx_mailbox_messages")
         .select("id", { count: "exact", head: true })
@@ -246,6 +285,7 @@ export function buildMailboxRouter(deps = {}) {
         backfill_done: !!conn.backfill_done,
         message_count: count || 0,
         last_error: conn.last_error || null,
+        access,
       });
     } catch (e) {
       res.status(500).json({ error: e.message });

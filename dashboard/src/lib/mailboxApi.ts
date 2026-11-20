@@ -98,6 +98,20 @@ export interface Status {
   backfill_done: boolean;
   message_count: number;
   last_error: string | null;
+  /** The signed-in user's mailbox access (admins always "draft"). Absent on an older server. */
+  access?: MailboxAccess;
+}
+
+/** Per-user Support Mailbox access. "view" reads only; "draft" can also write. */
+export type MailboxAccess = "none" | "view" | "draft";
+
+/** A mailbox call the server refused (403): the message is the server's own. */
+export class MailboxForbiddenError extends Error {
+  readonly status = 403;
+  constructor(message: string) {
+    super(message);
+    this.name = "MailboxForbiddenError";
+  }
 }
 
 export type ConnectionTest =
@@ -223,6 +237,7 @@ async function call<T>(
   }
   if (!res.ok) {
     const body = await res.json().catch(() => null);
+    if (res.status === 403) throw new MailboxForbiddenError(body?.error ? String(body.error) : "You don't have access to do that in the Support Mailbox.");
     if (body?.error) throw new Error(String(body.error));
     throw new Error(res.status === 404 ? "The server does not have the mailbox yet. It needs its next update." : `The server returned ${res.status}`);
   }

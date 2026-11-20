@@ -6,6 +6,7 @@ import {
   getThreadsForTask,
   mailboxShipmentHref,
   mailboxThreadHref,
+  MailboxLinksForbiddenError,
   MailboxLinksUnavailableError,
   type LinkedThread,
 } from "../lib/mailboxLinks";
@@ -59,6 +60,7 @@ export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shi
   const [resolvedShipmentId, setResolvedShipmentId] = useState<string | null>(shipmentId || null);
   const [error, setError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState(false);
+  const [forbidden, setForbidden] = useState(false);
   const [loading, setLoading] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -67,7 +69,7 @@ export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shi
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 20_000);
     let mounted = true;
-    setLoading(true); setError(null); setUnavailable(false);
+    setLoading(true); setError(null); setUnavailable(false); setForbidden(false);
     const p = shipmentId
       ? getThreadsForShipment(shipmentId, ctrl.signal).then((r) => ({ shipment_id: shipmentId, threads: r.threads }))
       : getThreadsForTask(taskId as string, ctrl.signal);
@@ -79,6 +81,7 @@ export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shi
       .catch((e: unknown) => {
         if (!mounted) return;
         if (e instanceof MailboxLinksUnavailableError) { setUnavailable(true); setThreads([]); return; }
+        if (e instanceof MailboxLinksForbiddenError) { setForbidden(true); setThreads([]); return; }
         if (e instanceof DOMException && e.name === "AbortError") { setError("The server took too long to answer. Try again."); return; }
         setError(e instanceof Error ? e.message : String(e));
       })
@@ -89,7 +92,9 @@ export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shi
   const pad = compact ? "px-2 py-1.5" : "px-3 py-2";
 
   let body: ReactNode;
-  if (unavailable) {
+  if (forbidden) {
+    body = <p className="text-sm text-slate-500">You don't have access to the Support Mailbox.</p>;
+  } else if (unavailable) {
     body = <p className="text-sm text-slate-500">Emails will appear here once the mailbox update is live.</p>;
   } else if (error) {
     body = (
@@ -137,7 +142,7 @@ export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shi
   return (
     <div className="space-y-2">
       {body}
-      {resolvedShipmentId && !unavailable ? (
+      {resolvedShipmentId && !unavailable && !forbidden ? (
         <Link to={mailboxShipmentHref(resolvedShipmentId)} className="inline-flex items-center gap-1 text-xs font-medium text-sky-700 hover:text-sky-900">
           <Mail className="h-3.5 w-3.5" /> See all in Support Mailbox
         </Link>

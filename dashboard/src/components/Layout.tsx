@@ -64,7 +64,9 @@ export function Layout({ tab, onTab, children }: Props) {
   const { profile, realProfile, impersonate, stopImpersonate, signOut } = useAuth();
   const isAdmin = profile?.role === "admin";
   const isRealAdmin = realProfile?.role === "admin";
-  const visibleTabs = ALL_TABS.filter((t) => t.group !== "admin" || isAdmin);
+  // Support Mailbox is hidden for non-admins with no mailbox access (missing = "draft").
+  const noMailbox = !isAdmin && profile?.mailbox_access === "none";
+  const visibleTabs = ALL_TABS.filter((t) => (t.group !== "admin" || isAdmin) && !(t.id === "mailbox" && noMailbox));
   const primaryTabs = visibleTabs.filter((t) => t.group === "primary");
   const moreTabs = visibleTabs.filter((t) => t.group === "more");
   const adminTabs = visibleTabs.filter((t) => t.group === "admin");
