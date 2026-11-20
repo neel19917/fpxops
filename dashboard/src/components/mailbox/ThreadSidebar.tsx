@@ -3,13 +3,16 @@
 // same shipments. Links are found by the server's linker; a person can add a
 // link by hand, hide a wrong one (flagged, never deleted) or change the party.
 // With view-only access (readOnly) the values show but none of those controls do.
-import { useCallback, useState } from "react";
+// A linked shipment that is in FPX gets the email logged in its notes ("Logged on
+// shipment"); numbers found in the emails that match no FPX shipment are listed
+// under "Not in FPX" with a search link and a one-click fill of the link input.
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { ArrowRight, Link2, ListChecks, Loader2, Mail, Package, Plus, Users, X } from "lucide-react";
+import { ArrowRight, CheckCircle2, Link2, ListChecks, Loader2, Mail, Package, Plus, Search, SearchX, Users, X } from "lucide-react";
 import {
   dismissLink, getThreadContext, linkShipment, setDomainParty, setThreadParty,
-  type ContextShipment, type ContextTask, type Party, type ThreadContext,
+  type ContextShipment, type ContextTask, type NotInFpx, type Party, type ThreadContext,
 } from "../../lib/mailboxApi";
 import { useCached } from "../../lib/useCached";
 import { invalidateCache } from "../../lib/sessionCache";
@@ -23,6 +26,11 @@ export const threadContextKey = (conversationId: string) => `mailbox:context:${c
 type Choice = Exclude<Party, "unknown">;
 
 const SOURCE_LABEL: Record<string, string> = { rule: "by rule", ai: "by AI", person: "set by a person" };
+const KIND_LABEL: Record<string, string> = {
+  shipment_id: "Shipment", tracking: "PRO", bol: "BOL", po: "PO", load: "Load", reference: "Ref",
+  pickup: "Pickup", confirmation: "Conf", number: "No.",
+};
+
 const MATCHED_LABEL: Record<string, string> = {
   shipment_id: "shipment id", tracking_number: "tracking / PRO", order_number: "PO / order", reference: "reference",
   pickup_number: "pickup number", confirmation_number: "confirmation number", manual: "linked by hand",
@@ -42,6 +50,8 @@ export function ThreadSidebar({ conversationId, onOpenThread, onClose, readOnly 
   const { data, error, refresh } = useCached(threadContextKey(conversationId), fetcher);
   const [busy, setBusy] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
+  // Value + bump counter so clicking "Link" on the same number twice re-fills the input.
+  const [prefill, setPrefill] = useState<{ value: string; n: number } | null>(null);
 
   /** Runs a write, then refreshes the sidebar and the conversation list. */
   const run = async (key: string, fn: () => Promise<unknown>) => {
@@ -94,7 +104,10 @@ export function ThreadSidebar({ conversationId, onOpenThread, onClose, readOnly 
         onSetDomain={(d, p) => run(`domain:${d}`, () => setDomainParty(d, p))} />
       <ShipmentsSection shipments={data.shipments} busy={busy} readOnly={readOnly}
         onDismiss={(linkId) => run(`dismiss:${linkId}`, () => dismissLink(linkId))}
+        prefill={prefill}
         onLink={(id) => run("link", () => linkShipment(conversationId, id))} />
+      <NotInFpxSection items={data.not_in_fpx ?? []} readOnly={readOnly}
+        onLink={(value) => setPrefill((p) => ({ value, n: (p?.n ?? 0) + 1 }))} />
       <TasksSection tasks={data.tasks} />
       <RelatedSection threads={data.related_threads} onOpen={onOpenThread} />
     </div>
@@ -184,14 +197,22 @@ function PartySection({ ctx, busy, readOnly, onSetThread, onSetDomain }: {
   );
 }
 
-function ShipmentsSection({ shipments, busy, readOnly, onDismiss, onLink }: {
+function ShipmentsSection({ shipments, busy, readOnly, prefill, onDismiss, onLink }: {
   shipments: ContextShipment[];
   busy: string | null;
   readOnly: boolean;
+  prefill: { value: string; n: number } | null;
   onDismiss: (linkId: string) => Promise<boolean>;
   onLink: (shipmentId: string) => Promise<boolean>;
 }) {
   const [input, setInput] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!prefill) return;
+    setInput(prefill.value);
+    inputRef.current?.focus();
+    inputRef.current?.scrollIntoView({ block: "nearest" });
+  }, [prefill]);
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     const id = input.trim().replace(/^#/, "");
@@ -210,6 +231,7 @@ function ShipmentsSection({ shipments, busy, readOnly, onDismiss, onLink }: {
         <label className="sr-only" htmlFor="mailbox-link-shipment">Link a shipment</label>
         <input
           id="mailbox-link-shipment"
+          ref={inputRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="Link a shipment (shipment id)"
@@ -254,6 +276,13 @@ function ShipmentCard({ s, busy, onDismiss }: { s: ContextShipment; busy: boolea
           ? <><dt className="text-slate-400">Delivered</dt><dd className="text-slate-700">{fmtDate(s.delivery_date)}</dd></>
           : s.estimated_arrival ? <><dt className="text-slate-400">ETA</dt><dd className="text-slate-700">{fmtDate(s.estimated_arrival)}</dd></> : null}
       </dl>
+      {s.logged_at ? (
+        <div className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700"
+          title="This email was added to the shipment's notes">
+          <CheckCircle2 className="h-3 w-3 shrink-0" />
+          <span>Logged on shipment · <span title={fmtDateTime(s.logged_at)}>{fmtRelative(s.logged_at)}</span></span>
+        </div>
+      ) : null}
       <div className="mt-1.5 flex items-center gap-2 text-[11px] text-slate-500">
         {matched ? (
           <span className="inline-flex items-center gap-1 min-w-0" title={s.matched_text || undefined}>
@@ -266,6 +295,39 @@ function ShipmentCard({ s, busy, onDismiss }: { s: ContextShipment; busy: boolea
         </Link>
       </div>
     </li>
+  );
+}
+
+function NotInFpxSection({ items, readOnly, onLink }: {
+  items: NotInFpx[];
+  readOnly: boolean;
+  onLink: (value: string) => void;
+}) {
+  if (!items.length) return null;
+  return (
+    <section>
+      <SectionTitle icon={SearchX} count={items.length}>Not in FPX</SectionTitle>
+      <p className="mb-2 text-xs text-slate-500">Numbers in these emails that match no FPX shipment.</p>
+      <ul className="space-y-1.5">
+        {items.map((n) => (
+          <li key={n.value} className="flex items-center gap-2 text-xs">
+            <span className="min-w-0 truncate rounded-md bg-slate-100 ring-1 ring-slate-200 px-1.5 py-0.5 font-mono text-slate-800" title={`${n.kind}: ${n.value}`}>
+              <span className="text-slate-500">{KIND_LABEL[n.kind] || n.kind}</span> {n.value}
+            </span>
+            <Link to={`/tracking?q=${encodeURIComponent(n.value)}`} title={`Search shipments for ${n.value}`}
+              className="ml-auto shrink-0 inline-flex items-center gap-0.5 text-violet-700 hover:underline font-medium">
+              <Search className="h-3 w-3" /> Search
+            </Link>
+            {!readOnly ? (
+              <button type="button" onClick={() => onLink(n.value)} title="Put this number in the Link a shipment box"
+                className="shrink-0 inline-flex items-center gap-0.5 text-violet-700 hover:underline font-medium">
+                <Link2 className="h-3 w-3" /> Link
+              </button>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

@@ -168,6 +168,18 @@ export interface ContextShipment {
   matched_text: string | null;
   source: string | null;
   link_id: string;
+  /** When the link was logged as a note on the FPX shipment (null = not logged; missing on older servers). */
+  logged_at?: string | null;
+  /** The fpx_shipment_notes row written for the log. */
+  note_id?: string | null;
+  /** fpx_shipments.id (uuid) of the linked shipment. */
+  fpx_id?: string | null;
+}
+
+/** A shipment-looking number found in the emails that does not match any FPX shipment. */
+export interface NotInFpx {
+  value: string;
+  kind: string;
 }
 
 export interface ContextTask {
@@ -195,6 +207,8 @@ export interface ThreadContext {
   shipments: ContextShipment[];
   tasks: ContextTask[];
   related_threads: RelatedThread[];
+  /** Missing on older servers: treat as []. */
+  not_in_fpx?: NotInFpx[];
 }
 
 export interface ConnectInput {

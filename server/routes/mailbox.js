@@ -25,6 +25,10 @@ const MESSAGE_COLS = "id, conversation_id, folder, direction, subject, from_addr
 const DRAFT_COLS = "id, conversation_id, reply_to_message_id, web_link, body, ai_generated, reply_all, created_by, created_at";
 const THREAD_COLS = "conversation_id, subject, last_message_at, last_inbound_at, last_outbound_at, message_count, preview, last_from_name, last_from_address, participants, status, party, linked_shipment_ids, linked_count";
 const LINK_COLS = "id, connection_id, conversation_id, shipment_id, matched_on, matched_text, source, created_by, dismissed, dismissed_by, dismissed_at, created_at";
+// Added by 2026-11-20_mailbox_link_log.sql; read separately so an older DB
+// without them still serves the sidebar.
+const LINK_LOG_COLS = "note_id, logged_at";
+const isMissingColumn = (err) => /note_id|logged_at/.test(String(err?.message || "")) && /column|schema cache/i.test(String(err?.message || ""));
 const SHIPMENT_CARD_COLS = "id, shipment_id, tracking_number, customer_name, carrier_name, mode, shipment_status, pickup_date, estimated_arrival, delivery_date, origin, destination, scraped_at";
 const TASK_COLS = "id, shipment_id, tracking_number, title, status, priority, assigned_to, due_at, created_at";
 
@@ -234,6 +238,11 @@ export function buildMailboxRouter(deps = {}) {
     supabase, logAudit, logGovernance, encryptSecret, graphFetch, loadConnection, testConnection,
     publicConnection, requestSync, getBodyHtml, generateMailboxReply,
     classifyDomainChange: async (...args) => (await linkingModule()).classifyDomainChange(...args),
+    // Log links on their shipments as notes (never throws).
+    logLinksToShipments: async (opts = {}) => (await linkingModule()).logLinksToShipments({ db: d.supabase, ...opts }),
+    logUnlink: async (opts = {}) => (await linkingModule()).logUnlink({ db: d.supabase, ...opts }),
+    // "Not in FPX" numbers for a thread.
+    notInFpx: async (opts = {}) => (await linkingModule()).notInFpx({ db: d.supabase, ...opts }),
     ...deps,
   };
   const db = () => d.supabase;
@@ -579,14 +588,16 @@ export function buildMailboxRouter(deps = {}) {
       const thread = await threadRow(conn.id, conversationId, "conversation_id");
       if (!thread) return res.status(404).json({ error: "Thread not found" });
 
-      const [metaRes, linksRes, messages] = await Promise.all([
+      const linksQuery = (cols) => db().from("fpx_mailbox_links").select(cols)
+        .eq("connection_id", conn.id).eq("conversation_id", conversationId).eq("dismissed", false)
+        .order("created_at", { ascending: true });
+      let [metaRes, linksRes, messages] = await Promise.all([
         db().from("fpx_mailbox_thread_meta").select("party, party_source, party_reason, party_set_by")
           .eq("connection_id", conn.id).eq("conversation_id", conversationId).maybeSingle(),
-        db().from("fpx_mailbox_links").select(LINK_COLS)
-          .eq("connection_id", conn.id).eq("conversation_id", conversationId).eq("dismissed", false)
-          .order("created_at", { ascending: true }),
+        linksQuery(`${LINK_COLS}, ${LINK_LOG_COLS}`),
         threadMessages(conn.id, conversationId),
       ]);
+      if (linksRes.error && isMissingColumn(linksRes.error)) linksRes = await linksQuery(LINK_COLS);
       if (metaRes.error) return res.status(500).json({ error: metaRes.error.message });
       if (linksRes.error) return res.status(500).json({ error: linksRes.error.message });
       const meta = metaRes.data || null;
@@ -623,8 +634,27 @@ export function buildMailboxRouter(deps = {}) {
           matched_text: l.matched_text ?? null,
           source: l.source ?? null,
           link_id: l.id,
+          logged_at: l.logged_at ?? null,
+          note_id: l.note_id ?? null,
+          fpx_id: s.id ?? null,
         };
       });
+
+      // Shipment-looking numbers in the thread that match no FPX shipment.
+      // Best effort: a failure here never breaks the sidebar.
+      let not_in_fpx = [];
+      try {
+        const newestIn = [...messages].reverse().find((m) => m.direction === "in") || null;
+        let bodies = new Map();
+        if (newestIn?.id) {
+          const { data: b } = await db().from("fpx_mailbox_messages").select("id, body_html").eq("id", newestIn.id).maybeSingle();
+          if (b?.body_html) bodies = new Map([[b.id || newestIn.id, b.body_html]]);
+        }
+        const out = await d.notInFpx({ messages, bodies, linked: shipments });
+        not_in_fpx = Array.isArray(out) ? out : [];
+      } catch (e) {
+        console.warn(`[FPX] mailbox: not-in-FPX numbers skipped: ${e?.message || e}`);
+      }
 
       const tasks = await tasksForShipments(shipmentIds, latest);
 
@@ -659,6 +689,7 @@ export function buildMailboxRouter(deps = {}) {
         shipments,
         tasks,
         related_threads,
+        not_in_fpx,
       });
     } catch (e) {
       res.status(500).json({ error: e.message });
@@ -706,7 +737,13 @@ export function buildMailboxRouter(deps = {}) {
         before: existing ? { dismissed: true } : null, after: { shipment_id: shipmentId, dismissed: false },
         metadata: { conversation_id: conversationId, shipment_id: shipmentId, input: String(raw).trim().slice(0, 200) },
       });
-      res.json({ link });
+      // Log it on the shipment's notes right away (never fails the request).
+      let logged = 0;
+      try {
+        const r = await d.logLinksToShipments({ connectionId: conn.id, conversationId, limit: 20 });
+        logged = Number(r?.logged) || 0;
+      } catch { /* the linker tick will retry */ }
+      res.json({ link, logged });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -767,6 +804,12 @@ export function buildMailboxRouter(deps = {}) {
         .update({ dismissed: true, dismissed_by: actorOf(req), dismissed_at: new Date().toISOString() })
         .eq("id", id).select(LINK_COLS).single();
       if (uErr) return res.status(500).json({ error: uErr.message });
+      // If the link had been logged on the shipment, say it was unlinked
+      // (the first note is kept). Best effort.
+      try {
+        const { data: lg, error: lgErr } = await db().from("fpx_mailbox_links").select(LINK_LOG_COLS).eq("id", id).maybeSingle();
+        if (!lgErr && lg?.logged_at && lg?.note_id) await d.logUnlink({ link: { ...link, ...lg }, who: actorOf(req) });
+      } catch { /* ignore */ }
       logAuditSafe(req, {
         action: "dismiss", entity_type: "mailbox_link", entity_id: id,
         summary: `Unlinked shipment ${link.shipment_id} from an email thread`,
