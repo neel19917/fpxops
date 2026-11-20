@@ -168,7 +168,10 @@ export const _resetState = () => { inflight.clear(); attempted.clear(); };
 
 async function doCache(conn, row) {
   const base = `${mailboxPath(conn.mailbox)}/messages/${encodeURIComponent(row.graph_id)}/attachments`;
-  const listed = await _deps.graphFetch(conn, `${base}?$select=id,contentId,contentType,size,name,isInline`);
+  // No $select: contentId exists only on fileAttachment, and Graph rejects
+  // selecting it on the base attachment type ("Could not find a property named
+  // 'contentId'"). The plain list returns contentId and usually contentBytes.
+  const listed = await _deps.graphFetch(conn, base);
   const picked = pickAttachments(listed?.value, row.body_html);
   if (!picked.length) return;
   await ensureBucket();
@@ -176,7 +179,7 @@ async function doCache(conn, row) {
   const records = [];
   for (const a of picked) {
     try {
-      const full = await _deps.graphFetch(conn, `${base}/${encodeURIComponent(a.id)}`);
+      const full = a.contentBytes ? a : await _deps.graphFetch(conn, `${base}/${encodeURIComponent(a.id)}`);
       if (!full?.contentBytes) continue;
       const buf = Buffer.from(full.contentBytes, "base64");
       if (buf.length > MAX_IMAGE_BYTES) continue;

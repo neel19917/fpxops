@@ -63,7 +63,9 @@ function fakeGraph(attachments) {
   const calls = [];
   const fn = async (_conn, path) => {
     calls.push(path);
-    if (/\/attachments\?/.test(path)) return { value: attachments.map(({ contentBytes, ...a }) => a) };
+    // The list call (no attachment id). Like Graph, it may omit contentBytes
+    // for an item; those are fetched one by one.
+    if (/\/attachments$/.test(path)) return { value: attachments.map(({ contentBytes, listBytes, ...a }) => (listBytes ? { ...a, contentBytes } : a)) };
     const id = decodeURIComponent(path.split("/attachments/")[1]);
     const a = attachments.find((x) => x.id === id);
     return a ? { ...a } : null;
@@ -153,7 +155,7 @@ describe("cache + rewrite", () => {
     assert.equal(sb.state.uploads, 1);
     assert.equal(sb.state.rows.length, 1);
     assert.deepEqual(sb.state.rows[0], { message_id: MID, content_id: "image001.png@01da", storage_path: `${MID}/image001.png@01da`, content_type: "image/png", size: 8 });
-    assert.match(graph.calls[0], /\/users\/freightsupport%40freightpop\.com\/messages\/AAMk%2F1%3D\/attachments\?\$select=/);
+    assert.match(graph.calls[0], /\/users\/freightsupport%40freightpop\.com\/messages\/AAMk%2F1%3D\/attachments$/);
     assert.equal(graph.calls.length, 2);
     assert.equal(sb.state.signCalls[0].secs, SIGNED_URL_SECONDS);
 
@@ -164,6 +166,15 @@ describe("cache + rewrite", () => {
     assert.equal(graph.calls.length, 2);
     assert.equal(sb.state.uploads, 1);
     assert.equal(sb.state.signCalls.length, 2);
+  });
+
+  it("uses contentBytes from the list call when Graph includes them", async () => {
+    const graph = fakeGraph([{ id: "a", contentId: "logo.png@01X", contentType: "image/png", size: 8, isInline: true, contentBytes: png, listBytes: true }]);
+    _deps.graphFetch = graph;
+    const out = await withInlineImages(CONN, row(`<img src="cid:logo.png@01X">`));
+    assert.equal(out, `<img src="https://x.supabase.co/sign/${MID}/logo.png@01x?t=1">`);
+    assert.equal(graph.calls.length, 1);
+    assert.equal(sb.state.uploads, 1);
   });
 
   it("matches html cid without @domain to an attachment with one", async () => {
@@ -177,7 +188,7 @@ describe("cache + rewrite", () => {
     const gate = new Promise((r) => { release = r; });
     const inner = fakeGraph([{ id: "a", contentId: "x", contentType: "image/png", size: 8, isInline: true, contentBytes: png }]);
     let listCalls = 0;
-    _deps.graphFetch = async (c, p) => { if (/\?/.test(p)) { listCalls++; await gate; } return inner(c, p); };
+    _deps.graphFetch = async (c, p) => { if (/\/attachments$/.test(p)) { listCalls++; await gate; } return inner(c, p); };
     const r = row(`<img src="cid:x">`);
     const p1 = cacheInlineImages(CONN, r);
     const p2 = cacheInlineImages(CONN, r);
