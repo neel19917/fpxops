@@ -1,4 +1,4 @@
--- Not applied yet.
+-- Applied to production 2026-11-20.
 -- The invoice pipeline: every ERP pull (an fpx_invoice_audits row with
 -- shipment_type 'erp_pending') is a numbered run that FPX carries forward on
 -- its own: pull → approval check → report email → Get Invoice batches for the
