@@ -7,6 +7,7 @@ import {
   normalizeButtons, describeButtons,
 } from "../lib/getInvoice.js";
 import { APPROVAL_CHECK_SCOPE } from "../lib/approvalMatch.js";
+import { onRequestComplete } from "../lib/invoicePipeline.js";
 
 export const opsRouter = Router();
 
@@ -69,70 +70,77 @@ async function resetGetInvoiceRows(request, note) {
   }
 }
 
-async function requestGetInvoice(req, res) {
-  const auditId = String(req.body?.audit_id || "").trim();
-  if (!auditId) return res.status(400).json({ error: "audit_id required" });
-  const picked = normalizeShipmentIds(req.body?.shipment_ids);
-  if (picked.error) return res.status(400).json({ error: picked.error });
+// Queueing the invoicing jobs, as plain functions: the HTTP routes below call
+// them, and so does the invoice pipeline (lib/invoicePipeline.js), which has no
+// request. Each returns { ok: true, request } or { ok: false, status, error }
+// (status is the HTTP code the route answers with). `req`, when there is one,
+// is only used for the audit log and to name who asked; requestedBy overrides
+// that name (the hosted browser runs the job as that person).
+const askedBy = (req, requestedBy) => (requestedBy !== undefined ? requestedBy : (req?.user?.email || req?.apiKey?.name || null));
+const fail = (status, error) => ({ ok: false, status, error });
+
+// { auditId, shipmentIds (≤200), pauseAfterFirst = true, buttons } — buttons
+// left out (undefined/null) means every View Shipment button.
+export async function queueGetInvoice({ auditId: auditIn, shipmentIds, pauseAfterFirst = true, buttons: buttonsIn } = {}, { req = null, requestedBy } = {}) {
+  const auditId = String(auditIn || "").trim();
+  if (!auditId) return fail(400, "audit_id required");
+  const picked = normalizeShipmentIds(shipmentIds);
+  if (picked.error) return fail(400, picked.error);
   const ids = picked.ids;
-  const pauseFirst = req.body?.pause_after_first !== false; // on unless switched off
+  const pauseFirst = pauseAfterFirst !== false; // on unless switched off
   // Which View Shipment buttons to press: nothing sent means all of them.
-  const chosen = normalizeButtons(req.body?.buttons);
-  if (chosen.error) return res.status(400).json({ error: chosen.error });
+  const chosen = normalizeButtons(buttonsIn);
+  if (chosen.error) return fail(400, chosen.error);
   const buttons = chosen.buttons;
 
-  if (!isUuid(auditId)) return res.status(404).json({ error: "Invoice audit not found" });
+  if (!isUuid(auditId)) return fail(404, "Invoice audit not found");
   const { data: audit, error: aErr } = await supabase
     .from("fpx_invoice_audits").select("id, shipment_type, date_from, date_to").eq("id", auditId).maybeSingle();
-  if (aErr) return res.status(500).json({ error: aErr.message });
-  if (!audit) return res.status(404).json({ error: "Invoice audit not found" });
-  if (audit.shipment_type !== "erp_pending") {
-    return res.status(400).json({ error: "That audit is not an ERP pull" });
-  }
+  if (aErr) return fail(500, aErr.message);
+  if (!audit) return fail(404, "Invoice audit not found");
+  if (audit.shipment_type !== "erp_pending") return fail(400, "That audit is not an ERP pull");
   if (!audit.date_from || !audit.date_to) {
-    return res.status(400).json({ error: "That ERP pull has no date range, so its shipments can't be looked up. Run a new pull." });
+    return fail(400, "That ERP pull has no date range, so its shipments can't be looked up. Run a new pull.");
   }
 
   const found = await updateRowsRaw(supabase, audit.id, ids, null);
-  if (found.error) return res.status(500).json({ error: found.error });
+  if (found.error) return fail(500, found.error);
   const missing = missingShipmentIds(ids, found.rows);
   if (missing.length) {
     const shown = missing.slice(0, 5).join(", ");
     const more = missing.length > 5 ? ` and ${missing.length - 5} more` : "";
-    return res.status(400).json({
-      error: `${missing.length} shipment${missing.length === 1 ? " is" : "s are"} not in this ERP pull: ${shown}${more}`,
-    });
+    return fail(400, `${missing.length} shipment${missing.length === 1 ? " is" : "s are"} not in this ERP pull: ${shown}${more}`);
   }
 
   const { data: busy, error: bErr } = await supabase
     .from("fpx_scrape_requests").select("id")
     .eq("scope", GET_INVOICE_SCOPE).in("status", ["pending", "claimed"]).limit(1);
-  if (bErr) return res.status(500).json({ error: bErr.message });
-  if (busy?.[0]) return res.status(409).json({ error: "An invoice run is already queued or running" });
+  if (bErr) return fail(500, bErr.message);
+  if (busy?.[0]) return fail(409, "An invoice run is already queued or running");
 
-  const requestedBy = req.user?.email || req.apiKey?.name || null;
+  const by = askedBy(req, requestedBy);
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
     .insert({
       scope: GET_INVOICE_SCOPE,
       tracking_numbers: ids,
       note: buildGetInvoiceNote({ auditId: audit.id, from: audit.date_from, to: audit.date_to, pauseFirst, buttons }),
-      requested_by: requestedBy,
+      requested_by: by,
     })
     .select().single();
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) return fail(500, error.message);
   logAudit(req, {
     action: "rescrape_request",
     entity_type: "scrape_request",
     entity_id: data.id,
-    summary: `Requested Get Invoice for ${ids.length} shipment(s) · ${describeButtons(buttons)}`,
-    metadata: { scope: GET_INVOICE_SCOPE, audit_id: audit.id, count: ids.length, shipment_ids: ids, pause_after_first: pauseFirst, buttons: buttons ?? "all" },
+    summary: `Requested Get Invoice for ${ids.length} shipment(s) · ${describeButtons(buttons)}${req ? "" : " · invoice pipeline"}`,
+    metadata: { scope: GET_INVOICE_SCOPE, audit_id: audit.id, count: ids.length, shipment_ids: ids, pause_after_first: pauseFirst, buttons: buttons ?? "all", ...(req ? {} : { requested_by: by, source: "invoice_pipeline" }) },
   });
 
   // Show the chosen rows as requested. The request is already queued, so a
   // failure here is only logged.
   try {
-    const stamp = { requested_at: data.requested_at || new Date().toISOString(), requested_by: requestedBy, request_id: data.id };
+    const stamp = { requested_at: data.requested_at || new Date().toISOString(), requested_by: by, request_id: data.id };
     const marked = await updateRowsRaw(supabase, audit.id, ids, (raw) => markRequested(raw, stamp));
     if (marked.error || marked.failed) {
       console.warn(`[FPX] get_invoice ${data.id}: could not mark rows requested (${marked.error || `${marked.failed} failed`})`);
@@ -140,78 +148,98 @@ async function requestGetInvoice(req, res) {
   } catch (e) {
     console.warn(`[FPX] get_invoice ${data.id}: could not mark rows requested (${e.message})`);
   }
-  return res.json({ request: data });
+  return { ok: true, request: data };
 }
 
-async function requestApprovalCheck(req, res) {
-  const auditId = String(req.body?.audit_id || "").trim();
-  if (!auditId) return res.status(400).json({ error: "audit_id required" });
-  if (!isUuid(auditId)) return res.status(404).json({ error: "Invoice audit not found" });
+// { auditId } — one approval check at a time.
+export async function queueApprovalCheck({ auditId: auditIn } = {}, { req = null, requestedBy } = {}) {
+  const auditId = String(auditIn || "").trim();
+  if (!auditId) return fail(400, "audit_id required");
+  if (!isUuid(auditId)) return fail(404, "Invoice audit not found");
   const { data: audit, error: aErr } = await supabase
     .from("fpx_invoice_audits").select("id, shipment_type").eq("id", auditId).maybeSingle();
-  if (aErr) return res.status(500).json({ error: aErr.message });
-  if (!audit) return res.status(404).json({ error: "Invoice audit not found" });
-  if (audit.shipment_type !== "erp_pending") {
-    return res.status(400).json({ error: "That audit is not an ERP pull" });
-  }
+  if (aErr) return fail(500, aErr.message);
+  if (!audit) return fail(404, "Invoice audit not found");
+  if (audit.shipment_type !== "erp_pending") return fail(400, "That audit is not an ERP pull");
 
   const { data: busy, error: bErr } = await supabase
     .from("fpx_scrape_requests").select("id")
     .eq("scope", APPROVAL_CHECK_SCOPE).in("status", ["pending", "claimed"]).limit(1);
-  if (bErr) return res.status(500).json({ error: bErr.message });
-  if (busy?.[0]) return res.status(409).json({ error: "An approval check is already queued or running" });
+  if (bErr) return fail(500, bErr.message);
+  if (busy?.[0]) return fail(409, "An approval check is already queued or running");
 
+  const by = askedBy(req, requestedBy);
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
-    .insert({
-      scope: APPROVAL_CHECK_SCOPE,
-      note: `audit=${audit.id}`,
-      requested_by: req.user?.email || req.apiKey?.name || null,
-    })
+    .insert({ scope: APPROVAL_CHECK_SCOPE, note: `audit=${audit.id}`, requested_by: by })
     .select().single();
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) return fail(500, error.message);
   logAudit(req, {
     action: "rescrape_request",
     entity_type: "scrape_request",
     entity_id: data.id,
-    summary: "Requested approval check",
-    metadata: { scope: APPROVAL_CHECK_SCOPE, audit_id: audit.id },
+    summary: `Requested approval check${req ? "" : " · invoice pipeline"}`,
+    metadata: { scope: APPROVAL_CHECK_SCOPE, audit_id: audit.id, ...(req ? {} : { requested_by: by, source: "invoice_pipeline" }) },
   });
-  return res.json({ request: data });
+  return { ok: true, request: data };
 }
 
-opsRouter.post("/rescrape", async (req, res) => {
-  const scope = SCOPES.includes(req.body?.scope) ? req.body.scope : "all";
-  if (scope === GET_INVOICE_SCOPE) return requestGetInvoice(req, res);
-  if (scope === APPROVAL_CHECK_SCOPE) return requestApprovalCheck(req, res);
-  if (scope === "erp_audit") {
-    const rawMonths = req.body?.months;
-    const months = rawMonths === undefined || rawMonths === null || rawMonths === "" ? 3 : Number(rawMonths);
-    if (!Number.isInteger(months) || months < 1 || months > 12) {
-      return res.status(400).json({ error: "months must be a whole number from 1 to 12" });
-    }
+// { months (1-12, default 3), shipmentType ('non-parcel' | 'parcel' | 'both'),
+//   rejectIfBusy } — an ERP pull (FreightPOP's Transactions History Report).
+// A pending pull is reused ({ ok, request, coalesced: true }), as the Rescrape
+// route always did. rejectIfBusy: answer 409 instead when a pull is already
+// queued or running.
+export async function queueErpAudit({ months: rawMonths, shipmentType, rejectIfBusy = false } = {}, { req = null, requestedBy } = {}) {
+  const months = rawMonths === undefined || rawMonths === null || rawMonths === "" ? 3 : Number(rawMonths);
+  if (!Number.isInteger(months) || months < 1 || months > 12) {
+    return fail(400, "months must be a whole number from 1 to 12");
+  }
+  const type = ["parcel", "both"].includes(shipmentType) ? shipmentType : "non-parcel";
+  if (rejectIfBusy) {
+    const { data: busy, error: bErr } = await supabase
+      .from("fpx_scrape_requests").select("id")
+      .eq("scope", "erp_audit").in("status", ["pending", "claimed"]).limit(1);
+    if (bErr) return fail(500, bErr.message);
+    if (busy?.[0]) return fail(409, "A pull from FreightPOP is already queued or running");
+  } else {
     const { data: existing } = await supabase
       .from("fpx_scrape_requests")
       .select("*").eq("status", "pending").eq("scope", "erp_audit")
       .order("requested_at", { ascending: false }).limit(1);
-    if (existing?.[0]) return res.json({ request: existing[0], coalesced: true });
-    const { data, error } = await supabase
-      .from("fpx_scrape_requests")
-      .insert({
-        scope,
-        note: `months=${months};type=${["parcel", "both"].includes(req.body?.shipment_type) ? req.body.shipment_type : "non-parcel"}`,
-        requested_by: req.user?.email || req.apiKey?.name || null,
-      })
-      .select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    logAudit(req, {
-      action: "rescrape_request",
-      entity_type: "scrape_request",
-      entity_id: data.id,
-      summary: `Requested ERP audit pull (last ${months} month${months === 1 ? "" : "s"})`,
-      metadata: { scope, months },
-    });
-    return res.json({ request: data });
+    if (existing?.[0]) return { ok: true, request: existing[0], coalesced: true };
+  }
+  const { data, error } = await supabase
+    .from("fpx_scrape_requests")
+    .insert({ scope: "erp_audit", note: `months=${months};type=${type}`, requested_by: askedBy(req, requestedBy) })
+    .select().single();
+  if (error) return fail(500, error.message);
+  logAudit(req, {
+    action: "rescrape_request",
+    entity_type: "scrape_request",
+    entity_id: data.id,
+    summary: `Requested ERP audit pull (last ${months} month${months === 1 ? "" : "s"})`,
+    metadata: { scope: "erp_audit", months },
+  });
+  return { ok: true, request: data };
+}
+
+// Answers an HTTP request with a queue function's result.
+function answer(res, out) {
+  if (!out.ok) return res.status(out.status || 500).json({ error: out.error });
+  return res.json(out.coalesced ? { request: out.request, coalesced: true } : { request: out.request });
+}
+
+opsRouter.post("/rescrape", async (req, res) => {
+  const scope = SCOPES.includes(req.body?.scope) ? req.body.scope : "all";
+  if (scope === GET_INVOICE_SCOPE) {
+    return answer(res, await queueGetInvoice({
+      auditId: req.body?.audit_id, shipmentIds: req.body?.shipment_ids,
+      pauseAfterFirst: req.body?.pause_after_first, buttons: req.body?.buttons,
+    }, { req }));
+  }
+  if (scope === APPROVAL_CHECK_SCOPE) return answer(res, await queueApprovalCheck({ auditId: req.body?.audit_id }, { req }));
+  if (scope === "erp_audit") {
+    return answer(res, await queueErpAudit({ months: req.body?.months, shipmentType: req.body?.shipment_type }, { req }));
   }
   const tns = Array.isArray(req.body?.tracking_numbers)
     ? req.body.tracking_numbers.map(String).filter(Boolean)
@@ -387,7 +415,7 @@ opsRouter.post("/rescrape/:id/complete", async (req, res) => {
   // The update replaces note, which for a get-invoice run names its audit, so
   // read that first.
   const { data: before } = await supabase
-    .from("fpx_scrape_requests").select("id, scope, note, tracking_numbers")
+    .from("fpx_scrape_requests").select("id, scope, status, note, tracking_numbers, requested_at, requested_by, claimed_at")
     .eq("id", req.params.id).maybeSingle();
   const { data, error } = await supabase
     .from("fpx_scrape_requests")
@@ -402,6 +430,12 @@ opsRouter.post("/rescrape/:id/complete", async (req, res) => {
     await resetGetInvoiceRows(before, status === "error"
       ? "Not run — the invoice run stopped early. Pick it again to retry."
       : "Not run in this pass. Pick it again to continue.");
+  }
+  // ERP pulls, approval checks and Get Invoice runs carry the invoice
+  // pipeline forward (approvals → report → documents). Not waited for, and it
+  // never throws.
+  if (before && INVOICING_SCOPES.includes(before.scope)) {
+    onRequestComplete(before, data).catch((e) => console.warn(`[FPX] invoice pipeline: ${e?.message || e}`));
   }
   res.json({ request: data });
 });

@@ -83,6 +83,9 @@ const FALLBACKS = {
   // Most files sent in one go. A batch that would pass ~100 MB of request is
   // split into several (the API's cap is 100,000 requests or 256 MB).
   "invoice_ocr.batch_max_docs": 200,
+  // Who gets the "Not exported to ERP" Excel after each pull (lib/invoiceReport.js).
+  // Comma-separated emails (a JSON array of strings works too).
+  "invoices.report_recipients": "isaacs@freightpop.com",
   "model.default": process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
   // Large = long prompts (≥ ~12k chars) and any board-level synthesis.
   // Bumped to Opus 5 on 2026-09-22: the tasks page moved to heavier
