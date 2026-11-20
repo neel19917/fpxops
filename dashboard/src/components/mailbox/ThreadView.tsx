@@ -1,24 +1,43 @@
 import { useCallback, useMemo, useState } from "react";
-import { ArrowLeft, ExternalLink, FileText, RefreshCw, Sparkles } from "lucide-react";
+import { ArrowLeft, ExternalLink, FileText, PanelRightClose, PanelRightOpen, RefreshCw, Sparkles } from "lucide-react";
 import { getThread, type Draft, type Message } from "../../lib/mailboxApi";
 import { useCached } from "../../lib/useCached";
-import { invalidateCache } from "../../lib/sessionCache";
+import { cachedFetch, invalidateCache } from "../../lib/sessionCache";
 import { fmtDateTime, fmtRelative } from "../../lib/format";
 import { ErrorBlock } from "../ErrorBlock";
-import { LoadingState } from "../LoadingState";
-import { MessageItem } from "./MessageItem";
+import { MessageItem, prefetchMessageBody } from "./MessageItem";
 import { ReplyComposer } from "./ReplyComposer";
-import { ThreadStatusBadge, Toast, waitingFor } from "./shared";
+import { PartyTag, ThreadStatusBadge, Toast, waitingFor } from "./shared";
 
 export const threadCacheKey = (conversationId: string) => `mailbox:thread:${conversationId}`;
+
+/** A detail fetched less than this long ago is not asked for again by a prefetch. */
+const PREFETCH_FRESH_MS = 60_000;
+
+/**
+ * Warm a conversation before it is opened (first rows of a list, row hover):
+ * its detail goes into the cache, then its latest message body (the one that
+ * opens expanded). Never throws.
+ */
+export function prefetchThread(conversationId: string): void {
+  cachedFetch(threadCacheKey(conversationId), (s) => getThread(conversationId, s), { maxAgeMs: PREFETCH_FRESH_MS })
+    .then((d) => {
+      const last = d.messages[d.messages.length - 1];
+      if (last) prefetchMessageBody(last.id);
+    })
+    .catch(() => {});
+}
 
 interface Props {
   conversationId: string;
   mailbox: string | null;
   onBack: () => void;
+  /** The details sidebar (party, shipments, tasks) is showing. */
+  sidebarOpen?: boolean;
+  onToggleSidebar?: () => void;
 }
 
-export function ThreadView({ conversationId, mailbox, onBack }: Props) {
+export function ThreadView({ conversationId, mailbox, onBack, sidebarOpen, onToggleSidebar }: Props) {
   const fetcher = useCallback((signal: AbortSignal) => getThread(conversationId, signal), [conversationId]);
   const { data, error, refreshing, refresh } = useCached(threadCacheKey(conversationId), fetcher);
   const [replyToId, setReplyToId] = useState<string | null>(null);
@@ -40,7 +59,7 @@ export function ThreadView({ conversationId, mailbox, onBack }: Props) {
     return (
       <div className="p-4">
         <BackButton onBack={onBack} />
-        {error ? <ErrorBlock>{error} <button type="button" onClick={refresh} className="underline ml-1">Retry</button></ErrorBlock> : <LoadingState />}
+        {error ? <ErrorBlock>{error} <button type="button" onClick={refresh} className="underline ml-1">Retry</button></ErrorBlock> : <ThreadSkeleton />}
       </div>
     );
   }
@@ -58,9 +77,18 @@ export function ThreadView({ conversationId, mailbox, onBack }: Props) {
             className="shrink-0 p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100">
             <RefreshCw className={"h-4 w-4" + (refreshing ? " animate-spin" : "")} />
           </button>
+          {onToggleSidebar ? (
+            <button type="button" onClick={onToggleSidebar} aria-pressed={!!sidebarOpen}
+              title={sidebarOpen ? "Hide details" : "Show details: party, shipments, tasks"}
+              aria-label={sidebarOpen ? "Hide details" : "Show details"}
+              className={"shrink-0 p-1 rounded hover:bg-slate-100 " + (sidebarOpen ? "text-violet-700" : "text-slate-400 hover:text-slate-700")}>
+              {sidebarOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
+            </button>
+          ) : null}
         </div>
         <div className="flex items-center gap-2 flex-wrap text-xs text-slate-500">
           <ThreadStatusBadge status={thread.status} />
+          {thread.party !== undefined ? <PartyTag party={thread.party} /> : null}
           {wait ? <span className="text-amber-700">waiting {wait}</span> : null}
           <span>{thread.message_count} message{thread.message_count === 1 ? "" : "s"}</span>
           <span>· last {fmtRelative(thread.last_message_at)}</span>
@@ -119,6 +147,21 @@ export function ThreadView({ conversationId, mailbox, onBack }: Props) {
           ) : <div className="text-xs mt-0.5">Find it in the support mailbox's Drafts folder.</div>}
         </Toast>
       ) : null}
+    </div>
+  );
+}
+
+function ThreadSkeleton() {
+  return (
+    <div className="animate-pulse space-y-3" aria-label="Loading conversation">
+      <div className="h-5 w-2/3 rounded bg-slate-200" />
+      <div className="flex gap-2"><div className="h-4 w-24 rounded-full bg-slate-100" /><div className="h-4 w-16 rounded-full bg-slate-100" /></div>
+      {[0, 1, 2].map((i) => (
+        <div key={i} className="rounded-lg ring-1 ring-slate-100 p-3 space-y-2">
+          <div className="flex gap-2"><div className="h-3 w-36 rounded bg-slate-200" /><div className="ml-auto h-3 w-12 rounded bg-slate-100" /></div>
+          {i === 2 ? <div className="h-32 rounded bg-slate-100" /> : null}
+        </div>
+      ))}
     </div>
   );
 }

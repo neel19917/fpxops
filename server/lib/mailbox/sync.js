@@ -12,6 +12,7 @@
 // - One run at a time (single flight), ~4 minutes at most.
 import { supabase, isDbReady } from "../supabase.js";
 import { graphFetch, loadConnection, loadConnectionById, mailboxPath } from "./graph.js";
+import { withInlineImages } from "./images.js";
 
 export const FOLDERS = ["inbox", "sentitems"];
 export const MESSAGE_SELECT = [
@@ -364,14 +365,21 @@ export async function getBodyHtml(messageRowId) {
     .select("id, connection_id, graph_id, body_html").eq("id", messageRowId).maybeSingle();
   if (error) throw new Error(`message not read: ${error.message}`);
   if (!row) throw Object.assign(new Error("Message not found"), { status: 404 });
-  if (row.body_html != null) return row.body_html;
 
-  const conn = await loadConnectionById(row.connection_id);
-  if (!conn) throw Object.assign(new Error("Mailbox connection not found"), { status: 404 });
-  const msg = await graphFetch(conn, `${mailboxPath(conn.mailbox)}/messages/${encodeURIComponent(row.graph_id)}?$select=body`);
-  const html = bodyToHtml(msg?.body);
-  const { error: upErr } = await supabase.from("fpx_mailbox_messages")
-    .update({ body_html: html, updated_at: new Date().toISOString() }).eq("id", row.id);
-  if (upErr) warnOnce("body", `message body not cached: ${upErr.message}`);
-  return html;
+  let conn = null;
+  const getConn = async () => (conn ??= await loadConnectionById(row.connection_id));
+  if (row.body_html == null) {
+    await getConn();
+    if (!conn) throw Object.assign(new Error("Mailbox connection not found"), { status: 404 });
+    const msg = await graphFetch(conn, `${mailboxPath(conn.mailbox)}/messages/${encodeURIComponent(row.graph_id)}?$select=body`);
+    row.body_html = bodyToHtml(msg?.body);
+    const { error: upErr } = await supabase.from("fpx_mailbox_messages")
+      .update({ body_html: row.body_html, updated_at: new Date().toISOString() }).eq("id", row.id);
+    if (upErr) warnOnce("body", `message body not cached: ${upErr.message}`);
+  }
+  // body_html stays stored with its cid: refs; inline images are served from
+  // the Storage cache through fresh signed URLs. Not gated on has_attachments:
+  // Graph reports hasAttachments=false for messages whose only attachments are inline.
+  if (!/cid:/i.test(row.body_html)) return row.body_html;
+  return withInlineImages(getConn, row);
 }

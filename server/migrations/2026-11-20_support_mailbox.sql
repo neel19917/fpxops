@@ -1,4 +1,4 @@
--- NOT APPLIED YET.
+-- Applied to production 2026-11-20.
 -- Support mailbox (freightsupport@freightpop.com) read through Microsoft Graph
 -- by a dedicated Entra app whose access is limited to that one mailbox by an
 -- Exchange Online RBAC-for-Applications management scope. See

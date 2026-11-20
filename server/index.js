@@ -256,6 +256,13 @@ const server = app.listen(PORT, HOST, () => {
   // Syncs the connected support mailbox every 2 minutes. Never allowed to
   // take the server down.
   try { startMailboxSyncWorker(); } catch (e) { console.warn("[FPX] support mailbox worker failed to start:", e?.message || e); }
+  // Thread → shipment linker + party classifier. Lazy import so a missing or
+  // broken linker module can never take the API down.
+  try {
+    import("./lib/mailbox/linking.js")
+      .then((m) => m.startMailboxLinker())
+      .catch((e) => console.warn("[FPX] support mailbox linker failed to start:", e?.message || e));
+  } catch (e) { console.warn("[FPX] support mailbox linker failed to start:", e?.message || e); }
   // Moves each ERP pull on to its approval check, report email and saved
   // documents (every 2 minutes, and on each request's completion).
   try { startInvoicePipeline(); } catch (e) { console.warn("[FPX] invoice pipeline failed to start:", e?.message || e); }

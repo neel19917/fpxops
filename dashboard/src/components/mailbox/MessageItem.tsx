@@ -6,8 +6,30 @@ import { ErrorBlock } from "../ErrorBlock";
 import { LoadingState } from "../LoadingState";
 import { messageTime, recipientsText } from "./shared";
 
-// Bodies already read this session, by message id, so re-opening is instant.
+// Bodies never change: kept for the session by message id (and in-flight
+// requests shared), so re-opening is instant and a prefetch is reused.
 const bodyCache = new Map<string, string>();
+const bodyInflight = new Map<string, Promise<string>>();
+
+/** The message's HTML, from the session cache or the server (one request per id). */
+export function loadMessageBody(id: string): Promise<string> {
+  const hit = bodyCache.get(id);
+  if (hit != null) return Promise.resolve(hit);
+  let p = bodyInflight.get(id);
+  if (!p) {
+    p = getMessageBody(id)
+      .then((r) => { const html = r.body_html || ""; bodyCache.set(id, html); return html; })
+      .finally(() => { bodyInflight.delete(id); });
+    bodyInflight.set(id, p);
+  }
+  return p;
+}
+
+/** Start loading a body in the background; errors are left for the real open. */
+export function prefetchMessageBody(id: string): void {
+  if (bodyCache.has(id)) return;
+  loadMessageBody(id).catch(() => {});
+}
 
 // Put before the email's own markup: the parser moves these into <head>, so
 // they apply whatever the email contains. The frame is also sandbox="" (no
@@ -51,21 +73,14 @@ export function MessageItem({ message: m, mailbox, defaultOpen = false, isReplyT
 
   useEffect(() => {
     if (!open || body != null) return;
-    const ctl = new AbortController();
+    let live = true;
     setErr(null);
-    getMessageBody(m.id, ctl.signal).then(
-      (r) => {
-        if (ctl.signal.aborted) return;
-        const html = r.body_html || "";
-        bodyCache.set(m.id, html);
-        setBody(html);
-      },
-      (e: unknown) => {
-        if (ctl.signal.aborted) return;
-        setErr((e as Error)?.message || "Could not load the message.");
-      },
+    // Shared with prefetches; not aborted on unmount so a prefetch can finish.
+    loadMessageBody(m.id).then(
+      (html) => { if (live) setBody(html); },
+      (e: unknown) => { if (live) setErr((e as Error)?.message || "Could not load the message."); },
     );
-    return () => ctl.abort();
+    return () => { live = false; };
   }, [open, body, m.id, nonce]);
 
   const to = recipientsText(m.to_recipients);

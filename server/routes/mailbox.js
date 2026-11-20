@@ -23,7 +23,23 @@ const MAX_DRAFT_CHARS = 50_000;
 const CONNECTION_COLS = "id, mailbox, tenant_id, client_id, secret_hint, status, last_error, connected_by, connected_at, last_sync_at, last_sync_result, backfill_done, created_at, updated_at";
 const MESSAGE_COLS = "id, conversation_id, folder, direction, subject, from_address, from_name, to_recipients, cc_recipients, received_at, sent_at, body_preview, has_attachments, is_read, web_link";
 const DRAFT_COLS = "id, conversation_id, reply_to_message_id, web_link, body, ai_generated, reply_all, created_by, created_at";
-const THREAD_COLS = "conversation_id, subject, last_message_at, last_inbound_at, last_outbound_at, message_count, preview, last_from_name, last_from_address, participants, status";
+const THREAD_COLS = "conversation_id, subject, last_message_at, last_inbound_at, last_outbound_at, message_count, preview, last_from_name, last_from_address, participants, status, party, linked_shipment_ids, linked_count";
+const LINK_COLS = "id, connection_id, conversation_id, shipment_id, matched_on, matched_text, source, created_by, dismissed, dismissed_by, dismissed_at, created_at";
+const SHIPMENT_CARD_COLS = "id, shipment_id, tracking_number, customer_name, carrier_name, mode, shipment_status, pickup_date, estimated_arrival, delivery_date, origin, destination, scraped_at";
+const TASK_COLS = "id, shipment_id, tracking_number, title, status, priority, assigned_to, due_at, created_at";
+
+export const PARTIES = ["customer", "carrier", "internal", "other"];
+export const PARTY_FILTERS = ["all", ...PARTIES, "unknown"];
+export const DAY_RANGES = ["7", "30", "90", "all"];
+const OPEN_TASK_STATUSES = ["open", "in_progress", "blocked"];
+const MAX_DONE_TASKS = 20;
+const MAX_RELATED_THREADS = 10;
+const DOMAIN_RE = /^(?=.{3,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+// Lazy so this module (and its tests) load even before linking.js exists.
+async function linkingModule() {
+  return import("../lib/mailbox/linking.js");
+}
 
 // ---------- pure helpers (exported for tests) ----------
 
@@ -71,7 +87,56 @@ export function parseThreadQuery(q = {}) {
   // PostgREST or() syntax uses , ( ) and : — strip them (and wildcards) from
   // the search text instead of trying to escape them.
   const search = String(q.q || "").replace(/[,()*%\\:"]/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
-  return { status, limit, offset, search };
+  const party = String(q.party || "all").toLowerCase();
+  if (!PARTY_FILTERS.includes(party)) return { error: `party must be one of ${PARTY_FILTERS.join(", ")}` };
+  const shipment_id = q.shipment_id != null && String(q.shipment_id).trim() !== "" ? String(q.shipment_id).trim().slice(0, 100) : null;
+  // Default range is the last 30 days — except when filtering to one
+  // shipment, where every linked thread matters (deep links from a shipment
+  // or task). An explicit ?days= always wins.
+  const daysRaw = q.days != null && String(q.days) !== "" ? String(q.days).toLowerCase() : (shipment_id ? "all" : "30");
+  if (!DAY_RANGES.includes(daysRaw)) return { error: `days must be one of ${DAY_RANGES.join(", ")}` };
+  const days = daysRaw === "all" ? null : Number(daysRaw);
+  return { status, limit, offset, search, party, days, shipment_id };
+}
+
+// ISO cutoff for a day range (null = all time).
+export function sinceIso(days, now = Date.now()) {
+  if (days == null) return null;
+  return new Date(now - days * 86_400_000).toISOString();
+}
+
+export function normalizeDomain(raw) {
+  const v = String(raw || "").trim().toLowerCase().replace(/^@/, "").replace(/\.$/, "");
+  return DOMAIN_RE.test(v) ? v : null;
+}
+
+export function validateParty(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  return PARTIES.includes(v) ? v : null;
+}
+
+export function domainOf(address) {
+  const m = /@([^@\s>]+)\s*>?$/.exec(String(address || "").trim().toLowerCase());
+  return m ? normalizeDomain(m[1]) : null;
+}
+
+// Open work first, then at most MAX_DONE_TASKS recent closed ones; newest
+// first within each group.
+export function orderContextTasks(tasks) {
+  const byNewest = (a, b) => String(b.created_at || "").localeCompare(String(a.created_at || ""));
+  const open = (tasks || []).filter((t) => OPEN_TASK_STATUSES.includes(t.status)).sort(byNewest);
+  const closed = (tasks || []).filter((t) => !OPEN_TASK_STATUSES.includes(t.status)).sort(byNewest).slice(0, MAX_DONE_TASKS);
+  return [...open, ...closed];
+}
+
+export function shapeThread(t) {
+  return {
+    ...t,
+    participants: t?.participants || [],
+    party: t?.party || "unknown",
+    linked_shipment_ids: t?.linked_shipment_ids || [],
+    linked_count: t?.linked_count ?? (t?.linked_shipment_ids || []).length,
+  };
 }
 
 export function validateConnectionBody(body = {}) {
@@ -134,6 +199,7 @@ export function buildMailboxRouter(deps = {}) {
   const d = {
     supabase, logAudit, logGovernance, encryptSecret, graphFetch, loadConnection, testConnection,
     publicConnection, requestSync, getBodyHtml, generateMailboxReply,
+    classifyDomainChange: async (...args) => (await linkingModule()).classifyDomainChange(...args),
     ...deps,
   };
   const db = () => d.supabase;
@@ -318,7 +384,7 @@ export function buildMailboxRouter(deps = {}) {
         .eq("connection_id", conn.id).eq("conversation_id", conversationId)
         .order("created_at", { ascending: false });
       if (dErr) return res.status(500).json({ error: dErr.message });
-      res.json({ thread: { ...thread, participants: thread.participants || [] }, messages, drafts: drafts || [] });
+      res.json({ thread: shapeThread(thread), messages, drafts: drafts || [] });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -340,7 +406,14 @@ export function buildMailboxRouter(deps = {}) {
       const applySearch = (qb) => p.search
         ? qb.or(`subject.ilike.%${p.search}%,last_from_address.ilike.%${p.search}%,last_from_name.ilike.%${p.search}%`)
         : qb;
-      const base = (cols, opts) => applySearch(db().from("fpx_mailbox_threads").select(cols, opts).eq("connection_id", conn.id));
+      const since = sinceIso(p.days);
+      const base = (cols, opts) => {
+        let q = applySearch(db().from("fpx_mailbox_threads").select(cols, opts).eq("connection_id", conn.id));
+        if (since) q = q.gte("last_message_at", since);
+        if (p.party !== "all") q = q.eq("party", p.party);
+        if (p.shipment_id) q = q.contains("linked_shipment_ids", [p.shipment_id]);
+        return q;
+      };
 
       let listQ = base(THREAD_COLS, { count: "exact" });
       if (p.status !== "all") listQ = listQ.eq("status", p.status);
@@ -357,10 +430,382 @@ export function buildMailboxRouter(deps = {}) {
       const counts = { all: cAll.count || 0 };
       THREAD_STATUSES.forEach((s, i) => { counts[s] = cStatus[i].count || 0; });
       res.json({
-        threads: (list.data || []).map((t) => ({ ...t, participants: t.participants || [] })),
+        threads: (list.data || []).map(shapeThread),
         total: list.count ?? (list.data || []).length,
         counts,
       });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ---------- linking: shipments, party, related threads ----------
+
+  async function threadRow(connectionId, conversationId, cols = THREAD_COLS) {
+    const { data, error } = await db().from("fpx_mailbox_threads").select(cols)
+      .eq("connection_id", connectionId).eq("conversation_id", conversationId).maybeSingle();
+    if (error) throw new Error(error.message);
+    return data || null;
+  }
+
+  // Resolve what a person typed (FreightPOP shipment id, an fpx_shipments row
+  // uuid, or a tracking/PRO number) to the FreightPOP shipment id that links
+  // are keyed by. null when no fpx_shipments row matches.
+  async function resolveShipmentId(raw) {
+    const v = String(raw || "").trim();
+    if (!v || v.length > 100) return null;
+    if (UUID_RE.test(v)) {
+      const { data, error } = await db().from("fpx_shipments").select("shipment_id").eq("id", v).maybeSingle();
+      if (error) throw new Error(error.message);
+      if (data?.shipment_id) return String(data.shipment_id);
+    }
+    const byId = await db().from("fpx_shipments").select("shipment_id").eq("shipment_id", v).limit(1);
+    if (byId.error) throw new Error(byId.error.message);
+    if (byId.data?.length) return String(byId.data[0].shipment_id);
+    const byTracking = await db().from("fpx_shipments").select("shipment_id").eq("tracking_number", v)
+      .order("scraped_at", { ascending: false }).limit(1);
+    if (byTracking.error) throw new Error(byTracking.error.message);
+    const sid = byTracking.data?.[0]?.shipment_id;
+    return sid ? String(sid) : null;
+  }
+
+  // Threads linked (non-dismissed) to one shipment, newest first.
+  async function threadsForShipment(shipmentId) {
+    const conn = await activeConnectionRow();
+    if (!conn || !shipmentId) return [];
+    const { data: links, error } = await db().from("fpx_mailbox_links").select("conversation_id")
+      .eq("connection_id", conn.id).eq("shipment_id", shipmentId).eq("dismissed", false).limit(500);
+    if (error) throw new Error(error.message);
+    const convs = [...new Set((links || []).map((l) => l.conversation_id).filter(Boolean))];
+    if (!convs.length) return [];
+    const { data: threads, error: tErr } = await db().from("fpx_mailbox_threads").select(THREAD_COLS)
+      .eq("connection_id", conn.id).in("conversation_id", convs)
+      .order("last_message_at", { ascending: false, nullsFirst: false }).limit(200);
+    if (tErr) throw new Error(tErr.message);
+    return (threads || []).map(shapeThread);
+  }
+
+  // Newest scrape row per FreightPOP shipment id.
+  async function latestShipments(shipmentIds) {
+    if (!shipmentIds.length) return new Map();
+    const { data, error } = await db().from("fpx_shipments").select(SHIPMENT_CARD_COLS)
+      .in("shipment_id", shipmentIds).order("scraped_at", { ascending: false }).limit(2000);
+    if (error) throw new Error(error.message);
+    const out = new Map();
+    for (const r of data || []) {
+      const k = String(r.shipment_id);
+      if (!out.has(k)) out.set(k, r);
+    }
+    return out;
+  }
+
+  // Tasks reference an fpx_shipments row uuid (any scrape) and carry the
+  // tracking number; match on either. Archived tasks are excluded.
+  async function tasksForShipments(shipmentIds, latest) {
+    if (!shipmentIds.length) return [];
+    const { data: rows, error } = await db().from("fpx_shipments").select("id, shipment_id")
+      .in("shipment_id", shipmentIds).limit(5000);
+    if (error) throw new Error(error.message);
+    const rowToShipment = new Map((rows || []).map((r) => [r.id, String(r.shipment_id)]));
+    const trackingToShipment = new Map();
+    for (const [sid, r] of latest) if (r.tracking_number) trackingToShipment.set(String(r.tracking_number), sid);
+    const rowIds = [...rowToShipment.keys()];
+    const trackings = [...trackingToShipment.keys()];
+    const queries = [];
+    if (rowIds.length) queries.push(db().from("fpx_shipment_tasks").select(TASK_COLS).in("shipment_id", rowIds).is("archived_at", null).limit(500));
+    if (trackings.length) queries.push(db().from("fpx_shipment_tasks").select(TASK_COLS).in("tracking_number", trackings).is("archived_at", null).limit(500));
+    const results = await Promise.all(queries);
+    const bad = results.find((r) => r?.error);
+    if (bad) throw new Error(bad.error.message);
+    const seen = new Map();
+    for (const r of results) for (const t of r.data || []) if (!seen.has(t.id)) seen.set(t.id, t);
+    return orderContextTasks([...seen.values()]).map((t) => ({
+      id: t.id,
+      shipment_id: rowToShipment.get(t.shipment_id) || trackingToShipment.get(String(t.tracking_number || "")) || null,
+      title: t.title,
+      status: t.status,
+      priority: t.priority ?? null,
+      assigned_to: t.assigned_to ?? null,
+      due_at: t.due_at ?? null,
+      created_at: t.created_at,
+    }));
+  }
+
+  async function sendContext(req, res, conversationId) {
+    if (!conversationId) return res.status(400).json({ error: "conversation id required" });
+    try {
+      const conn = await activeConnectionRow();
+      if (!conn) return res.status(404).json({ error: "Thread not found" });
+      const thread = await threadRow(conn.id, conversationId, "conversation_id");
+      if (!thread) return res.status(404).json({ error: "Thread not found" });
+
+      const [metaRes, linksRes, messages] = await Promise.all([
+        db().from("fpx_mailbox_thread_meta").select("party, party_source, party_reason, party_set_by")
+          .eq("connection_id", conn.id).eq("conversation_id", conversationId).maybeSingle(),
+        db().from("fpx_mailbox_links").select(LINK_COLS)
+          .eq("connection_id", conn.id).eq("conversation_id", conversationId).eq("dismissed", false)
+          .order("created_at", { ascending: true }),
+        threadMessages(conn.id, conversationId),
+      ]);
+      if (metaRes.error) return res.status(500).json({ error: metaRes.error.message });
+      if (linksRes.error) return res.status(500).json({ error: linksRes.error.message });
+      const meta = metaRes.data || null;
+      const links = linksRes.data || [];
+
+      // External sender domains (the mailbox's own domain is internal by definition).
+      const ownDomain = domainOf(conn.mailbox);
+      const domains = [...new Set(messages.filter((m) => m.direction !== "out").map((m) => domainOf(m.from_address)).filter(Boolean))]
+        .filter((dm) => dm !== ownDomain);
+      let domainParty = new Map();
+      if (domains.length) {
+        const { data: drows, error: dErr } = await db().from("fpx_mailbox_domains").select("domain, party").in("domain", domains);
+        if (dErr) return res.status(500).json({ error: dErr.message });
+        domainParty = new Map((drows || []).map((r) => [r.domain, r.party]));
+      }
+
+      const shipmentIds = [...new Set(links.map((l) => String(l.shipment_id)))];
+      const latest = await latestShipments(shipmentIds);
+      const shipments = links.map((l) => {
+        const s = latest.get(String(l.shipment_id)) || {};
+        return {
+          shipment_id: String(l.shipment_id),
+          tracking_number: s.tracking_number ?? null,
+          customer_name: s.customer_name ?? null,
+          carrier_name: s.carrier_name ?? null,
+          mode: s.mode ?? null,
+          shipment_status: s.shipment_status ?? null,
+          pickup_date: s.pickup_date ?? null,
+          estimated_arrival: s.estimated_arrival ?? null,
+          delivery_date: s.delivery_date ?? null,
+          origin: s.origin ?? null,
+          destination: s.destination ?? null,
+          matched_on: l.matched_on ?? null,
+          matched_text: l.matched_text ?? null,
+          source: l.source ?? null,
+          link_id: l.id,
+        };
+      });
+
+      const tasks = await tasksForShipments(shipmentIds, latest);
+
+      let related_threads = [];
+      if (shipmentIds.length) {
+        const { data: rl, error: rlErr } = await db().from("fpx_mailbox_links").select("conversation_id")
+          .eq("connection_id", conn.id).in("shipment_id", shipmentIds).eq("dismissed", false)
+          .neq("conversation_id", conversationId).limit(500);
+        if (rlErr) return res.status(500).json({ error: rlErr.message });
+        const convs = [...new Set((rl || []).map((r) => r.conversation_id).filter((c) => c && c !== conversationId))];
+        if (convs.length) {
+          const { data: rt, error: rtErr } = await db().from("fpx_mailbox_threads")
+            .select("conversation_id, subject, last_message_at, status, party")
+            .eq("connection_id", conn.id).in("conversation_id", convs)
+            .order("last_message_at", { ascending: false, nullsFirst: false }).limit(MAX_RELATED_THREADS);
+          if (rtErr) return res.status(500).json({ error: rtErr.message });
+          related_threads = (rt || []).map((t) => ({
+            conversation_id: t.conversation_id, subject: t.subject ?? null, last_message_at: t.last_message_at ?? null,
+            status: t.status ?? null, party: t.party || "unknown",
+          }));
+        }
+      }
+
+      res.json({
+        party: {
+          party: meta?.party || "unknown",
+          source: meta?.party_source || null,
+          reason: meta?.party_reason || null,
+          set_by: meta?.party_set_by || null,
+        },
+        sender_domains: domains.map((dm) => ({ domain: dm, party: domainParty.get(dm) || null })),
+        shipments,
+        tasks,
+        related_threads,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  }
+
+  async function addLink(req, res, conversationId) {
+    if (!conversationId) return res.status(400).json({ error: "conversation id required" });
+    const raw = req.body?.shipment_id;
+    if (raw == null || (typeof raw !== "string" && typeof raw !== "number") || !String(raw).trim()) {
+      return res.status(400).json({ error: "shipment_id is required" });
+    }
+    try {
+      const conn = await activeConnectionRow();
+      if (!conn) return res.status(404).json({ error: "Thread not found" });
+      const thread = await threadRow(conn.id, conversationId, "conversation_id, subject");
+      if (!thread) return res.status(404).json({ error: "Thread not found" });
+      const shipmentId = await resolveShipmentId(raw);
+      if (!shipmentId) return res.status(404).json({ error: `No shipment found for "${String(raw).trim().slice(0, 100)}"` });
+
+      const actor = actorOf(req);
+      const { data: existing, error: exErr } = await db().from("fpx_mailbox_links").select(LINK_COLS)
+        .eq("connection_id", conn.id).eq("conversation_id", conversationId).eq("shipment_id", shipmentId).maybeSingle();
+      if (exErr) return res.status(500).json({ error: exErr.message });
+      let link;
+      if (existing) {
+        if (!existing.dismissed) return res.json({ link: existing });
+        // Re-linking a dismissed link restores it (rows are never deleted).
+        const { data, error } = await db().from("fpx_mailbox_links")
+          .update({ dismissed: false, dismissed_by: null, dismissed_at: null, source: "person", created_by: existing.created_by || actor })
+          .eq("id", existing.id).select(LINK_COLS).single();
+        if (error) return res.status(500).json({ error: error.message });
+        link = data;
+      } else {
+        const { data, error } = await db().from("fpx_mailbox_links").insert({
+          connection_id: conn.id, conversation_id: conversationId, shipment_id: shipmentId,
+          matched_on: "manual", matched_text: String(raw).trim().slice(0, 200), source: "person", created_by: actor,
+        }).select(LINK_COLS).single();
+        if (error) return res.status(500).json({ error: error.message });
+        link = data;
+      }
+      logAuditSafe(req, {
+        action: "link", entity_type: "mailbox_link", entity_id: link?.id || null,
+        summary: `Linked email "${String(thread.subject || "(no subject)").slice(0, 120)}" to shipment ${shipmentId}`,
+        before: existing ? { dismissed: true } : null, after: { shipment_id: shipmentId, dismissed: false },
+        metadata: { conversation_id: conversationId, shipment_id: shipmentId, input: String(raw).trim().slice(0, 200) },
+      });
+      res.json({ link });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  }
+
+  async function setThreadParty(req, res, conversationId) {
+    if (!conversationId) return res.status(400).json({ error: "conversation id required" });
+    const party = validateParty(req.body?.party);
+    if (!party) return res.status(400).json({ error: `party must be one of ${PARTIES.join(", ")}` });
+    try {
+      const conn = await activeConnectionRow();
+      if (!conn) return res.status(404).json({ error: "Thread not found" });
+      const thread = await threadRow(conn.id, conversationId, "conversation_id, subject, party");
+      if (!thread) return res.status(404).json({ error: "Thread not found" });
+      const actor = actorOf(req);
+      const row = {
+        connection_id: conn.id, conversation_id: conversationId, party, party_source: "person",
+        party_reason: `Set by ${actor || "a person"}`, party_set_by: actor, updated_at: new Date().toISOString(),
+      };
+      const { data, error } = await db().from("fpx_mailbox_thread_meta")
+        .upsert(row, { onConflict: "connection_id,conversation_id" })
+        .select("party, party_source, party_reason, party_set_by").single();
+      if (error) return res.status(500).json({ error: error.message });
+      logAuditSafe(req, {
+        action: "update", entity_type: "mailbox_thread", entity_id: conversationId,
+        summary: `Marked email "${String(thread.subject || "(no subject)").slice(0, 120)}" as ${party}`,
+        before: { party: thread.party || "unknown" }, after: { party, party_source: "person" },
+        metadata: { conversation_id: conversationId },
+      });
+      res.json({ party: { party: data?.party || party, source: data?.party_source || "person", reason: data?.party_reason ?? row.party_reason, set_by: data?.party_set_by ?? actor } });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  }
+
+  // GET /threads/<encoded id>/context (or /threads/context?id=)
+  router.get(/^\/threads\/(?:(.+)\/)?context$/, (req, res) =>
+    sendContext(req, res, decodeConversationId({ pathValue: req.params[0], queryValue: req.query.id })));
+
+  // POST /threads/<encoded id>/links { shipment_id } (or /threads/links?id=)
+  router.post(/^\/threads\/(?:(.+)\/)?links$/, (req, res) =>
+    addLink(req, res, decodeConversationId({ pathValue: req.params[0], queryValue: req.query.id })));
+
+  // PUT /threads/<encoded id>/party { party } (or /threads/party?id=)
+  router.put(/^\/threads\/(?:(.+)\/)?party$/, (req, res) =>
+    setThreadParty(req, res, decodeConversationId({ pathValue: req.params[0], queryValue: req.query.id })));
+
+  // POST /links/:linkId/dismiss — sets dismissed; never deletes.
+  router.post("/links/:linkId/dismiss", async (req, res) => {
+    const id = String(req.params.linkId || "");
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: "link id must be a uuid" });
+    try {
+      const { data: link, error } = await db().from("fpx_mailbox_links").select(LINK_COLS).eq("id", id).maybeSingle();
+      if (error) return res.status(500).json({ error: error.message });
+      if (!link) return res.status(404).json({ error: "Link not found" });
+      if (link.dismissed) return res.json({ link });
+      const { data, error: uErr } = await db().from("fpx_mailbox_links")
+        .update({ dismissed: true, dismissed_by: actorOf(req), dismissed_at: new Date().toISOString() })
+        .eq("id", id).select(LINK_COLS).single();
+      if (uErr) return res.status(500).json({ error: uErr.message });
+      logAuditSafe(req, {
+        action: "dismiss", entity_type: "mailbox_link", entity_id: id,
+        summary: `Unlinked shipment ${link.shipment_id} from an email thread`,
+        before: { dismissed: false }, after: { dismissed: true },
+        metadata: { conversation_id: link.conversation_id, shipment_id: link.shipment_id, matched_on: link.matched_on, source: link.source },
+      });
+      res.json({ link: data });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // PUT /domains/:domain { party } — a person's rule; re-classifies that
+  // domain's threads in the background.
+  router.put("/domains/:domain", async (req, res) => {
+    const domain = normalizeDomain(req.params.domain);
+    if (!domain) return res.status(400).json({ error: "domain must look like example.com" });
+    const party = validateParty(req.body?.party);
+    if (!party) return res.status(400).json({ error: `party must be one of ${PARTIES.join(", ")}` });
+    try {
+      const { data: before } = await db().from("fpx_mailbox_domains").select("domain, party, source").eq("domain", domain).maybeSingle();
+      const actor = actorOf(req);
+      const { data, error } = await db().from("fpx_mailbox_domains")
+        .upsert({ domain, party, source: "person", set_by: actor, updated_at: new Date().toISOString() }, { onConflict: "domain" })
+        .select("domain, party, source, set_by, updated_at").single();
+      if (error) return res.status(500).json({ error: error.message });
+      logAuditSafe(req, {
+        action: "update", entity_type: "mailbox_domain", entity_id: domain,
+        summary: `Always treat ${domain} as ${party}`,
+        before: before ? { party: before.party, source: before.source } : null, after: { party, source: "person" },
+        metadata: { domain },
+      });
+      // Fire-and-forget: re-classify threads from this domain.
+      Promise.resolve().then(() => d.classifyDomainChange(domain, party))
+        .catch((e) => console.warn("[FPX-MAILBOX] classifyDomainChange failed:", e?.message || e));
+      res.json({ domain: data });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /by-shipment/:shipmentId — FreightPOP shipment id, fpx_shipments row
+  // uuid, or tracking number.
+  router.get("/by-shipment/:shipmentId", async (req, res) => {
+    const raw = String(req.params.shipmentId || "").trim();
+    if (!raw || raw.length > 100) return res.status(400).json({ error: "shipment id required" });
+    try {
+      const shipmentId = (await resolveShipmentId(raw)) || raw;
+      const threads = await threadsForShipment(shipmentId);
+      res.json({ shipment_id: shipmentId, threads });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /by-task/:taskId → { shipment_id, threads }
+  router.get("/by-task/:taskId", async (req, res) => {
+    const taskId = String(req.params.taskId || "").trim();
+    if (!taskId || taskId.length > 100) return res.status(400).json({ error: "task id required" });
+    try {
+      const { data: task, error } = await db().from("fpx_shipment_tasks").select("id, shipment_id, tracking_number").eq("id", taskId).maybeSingle();
+      if (error) return res.status(500).json({ error: error.message });
+      if (!task) return res.status(404).json({ error: "Task not found" });
+      let shipmentId = null;
+      let tracking = task.tracking_number || null;
+      if (task.shipment_id) {
+        const { data: ship, error: sErr } = await db().from("fpx_shipments").select("shipment_id, tracking_number").eq("id", task.shipment_id).maybeSingle();
+        if (sErr) return res.status(500).json({ error: sErr.message });
+        if (ship?.shipment_id) shipmentId = String(ship.shipment_id);
+        tracking = tracking || ship?.tracking_number || null;
+      }
+      if (!shipmentId && tracking) {
+        const { data: rows, error: tErr } = await db().from("fpx_shipments").select("shipment_id").eq("tracking_number", tracking)
+          .not("shipment_id", "is", null).order("scraped_at", { ascending: false }).limit(1);
+        if (tErr) return res.status(500).json({ error: tErr.message });
+        if (rows?.[0]?.shipment_id) shipmentId = String(rows[0].shipment_id);
+      }
+      const threads = shipmentId ? await threadsForShipment(shipmentId) : [];
+      res.json({ shipment_id: shipmentId, threads });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }

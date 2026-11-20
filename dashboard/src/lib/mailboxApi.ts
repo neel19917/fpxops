@@ -10,6 +10,12 @@ export const DEFAULT_MAILBOX = "freightsupport@freightpop.com";
 export type ThreadStatus = "awaiting_reply" | "responded" | "outbound_only";
 export type ThreadFilter = "all" | ThreadStatus;
 export type ConnectionStatus = "connected" | "error" | "disconnected";
+/** Who a conversation is with. "unknown" until the linker classifies it. */
+export type Party = "customer" | "carrier" | "internal" | "other" | "unknown";
+export type PartyFilter = "all" | Party;
+/** The list's time range, in days ("all" = all time). Default 30. */
+export type RangeDays = "7" | "30" | "90" | "all";
+export type PartySource = "rule" | "ai" | "person";
 
 export interface Recipient {
   emailAddress?: { name?: string | null; address?: string | null } | null;
@@ -29,6 +35,10 @@ export interface Thread {
   last_from_address: string | null;
   participants: string[] | null;
   status: ThreadStatus;
+  /** From the linker; absent on a server that has not been updated yet. */
+  party?: Party | null;
+  linked_shipment_ids?: string[] | null;
+  linked_count?: number | null;
 }
 
 export interface Message {
@@ -113,6 +123,66 @@ export interface ThreadDetail {
   drafts: Draft[];
 }
 
+export interface ThreadLink {
+  id: string;
+  connection_id?: string | null;
+  conversation_id: string;
+  shipment_id: string;
+  matched_on: string | null;
+  matched_text: string | null;
+  source: "auto" | "person" | string | null;
+  created_by?: string | null;
+  dismissed: boolean;
+  dismissed_by?: string | null;
+  dismissed_at?: string | null;
+  created_at?: string | null;
+}
+
+export interface ContextShipment {
+  shipment_id: string;
+  tracking_number: string | null;
+  customer_name: string | null;
+  carrier_name: string | null;
+  mode: string | null;
+  shipment_status: string | null;
+  pickup_date: string | null;
+  estimated_arrival: string | null;
+  delivery_date: string | null;
+  origin: string | null;
+  destination: string | null;
+  matched_on: string | null;
+  matched_text: string | null;
+  source: string | null;
+  link_id: string;
+}
+
+export interface ContextTask {
+  id: string;
+  shipment_id: string;
+  title: string | null;
+  status: string | null;
+  priority: string | null;
+  assigned_to: string | null;
+  due_at: string | null;
+  created_at: string | null;
+}
+
+export interface RelatedThread {
+  conversation_id: string;
+  subject: string | null;
+  last_message_at: string | null;
+  status: ThreadStatus;
+  party: Party | null;
+}
+
+export interface ThreadContext {
+  party: { party: Party; source: PartySource | null; reason: string | null; set_by: string | null };
+  sender_domains: { domain: string; party: Exclude<Party, "unknown"> | null }[];
+  shipments: ContextShipment[];
+  tasks: ContextTask[];
+  related_threads: RelatedThread[];
+}
+
 export interface ConnectInput {
   tenant_id: string;
   client_id: string;
@@ -184,11 +254,22 @@ export const syncMailboxNow = () => call<{ started: boolean }>("/sync", { body: 
 
 // ---- Threads and messages (any user) ----
 export const listThreads = (
-  opts: { status?: ThreadFilter; q?: string; limit?: number; offset?: number } = {},
+  opts: {
+    status?: ThreadFilter; q?: string; limit?: number; offset?: number;
+    party?: PartyFilter; days?: RangeDays; shipment_id?: string;
+  } = {},
   signal?: AbortSignal,
 ) =>
   call<ThreadList>("/threads", {
-    params: { status: opts.status || "all", q: opts.q?.trim() || undefined, limit: opts.limit ?? 50, offset: opts.offset ?? 0 },
+    params: {
+      status: opts.status || "all",
+      q: opts.q?.trim() || undefined,
+      limit: opts.limit ?? 50,
+      offset: opts.offset ?? 0,
+      party: opts.party && opts.party !== "all" ? opts.party : undefined,
+      days: opts.days || "30",
+      shipment_id: opts.shipment_id?.trim() || undefined,
+    },
     signal,
   });
 
@@ -208,3 +289,24 @@ export const aiDraft = (messageId: string, instructions?: string) =>
 /** Creates a reply DRAFT in the mailbox's Outlook Drafts folder. Never sends. */
 export const createDraft = (messageId: string, input: { body: string; reply_all?: boolean; ai_generated?: boolean }) =>
   call<{ draft: Draft }>(`/messages/${enc(messageId)}/draft`, { body: input, timeoutMs: SLOW_TIMEOUT_MS });
+
+// ---- Linking: party, shipments, tasks, related threads (any signed-in user) ----
+
+/** Party, linked shipments and their tasks, and related threads for the sidebar. */
+export const getThreadContext = (conversationId: string, signal?: AbortSignal) =>
+  call<ThreadContext>(`/threads/${enc(conversationId)}/context`, { signal });
+
+/** Link a shipment by hand. The shipment must exist in FPX. */
+export const linkShipment = (conversationId: string, shipmentId: string) =>
+  call<{ link: ThreadLink }>(`/threads/${enc(conversationId)}/links`, { body: { shipment_id: shipmentId.trim() } });
+
+/** Hides a link (it is flagged, never deleted). */
+export const dismissLink = (linkId: string) =>
+  call<{ link: ThreadLink }>(`/links/${enc(linkId)}/dismiss`, { body: {} });
+
+export const setThreadParty = (conversationId: string, party: Exclude<Party, "unknown">) =>
+  call<{ party: unknown }>(`/threads/${enc(conversationId)}/party`, { method: "PUT", body: { party } });
+
+/** Treat every email from this domain as the party (re-classifies its threads). */
+export const setDomainParty = (domain: string, party: Exclude<Party, "unknown">) =>
+  call<{ domain: unknown }>(`/domains/${enc(domain)}`, { method: "PUT", body: { party } });
