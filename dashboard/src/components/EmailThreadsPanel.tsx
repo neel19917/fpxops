@@ -1,6 +1,9 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { Mail, RefreshCw } from "lucide-react";
+import { ArrowLeft, Mail, RefreshCw } from "lucide-react";
+import { useAuth } from "../lib/auth";
+import { ThreadView } from "./mailbox/ThreadView";
+import { ThreadSidebar } from "./mailbox/ThreadSidebar";
 import {
   getThreadsForShipment,
   getThreadsForTask,
@@ -55,7 +58,15 @@ function StatusPill({ status }: { status: string }) {
   return <span className="text-[10px] font-medium rounded-full px-1.5 py-0.5 bg-slate-50 text-slate-500 ring-1 ring-slate-200">Sent</span>;
 }
 
-export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shipmentId?: string | null; taskId?: string | null; compact?: boolean }) {
+// `inline`: clicking a thread opens it right here (messages + the same Details
+// sidebar as the Support Mailbox) instead of going to /mailbox.
+export function EmailThreadsPanel({ shipmentId, taskId, compact = false, inline = false }: { shipmentId?: string | null; taskId?: string | null; compact?: boolean; inline?: boolean }) {
+  const { profile } = useAuth();
+  const isAdmin = profile?.role === "admin";
+  const access = (profile as { mailbox_access?: string } | null)?.mailbox_access;
+  const canDraft = isAdmin || !access || access === "draft";
+  const [open, setOpen] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [threads, setThreads] = useState<LinkedThread[] | null>(null);
   const [resolvedShipmentId, setResolvedShipmentId] = useState<string | null>(shipmentId || null);
   const [error, setError] = useState<string | null>(null);
@@ -116,7 +127,8 @@ export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shi
           const party = String(t.party || "unknown");
           return (
             <li key={t.conversation_id}>
-              <Link to={mailboxThreadHref(t.conversation_id)} className={`block ${pad} hover:bg-slate-50`}>
+              <Link to={mailboxThreadHref(t.conversation_id)} className={`block ${pad} hover:bg-slate-50`}
+                onClick={inline ? (e) => { if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; e.preventDefault(); setOpen(t.conversation_id); } : undefined}>
                 <div className="flex items-center gap-2 min-w-0">
                   <span className={`shrink-0 text-[10px] font-medium rounded-full px-1.5 py-0.5 ${PARTY_STYLE[party] || PARTY_STYLE.unknown}`}>
                     {PARTY_LABEL[party] || party}
@@ -136,6 +148,34 @@ export function EmailThreadsPanel({ shipmentId, taskId, compact = false }: { shi
           );
         })}
       </ul>
+    );
+  }
+
+  if (inline && open && !forbidden) {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={() => setOpen(null)} className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900">
+            <ArrowLeft className="h-3.5 w-3.5" /> All emails for this shipment
+          </button>
+          <Link to={mailboxThreadHref(open)} className="ml-auto inline-flex items-center gap-1 text-xs font-medium text-sky-700 hover:text-sky-900">
+            <Mail className="h-3.5 w-3.5" /> Open in Support Mailbox
+          </Link>
+        </div>
+        {/* Side by side when the drawer is wide enough, stacked otherwise. */}
+        <div className="flex flex-wrap items-start gap-3">
+          <div className="flex-1 basis-[420px] min-w-0 rounded-lg ring-1 ring-slate-200 bg-white overflow-hidden">
+            <ThreadView key={open} conversationId={open} mailbox={null} onBack={() => setOpen(null)}
+              canDraft={canDraft} sidebarOpen={sidebarOpen} onToggleSidebar={() => setSidebarOpen((v) => !v)} />
+          </div>
+          {sidebarOpen ? (
+            <aside aria-label="Conversation details" className="grow basis-72 max-w-full sm:max-w-[340px] rounded-lg ring-1 ring-slate-200 bg-slate-50">
+              <ThreadSidebar key={open} conversationId={open} readOnly={!canDraft}
+                onOpenThread={(c) => setOpen(c)} onClose={() => setSidebarOpen(false)} />
+            </aside>
+          ) : null}
+        </div>
+      </div>
     );
   }
 
