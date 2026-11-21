@@ -203,6 +203,83 @@ export async function setReportRecipients(recipients: string[]): Promise<{ recip
 }
 
 // ---------------------------------------------------------------------------
+// Push to ERP: press FreightPOP's Get Invoice (which pushes the shipment into
+// FreightPOP's NetSuite) for approved shipments that aren't exported yet.
+// ---------------------------------------------------------------------------
+
+export type PushGetInvoiceStatus = "requested" | "done" | "failed" | "not_started";
+
+export interface PushShipment {
+  shipment_id: string;
+  customer: string | null;
+  carrier: string | null;
+  tracking: string | null;
+  charge: number | null;
+  invoice_number: string | null;
+  approved_by: string | null;
+  docs_saved: boolean;
+  /** From that run's audit row, if Get Invoice was ever pressed for it. */
+  get_invoice: { status: PushGetInvoiceStatus; at: string | null; note: string | null } | null;
+}
+
+/** The approved-and-ready shipments whose latest pull is one run. */
+export interface PushGroup {
+  audit_id: string;
+  run_number: number | null;
+  pulled_at: string | null;
+  shipments: PushShipment[];
+}
+
+export interface PushCandidates {
+  /** Newest run first. */
+  groups: PushGroup[];
+  /** Approved-and-ready shipments overall. */
+  total: number;
+  /** Approved-and-ready shipments with no known pull; they need a new Pull first. */
+  unassigned: number;
+  /** The Get Invoice job queued or running now, from any source. */
+  active: {
+    request_id: string;
+    status: "pending" | "claimed";
+    audit_id: string | null;
+    count: number | null;
+    requested_at: string;
+    requested_by: string | null;
+  } | null;
+  /** The newest finished Get Invoice job. */
+  last: {
+    request_id: string;
+    status: string;
+    completed_at: string | null;
+    count: number | null;
+    source: "push_to_erp" | "pipeline" | "manual";
+  } | null;
+}
+
+/** Most shipments one Push to ERP can press Get Invoice for. */
+export const PUSH_MAX = 200;
+
+/** Approved shipments FreightPOP hasn't exported, grouped by their latest run. */
+export async function getPushCandidates(): Promise<PushCandidates> {
+  const res = await call(`${BASE}/push`);
+  const body = (await res.json()) as Partial<PushCandidates>;
+  return {
+    groups: body.groups ?? [],
+    total: body.total ?? 0,
+    unassigned: body.unassigned ?? 0,
+    active: body.active ?? null,
+    last: body.last ?? null,
+  };
+}
+
+/** Queue one Get Invoice run for shipments of one run (≤200). */
+/** repush: the person deliberately ticked shipments that already had Get Invoice pressed (the server refuses them otherwise). */
+export async function pushToErp(auditId: string, shipmentIds: string[], repush = false): Promise<{ request: { id: string; status: string }; count: number }> {
+  const res = await call(`${BASE}/push`, { method: "POST", body: JSON.stringify({ audit_id: auditId, shipment_ids: shipmentIds, ...(repush ? { repush: true } : {}) }) });
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
 // Plain words for a run's progress.
 // ---------------------------------------------------------------------------
 

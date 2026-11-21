@@ -79,9 +79,12 @@ async function resetGetInvoiceRows(request, note) {
 const askedBy = (req, requestedBy) => (requestedBy !== undefined ? requestedBy : (req?.user?.email || req?.apiKey?.name || null));
 const fail = (status, error) => ({ ok: false, status, error });
 
-// { auditId, shipmentIds (≤200), pauseAfterFirst = true, buttons } — buttons
-// left out (undefined/null) means every View Shipment button.
-export async function queueGetInvoice({ auditId: auditIn, shipmentIds, pauseAfterFirst = true, buttons: buttonsIn } = {}, { req = null, requestedBy } = {}) {
+// { auditId, shipmentIds (≤200), pauseAfterFirst = true, buttons, source } —
+// buttons left out (undefined/null) means every View Shipment button. source
+// (optional, e.g. "push_to_erp") is written to the audit-log entry's metadata
+// so the dashboard can say where a run came from; left out, nothing changes.
+const GET_INVOICE_SOURCE_LABELS = { push_to_erp: "Push to ERP" };
+export async function queueGetInvoice({ auditId: auditIn, shipmentIds, pauseAfterFirst = true, buttons: buttonsIn, source } = {}, { req = null, requestedBy } = {}) {
   const auditId = String(auditIn || "").trim();
   if (!auditId) return fail(400, "audit_id required");
   const picked = normalizeShipmentIds(shipmentIds);
@@ -133,8 +136,8 @@ export async function queueGetInvoice({ auditId: auditIn, shipmentIds, pauseAfte
     action: "rescrape_request",
     entity_type: "scrape_request",
     entity_id: data.id,
-    summary: `Requested Get Invoice for ${ids.length} shipment(s) · ${describeButtons(buttons)}${req ? "" : " · invoice pipeline"}`,
-    metadata: { scope: GET_INVOICE_SCOPE, audit_id: audit.id, count: ids.length, shipment_ids: ids, pause_after_first: pauseFirst, buttons: buttons ?? "all", ...(req ? {} : { requested_by: by, source: "invoice_pipeline" }) },
+    summary: `Requested Get Invoice for ${ids.length} shipment(s) · ${describeButtons(buttons)}${req ? "" : " · invoice pipeline"}${source ? ` · ${GET_INVOICE_SOURCE_LABELS[source] || source}` : ""}`,
+    metadata: { scope: GET_INVOICE_SCOPE, audit_id: audit.id, count: ids.length, shipment_ids: ids, pause_after_first: pauseFirst, buttons: buttons ?? "all", ...(req ? {} : { requested_by: by, source: "invoice_pipeline" }), ...(source ? { source: String(source) } : {}) },
   });
 
   // Show the chosen rows as requested. The request is already queued, so a

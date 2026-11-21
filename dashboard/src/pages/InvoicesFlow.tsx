@@ -173,7 +173,7 @@ export function InvoicesFlowPage() {
       </Section>
 
       <Section id="push" n={5} title="Push to ERP">
-        <PushToErpSection />
+        <PushToErpSection version={version} onChanged={() => { void refresh(); }} />
       </Section>
 
       <footer className="border-t border-slate-200 pt-4 text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
