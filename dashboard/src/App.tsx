@@ -48,12 +48,15 @@ const ScrapingPage    = lazy(() => import("./pages/Scraping").then((m) => ({ def
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
 const SupportMailboxPage = lazy(() => import("./pages/SupportMailbox"));
 const SupportMailboxAdminPage = lazy(() => import("./pages/SupportMailboxAdmin").then((m) => ({ default: m.SupportMailboxAdminPage })));
+const ShippersPage    = lazy(() => import("./pages/Shippers"));
+const ShipperDetailPage = lazy(() => import("./pages/ShipperDetail"));
 const ShipmentDetailsMonitorPage = lazy(() => import("./pages/ShipmentDetailsMonitor").then((m) => ({ default: m.ShipmentDetailsMonitorPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
   tracking: "/tracking",
   tasks: "/tasks",
+  shippers: "/shippers",
   ops: "/ops",
   scraping: "/scraping",
   shipment_details: "/tracking/details",
@@ -106,6 +109,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/audits/invoice") || pathname.startsWith("/invoicing") || pathname.startsWith("/invoices")) return "invoicing";
   if (pathname.startsWith("/email-studio")) return "emails";
   if (pathname.startsWith("/tasks")) return "tasks";
+  if (pathname.startsWith("/shippers")) return "shippers";
   if (pathname.startsWith("/ops")) return "ops";
   if (pathname.startsWith("/scraping")) return "scraping";
   if (pathname.startsWith("/freightpop")) return "freightpop";
@@ -287,6 +291,8 @@ function AuthedApp() {
             <Route path="/tasks/customer-followups" element={<TasksPage />} />
             <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
             <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
+            <Route path="/shippers" element={<ShippersPage />} />
+            <Route path="/shippers/:key" element={<ShipperDetailPage />} />
             <Route path="/ops" element={<OpsPage />} />
             <Route path="/scraping" element={<ScrapingPage />} />
             <Route path="/freightpop" element={<FreightPopLoginPage />} />
