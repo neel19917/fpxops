@@ -6,7 +6,7 @@ import { setImpersonate } from "../lib/impersonate";
 import { api } from "../lib/api";
 import { ImpersonateModal } from "./ImpersonateModal";
 
-export type TabId = "tracking" | "tasks" | "shippers" | "ops" | "scraping" | "shipment_details" | "freightpop" | "notes" | "analyses" | "gp" | "invoicing" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude" | "mailbox" | "mailbox_admin";
+export type TabId = "tracking" | "tasks" | "shippers" | "ops" | "scraping" | "shipment_details" | "freightpop" | "notes" | "analyses" | "gp" | "invoicing" | "invoice" | "keys" | "users" | "shares" | "feedback" | "install" | "audit" | "settings" | "services" | "ai_export" | "scrape_logs" | "hosted_browser" | "emails" | "ai_governance" | "data_flow" | "claude" | "mailbox" | "mailbox_admin" | "mailbox_metrics";
 
 interface TabDef {
   id: TabId;
@@ -53,6 +53,7 @@ const ALL_TABS: TabDef[] = [
   { id: "scrape_logs", label: "Scrape Logs",  Icon: ScrollText,   group: "admin" },
   { id: "hosted_browser", label: "Hosted Browser", Icon: MonitorPlay, group: "admin" },
   { id: "mailbox_admin", label: "Support Mailbox", Icon: Inbox, group: "admin" },
+  { id: "mailbox_metrics", label: "Mailbox Metrics", Icon: BarChart3, group: "admin" },
 ];
 
 interface Props {
