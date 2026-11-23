@@ -7,8 +7,9 @@
 //       already queued, running or done for it is adopted, not repeated)
 //     → the not-exported report is emailed (lib/invoiceReport.js; a failure is
 //       recorded on the run and never holds it up)
-//     → stage "documents": Get Invoice for every not-exported shipment of the
-//       run that has no saved documents yet, in batches of up to 200, all View
+//     → stage "documents": Get Invoice for every approved-and-ready, not-exported
+//       shipment of the run that has no saved documents yet (never unapproved
+//       ones: Get Invoice pushes into FreightPOP's NetSuite), in batches of up to 200, all View
 //       Shipment buttons, no pause after the first; one batch at a time, each
 //       batch's completion queues the next
 //     → stage "done"
@@ -160,23 +161,29 @@ export function createInvoicePipeline({
     return rows;
   }
 
-  // Of these shipment ids, the ones still not exported to ERP and with no
-  // saved invoice documents, in the order given.
+  // Of these shipment ids, the ones whose invoice is approved and ready
+  // (fpx_erp_invoicing bucket "approved_ready"), still not exported to ERP and
+  // with no saved invoice documents, in the order given. Pressing Get Invoice
+  // pushes the shipment into FreightPOP's NetSuite, so unapproved shipments
+  // (no invoice yet, or an invoice not approved) are never pressed.
   async function needingDocsOf(ids) {
     if (!ids.length) return [];
     const drop = new Set();
+    const approved = new Set();
     for (let i = 0; i < ids.length; i += ID_CHUNK) {
       const chunk = ids.slice(i, i + ID_CHUNK);
-      const [exported, records, docs] = await Promise.all([
+      const [ready, exported, records, docs] = await Promise.all([
+        must(db.from("fpx_erp_invoicing").select("shipment_id").in("shipment_id", chunk).eq("bucket", "approved_ready")),
         must(db.from("fpx_erp_transactions").select("shipment_id").in("shipment_id", chunk).eq("exported_to_erp", true)),
         must(db.from("fpx_shipment_records").select("shipment_id, files").in("shipment_id", chunk).eq("kind", "invoice")),
         must(db.from("fpx_invoice_documents").select("shipment_id").in("shipment_id", chunk)),
       ]);
+      for (const r of ready || []) approved.add(String(r.shipment_id));
       for (const r of exported || []) drop.add(String(r.shipment_id));
       for (const r of records || []) if (Array.isArray(r.files) && r.files.length) drop.add(String(r.shipment_id));
       for (const r of docs || []) drop.add(String(r.shipment_id));
     }
-    return ids.filter((id) => !drop.has(id));
+    return ids.filter((id) => approved.has(id) && !drop.has(id));
   }
 
   // Not-exported shipments of the run with no saved invoice documents yet.

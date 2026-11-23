@@ -80,6 +80,8 @@ function setup({ rows = 150, extraTables = {} } = {}) {
     fpx_erp_transactions: [],
     fpx_shipment_records: [],
     fpx_invoice_documents: [],
+    // Every shipment approved and ready unless a test says otherwise.
+    fpx_erp_invoicing: Array.from({ length: rows }, (_, i) => ({ shipment_id: String(1000 + i), bucket: "approved_ready" })),
     ...extraTables,
   };
   const db = fakeDb(tables);
@@ -235,6 +237,32 @@ describe("invoice pipeline flow", () => {
     assert.equal(run.docs_failed, 10);
     assert.equal(env.calls.getInvoice.length, 3);
     assert.equal(env.calls.report.length, 1, "the report is emailed once");
+  });
+
+  it("never presses Get Invoice for unapproved shipments", async () => {
+    const env = setup({ rows: 10 });
+    env.tables.fpx_erp_invoicing[1].bucket = "no_invoice";
+    env.tables.fpx_erp_invoicing[2].bucket = "invoice_not_approved";
+    env.tables.fpx_erp_invoicing.splice(3, 1); // 1003: not in the invoicing view at all
+    const p = env.pipeline();
+    const { before, after } = pull();
+    await p.onRequestComplete(before, after);
+    await complete(env, p, "ac-1", "done", "audit b1064935");
+    const run = env.tables.fpx_invoice_pipeline[0];
+    assert.equal(run.docs_total, 7);
+    assert.deepEqual(env.calls.getInvoice[0].args.shipmentIds, ["1000", "1004", "1005", "1006", "1007", "1008", "1009"]);
+  });
+
+  it("finishes without a Get Invoice run when nothing is approved", async () => {
+    const env = setup({ rows: 5 });
+    for (const r of env.tables.fpx_erp_invoicing) r.bucket = "no_invoice";
+    const p = env.pipeline();
+    const { before, after } = pull();
+    await p.onRequestComplete(before, after);
+    await complete(env, p, "ac-1", "done", "audit b1064935");
+    await p.advancePipelines();
+    assert.equal(env.calls.getInvoice.length, 0);
+    assert.equal(env.tables.fpx_invoice_pipeline[0].stage, "done");
   });
 
   it("skips backfill pulls", async () => {
