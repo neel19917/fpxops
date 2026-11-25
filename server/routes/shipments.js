@@ -528,8 +528,24 @@ shipmentsRouter.get("/stats", async (req, res) => {
   res.json({ total, issues, statuses });
 });
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 shipmentsRouter.get("/:id", async (req, res) => {
-  const { data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", req.params.id).maybeSingle();
+  const key = String(req.params.id || "").trim();
+  let ship = null;
+  let error = null;
+  if (UUID_RE.test(key)) {
+    ({ data: ship, error } = await supabase.from("fpx_shipments").select("*").eq("id", key).maybeSingle());
+  } else if (key) {
+    // Links built from a FreightPOP shipment id or a tracking number
+    // (Support Mailbox, Shippers) resolve to the newest matching row.
+    for (const col of ["shipment_id", "tracking_number"]) {
+      const r = await supabase.from("fpx_shipments").select("*").eq(col, key)
+        .order("scraped_at", { ascending: false, nullsFirst: false }).limit(1);
+      if (r.error) { error = r.error; break; }
+      if (r.data?.length) { ship = r.data[0]; break; }
+    }
+  }
   if (error) return res.status(500).json({ error: error.message });
   if (!ship) return res.status(404).json({ error: "Shipment not found" });
   const [analysesRes, historyRes, tasksRes, notesRes, recentDiffRes] = await Promise.all([

@@ -41,6 +41,8 @@ import { lookbackRouter } from "./routes/lookback.js";
 import { scrapeHistoryRouter } from "./routes/scrapeHistory.js";
 import { getInvoiceRunsRouter } from "./routes/getInvoiceRuns.js";
 import { mailboxRouter } from "./routes/mailbox.js";
+import { mailboxMetricsRouter } from "./routes/mailboxMetrics.js";
+import { shippersRouter } from "./routes/shippers.js";
 import { startMailboxSyncWorker } from "./lib/mailbox/sync.js";
 import { invoiceFlowRouter } from "./routes/invoiceFlow.js";
 import { startInvoicePipeline } from "./lib/invoicePipeline.js";
@@ -163,6 +165,10 @@ api.use("/shipment-details", shipmentDetailsRouter);
 // Support Mailbox (freightsupport@): threads, Outlook reply drafts. Admin-only
 // routes inside check the role themselves.
 api.use("/mailbox", mailboxRouter);
+// Support Mailbox Metrics (admin only, read only).
+api.use("/mailbox-metrics", mailboxMetricsRouter);
+// Shippers view: one read-only dashboard per shipper (tracking, tasks, emails).
+api.use("/shippers", shippersRouter);
 app.use("/api", api);
 
 // Admin routes (admin scope OR admin role).

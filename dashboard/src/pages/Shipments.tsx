@@ -496,6 +496,15 @@ export function ShipmentsPage({ initialShipmentId, drawerSection, onShipmentCons
     api.shipments.get(drawerId)
       .then((d) => {
         if (cancelled) return;
+        // Opened by FreightPOP shipment id / tracking number (links from the
+        // Support Mailbox and Shippers): switch to the row's real id so every
+        // drawer action (notes, tasks, overrides) targets it.
+        const realId = d?.shipment?.id;
+        if (realId && realId !== drawerId) {
+          setDrawerIdState(realId);
+          onDrawerChange?.(realId, drawerTab === "overview" ? null : drawerTab);
+          return;
+        }
         setDrawerData(d);
         setDrawerTasks(d.tasks || []);
         setNotesLog(d.notes_log || []);

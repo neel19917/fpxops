@@ -48,12 +48,16 @@ const ScrapingPage    = lazy(() => import("./pages/Scraping").then((m) => ({ def
 const AiExportPage    = lazy(() => import("./pages/AiExport").then((m) => ({ default: m.AiExportPage })));
 const SupportMailboxPage = lazy(() => import("./pages/SupportMailbox"));
 const SupportMailboxAdminPage = lazy(() => import("./pages/SupportMailboxAdmin").then((m) => ({ default: m.SupportMailboxAdminPage })));
+const SupportMailboxMetricsPage = lazy(() => import("./pages/SupportMailboxMetrics"));
+const ShippersPage    = lazy(() => import("./pages/Shippers"));
+const ShipperDetailPage = lazy(() => import("./pages/ShipperDetail"));
 const ShipmentDetailsMonitorPage = lazy(() => import("./pages/ShipmentDetailsMonitor").then((m) => ({ default: m.ShipmentDetailsMonitorPage })));
 
 // Map a tab id to its route. Drawer sub-routes live under /tracking/:id/:section.
 const TAB_PATH: Record<TabId, string> = {
   tracking: "/tracking",
   tasks: "/tasks",
+  shippers: "/shippers",
   ops: "/ops",
   scraping: "/scraping",
   shipment_details: "/tracking/details",
@@ -79,10 +83,11 @@ const TAB_PATH: Record<TabId, string> = {
   data_flow: "/admin/data-flow",
   mailbox: "/mailbox",
   mailbox_admin: "/admin/support-mailbox",
+  mailbox_metrics: "/admin/mailbox-metrics",
   claude: "/claude",
 };
 
-const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "ai_governance", "data_flow", "mailbox_admin"]);
+const ADMIN_TABS = new Set<TabId>(["users", "keys", "audit", "settings", "services", "ai_export", "scrape_logs", "hosted_browser", "ai_governance", "data_flow", "mailbox_admin", "mailbox_metrics"]);
 
 // Resolve the active tab from the current pathname. Order matters: longer
 // prefixes win so /audits/gp doesn't get matched by a stray /audits handler.
@@ -98,6 +103,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/admin/email-studio")) return "emails"; // old prompts URL, redirects below
   if (pathname.startsWith("/admin/ai-governance")) return "ai_governance";
   if (pathname.startsWith("/admin/data-flow")) return "data_flow";
+  if (pathname.startsWith("/admin/mailbox-metrics")) return "mailbox_metrics";
   if (pathname.startsWith("/admin/support-mailbox")) return "mailbox_admin";
   if (pathname.startsWith("/mailbox")) return "mailbox";
   if (pathname.startsWith("/claude")) return "claude";
@@ -106,6 +112,7 @@ function pathToTab(pathname: string): TabId {
   if (pathname.startsWith("/audits/invoice") || pathname.startsWith("/invoicing") || pathname.startsWith("/invoices")) return "invoicing";
   if (pathname.startsWith("/email-studio")) return "emails";
   if (pathname.startsWith("/tasks")) return "tasks";
+  if (pathname.startsWith("/shippers")) return "shippers";
   if (pathname.startsWith("/ops")) return "ops";
   if (pathname.startsWith("/scraping")) return "scraping";
   if (pathname.startsWith("/freightpop")) return "freightpop";
@@ -287,6 +294,8 @@ function AuthedApp() {
             <Route path="/tasks/customer-followups" element={<TasksPage />} />
             <Route path="/tasks/:taskId" element={<TaskWalkRoute />} />
             <Route path="/tasks/:taskId/:section" element={<TaskWalkRoute />} />
+            <Route path="/shippers" element={<ShippersPage />} />
+            <Route path="/shippers/:key" element={<ShipperDetailPage />} />
             <Route path="/ops" element={<OpsPage />} />
             <Route path="/scraping" element={<ScrapingPage />} />
             <Route path="/freightpop" element={<FreightPopLoginPage />} />
@@ -321,6 +330,7 @@ function AuthedApp() {
                 <Route path="/admin/ai-governance" element={<AIGovernancePage />} />
                 <Route path="/admin/data-flow" element={<DataFlowPage />} />
                 <Route path="/admin/support-mailbox" element={<SupportMailboxAdminPage />} />
+                <Route path="/admin/mailbox-metrics" element={<SupportMailboxMetricsPage />} />
               </>
             ) : null}
             <Route path="*" element={<Navigate to="/tasks" replace />} />

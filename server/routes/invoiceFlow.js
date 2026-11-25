@@ -10,8 +10,12 @@
 //   POST /pull { months, shipment_type }   queues an ERP pull (409 when one is queued or running)
 //   POST /report/email                  emails the report now
 //   PUT  /report/recipients { recipients }  admins only, @freightpop.com addresses
+//   GET  /push                          approved-and-ready shipments by ERP pull, the current/last Get Invoice job
+//   POST /push { audit_id, shipment_ids }   queues one Get Invoice job (FreightPOP pushes each to NetSuite)
 // The pipeline after each pull (approval check, documents, the emailed report)
-// runs in lib/invoicePipeline.js. Nothing here deletes anything or touches FreightPOP.
+// runs in lib/invoicePipeline.js. Nothing here deletes anything; POST /push only
+// queues the hosted browser's Get Invoice job (pressing GET INVOICE is the one
+// outward action, never a NetSuite call).
 import { Router } from "express";
 import { supabase as realSupabase } from "../lib/supabase.js";
 import { logAudit as realLogAudit } from "../lib/audit.js";
@@ -22,7 +26,11 @@ import {
   NOT_EXPORTED_STATUSES, DEFAULT_RECIPIENTS, RECIPIENTS_KEY,
   isUuid, isAdminReq, validatePull, validateRecipients, toNotExportedRow, activeFrom,
   loadRuns, loadCounts, lastEmailedAt, loadNotExportedPage, pageLookups, loadRunFiles, loadRunDocuments, queueErpPull,
+  PUSH_SOURCE, validatePush, checkPushIds, groupPushCandidates, pushJobs,
+  loadApprovedReady, loadPushJobs, loadGetInvoiceStates, loadPushChecks,
 } from "../lib/invoiceFlow.js";
+
+const PUSH_BUSY = "A Get Invoice run is already queued or running. Try again when it finishes.";
 
 const XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
@@ -54,6 +62,11 @@ export function buildInvoiceFlowRouter(overrides = {}) {
     buildNotExportedWorkbook: async () => (await report()).buildNotExportedWorkbook(),
     sendNotExportedReport: async (opts) => (await report()).sendNotExportedReport(opts),
     setRecipients: (list, by) => setSetting(RECIPIENTS_KEY, list.join(", "), by),
+    // Push to ERP. Loaded when first used, like queuePull's ops import.
+    queueGetInvoice: async (args, opts) => (await import("./ops.js")).queueGetInvoice(args, opts),
+    loadPushJobs: () => loadPushJobs(sb),
+    loadGetInvoiceStates: (idsByAudit) => loadGetInvoiceStates(sb, idsByAudit),
+    loadPushChecks: (ids) => loadPushChecks(sb, ids),
     ...overrides,
   };
   const router = Router();
@@ -226,6 +239,48 @@ export function buildInvoiceFlowRouter(overrides = {}) {
         after: { recipients: v.recipients },
       });
       res.json({ recipients: v.recipients });
+    } catch (e) { fail(res, e); }
+  });
+
+  router.get("/push", async (_req, res) => {
+    try {
+      const loadPage = deps.loadNotExportedPage || ((o) => loadNotExportedPage(sb, o));
+      const [{ runs }, { rows, total }, jobs] = await Promise.all([
+        deps.loadRuns(), loadApprovedReady(loadPage), deps.loadPushJobs(),
+      ]);
+      const ids = rows.map((r) => String(r.shipment_id));
+      const { docsSaved, lastPull } = await (deps.pageLookups || ((list) => pageLookups(sb, list)))(ids);
+      const idsByAudit = new Map();
+      for (const id of ids) {
+        const audit = lastPull.get(id);
+        if (!audit) continue;
+        if (!idsByAudit.has(audit)) idsByAudit.set(audit, []);
+        idsByAudit.get(audit).push(id);
+      }
+      const states = await deps.loadGetInvoiceStates(idsByAudit);
+      const { groups, unassigned } = groupPushCandidates({ rows, lastPull, docsSaved, runs, states });
+      const { active, last } = pushJobs(jobs.requests || [], jobs.sources || new Map());
+      res.set("Cache-Control", "private, no-store");
+      res.json({ groups, total, unassigned, active, last });
+    } catch (e) { fail(res, e); }
+  });
+
+  router.post("/push", async (req, res) => {
+    const v = validatePush(req.body || {});
+    if (v.error) return res.status(400).json({ error: v.error });
+    try {
+      const checks = await deps.loadPushChecks(v.ids);
+      const bad = checkPushIds(v.ids, v.auditId, checks, { repush: v.repush });
+      if (bad) return res.status(400).json({ error: bad });
+      const out = await deps.queueGetInvoice(
+        { auditId: v.auditId, shipmentIds: v.ids, pauseAfterFirst: false, buttons: null, source: PUSH_SOURCE },
+        { req },
+      );
+      if (!out?.ok) {
+        if (out?.status === 409) return res.status(409).json({ error: PUSH_BUSY });
+        return res.status(out?.status || 500).json({ error: out?.error || "The push could not be queued" });
+      }
+      res.json({ request: { id: out.request?.id, status: out.request?.status || "pending" }, count: v.ids.length });
     } catch (e) { fail(res, e); }
   });
 
